@@ -830,8 +830,45 @@ void RequestsHandler::initHandlers()
 	_handlers.emplace(SipMessageTypes::REQUEST_TERMINATED,std::bind(&RequestsHandler::onReqTerminated,  this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::REFER,             std::bind(&RequestsHandler::onRefer,          this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::UPDATE,            std::bind(&RequestsHandler::onUpdate,         this, std::placeholders::_1));
+	_handlers.emplace(SipMessageTypes::PRACK,             std::bind(&RequestsHandler::onPrack,          this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::MESSAGE,           std::bind(&RequestsHandler::onMessage,        this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::SUBSCRIBE,         std::bind(&RequestsHandler::onSubscribe,      this, std::placeholders::_1));
+}
+
+namespace
+{
+	// Issue #172: the one route that honours Require: 100rel is the 777 echo, and only for an
+	// initial INVITE (no To tag). Only the header gate keys on this; onInvite's 777 branch keys on
+	// destNumber == "777", the same To user.
+	bool isEchoTestInvite(const SipMessage& m)
+	{
+		return m.getType() == SipMessageTypes::INVITE && m.getToNumber() == "777" &&
+			m.getTo().find("tag=") == std::string_view::npos;
+	}
+
+	// RFC 3262 §7.2: RAck = response-num SP CSeq-num SP method. Bounded, no allocation.
+	bool parseRAck(std::string_view v, uint32_t& rseq, uint32_t& cseq, std::string_view& method)
+	{
+		auto token = [&v]() {
+			while (!v.empty() && v.front() == ' ') v.remove_prefix(1);
+			const size_t n = v.find(' ');
+			const std::string_view t = v.substr(0, n);
+			v.remove_prefix(n == std::string_view::npos ? v.size() : n);
+			return t;
+		};
+		auto number = [](std::string_view t, uint32_t& out) {
+			const char* end = t.data() + t.size();
+			const auto r = std::from_chars(t.data(), end, out);
+			return !t.empty() && r.ec == std::errc{} && r.ptr == end;
+		};
+		const std::string_view a = token();
+		const std::string_view b = token();
+		const std::string_view c = token();
+		while (!v.empty() && v.front() == ' ') v.remove_prefix(1);
+		if (!v.empty() || c.empty() || !number(a, rseq) || !number(b, cseq)) return false;
+		method = c;
+		return true;
+	}
 }
 
 void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_view rawBytes)
@@ -947,7 +984,14 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		if (request->headerLinesTruncated()) _headerLineCuts.fetch_add(1, std::memory_order_relaxed);
 		bool headerRefused = false;
 		std::string_view unsupportedTag;
-		if (const auto hv = request->checkHeaders(unsupportedTag); hv != SipMessage::HeaderVerdict::Ok)
+		// #172, RFC 3262 §3: a UAS unwilling to send a provisional reliably MUST answer 420 naming
+		// 100rel. Only the 777 echo sends its 180 reliably, so only its INVITE is told 100rel is
+		// honoured; any other message is judged at its Require line as before #172. Emergency traffic
+		// is never the echo (a PSAP callback to 777 is answered by that branch), so it takes the
+		// yield below as it always has.
+		const bool echoInvite = isEchoTestInvite(*request) && !isEmergencyTraffic(*request);
+		const auto hv = request->checkHeaders(unsupportedTag, echoInvite);
+		if (hv != SipMessage::HeaderVerdict::Ok)
 		{
 			if (isEmergencyTraffic(*request))
 			{
@@ -1596,7 +1640,7 @@ namespace
 	// UNAVAILABLE/OK/FINAL_FAILURE/REQUEST_TERMINATED) are RESPONSE keys, not
 	// methods, and have no business in Allow.
 	//
-	// Deliberately absent: PRACK (no handler — so 100rel must not be claimed
+	// Deliberately absent: PRACK (onPrack covers only the 777 echo, #172; 100rel is not claimed
 	// either), NOTIFY (BlfSubscriptions SENDS them; nothing accepts one) and
 	// PUBLISH. A phone that saw those here would wait on replies we never send.
 	constexpr const char* kAllowedMethods =
@@ -1620,8 +1664,9 @@ namespace
 	// or omitting Session-Expires when refresher=uas or unsupported (#724); and
 	// in-dialog bodiless UPDATE refreshes are handled locally or relayed (#439, #782).
 	//
-	// NOT "100rel" (RFC 3262 needs PRACK), "norefersub", "path", "gruu" or
-	// "outbound" — none of them have any implementation in this codebase.
+	// NOT "100rel": it is honoured only in a Require on the 777 echo INVITE (#172), not as a general
+	// capability a phone could rely on. NOT "norefersub", "path", "gruu" or "outbound" — none of
+	// them have any implementation in this codebase.
 	constexpr const char* kSupportedOptionTags = "replaces, timer";
 
 	// Body types this PBX actually parses: SDP on INVITE/re-INVITE/UPDATE/ACK,
@@ -2496,6 +2541,11 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 			return;
 		}
 		newSession->setDest(dummy777);
+		// #172, Rule 5: a PSAP callback to 777 is answered here as an echo (the emergency return above
+		// takes only 911/933 and a rule-made one) but is not the echo test's dialog, so the PBX is not its
+		// PRACK UAS and onPrack must not 481 it. isEmergencyTraffic() is that decision, taken once.
+		const bool emergency = isEmergencyTraffic(*data);
+		newSession->setEchoDialog(!emergency);
 		_sessions.emplace(data->getCallID(), newSession);
 		newSession->setState(Session::State::Connected);
 
@@ -2516,6 +2566,20 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 			std::string(data->getTo()) + ";tag=" + toTag);
 		ringing->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		ringing->setContact(buildContact("777"));
+		// #172, RFC 3262 §3: the echo's 180 is sent reliably when the INVITE asked for it. The clone's
+		// Require lines are dropped (a 180 echoing Require: 100rel with no RSeq would claim to be reliable),
+		// then exactly one Require: 100rel is added, and RSeq 1 is in the MUST range (1..2**31-1).
+		// The RECOMMENDED random value is not drawn, since IDGen::fillRandom is private. No hold: the 180
+		// carries no session description, so §3 lets the 200 go before PRACK, and nothing is retransmitted
+		// once the final is sent (§3: SHOULD NOT continue to retransmit after a final response).
+		// Rule 5: emergency traffic (a PSAP callback is one on any To) keeps the plain 180.
+		ringing->removeHeaders("Require");
+		if (data->requiresReliableProvisional() && !emergency)
+		{
+			ringing->addHeader("Require", "100rel");
+			ringing->setHeaderOnce("RSeq", "1");
+			newSession->openReliableProvisional(1, siphdr::cseqNumber(data->getCSeq()));
+		}
 		_outbox.emplace_back(data->getSource(), std::move(ringing));
 
 		okResponse->setHeader(SipMessageTypes::OK);
@@ -6249,6 +6313,32 @@ void RequestsHandler::onSessionProgress(std::shared_ptr<SipMessage> data)
 	if (handleTrunkInboundReply(data)) return;   // #398: the handset answering a carrier's call
 #endif
 	(void)_sipTrunk.handleResponse(data);
+}
+
+// Issue #172, RFC 3262 §3 and §7.2. The PBX is the UAS of a PRACK only on the 777 echo test's own dialog
+// (Session::isEchoDialog, set by onInvite's 777 branch): a matching RAck gets 200 and every other PRACK
+// there gets 481, whether or not the 180 was reliable. A PRACK on any other session is a relayed dialog's,
+// not ours to answer, and stays silent as it always was; a 481 there would make its sender end an early
+// dialog (RFC 3261 §12.2.1.2). That includes a call whose dest *11 or *69 repointed at a virtual 777 peer
+// (a 911 included) and a PSAP callback to 777, so this is keyed on the session's state, not on dest.
+void RequestsHandler::onPrack(std::shared_ptr<SipMessage> data)
+{
+	auto session = getSession(data->getCallID());
+	if (!session.has_value() || !session.value()->isEchoDialog()) return;
+	if (!isDialogSourceAuthorized(session.value(), data->getSource())) return;
+	uint32_t rseq = 0;
+	uint32_t cseq = 0;
+	std::string_view method;
+	const bool matches = parseRAck(siphdr::stripHeaderNameView(data->getHeaderLine("RAck")), rseq, cseq, method) &&
+		method == SipMessageTypes::INVITE && session.value()->matchesReliableProvisional(rseq, cseq);
+	auto response = getMessageFromPool(*data);
+	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+	response->setHeader(matches ? SipMessageTypes::OK : SipMessageTypes::NO_TRANSACTION);
+	response->clearBody();
+	response->removeHeaders("RAck");
+	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+	if (matches) session.value()->acknowledgeReliableProvisional();
+	_outbox.emplace_back(data->getSource(), std::move(response));
 }
 
 void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
@@ -12084,8 +12174,8 @@ void RequestsHandler::drainOutboxInto(
 	// otherwise send one-shot UDP messages that are simply lost on a dropped
 	// packet. classify() (TransactionLayer.cpp) tracks INVITE requests, every
 	// other request except ACK/OPTIONS/REGISTER (NOTIFY included), and our
-	// own responses to INVITE/BYE/CANCEL/REFER/UPDATE; everything else is
-	// left untracked.
+	// own responses to INVITE/BYE/CANCEL/REFER/UPDATE and the 2xx of a PRACK;
+	// everything else is left untracked.
 	//
 	// Ordering matters (#70): the scan must run after everything that appends to
 	// _outbox during this pass (BLF NOTIFYs, tick()-originated forks — park

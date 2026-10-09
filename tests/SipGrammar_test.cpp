@@ -238,7 +238,7 @@ namespace
 		  i.extra = "Contact: <sip:500@10.9.2.1>, <sip:500@10.9.2.2>, <sip:500@10.9.2.3>, <sip:500@10.9.2.4>\r\n";
 		  v.push_back({"5 Contact entries", "SIP/2.0 400", i}); }
 		{ Invite i; i.callId = "sg-v-100rel"; i.extra = "Require: 100rel\r\n";
-		  v.push_back({"Require: 100rel (no PRACK)", "SIP/2.0 420", i}); }
+		  v.push_back({"Require: 100rel to an ordinary extension (only the 777 echo honours it)", "SIP/2.0 420", i}); }
 		{ Invite i; i.callId = "sg-v-preq"; i.extra = "Proxy-Require: sec-agree\r\n";
 		  v.push_back({"Proxy-Require: sec-agree", "SIP/2.0 420", i}); }
 		{ Invite i; i.callId = "sg-v-text"; i.contentType = "text/plain"; i.body = "hello\r\n";

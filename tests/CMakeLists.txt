@@ -113,6 +113,8 @@ add_executable(sip_parser_tests
     # BEFORE building any 180/200, mirroring the ordinary call-to-call INVITE
     # path, so a full session pool gets a real 503 instead of a false 200.
     Invite777SessionPool_test.cpp
+    # Issue #172: RFC 3262 Require: 100rel is honoured on the 777 echo route only.
+    Prack100rel_test.cpp
     # Relay codec policy: filterAudioCodecs()/offersSupportedAudio() replaced the
     # blind enforceG711() "0 8 101" rewrite on peer-to-peer legs -- offer order
     # preserved, G.722 admitted, unsupported payloads (and their rtpmap/fmtp)

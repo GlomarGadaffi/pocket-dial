@@ -435,13 +435,18 @@ static_assert(POCKETDIAL_HAS_ANCHOR || POCKETDIAL_HAS_TRUNK,
 // preview), the register beep, and the failure responses the engine mints itself
 // (403/404/486/488/503/603). Second, only the methods where re-processing a
 // duplicate actually does harm get a non-INVITE server transaction — BYE, CANCEL,
-// REFER and UPDATE — while REGISTER, OPTIONS, MESSAGE, INFO and SUBSCRIBE are
+// REFER and UPDATE, and the 2xx of a PRACK (the 777 echo's, #172: at most one slot
+// per reliable echo call, since only its first matching PRACK is answered 2xx; a
+// 481 or 420 re-processes to the same answer and takes none) — while REGISTER,
+// OPTIONS, MESSAGE, INFO and SUBSCRIBE are
 // left to be re-processed as before, because they are idempotent enough that a
 // 32 s Timer J slot each would cost far more than it buys. (INFO is the close
 // call: a duplicated DTMF digit is a real bug, but at one slot per keypress for
 // 32 s it would dominate this pool on its own. Tracked separately.)
 //
-// Same graceful degradation: no free slot → the response is still sent once.
+// Same graceful degradation: no free slot → the response is still sent once, with
+// no retransmit or absorb tracking. A PRACK 200 sent that way is not cached, so a
+// retransmission of that PRACK is re-processed and draws a 481.
 #ifndef POCKETDIAL_MAX_SERVER_TRANSACTIONS
 #define POCKETDIAL_MAX_SERVER_TRANSACTIONS (POCKETDIAL_MAX_SESSIONS + 8)
 #endif

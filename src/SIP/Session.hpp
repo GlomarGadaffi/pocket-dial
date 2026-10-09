@@ -150,6 +150,28 @@ public:
 #endif
 	}
 
+	// Issue #172: this is the 777 echo test's own dialog, the one the PBX answers PRACK on (onPrack).
+	// Set by onInvite's 777 branch for non-emergency traffic only. Dest is not a stand-in for it: *11
+	// and *69 repoint a relayed (or 911) call's dest at a virtual 777 peer, and a PSAP callback to 777
+	// is answered by the same branch, and none of those is the PBX's dialog to PRACK.
+	void setEchoDialog(bool v) { _echoDialog = v; }
+	bool isEchoDialog() const { return _echoDialog; }
+
+	// Issue #172, RFC 3262 §3: the 777 echo answered a Require: 100rel INVITE with a
+	// reliable 180. _prackRSeq is that provisional's RSeq while it awaits its PRACK
+	// (0 = none); _prackCSeq is the INVITE CSeq it was sent for. Once the PRACK has
+	// matched, _prackRSeq is back to 0, so a repeat PRACK on the echo gets 481.
+	void openReliableProvisional(uint32_t rseq, uint32_t cseq)
+	{
+		_prackRSeq = rseq;
+		_prackCSeq = cseq;
+	}
+	bool matchesReliableProvisional(uint32_t rseq, uint32_t cseq) const
+	{
+		return _prackRSeq != 0 && rseq == _prackRSeq && cseq == _prackCSeq;
+	}
+	void acknowledgeReliableProvisional() { _prackRSeq = 0; }
+
 	// Issue #604: RTP inactivity watch. `legA`/`legB` are the received-packet
 	// counters of the call's two relayed legs (pass one counter twice for a
 	// one-leg bridge). The clock restarts whenever EITHER leg has received
@@ -414,6 +436,9 @@ private:
 	bool _isTrunk = false;
 	int  _trunkRelaySlot = -1;
 	bool _isEmergency = false;                          // #604
+	bool _echoDialog = false;       // #172
+	uint32_t _prackRSeq = 0;        // #172
+	uint32_t _prackCSeq = 0;        // #172
 	std::string_view _emergencyNumber;                  // #879
 	bool _rtpWatchArmed = false;                        // #604
 	uint32_t _rtpMarkA = 0;                             // #604
