@@ -361,7 +361,9 @@ private:
 	// means this one returns false at once (the caller keeps its cached token). Only start() passes
 	// waitForArena, and only the Ordinary lane honours it: start() is off the 911 lane, and a
 	// restart that lost the claim would leave the anchor down. The Emergency lane never waits.
-	bool fetchToken(telephony::TokenLane lane = telephony::TokenLane::Ordinary, bool waitForArena = false);
+	// sosCallId (EmergencyScope::id()) names the 911/933 in the witness when its claim is refused.
+	bool fetchToken(telephony::TokenLane lane = telephony::TokenLane::Ordinary, bool waitForArena = false,
+	                std::uint32_t sosCallId = 0);
 	bool ensureToken();          // refresh iff expiring AND no media streams active (the ordinary lane)
 	bool tokenExpiringSoon() const; // true when within the refresh margin of JWT exp
 	bool haveCachedToken() const;   // any token installed, even one past expiry (under _mutex)

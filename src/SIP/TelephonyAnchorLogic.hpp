@@ -827,15 +827,23 @@ public:
 
 	// claim(), then, for the Ordinary lane only, up to `polls` more tries `pollMs` apart (start():
 	// off the 911 lane, and a restart that lost the claim would leave the anchor down). The
-	// Emergency lane makes the one try and never calls sleepMs.
+	// Emergency lane makes the one try and never calls sleepMs. A refused Emergency claim is one
+	// witness line naming the 911/933 that lost (sosCallId, EmergencyScope::id()) and why: another
+	// 911/933's fetch holds the arena (operator ruling 4 on #945).
 	template <class Sleep>
-	Lease claimWaiting(TokenLane lane, int polls, std::uint32_t pollMs, Sleep&& sleepMs)
+	Lease claimWaiting(TokenLane lane, int polls, std::uint32_t pollMs, Sleep&& sleepMs, std::uint32_t sosCallId = 0)
 	{
 		Lease lease = claim(lane);
 		for (int i = 0; lane == TokenLane::Ordinary && !lease && i < polls; ++i)
 		{
 			sleepMs(pollMs);
 			lease = claim(lane);
+		}
+		if (!lease && lane == TokenLane::Emergency)
+		{
+			PD_WITNESS_W("e911", "token_sos_claim_lost_862: 911/933 call %u lost the 911/933 token arena claim: another 911/933 "
+			                     "token fetch holds the arena, so this call fetches nothing and goes on with the token it has; "
+			                     "a failed POST goes to NOT ROUTED (#880) (#862)", static_cast<unsigned>(sosCallId));
 		}
 		return lease;
 	}

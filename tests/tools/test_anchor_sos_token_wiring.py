@@ -38,6 +38,7 @@ class SosTokenWiringTest(unittest.TestCase):
         tac = read("TelephonyAnchorClient.cpp")
         self.make = body_of(tac, "bool TelephonyAnchorClient::makeCall(")
         self.free = body_of(tac, "void TelephonyAnchorClient::freeSlotLocked(")
+        self.fetch = body_of(tac, "bool TelephonyAnchorClient::fetchToken(")
 
     def test_ruling_1_the_401_step_asks_whether_another_911_is_pending_or_up(self):
         at = self.make.index("telephony::sosRetryOn401(")
@@ -57,6 +58,14 @@ class SosTokenWiringTest(unittest.TestCase):
                         "before makeCall() returns, so it overlaps the pending scope with no gap")
         self.assertIn("slot.emergency.store(false, std::memory_order_release)", self.free,
                       "the one place a slot goes back to free")
+
+    def test_ruling_4_every_911_fetch_names_its_call_to_the_arena_claim(self):
+        self.assertEqual(self.make.count("fetchToken(telephony::TokenLane::Emergency, false, sosScope.id())"), 2,
+                         "the fetch before the POST (no token) and the 401 step's")
+        self.assertNotIn("fetchToken(telephony::TokenLane::Emergency)", self.make,
+                         "a 911/933 fetch that does not name its call leaves an anonymous claim loss")
+        self.assertRegex(self.fetch, r"(?s)claimWaiting\(.*?\},\s*sosCallId\);",
+                         "the refused claim's witness is emitted by claimWaiting, which needs the number")
 
 
 if __name__ == "__main__":

@@ -645,6 +645,41 @@ TEST(TokenLanes, Emergency_ClaimHeldByAnother911FallsThroughAtOnceAndRefusesNoth
 	EXPECT_TRUE(ordinary) << "the ordinary lane is not involved";
 }
 
+// Operator ruling 4 on #945 (interim): two 911/933s both answered 401, the loser's fetch is turned
+// away at the arena claim and its call falls to #880. The line says which 911/933 lost and why.
+TEST(TokenLanes, Emergency_ClaimLossWitnessNamesTheLosing911AndAnOrdinaryLossLeavesNone)
+{
+	Lanes lanes;
+	Sleeper sleeper;
+	Lanes::EmergencyScope holder(lanes, true);   // call 1: its fetch holds the 911/933 arena
+	Lanes::EmergencyScope loser(lanes, true);    // call 2: turned away
+	ASSERT_EQ(holder.id(), 1u);
+	ASSERT_EQ(loser.id(), 2u);
+	Arena::Lease held = lanes.claim(TokenLane::Emergency);
+	ASSERT_TRUE(held);
+
+	pdwitness::clear();
+	Arena::Lease turnedAway = lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper, loser.id());
+	EXPECT_FALSE(turnedAway);
+	EXPECT_EQ(sleeper.calls, 0) << "and it still did not wait";
+	EXPECT_EQ(pdwitness::count("token_sos_claim_lost_862"), 1u) << "one line for the one loss";
+	const std::vector<std::string> lines = pdwitness::lines();
+	ASSERT_EQ(lines.size(), 1u);
+	EXPECT_NE(lines[0].find("call 2 "), std::string::npos) << "names the 911/933 that lost: " << lines[0];
+	EXPECT_EQ(lines[0].find("call 1 "), std::string::npos) << "and not the one holding the arena: " << lines[0];
+	EXPECT_NE(lines[0].find("another 911/933 token fetch holds the arena"), std::string::npos) << "and why: " << lines[0];
+
+	pdwitness::clear();
+	Arena::Lease ordinaryHeld = lanes.claim(TokenLane::Ordinary);
+	ASSERT_TRUE(ordinaryHeld);
+	EXPECT_FALSE(lanes.claimWaiting(TokenLane::Ordinary, 0, kPollMs, sleeper));
+	EXPECT_EQ(pdwitness::count("token_sos_claim_lost_862"), 0u) << "an ordinary fetch turned away is not a 911/933 that lost";
+
+	held = Arena::Lease();   // the holder's fetch is over
+	EXPECT_TRUE(lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper, loser.id()));
+	EXPECT_EQ(pdwitness::count("token_sos_claim_lost_862"), 0u) << "a claim that is granted leaves no line";
+}
+
 TEST(TokenLanes, Emergency_ClaimWhileAnOrdinaryFetchHoldsItsArenaProceedsAtOnce)
 {
 	Lanes lanes;
@@ -1154,6 +1189,46 @@ TEST(Sos401, WithNoOther911LiveTheOneFetchAndTheOneRetryAreAsTheyWere)
 	EXPECT_EQ(pdwitness::count("token_sos_401_skip_862"), 0u);
 	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 1u);
 	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 1u);
+}
+
+// Ruling 4: not the skip of ruling 1 (that needs another 911/933 live when the question is asked),
+// but two fetches that both got past it, as two calls with no cached token do (FetchThenPost). The
+// fetch of the one that loses the claim fails, so its 401 step returns the 401 and #880 takes it.
+TEST(Sos401, TheLoserOfTwoFetchesIsTurnedAwayAtTheArenaClaimAndFallsToNotRouted)
+{
+	Lanes lanes;
+	Sleeper sleeper;
+	Lanes::EmergencyScope winner(lanes, true);
+	Lanes::EmergencyScope loser(lanes, true);
+	Arena::Lease winnersFetch = lanes.claim(TokenLane::Emergency);   // call 1's fetch, mid-read
+	ASSERT_TRUE(winnersFetch);
+	Net net;
+	int fetchesRun = 0;
+	pdwitness::clear();
+	const telephony::PostResult first = net.post();
+	const telephony::PostResult r = telephony::sosRetryOn401(
+	    first, loser.id(), [] { return false; },
+	    [&] {
+		    Arena::Lease lease = lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper, loser.id());
+		    if (!lease) return false;   // fetchToken() returns false here, before any I/O
+		    ++fetchesRun;
+		    return net.fetch();
+	    },
+	    [&] { return net.post(); });
+	EXPECT_FALSE(r.ok);
+	EXPECT_EQ(r.status, 401) << "the 401 comes back unchanged, which is what #880 handles";
+	EXPECT_EQ(fetchesRun, 0) << "no fetch ran for the loser";
+	const std::vector<std::string> want = {"post:old"};
+	EXPECT_EQ(net.events, want) << "and no retry";
+	EXPECT_EQ(pdwitness::count("token_sos_claim_lost_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 0u);
+	const std::vector<std::string> lines = pdwitness::lines();
+	bool named = false;
+	for (const std::string& l : lines)
+	{
+		if (l.find("token_sos_claim_lost_862") != std::string::npos) named = l.find("call 2 ") != std::string::npos;
+	}
+	EXPECT_TRUE(named) << "the loser is call 2";
 }
 
 TEST(TokenLanes, AnotherPendingNeedsAnotherActiveScopeAndEvery911ScopeGetsItsOwnNumber)

@@ -339,7 +339,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		ESP_LOGI(TAG, "911/933 makeCall: call %u (#862)", static_cast<unsigned>(sosScope.id()));
 		if (telephony::sosFirstStep(haveCachedToken()) == telephony::SosFirstStep::FetchThenPost)
 		{
-			fetchToken(telephony::TokenLane::Emergency);
+			fetchToken(telephony::TokenLane::Emergency, false, sosScope.id());
 		}
 		_tokenLanes.noteSosDial(tokenExpiringSoon());
 	}
@@ -450,7 +450,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 			    }
 			    return false;
 		    },
-		    [this] { return fetchToken(telephony::TokenLane::Emergency); },
+		    [&] { return fetchToken(telephony::TokenLane::Emergency, false, sosScope.id()); },
 		    [&] {
 			    status = 0; respBody.clear(); requestSent = false;
 			    postSeq = readPostSeq();
@@ -989,7 +989,7 @@ static bool acceptToken(std::string_view token)
 	return check == telephony::TokenCheck::Ok;
 }
 
-bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForArena)
+bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForArena, std::uint32_t sosCallId)
 {
 	// #862: claim the lane's token arena before any I/O. A fetch on this lane already holds it,
 	// and a second one would only invalidate the first one's token (Telephony drops the old token
@@ -1003,7 +1003,7 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 	constexpr uint32_t kClaimWaitPollMs = 100;
 	telephony::TokenLanes::Lease lease = _tokenLanes.claimWaiting(
 	    lane, waitForArena ? kClaimWaitPolls : 0, kClaimWaitPollMs,
-	    [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); });
+	    [](uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }, sosCallId);
 	if (!lease)
 	{
 		ESP_LOGW(TAG, "Token fetch skipped: another %s fetch is running",
