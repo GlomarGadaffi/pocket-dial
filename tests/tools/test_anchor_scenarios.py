@@ -587,7 +587,8 @@ class RefusalTest(unittest.TestCase):
         # x379_cancel_before_leg joined the registry with this change (the CANCEL-before-the-leg race)
         self.assertEqual(sorted(an.SCENARIOS), ["x279_degraded_bye", "x349_unread_makecall",
                                                 "x379_cancel_before_leg", "x379_never_opened",
-                                                "x4_cancel_ringing", "x518_403_clean_giveup"])
+                                                "x4_cancel_ringing", "x518_403_clean_giveup",
+                                                "x952_token_age_held"])
 
     def test_dry_run_prints_the_plan_and_the_ring_required_banner(self):
         rc, out = run_main(cli("--dry-run"), base_env(), http=NoNetwork())
@@ -637,6 +638,15 @@ class WitnessSampleTest(unittest.TestCase):
                                   "not hung up (#906)",
         "cdr_callee_dialed_901": "I (99001) pbx: CDR callee is the dialed number (anchor audio write failure) (#901)",
         "ctrl_request_884": "I (52010) TelephonyAnchor: ctrl request: attempt 0 resumed in 131 ms (#884)",
+        # #952/#945: main's token witnesses, as TelephonyAnchorClient.cpp and BenchProbe.cpp format them
+        "bench_token_age": "W (51000) BenchProbe: BENCHFAULT token_age fired",
+        "token_refresh_near_expiry": "I (51100) TelephonyAnchor: Access token near expiry — refreshing",
+        "token_refresh_deferred_live": "W (51200) TelephonyAnchor: Token near expiry but media streams active "
+                                       "— deferring refresh",
+        "token_retrieved": "I (51300) TelephonyAnchor: Retrieved access token (len=1043, lifetime=3600s)",
+        "token_fetch_failed": "E (51400) TelephonyAnchor: Token request returned HTTP 401",
+        "ws_restart_stale_token": "W (51500) TelephonyAnchor: WS disconnected/errored with an expiring token "
+                                  "— requesting anchor restart to refresh it",
     }
 
     def test_each_witness_regex_matches_the_line_the_firmware_formats(self):
@@ -2213,6 +2223,52 @@ class FakeProbeBoard(FakeBoard):
                 self.bye_handset(c)
             c["state"] = "stuck" if k.get("stuck") else "ended"
 
+    # #952: a held, answered call; token_age fires on the next tick once it is armed. Knobs:
+    # origination_lines (logged before any stream), token_lines (logged right after the fire),
+    # far_hangs_up_s (the far side ends the call that long after the fire), refuse, no_post_open,
+    # post_open_delay_s (the POST stream opens that long after the answer).
+    def _call_x952(self, c):
+        k = self.knobs
+        for line in k.get("origination_lines", ()):
+            self.log(line)
+        if k.get("refuse"):                             # the makecall failed: no leg was ever created
+            return self.refuse(c, 503)
+        self.initiated(c)
+        self.answer(c)
+
+        def open_stream():
+            c["stream_open"] = True
+            self.log("TelephonyAnchor: POST (device->Telephony) audio stream OPEN: %s" % self.url(c["leg"]))
+        if k.get("post_open_delay_s"):
+            threading.Timer(k["post_open_delay_s"], open_stream).start()
+        elif not k.get("no_post_open"):
+            open_stream()
+        threading.Thread(target=self._age_watch, args=(c,), daemon=True).start()
+
+    def _age_watch(self, c):
+        while True:
+            time.sleep(0.02)
+            with self.lock:
+                if c["state"] != "up":
+                    return
+                if self.faults["token_age"]["armed"] and self.fire("token_age") is not None:
+                    for line in self.knobs.get("token_lines", ()):
+                        self.log(line)
+                    break
+        hang = self.knobs.get("far_hangs_up_s")
+        if hang is None:
+            return
+        time.sleep(hang)
+        with self.lock:
+            if c["state"] != "up":
+                return
+            self.log("MediaBridge: stopBridge call=%s part=%s" % (c["req"].call_id(), c["leg"]))
+            c["released"] = True
+            self.endcall(c, "anchor hangup")
+            self.drop(c)
+            self.bye_handset(c)
+            c["state"] = "ended"
+
 
 class ProbeRunCase(unittest.TestCase):
     MODE = "x349"
@@ -2226,12 +2282,13 @@ class ProbeRunCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def go(self, scenario=None, overrides=None, env=None, version=PROBE_VERSION, fast_cap=None, pin_check="0.05"):
+    def go(self, scenario=None, overrides=None, env=None, version=PROBE_VERSION, fast_cap=None, pin_check="0.05",
+           extra=()):
         def start_logger(argv, out_path):
             return FakeLogger(self.board, argv, out_path)
         argv = cli("--port", str(self.board.port), "--http-port", str(self.http_port), "--local-ip", "127.0.0.1",
                    "--syslog-port", "0", "--set-syslog", "--pin-check-s", pin_check, "--out", self.tmp.name,
-                   "--expect-version", version, scenario=scenario or self.SCENARIO)
+                   "--expect-version", version, *extra, scenario=scenario or self.SCENARIO)
         ov = dict(self.FAST, **(overrides or {}))
         with contextlib.ExitStack() as stack:
             if fast_cap is not None:     # a harness hangup at the cap, without a 30 s test
@@ -2740,6 +2797,345 @@ class ProbeSafetyTest(ProbeRunCase):
         rc, out = self.go()
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.board.ballast["released"]["api"], 1)
+        self.assert_clean_probe(out)
+
+
+# ---------------------------------------------------------------- x952_token_age_held (#952, #945)
+X952 = "x952_token_age_held"
+X952_FAST = {"hold_s": 1.0, "margin_s": 0.4, "arm_wait_s": 2.0, "post_open_wait_s": 2.0, "settle_s": 0.6,
+             "gap_s": 0.2}
+DEFER = "TelephonyAnchor: Token near expiry but media streams active — deferring refresh"
+RETRIEVED = "TelephonyAnchor: Retrieved access token (len=900, lifetime=3600s)"
+WS_RESTART = ("TelephonyAnchor: WS disconnected/errored with an expiring token — requesting anchor restart to "
+              "refresh it")
+
+
+def allow_held(test, approvals=None):
+    """A held call needs a recorded approval of its own, and none is recorded yet: the test supplies one."""
+    p = mock.patch.object(an, "LONG_HOLD_APPROVALS", (an.APPROVALS[0],) if approvals is None else approvals)
+    p.start()
+    test.addCleanup(p.stop)
+
+
+class X952RefusalTest(unittest.TestCase):
+    VER = ("--expect-version", PROBE_VERSION)
+
+    def setUp(self):
+        allow_held(self)
+
+    def go(self, *extra, **kw):
+        return cli(*self.VER, *extra, scenario=X952, **kw)
+
+    def refused(self, argv, env, *needles):
+        rc, out = run_main(argv, env, http=NoNetwork())
+        self.assertEqual(rc, an.REFUSED, out)
+        for n in needles:
+            self.assertIn(n, out)
+        self.assertNotIn(FAR, out)
+        self.assertNotIn(FAR[-10:], out)
+        return out
+
+    def accepted(self, *extra, **kw):
+        rc, out = run_main(self.go("--dry-run", *extra, **kw), base_env(), http=NoNetwork())
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn(FAR, out)
+        return out
+
+    def test_it_is_one_probe_scenario_that_arms_token_age_and_holds_a_call(self):
+        sc = an.SCENARIOS[X952]
+        self.assertEqual((sc["probe"], tuple(sc["faults"]), sc["held"], sc["path_counter"]),
+                         (True, ("token_age",), True, "bench_token_age"))
+        self.assertEqual((sc["calls"], sc["max_calls"], sc["arm_at"]), (1, 1, "mid-call"))
+        self.assertEqual(sc["agent_opts"]["caller"], {"rtp": True, "contact_params": ";line=pd6101",
+                                                      "invite_timeout": 45.0})
+        self.assertGreater(sc["agent_opts"]["caller"]["invite_timeout"], an.AGENT_INVITE_TIMEOUT_S,
+                           "the default 16 s would CANCEL a far end still ringing toward its voicemail")
+        self.assertEqual(an.OLD_TOKEN_MARGIN_S, 300)
+        self.assertGreater(sc["hold_s"], an.OLD_TOKEN_MARGIN_S)
+        self.assertEqual(an.scenario_problems(sc), [])
+        self.assertNotIn("x336_ws_reauth", an.SCENARIOS, "the ws_drop scenario stays unregistered")
+
+    def test_the_forbidden_destinations_are_refused_before_anything_is_sent(self):
+        owner = an.owner_set(None, None)
+        for num, why in (("911", "emergency or never-dial"), ("933", "emergency or never-dial"),
+                         ("113", "emergency or never-dial"), ("1001", "owner extension")):
+            with self.subTest(num=num):
+                self.assertTrue(an.far_end_problems(num, owner), num)
+                for far in (num, "+" + num):
+                    rc, out = run_main(self.go(), base_env(PD_ANCHOR_FAR_END=far), http=NoNetwork())
+                    self.assertEqual(rc, an.REFUSED, out)
+                    self.assertIn(why, out)
+                    self.assertIn("nothing was sent", out)
+        self.assertEqual(an.far_end_problems(FAR, owner), [], "a far end that is none of them is accepted")
+        self.accepted()
+
+    def test_a_second_run_is_refused_when_the_cap_is_one(self):
+        self.refused(self.go("--runs", "2"), base_env(), "calls must be 1-1")
+        self.refused(self.go("--runs", "2", "--run-cap", "1"), base_env(), "calls must be 1-1")
+        self.refused(self.go("--runs", "0"), base_env(), "calls must be 1-1")
+        self.refused(self.go("--runs", "4", "--run-cap", "3"), base_env(), "calls must be 1-3")
+        self.refused(self.go("--run-cap", "4"), base_env(), "the run cap (max_calls) must be 1-3")
+        self.refused(self.go("--run-cap", "0"), base_env(), "the run cap (max_calls) must be 1-3")
+        self.assertIn("1 run(s), run cap 1", self.accepted())
+        self.assertIn("2 run(s), run cap 2", self.accepted("--runs", "2", "--run-cap", "2"))
+
+    def test_the_hold_must_outlast_the_old_margin_and_stay_under_the_ceiling(self):
+        for bad in ("300", "299", "0", "-5", "901"):
+            self.refused(self.go("--hold-s", bad), base_env(), "hold_s must be longer than the old 300 s")
+        for bad in ("nan", "inf"):
+            self.refused(self.go("--hold-s", bad), base_env(), "--hold-s must be a finite number")
+        self.assertIn("each <= 331 s", self.accepted("--hold-s", "301"))
+        self.assertIn("each <= 930 s", self.accepted("--hold-s", "900"))
+        self.assertIn("held      330 s after token_age is armed once the call's streams are open (the old margin "
+                      "is 300 s)", self.accepted())
+
+    def test_the_new_flags_are_numeric_but_the_far_end_is_still_never_an_argument(self):
+        self.accepted("--hold-s", "330", "--runs", "1", "--run-cap", "1", "--arm-at", "before-call")
+        self.accepted("--hold-s=330", "--run-cap=1")
+        self.refused(self.go("330"), base_env(), "number-shaped")
+        self.refused(self.go("--hold-s", FAR), base_env(), "holds a secret")
+        self.refused(self.go("--hold-s=" + FAR), base_env(), "holds a secret")
+        self.refused(self.go("--arm-at", "tomorrow"), base_env(), "invalid choice")
+
+    def test_the_flags_apply_to_the_held_scenario_alone(self):
+        for flag in (("--hold-s", "60"), ("--runs", "1"), ("--run-cap", "1"), ("--arm-at", "mid-call")):
+            self.refused(cli(*flag, scenario="x349_unread_makecall"), base_env(), "apply only to a held scenario")
+
+    def test_a_held_call_needs_an_approval_recorded_for_it(self):
+        for approvals in ((), ("https://github.com/GlomarGadaffi/pocket-dial/issues/952#issuecomment-1",)):
+            with mock.patch.object(an, "LONG_HOLD_APPROVALS", approvals):
+                for url in an.APPROVALS:
+                    self.refused(self.go(approval=url), base_env(), "not a recorded approval of a held call")
+        held = "https://github.com/GlomarGadaffi/pocket-dial/issues/952#issuecomment-1"
+        with mock.patch.object(an, "LONG_HOLD_APPROVALS", (held,)):
+            self.accepted(approval=held)
+            # the held approval is not an approval of the 30-second scenarios, nor theirs of this one
+            self.refused(cli(approval=held), base_env(), "not a recorded approval")
+            self.refused(self.go(), base_env(), "not a recorded approval of a held call")
+
+    def test_the_30_second_ceiling_is_unchanged_for_every_other_scenario(self):
+        self.assertEqual(an.MAX_CALL_S, 30)
+        other = an.SCENARIOS["x349_unread_makecall"]
+        held = an.SCENARIOS[X952]
+        for sc in (dict(other, call_cap_s=360), dict(held, held=False)):
+            self.assertTrue(any("call_cap_s must be 1-30" in p for p in an.scenario_problems(sc)), sc["name"])
+        self.assertTrue(any("call_cap_s must be 1-930" in p
+                            for p in an.scenario_problems(dict(held, call_cap_s=931))))
+        self.assertTrue(any("hold_s must be longer" in p for p in an.scenario_problems(dict(held, hold_s=901))))
+
+    def test_it_inherits_the_probe_scenarios_preconditions(self):
+        self.refused(self.go(checkout=None), base_env(), "no CHECK-OUT")
+        self.refused(self.go(exp=expiry(60)), base_env(), "before this run would end")
+        self.refused(self.go(approval=None), base_env(), "no --approval-url")
+        self.refused(self.go("--far-end", FAR), base_env(), "never goes on an argv")
+        self.refused(self.go(), base_env(PD_ANCHOR_FAR_END=None), "no far end")
+        self.refused(self.go(), base_env(PD_BOARD_ADMIN_PIN=None), "PD_BOARD_ADMIN_PIN")
+        self.refused(self.go(host="192.168.12.110"), base_env(), "not an approved rig")
+        self.refused(self.go(), base_env(PD_ANCHOR_FAR_END="6104"), "this PBX owns")
+        self.refused(cli(scenario=X952), base_env(), "no --expect-version")
+        self.refused(cli("--expect-version", "v1.5.0", scenario=X952), base_env(), "not a -probe stamp")
+        out = self.accepted()
+        for needle in ("RING-REQUIRED", "PROBE IMAGE", "bench_token_age"):
+            self.assertIn(needle, out)
+
+
+class X952WitnessTest(unittest.TestCase):
+    LOG = ["W (1) BenchProbe: BENCHFAULT token_age fired",
+           "W (2) " + DEFER,
+           "W (3) " + DEFER,
+           "I (4) " + RETRIEVED,
+           "E (5) TelephonyAnchor: Token request returned HTTP 401",
+           "I (6) TelephonyAnchor: Successfully dropped participant 41"]
+    ZERO = {"bench_token_age": 0, "token_refresh_near_expiry": 0, "token_refresh_deferred_live": 0,
+            "token_retrieved": 0, "token_fetch_failed": 0, "ws_restart_stale_token": 0}
+
+    def test_each_token_witness_counts_its_own_line_and_no_other(self):
+        for name, line in sorted(WitnessSampleTest.SAMPLES.items()):
+            if name not in an.TOKEN_WITNESSES:
+                continue
+            with self.subTest(counter=name):
+                self.assertEqual(an.token_counts([line]), dict(self.ZERO, **{name: 1}))
+        for near_miss in ("Access token near expiry — deferring", "Token near expiry — deferring refresh",
+                          "BENCHFAULT token_age armed (value 0)", "Retrieved access token", "token_maint_skip_862"):
+            self.assertEqual(an.token_counts([near_miss]), self.ZERO, near_miss)
+
+    def test_the_counts_for_a_fixed_log_excerpt(self):
+        self.assertEqual(an.token_counts(self.LOG), dict(self.ZERO, bench_token_age=1, token_refresh_deferred_live=2,
+                                                         token_retrieved=1, token_fetch_failed=1))
+        self.assertEqual(list(an.token_counts(self.LOG)), list(an.TOKEN_WITNESSES))
+        self.assertEqual(an.token_counts([]), self.ZERO)
+
+    def test_the_summary_as_json_and_as_text(self):
+        sc = an.SCENARIOS[X952]
+        calls = [{"call": 1, "hold_s": 331.2, "ended_early": False, "aged_ms": 4200,
+                  "log": an.token_counts(self.LOG)},
+                 {"call": 2, "hold_s": 120.0, "ended_early": True, "aged_ms": 3900,
+                  "log": an.token_counts(self.LOG[:2])}]
+        summary = an.held_summary(calls, sc)
+        self.assertEqual((summary["hold_s_planned"], summary["margin_s"], summary["arm_at"]), (330.0, 300, "mid-call"))
+        self.assertEqual(summary["witnesses"], dict(self.ZERO, bench_token_age=2, token_refresh_deferred_live=3,
+                                                    token_retrieved=1, token_fetch_failed=1))
+        self.assertEqual([(r["run"], r["hold_s"], r["ended_early"]) for r in summary["runs"]],
+                         [(1, 331.2, False), (2, 120.0, True)])
+        self.assertEqual(json.loads(json.dumps(summary)), summary)
+        self.assertEqual(an.held_summary_text(summary), [
+            "x952 token_age held: planned hold 330 s (old margin 300 s), token_age armed mid-call, 2 run(s)",
+            "  run 1: held 331.2 s after the token was aged: bench_token_age=1 token_refresh_near_expiry=0 "
+            "token_refresh_deferred_live=2 token_retrieved=1 token_fetch_failed=1 ws_restart_stale_token=0",
+            "  run 2: held 120.0 s after the token was aged, ended early: bench_token_age=1 "
+            "token_refresh_near_expiry=0 token_refresh_deferred_live=1 token_retrieved=0 token_fetch_failed=0 "
+            "ws_restart_stale_token=0",
+            "  total: bench_token_age=2 token_refresh_near_expiry=0 token_refresh_deferred_live=3 token_retrieved=1 "
+            "token_fetch_failed=1 ws_restart_stale_token=0"])
+        bare = an.held_summary_text(an.held_summary([{"call": 1}], sc))
+        self.assertEqual(bare[1], "  run 1: held n/a after the token was aged: no counts")
+
+
+class X952Test(ProbeRunCase):
+    MODE = "x952"
+    SCENARIO = X952
+    FAST = X952_FAST
+
+    def setUp(self):
+        super().setUp()
+        allow_held(self)
+
+    def test_pass_arms_after_the_streams_open_holds_and_reports(self):
+        seen = []
+        self.board.knobs["post_open_delay_s"] = 0.3            # the answer comes first, the stream a moment later
+        self.board.on_arm = lambda fault: seen.append(any(c.get("stream_open") for c in self.board.calls.values()))
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((self.arms(), seen), (["token_age"], [True]), "armed once, after the POST stream opened")
+        self.assertEqual(self.manifest["probe"]["fired"], {"token_age": 1})
+        c = self.calls[0]
+        self.assertEqual((c["final"], c["hangup_bye"], c["arm_at"], c["ended_early"]), (200, 200, "mid-call", False))
+        self.assertGreaterEqual(c["hold_s"], 1.0)
+        self.assertGreaterEqual(c["post_open_ms"], 300)
+        self.assertGreaterEqual(c["aged_ms"], c["post_open_ms"])
+        self.assertGreater(self.board.rtp_rx, 0, "the handset sends audio, so the POST stream is really live")
+        s = self.manifest["summary"]
+        self.assertEqual(s["witnesses"], dict(X952WitnessTest.ZERO, bench_token_age=1))
+        self.assertEqual(s["runs"][0]["hold_s"], c["hold_s"])
+        self.assertIn("x952 token_age held: planned hold 1 s (old margin 0.4 s), token_age armed mid-call, 1 run(s)",
+                      out)
+        self.assertEqual(self.manifest["log_counters"]["dropped"], 1)
+        self.assertEqual(c["sessions"], {"baseline": 0, "after": 0, "test_ua_sessions": 0})
+        self.assertEqual(self.board.bindings, {})
+        self.assert_clean_probe(out)
+
+    def test_the_counts_start_when_the_token_is_aged_not_at_the_dial(self):
+        self.board.knobs["origination_lines"] = [RETRIEVED]
+        self.board.knobs["token_lines"] = [DEFER, DEFER, WS_RESTART]
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.manifest["summary"]["witnesses"],
+                         dict(X952WitnessTest.ZERO, bench_token_age=1, token_refresh_deferred_live=2,
+                              ws_restart_stale_token=1))
+        self.assertEqual(self.manifest["log_counters"]["token_retrieved"], 1, "the whole-run counter still sees it")
+
+    def test_before_call_arms_before_the_invite(self):
+        order = []
+
+        def on_arm(fault):                          # the anchor's next tick fires it, after the POST is answered
+            order.append(len(self.board.invite_users))
+
+            def tick():
+                with self.board.lock:
+                    self.board.fire(fault)
+            threading.Timer(0.1, tick).start()
+        self.board.on_arm = on_arm
+        rc, out = self.go(extra=("--arm-at", "before-call"))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(order, [0], "armed with no INVITE yet")
+        self.assertEqual(self.calls[0]["arm_at"], "before-call")
+        self.assertLess(self.calls[0]["aged_ms"], 0)
+        self.assertEqual(self.manifest["summary"]["witnesses"]["bench_token_age"], 1)
+
+    def test_two_runs_when_the_cap_allows_them(self):
+        self.board.knobs["token_lines"] = [DEFER]
+        rc, out = self.go(extra=("--runs", "2", "--run-cap", "2"))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.board.invite_users, [FAR, FAR])
+        self.assertEqual([c["call"] for c in self.calls], [1, 2])
+        self.assertEqual(self.manifest["probe"]["fired"], {"token_age": 2})
+        self.assertEqual(self.manifest["summary"]["witnesses"],
+                         dict(X952WitnessTest.ZERO, bench_token_age=2, token_refresh_deferred_live=2))
+        self.assertEqual([r["witnesses"]["token_refresh_deferred_live"] for r in self.manifest["summary"]["runs"]],
+                         [1, 1])
+        self.assertEqual(self.manifest["log_counters"]["dropped"], 2)
+        for n in ("call-01.pcap", "call-02.pcap"):
+            self.assertTrue(os.path.exists(os.path.join(self.res, "pcap", n)), n)
+        self.assert_clean_probe(out)
+
+    def test_invalid_when_the_far_side_hangs_up_inside_the_margin(self):
+        self.board.knobs["far_hangs_up_s"] = 0.02
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("not past the old 0.4 s margin", out)
+        self.assertIn("endCall reasons: anchor hangup", out)
+        c = self.calls[0]
+        self.assertTrue(c["ended_early"])
+        self.assertLess(c["hold_s"], 0.4)
+        self.assertEqual(c["pbx_byes"], 1)
+        self.assertNotIn("hangup_bye", c, "the PBX hung up; the harness sent no BYE")
+        self.assert_clean_probe(out)
+
+    def test_a_call_that_ends_past_the_margin_but_before_the_planned_hold_is_reported_not_invalid(self):
+        self.board.knobs["far_hangs_up_s"] = 0.7
+        rc, out = self.go(overrides={"hold_s": 3.0})
+        self.assertEqual(rc, 0, out)
+        run = self.manifest["summary"]["runs"][0]
+        self.assertTrue(run["ended_early"])
+        self.assertGreater(run["hold_s"], 0.4)
+        self.assertEqual(self.calls[0]["pbx_byes"], 1)
+        self.assertIn("ended early", out)
+
+    def test_invalid_without_ringing_on_when_token_age_never_fires(self):
+        self.board.fire_enabled = False
+        rc, out = self.go(overrides={"hold_s": 30.0, "arm_wait_s": 0.5})
+        self.assertEqual(rc, 3, out)
+        self.assertIn("no 'BENCHFAULT token_age fired' line came within 0.5 s", out)
+        self.assertIn("the fault token_age fired 0 times", out)
+        self.assertLess(self.calls[0]["duration_s"], 10.0, "nothing was aged, so the call was not held for 30 s")
+        self.assertEqual(self.calls[0]["hangup_bye"], 200)
+        self.assert_clean_probe(out)
+
+    def test_invalid_when_no_stream_opens_and_nothing_is_armed(self):
+        self.board.knobs["no_post_open"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("no POST stream OPEN line for the call's leg", out)
+        self.assertEqual(self.arms(), [])
+        self.assert_clean_probe(out)
+
+    def test_invalid_when_the_far_end_does_not_answer(self):
+        self.board.knobs["refuse"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("the far end did not answer (final 503)", out)
+        self.assertEqual(self.arms(), [])
+
+    def test_an_emergency_that_appears_after_the_preflight_stops_the_run_before_the_invite(self):
+        read = self.board.counters
+        reads = []
+
+        def counters():
+            reads.append(1)
+            if len(reads) > 1:                     # the preflight read was clear; the next one is not
+                self.board.emergency_live = True
+            return read()
+        self.board.counters = counters
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("refusing to dial: the probe reports an emergency call live", out)
+        self.assertEqual((self.board.invite_users, self.arms()), ([], []))
+
+    def test_fail_on_a_second_drop(self):
+        self.board.knobs["double_drop"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("dropped 2 times", out)
         self.assert_clean_probe(out)
 
 

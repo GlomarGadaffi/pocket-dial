@@ -13,7 +13,7 @@ Safety, all checked before the first packet (exit 2, nothing sent):
   * a discussion #428 CHECK-OUT link whose expiry covers the run
     (load_profile.checkout_problems);
   * an approval link that is one of APPROVALS (the recorded desmo approvals) or
-    EXTRA_APPROVALS; nothing else;
+    EXTRA_APPROVALS; nothing else (a held scenario: one of LONG_HOLD_APPROVALS, below);
   * the far end comes from a 0600 file named by PD_ANCHOR_FAR_END_FILE, or from
     PD_ANCHOR_FAR_END; never from argv. A number-shaped argument is refused
     without echoing it. 911, 933 (anywhere in it), 112, 113, 999, the owner
@@ -52,6 +52,14 @@ end, never while the probe reports an emergency), and always disarm every fault 
 release the ballast in a finally block. The counters must show nothing armed at the
 end, and every pre-registered fault must show fired >= 1, or the run is INVALID.
 
+x952_token_age_held (#952, #945) is the one scenario that holds an answered call for minutes: it arms
+token_age once the call's streams are up, holds past the old 5-minute token margin, hangs up, and reports
+the token witnesses main emits (TOKEN_WITNESSES) with the hold reached. It reports; it does not judge the
+refresh. Because it exceeds the ~30 s per call the recorded approvals allow, it runs only under an
+approval in LONG_HOLD_APPROVALS (empty until desmo's OK is recorded by a reviewed PR). --hold-s, --runs,
+--run-cap and --arm-at apply to it alone. The #862 witnesses (token_maint_*_862, token_sos_*_862) are not
+emitted on main and are not counted here.
+
 Syslog carries esp_log lines only. RequestsHandler's queueLog() lines (e.g. "anchor
 call torn down: ...", "no rx audio, dropping leg") go to stdout and never reach it
 (#533/#603), so the scenarios count the esp_log witnesses instead: "pbx: endCall
@@ -75,6 +83,7 @@ import datetime
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 import signal
@@ -108,6 +117,9 @@ APPROVALS = (
     "https://github.com/GlomarGadaffi/pocket-dial/discussions/451#discussioncomment-18621141",
 )
 EXTRA_APPROVALS = ()          # a later recorded approval is added here by a reviewed PR
+# The recorded approvals above allow ~30 s a call. A held scenario (x952) keeps one call up for minutes,
+# so it needs its own recorded OK, and an old approval never covers it. Empty until desmo records one.
+LONG_HOLD_APPROVALS = ()
 RIG_HOSTS = ("192.168.12.195", "192.168.12.244")
 TEST_UAS = ("6101", "6102", "6103", "6104")
 PIN_UA = "6104"
@@ -116,6 +128,12 @@ NEVER_EXACT = ("911", "933", "112", "113", "999")
 OTHER_PBX_NUMBERS = ("440",) + tuple(str(n) for n in range(700, 710))
 MAX_CALLS = 30                # the #384 approval: 20-30 anchored calls a run
 MAX_CALL_S = 30               # each call <= ~30 s (d451 18621141)
+# The held scenario's own ceilings. MAX_CALL_S stays 30 for every other scenario.
+OLD_TOKEN_MARGIN_S = 300      # TelephonyAnchorClient::tokenExpiringSoon(): kRefreshMarginUs, 5 minutes
+HELD_HOLD_S = 330.0           # the default hold: past the old margin
+HELD_MAX_HOLD_S = 900.0
+HELD_SLACK_S = 30.0           # the call cap is the hold plus this (arming, the BYE and the settle)
+HELD_MAX_RUNS = 3
 BEEP_USER = "pbx"             # RegisterBeeper's From user (ServiceExtensions.hpp kServicePbx)
 FAR_END_FILE_ENV = "PD_ANCHOR_FAR_END_FILE"
 FAR_END_ENV = "PD_ANCHOR_FAR_END"
@@ -172,6 +190,17 @@ LOG_COUNTERS = {
     "bench_fired": r"BENCHFAULT (\S+) fired",
     "bench_makecall_read_fail": r"BENCHFAULT makecall_read_fail fired",
     "bench_emergency": r"BENCHFAULT (?:every fault disarmed: emergency call|ballast released \(emergency\))",
+    # #952/#945: the token witnesses main emits (TelephonyAnchorClient.cpp ensureToken(), fetchToken(),
+    # requestRestartIfTokenStale(); BenchProbe.cpp fire()). Three carry a U+2014 dash on the board; \S+
+    # takes it, and a plain "--" too. The #862 witnesses (token_maint_*_862 and the like) are not on main.
+    "bench_token_age": r"BENCHFAULT token_age fired",
+    "token_refresh_near_expiry": r"Access token near expiry \S+ refreshing",
+    "token_refresh_deferred_live": r"Token near expiry but media streams active \S+ deferring refresh",
+    "token_retrieved": r"Retrieved access token \(len=\d+, lifetime=(\d+)s\)",
+    "token_fetch_failed": r"Token (?:request returned HTTP -?\d+|failed to write body: -?\d+"
+                          r"|HTTP connection failed to open: )",
+    "ws_restart_stale_token": r"WS disconnected/errored with an expiring token \S+ requesting anchor "
+                              r"restart to refresh it",
     # makeCall() (#349): the unread response reconciled to our own leg, or not.
     "adopted_349": r"but 3CX has our leg (\S+) .*adopting the call instead of failing it \(#349\)",
     "orphaned_349": r"a call may be ORPHANED on 3CX \(#349/#328\)",
@@ -230,6 +259,9 @@ LOG_COUNTERS = {
     "rh_degraded": r"anchor call torn down: audio write repeatedly failed",
 }
 _RX = {k: re.compile(v) for k, v in LOG_COUNTERS.items()}
+# What x952 reports, in the order it prints it.
+TOKEN_WITNESSES = ("bench_token_age", "token_refresh_near_expiry", "token_refresh_deferred_live",
+                   "token_retrieved", "token_fetch_failed", "ws_restart_stale_token")
 _ATTEMPT = re.compile(r"GET stream (?:not ready \(HTTP -?\d+\)|transport failure \(no HTTP response, "
                       r"status=-?\d+\)|open failed \([^)]*\)), attempt (\d+)/(\d+)")
 # RequestsHandler::endCall logs the session key, which is the stored header line, so a real board writes
@@ -422,7 +454,8 @@ def load_far_ends(env, stat_fn=os.stat, posix=None):
 
 
 _FAR_FLAG = re.compile(r"^--?(?:far[-_]?end|far|target|dial|number|callee|to)(?:=|$)", re.I)
-_NUMERIC_FLAGS = ("--port", "--http-port", "--syslog-port", "--pin-check-s", "--owner-ext")
+_NUMERIC_FLAGS = ("--port", "--http-port", "--syslog-port", "--pin-check-s", "--owner-ext",
+                  "--hold-s", "--runs", "--run-cap")
 
 
 def argv_problems(argv, redactor):
@@ -444,10 +477,16 @@ def argv_problems(argv, redactor):
     return problems
 
 
-def approval_problems(url):
+def approval_problems(url, sc=None):
     if not url:
         return ["no --approval-url: pass the recorded approval this run relies on (%s)"
                 % ", ".join(APPROVALS)]
+    if sc and sc.get("held"):
+        if url in LONG_HOLD_APPROVALS:
+            return []
+        return ["--approval-url is not a recorded approval of a held call (LONG_HOLD_APPROVALS in "
+                "anchor_scenarios.py): %s keeps one call up for minutes, past the ~30 s the recorded "
+                "approvals allow, and needs desmo's recorded OK for that" % sc.get("name", "<unnamed>")]
     if url not in APPROVALS + EXTRA_APPROVALS:
         return ["--approval-url is not a recorded approval (APPROVALS / EXTRA_APPROVALS in "
                 "anchor_scenarios.py)"]
@@ -569,6 +608,25 @@ def leg_wait_problems(sc):
     return problems
 
 
+def held_problems(sc):
+    """The held scenario's own bounds, in place of MAX_CALL_S. The hold must outlast the old token
+    margin or the run proves nothing about it, so a shorter one is refused before any ring. The run
+    cap is max_calls (checked with `calls` in scenario_problems), here only its ceiling."""
+    n = sc.get("name", "<unnamed>")
+    problems = []
+    if not sc.get("margin_s", 0) < sc.get("hold_s", 0) <= HELD_MAX_HOLD_S:
+        problems.append("%s: hold_s must be longer than the old %g s token margin and at most %g s"
+                        % (n, sc.get("margin_s", 0), HELD_MAX_HOLD_S))
+    if not 0 < sc.get("call_cap_s", 0) <= HELD_MAX_HOLD_S + HELD_SLACK_S:
+        problems.append("%s: call_cap_s must be 1-%d (a held call: the hold plus %g s)"
+                        % (n, HELD_MAX_HOLD_S + HELD_SLACK_S, HELD_SLACK_S))
+    if not 1 <= sc.get("max_calls", 0) <= HELD_MAX_RUNS:
+        problems.append("%s: the run cap (max_calls) must be 1-%d" % (n, HELD_MAX_RUNS))
+    if sc.get("arm_at") not in ("mid-call", "before-call"):
+        problems.append("%s: arm_at must be mid-call or before-call" % n)
+    return problems
+
+
 def scenario_problems(sc):
     problems = []
     n = sc.get("name", "<unnamed>")
@@ -588,7 +646,9 @@ def scenario_problems(sc):
         problems.append("%s: calls must be 1-%d (%s)" % (
             n, cap, "the #384 approval" if cap == MAX_CALLS
             else "this scenario's own cap; the #384 approval allows %d" % MAX_CALLS))
-    if not 0 < sc.get("call_cap_s", 0) <= MAX_CALL_S:
+    if sc.get("held"):
+        problems += held_problems(sc)
+    elif not 0 < sc.get("call_cap_s", 0) <= MAX_CALL_S:
         problems.append("%s: call_cap_s must be 1-%d (each call <= ~30 s)" % (n, MAX_CALL_S))
     if not callable(sc.get("run")) or not callable(sc.get("judge")):
         problems.append("%s: needs a run and a judge" % n)
@@ -1263,6 +1323,14 @@ class AnchorRun:
             raise run_soak.Abort("INVALID", "probe preflight: " + "; ".join(problems))
         self.say("probe image answers: nothing armed, no ballast, no emergency live")
 
+    def no_emergency_live(self):
+        """Rule 5, read again immediately before an INVITE: the probe's emergencyLive is true while a
+        911/933 or a session in a PSAP-callback window is live (BENCH_PROBE.md). The preflight read it
+        once, long before a held run's later INVITEs."""
+        if self.probe.counters().get("emergencyLive") is not False:
+            raise run_soak.Abort("INVALID", "refusing to dial: the probe reports an emergency call live (a "
+                                 "911/933, or a session in a PSAP-callback window): rule 5")
+
     def arm(self, name, value=None):
         """Arm one pre-registered fault. Never for an emergency or never-dial far end (the
         probe would refuse to fire anyway, rule 5)."""
@@ -1776,7 +1844,7 @@ def finish_call(caller, dlg, rec):
 
 
 def after_call(run, sc, caller, rec, base):
-    run.pull_pcap("call-01")             # the ring holds 16 messages: right after the call
+    run.pull_pcap("call-%02d" % rec.get("call", 1))   # the ring holds 16 messages: right after the call
     rec["pcap_byes"] = run.pcap_count("BYE", caller, rec.get("_call_id"))
     rec["sessions"] = run.sessions_settle(base, caller.ext, sc["settle_s"])
 
@@ -2281,6 +2349,167 @@ scenario(name="x279_degraded_bye", issues=("#279",), probe=True, faults=("post_s
          judge=x279_judge)(probe_run(x279_run))
 
 
+# -- x952_token_age_held (#952, #945) -----------------------------------------------
+# One answered call held past the old 5-minute token margin with token_age armed under its live streams.
+# On main nothing refreshes a token mid-call (ensureToken() has one caller, makeCall(), before any stream
+# opens), so the likely count here is bench_token_age=1 and nothing else: that is the main-image answer,
+# not a failure. Arming before the INVITE (--arm-at before-call) only shows makeCall() refreshing the aged
+# token at origination.
+def token_counts(lines):
+    """{witness: lines} over TOKEN_WITNESSES, in that order."""
+    counts = count_lines(lines)
+    return {k: counts[k] for k in TOKEN_WITNESSES}
+
+
+def held_summary(calls, sc):
+    """JSON-ready: the planned hold, and per run the hold reached and the token witnesses counted from the
+    moment the token was aged to the end of the run, with their sum."""
+    runs = [{"run": c["call"], "hold_s": c.get("hold_s"), "ended_early": bool(c.get("ended_early")),
+             "aged_ms": c.get("aged_ms"), "witnesses": c.get("log") or {}} for c in calls]
+    return {"hold_s_planned": sc["hold_s"], "margin_s": sc["margin_s"], "arm_at": sc["arm_at"], "runs": runs,
+            "witnesses": {k: sum(r["witnesses"].get(k, 0) for r in runs) for k in TOKEN_WITNESSES}}
+
+
+def held_summary_text(summary):
+    """held_summary() as the lines run.log and the terminal carry."""
+    def counts(d):
+        return " ".join("%s=%d" % kv for kv in d.items()) or "no counts"
+    out = ["x952 token_age held: planned hold %g s (old margin %g s), token_age armed %s, %d run(s)"
+           % (summary["hold_s_planned"], summary["margin_s"], summary["arm_at"], len(summary["runs"]))]
+    for r in summary["runs"]:
+        out.append("  run %d: held %s after the token was aged%s: %s" % (
+            r["run"], "n/a" if r["hold_s"] is None else "%.1f s" % r["hold_s"],
+            ", ended early" if r["ended_early"] else "", counts(r["witnesses"])))
+    out.append("  total: " + counts(summary["witnesses"]))
+    return out
+
+
+def x952_age(run, sc):
+    """Arm token_age and wait for the anchor's next tick to fire it (it needs a token in hand). Gives up at
+    once if it does not, so a call is never held for minutes with nothing aged. -> when it fired."""
+    t0 = time.monotonic()
+    run.arm("token_age")
+    t, m = run.wait_line("bench_fired", t0, sc["arm_wait_s"], key="token_age")
+    if m is None:
+        raise run_soak.Abort("INVALID", "token_age was armed but no 'BENCHFAULT token_age fired' line came within "
+                             "%g s: the anchor holds no token to age" % sc["arm_wait_s"])
+    return t
+
+
+def x952_hold(run, sc, dlg, rec, t_aged):
+    """Wait for the call's streams, age the token if that was left for now, then hold."""
+    _, m = run.wait_line("initiated", rec["t_start"], sc["post_open_wait_s"])
+    t_open, m = run.wait_line("post_open", rec["t_start"], sc["post_open_wait_s"],
+                              key=m.group(1)) if m else (None, None)
+    if m is None:
+        return                                  # the judge says there was no stream
+    rec.update(leg=m.group(1), post_open_ms=ms_since(rec["t_start"], t_open))
+    if t_aged is None:
+        t_aged = x952_age(run, sc)
+    rec.update(_t_aged=t_aged, aged_ms=ms_since(rec["t_start"], t_aged))
+    t0 = max(t_aged, t_open)
+    rec["ended_early"] = run.watch_call(t0 + sc["hold_s"], stop_when=dlg.ended.is_set)
+    rec["hold_s"] = round(time.monotonic() - t0, 1)
+
+
+def x952_one(run, sc, caller, i):
+    run.checkpoint()
+    base = run.session_count()
+    t_aged = x952_age(run, sc) if sc["arm_at"] == "before-call" else None
+    run.no_emergency_live()                     # the last thing before the INVITE
+    dlg, rec = start_call(run, sc, caller)
+    rec.update(call=i + 1, arm_at=sc["arm_at"])
+    try:
+        if dlg.ok:
+            x952_hold(run, sc, dlg, rec, t_aged)
+    finally:
+        finish_call(caller, dlg, rec)
+    after_call(run, sc, caller, rec, base)
+    if rec.get("hold_s") is None:
+        run.say("run %d: final %s, not held (%s)" % (i + 1, rec["final"],
+                                                      "no stream opened" if answered(rec) else "not answered"))
+    else:
+        run.say("run %d: final %s, held %.1f s after the token was aged, %s" % (
+            i + 1, rec["final"], rec["hold_s"],
+            "the PBX ended the call" if rec["ended_early"] else "hung up by the harness (BYE %s)"
+            % rec.get("hangup_bye")))
+
+
+def x952_run(run, sc):
+    caller = run.agents["caller"]
+    n = sc["calls"]
+    run.say("%d held call(s) %s -> far end: token_age armed %s, held %g s after the token is aged and the streams "
+            "are up (the old margin is %g s), then one BYE; an emergency live on the board stops the run before "
+            "every INVITE" % (n, caller.ext, "after the INVITE's streams open" if sc["arm_at"] == "mid-call"
+                              else "before the INVITE", sc["hold_s"], sc["margin_s"]))
+    for i in range(n):
+        if run.stopped():
+            break
+        x952_one(run, sc, caller, i)
+        if i + 1 < n:
+            run.idle(sc["gap_s"])
+
+
+def x952_judge(run, sc, lines):
+    fails, invalid = common_problems(run, lines)
+    if not run.calls:
+        return fails, invalid, {}
+    caller = run.agents["caller"]
+
+    def begins(c):                  # before-call arms the fault, and so logs its fire line, ahead of the INVITE
+        return min(c["t_start"], c.get("_t_aged", c["t_start"]))
+    for i, c in enumerate(run.calls):
+        n = c["call"]
+        nxt = begins(run.calls[i + 1]) if i + 1 < len(run.calls) else None
+        whole = run.syslog.entries(begins(c), nxt) if run.syslog else []
+        c["log"] = token_counts([ln for t, ln in whole if t >= c.get("_t_aged", c["t_start"])])
+        c["end_reasons"] = [r for _, r in endcalls(whole, c.get("_call_id"))]
+        if not answered(c):
+            invalid.append("run %d: the far end did not answer (final %s)" % (n, c["final"]))
+            continue
+        if not c.get("leg"):
+            invalid.append("run %d: no POST stream OPEN line for the call's leg within %g s: the token had no "
+                           "live stream to be aged under" % (n, sc["post_open_wait_s"]))
+            continue
+        if c.get("ended_early") and c["hold_s"] <= sc["margin_s"]:
+            invalid.append("run %d: the call ended after %.1f s, not past the old %g s margin (the far end hung up, "
+                           "e.g. a voicemail limit, or the board tore it down; endCall reasons: %s): the token was "
+                           "not watched past the margin" % (n, c["hold_s"], sc["margin_s"],
+                                                           ", ".join(c["end_reasons"]) or "none logged"))
+            continue
+        problems = bye_problems(c, caller.ext, count=c.get("_t_hangup") is None)
+        if c.get("_t_hangup") is None:
+            problems += ruri_problems(c, caller.ext)
+        elif c.get("hangup_bye") != 200:
+            problems.append("the harness's BYE got %s, not 200" % c.get("hangup_bye"))
+        fails += ["run %d: %s" % (n, p) for p in problems + pcap_bye_problems(c, caller.ext)]
+        sf, si = session_problems(c, caller.ext)
+        fails += ["run %d: %s" % (n, p) for p in sf]
+        invalid += ["run %d: %s" % (n, p) for p in si]
+    if len(run.calls) < sc["calls"]:
+        invalid.append("only %d of %d runs ran" % (len(run.calls), sc["calls"]))
+    fails += drop_problems(lines)
+    summary = held_summary(run.calls, sc)
+    for line in held_summary_text(summary):
+        run.say(line)
+    return fails, invalid, summary
+
+
+scenario(name="x952_token_age_held", issues=("#952", "#945"), probe=True, faults=("token_age",), held=True,
+         about="test UA 6101 (sending RTP) -> the designated far end, answered (voicemail counts) and held "
+               "330 s by default, past the old 5-minute token margin: token_age is armed once the call's "
+               "streams are open, and the token witnesses main emits are counted from then on. A report, not "
+               "a verdict on the refresh. Needs a recorded approval of a held call (LONG_HOLD_APPROVALS)",
+         uas={"caller": "6101", "detector": PIN_UA},
+         # The agent's default INVITE timeout (16 s) CANCELs a far end that rings 4-6 times before its
+         # voicemail picks up: 3CX answers the caller only when the far leg connects.
+         agent_opts={"caller": {"rtp": True, "contact_params": ";line=pd6101", "invite_timeout": 45.0}},
+         calls=1, max_calls=1, hold_s=HELD_HOLD_S, margin_s=OLD_TOKEN_MARGIN_S, arm_at="mid-call",
+         call_cap_s=HELD_HOLD_S + HELD_SLACK_S, gap_s=30.0, arm_wait_s=5.0, post_open_wait_s=8.0,
+         settle_s=5.0, path_counter="bench_token_age", ring_required=True,
+         judge=x952_judge)(probe_run(x952_run))
+
+
 # ---------------------------------------------------------------- CLI
 class _Parser(argparse.ArgumentParser):
     def error(self, message):
@@ -2307,6 +2536,16 @@ def build_parser():
     ap.add_argument("--expect-version", default=None,
                     help="the /api/status version the run must see (required for a real run)")
     ap.add_argument("--pin-check-s", type=float, default=5.0)
+    ap.add_argument("--hold-s", type=float, default=None,
+                    help="x952 only: seconds to hold the answered call after the token is aged (default %g; "
+                         "must exceed the old %d s margin)" % (HELD_HOLD_S, OLD_TOKEN_MARGIN_S))
+    ap.add_argument("--runs", type=int, default=None, help="x952 only: held calls to place (default 1)")
+    ap.add_argument("--run-cap", type=int, default=None,
+                    help="x952 only: the most held calls this run may place (default 1; at most %d); "
+                         "--runs above it is refused" % HELD_MAX_RUNS)
+    ap.add_argument("--arm-at", choices=("mid-call", "before-call"), default=None,
+                    help="x952 only: when token_age is armed (default mid-call: once the call's streams are "
+                         "open; before-call only shows makeCall() refreshing the aged token)")
     ap.add_argument("--out", default="anchor-evidence")
     ap.add_argument("--dry-run", action="store_true", help="print the plan; contact nothing")
     return ap
@@ -2358,8 +2597,21 @@ def main(argv=None, env=None, http=None, agent_factory=None, start_logger=None, 
     for k, v in dict(RUN_DEFAULTS, **(run_defaults or {})).items():
         setattr(args, k, v)
     sc = dict(SCENARIOS[args.scenario], **(overrides or {}))
+    if args.hold_s is not None and not math.isfinite(args.hold_s):
+        problems.append("--hold-s must be a finite number of seconds")
+        args.hold_s = None
+    # --runs is the calls requested, --run-cap the most this run may place: scenario_problems refuses
+    # calls above max_calls, so a second run is refused when the cap is 1.
+    held_args = {"hold_s": args.hold_s, "calls": args.runs, "max_calls": args.run_cap, "arm_at": args.arm_at}
+    given = {k: v for k, v in held_args.items() if v is not None}
+    if given and not sc.get("held"):
+        problems.append("--hold-s, --runs, --run-cap and --arm-at apply only to a held scenario")
+    elif given:
+        sc.update(given)
+        if "hold_s" in given:
+            sc["call_cap_s"] = given["hold_s"] + HELD_SLACK_S
     owner = owner_set(args.owner_ext, env.get("PD_OWNER_EXTS"))
-    problems += scenario_problems(sc) + host_problems(args.host) + approval_problems(args.approval_url)
+    problems += scenario_problems(sc) + host_problems(args.host) + approval_problems(args.approval_url, sc)
     if far is not None:
         for end in far:
             problems += far_end_problems(end, owner)
@@ -2387,6 +2639,10 @@ def main(argv=None, env=None, http=None, agent_factory=None, start_logger=None, 
                                                else ""))
     emit("  calls     %d, each <= %d s; counter %s (INVALID if 0)" % (sc["calls"], sc["call_cap_s"],
                                                                      sc["path_counter"]))
+    if sc.get("held"):
+        emit("  held      %g s after token_age is armed %s (the old margin is %g s); %d run(s), run cap %d"
+             % (sc["hold_s"], "once the call's streams are open" if sc["arm_at"] == "mid-call"
+                else "before the INVITE", sc["margin_s"], sc["calls"], sc["max_calls"]))
     emit("  approval  %s" % (args.approval_url or "<none>"))
     emit("  CHECK-OUT %s until %s" % (args.checkout_url or "<none>", args.checkout_expiry or "<none>"))
     if sc.get("probe"):

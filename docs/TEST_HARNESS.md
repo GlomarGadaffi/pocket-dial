@@ -341,6 +341,7 @@ syslog. A run whose counter is 0 is INVALID, never PASS.
 | `x379_never_opened` | #379 (PR1) | 1 call, 6101 (Contact `;line=pd6101`) → the far end with `get_status=404` (a 404 is "not ready yet" and keeps the whole budget; a 403 gives up early, #902) and `get_max_attempts=12`, ≤ 30 s | `get_budget_spent`: `GET stream … attempt 12/12` | both faults' `fired` ≥ 1; attempt lines count to `/12`; the board drops the leg once on its own after the spent budget, before any `endCall` of the call (MediaNeverOpened); exactly one BYE at 6101, matching Call-ID and tags, at its registered Contact, answered 200 (UA and `/api/pcap`). A give-up by the transport or rebuild branch is INVALID, with its drop count recorded (#384 S6) |
 | `x518_403_clean_giveup` | #518, #379, #902 | the same run with `get_status=403` | `get_403_failfast_902`: `GET stream: HTTP 403 on 6 consecutive attempts for /callcontrol/<dn>/participants/<leg>/stream -- giving up now, not at attempt 12 (#902)` | everything `x379_never_opened` needs, but the give-up is the fail-fast line (6 consecutive 403s, counted before the answer too since #932), not the spent budget; the `GET stream refused (HTTP 403) for …` line (`get_refused_403`, #518) for that leg is still required. Two outcomes are valid (#937): the give-up comes after the answer (one BYE at 6101, as `x379`), or, usually, before it, about 3 s after dial: a final 503 to the caller, no BYE, one drop, `endCall … reason=anchor dropped the leg before it connected` and the `anchor dropped a ringing outbound leg` line (#880). No fail-fast line (the 12 attempts were spent instead) is INVALID; the fail-fast on `x379` (a 404) is a FAIL |
 | `x279_degraded_bye` | #279 (Connected variant) | 1 answered call, 6101 sends RTP (Contact `;line=pd6101`); `post_stream_fail` armed 1.5 s after its POST stream opens; the BYE due within 3 s | `degraded_endcall`: `endCall <Call-ID> reason=anchor audio write failure` | `fired` ≥ 1; exactly one BYE at 6101, matching Call-ID and tags, Request-URI = its registered Contact with its parameters, answered 200; the leg dropped once (syslog only); sessionCount back to baseline; a re-INVITE on the dead dialog gets 481 |
+| `x952_token_age_held` | #952, #945 | 1 answered call (voicemail counts), 6101 sends RTP (Contact `;line=pd6101`), held `--hold-s` seconds (default 330; it must exceed 300, the old 5-minute token margin, and is at most 900) after `token_age` fires. `token_age` is armed once the call's POST stream is open (`--arm-at mid-call`, the default). `--arm-at before-call` arms it before the INVITE, where `makeCall()` refreshes the aged token at origination, so nothing is aged under a live stream. `--runs` held calls (default 1), at most `--run-cap` (default 1, ceiling 3). The call cap is the hold plus 30 s. The INVITE waits up to 45 s for the far end, or its voicemail, to answer (the agent's default 16 s would CANCEL a far end still ringing toward voicemail), then CANCELs | `bench_token_age`: `BENCHFAULT token_age fired` | `fired` ≥ 1 (the run gives up at once, with no long hold, if it does not fire within 5 s); the call answered with its POST stream open and still up past the old margin; a BYE answered 200 (the harness's, or the PBX's at 6101's registered Contact if it ended past the margin); each leg dropped once; sessionCount back to baseline. A call that ends within the margin is INVALID. **It reports, it does not judge the refresh**: per run the hold reached and the token witnesses below counted from when the token was aged, in `manifest.json` (`summary`) and `run.log`. On main nothing refreshes a token mid-call (`ensureToken()`'s only caller is `makeCall()`, before any stream opens), so by the code the expected counts are `bench_token_age=1` and zeros; anything else is the finding. Needs an `--approval-url` in `LONG_HOLD_APPROVALS` (below) |
 
 **CANCEL timing.** 3CX's makecall response took 1.8-3.2 s on a real tenant (Stray's corrections on
 [#379](https://github.com/GlomarGadaffi/pocket-dial/issues/379#issuecomment-5985894096) and
@@ -361,7 +362,7 @@ far end's state, not of this harness. The reliable fix is an automated far end (
 answered by a harness UA), which needs desmo and the tenant; until then a diverted run is INVALID, not a
 firmware finding.
 
-**Probe scenarios** (`x349`, `x379`, `x518`, `x279`) drive the bench probe image
+**Probe scenarios** (`x349`, `x379`, `x518`, `x279`, `x952`) drive the bench probe image
 ([BENCH_PROBE.md](BENCH_PROBE.md)). On top of the preconditions below, `--expect-version` must be
 a `-probe` stamp, and the admin login must be the owner when an owner credential exists
 (`PD_BOARD_ADMIN_USER`). Each run reads `/api/bench/fault` before and after, and arms only its
@@ -398,7 +399,21 @@ the firmware formats.
 | `e911_degraded_kept_906` | `e911: audio to the anchor keeps failing on a connected 911/933: kept up, not hung up \(#906\)` | #906: the degraded-audio sweep kept a connected 911/933 up and told the notify list (once per call) |
 | `get_403_failfast_902` | `GET stream: HTTP 403 on (\d+) consecutive attempts for /callcontrol/<dn>/participants/([^/\s]+)/stream -- giving up now, not at attempt (\d+) \(#902\)` | #902/#932: 6 consecutive 403s, before the answer or after it, gave up an ordinary outbound leg early (MediaNeverOpened follows). ESP-only |
 | `cdr_callee_dialed_901` | `CDR callee is the dialed number \((anchor reap\|anchor audio write failure)\) \(#901\)` | #901: the degraded (audio write failure) and reaped anchor teardowns write the dialed number as the CDR callee |
+| `bench_token_age` | `BENCHFAULT token_age fired` | #952: the probe aged the token (`BenchProbe.cpp`, `fire()`); `x952`'s path counter |
+| `token_refresh_near_expiry` | `Access token near expiry \S+ refreshing` | #952: `ensureToken()` refetched a token within 5 minutes of expiry with no stream live (only at `makeCall()`). The dash is U+2014 on the board |
+| `token_refresh_deferred_live` | `Token near expiry but media streams active \S+ deferring refresh` | #952: `ensureToken()` found the token near expiry while a stream was live and kept it (reached only by a `makeCall()` while another call is up). U+2014 dash |
+| `token_retrieved` | `Retrieved access token \(len=\d+, lifetime=(\d+)s\)` | #952: a token fetch succeeded; group 1 is the lifetime in seconds |
+| `token_fetch_failed` | `Token (?:request returned HTTP -?\d+\|failed to write body: -?\d+\|HTTP connection failed to open: )` | #952: a token fetch failed |
+| `ws_restart_stale_token` | `WS disconnected/errored with an expiring token \S+ requesting anchor restart to refresh it` | #336/#952: the websocket dropped while the token read as expiring, so the anchor restarts (stop/start) to refetch it. U+2014 dash |
 | `ctrl_request_884` | `ctrl request: attempt (\d+) (reused\|resumed\|cold) in (\d+) ms \(#884\)` | #884: one line per successful control request (drop or answer) saying whether it rode an open socket (`reused`, no connect event), reconnected on the kept handle in 400 ms or less (`resumed`) or paid a full handshake (`cold`: a fresh handle, or a connect above 400 ms, which is the repo's cut and a timing heuristic, not proof of resumption). Group 3 is the elapsed ms. After #884 a `reused` is a bug. A failed attempt logs `Control request failed ... on attempt N` instead. ESP-only |
+
+The six `bench_token_age` … `ws_restart_stale_token` rows are existing `esp_log` lines on main, not
+`Witness.hpp` witnesses; `tests/tools/test_anchor_witness_wiring.py` checks each one's format string in
+`TelephonyAnchorClient.cpp` and `BenchProbe.cpp`. The #862 witnesses (`token_maint_refresh_862`,
+`token_maint_skip_862`, `token_sos_live_fetch_862`, `token_sos_401_fetch_862` and the rest) are not emitted
+on main, so they are not registered or counted here; add each one, with its wiring test, when the code that
+emits it lands. The two `token_sos_*_862` lines fire only on a 911/933 POST answered 401, which no scenario
+here dials, so `x952` could never count them.
 
 **Safety preconditions.** Each one is refused before anything is sent (exit 2), except
 the S1 pin and the far-end check, which are made against the board:
@@ -409,6 +424,14 @@ the S1 pin and the far-end check, which are made against the board:
 - the far end comes from a 0600 file (`PD_ANCHOR_FAR_END_FILE`) or from `PD_ANCHOR_FAR_END`,
   never from argv. It is refused if it holds 911 or 933 anywhere, or is 112, 113, 999, an owner
   extension (1001, 1002, 1003, 113, plus `PD_OWNER_EXTS`), a test UA or a PBX service number;
+- **a held call** (`x952`): the recorded approvals allow about 30 s a call, so `--approval-url` must be in
+  `LONG_HOLD_APPROVALS`, which is empty until desmo's OK for a call that long is recorded and a reviewed PR
+  adds its link (an old approval never covers it, and a held approval covers no other scenario).
+  `--hold-s` must be finite, over 300 s and at most 900 s; `--runs` may not exceed `--run-cap` (1 by default,
+  at most 3). The flags are refused on every other scenario. The ceiling of 30 s a call (`MAX_CALL_S`) is
+  unchanged for them. The far end is refused like any other: 911, 933, 113 and 1001 included. Immediately
+  before every INVITE the probe's `emergencyLive` is read again (it covers a 911/933 and a session in a
+  PSAP-callback window, BENCH_PROBE.md), and a live one stops the run INVALID. The scenario never dials one;
 - the board is `.195` or `.244`, and the admin PIN comes from `PD_BOARD_ADMIN_PIN`;
 - `--expect-version` names the image (the provenance the closure rule needs); the board's
   `/api/status` version must match it, or the run is INVALID before the first call;
