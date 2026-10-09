@@ -905,8 +905,8 @@ namespace
 	// Option tags this PBX honours in Require (RFC 3261 §8.2.2.3). "timer":
 	// RFC 4028 is honoured passively (pjsua sends Require: timer on every
 	// INVITE). "replaces": RFC 3891, see kSupportedOptionTags in
-	// RequestsHandler.cpp. 100rel is known only in Require on an INVITE (#172).
-	// Everything else -- path, gruu, outbound, sec-agree -- is a 420.
+	// RequestsHandler.cpp. 100rel is known only when checkHeaders() is told the INVITE
+	// is the 777 echo's (#172). Everything else -- path, gruu, outbound, sec-agree -- is a 420.
 	// A Content-Type value naming SDP. Media type only: parameters after ';' do
 	// not change what we parse.
 	bool isSdpMediaType(std::string_view contentTypeValue)
@@ -934,7 +934,7 @@ namespace
 	}
 }
 
-SipMessage::HeaderVerdict SipMessage::checkHeaders(std::string_view& unsupported) const
+SipMessage::HeaderVerdict SipMessage::checkHeaders(std::string_view& unsupported, bool echoTestInvite) const
 {
 	using namespace SipLimits;
 	unsupported = {};
@@ -995,7 +995,7 @@ SipMessage::HeaderVerdict SipMessage::checkHeaders(std::string_view& unsupported
 		}
 		else if (checkRequire && (iequal(name, "require") || iequal(name, "proxy-require")))
 		{
-			const bool honours100rel = method == SipMessageTypes::INVITE && iequal(name, "require");   // #172
+			const bool honours100rel = echoTestInvite && method == SipMessageTypes::INVITE && iequal(name, "require");   // #172
 			if (anyOptionTag(value, [&](std::string_view tag) {
 					if (isKnownOptionTag(tag) || (honours100rel && iequalLower(tag, "100rel"))) return false;
 					unsupported = tag;

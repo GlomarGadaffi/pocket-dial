@@ -842,7 +842,8 @@ namespace
 	// destNumber == "777", the same To user.
 	bool isEchoTestInvite(const SipMessage& m)
 	{
-		return m.getToNumber() == "777" && m.getTo().find("tag=") == std::string_view::npos;
+		return m.getType() == SipMessageTypes::INVITE && m.getToNumber() == "777" &&
+			m.getTo().find("tag=") == std::string_view::npos;
 	}
 
 	// RFC 3262 §7.2: RAck = response-num SP CSeq-num SP method. Bounded, no allocation.
@@ -983,16 +984,13 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		if (request->headerLinesTruncated()) _headerLineCuts.fetch_add(1, std::memory_order_relaxed);
 		bool headerRefused = false;
 		std::string_view unsupportedTag;
-		auto hv = request->checkHeaders(unsupportedTag);
 		// #172, RFC 3262 §3: a UAS unwilling to send a provisional reliably MUST answer 420 naming
-		// 100rel. Only the 777 echo sends its 180 reliably; every other route is refused here, and
-		// every emergency INVITE takes the yield below as it always has.
-		if (hv == SipMessage::HeaderVerdict::Ok && request->getType() == SipMessageTypes::INVITE &&
-			request->requiresReliableProvisional() && !isEchoTestInvite(*request))
-		{
-			hv = SipMessage::HeaderVerdict::UnsupportedOption;
-			unsupportedTag = "100rel";
-		}
+		// 100rel. Only the 777 echo sends its 180 reliably, so only its INVITE is told 100rel is
+		// honoured; any other message is judged at its Require line as before #172. Emergency traffic
+		// is never the echo (a PSAP callback to 777 is answered by that branch), so it takes the
+		// yield below as it always has.
+		const bool echoInvite = isEchoTestInvite(*request) && !isEmergencyTraffic(*request);
+		const auto hv = request->checkHeaders(unsupportedTag, echoInvite);
 		if (hv != SipMessage::HeaderVerdict::Ok)
 		{
 			if (isEmergencyTraffic(*request))

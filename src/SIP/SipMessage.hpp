@@ -268,9 +268,11 @@ public:
 		UnsupportedOption,       // 420 + Unsupported:
 		UnsupportedMediaType,    // 415 + Accept:
 	};
-	HeaderVerdict checkHeaders(std::string_view& unsupported) const;
-	// RFC 3262 §3: a Require header naming 100rel. checkHeaders() accepts 100rel only
-	// on an INVITE; the header gate refuses it (420) on every route but the 777 echo (#172).
+	// `echoTestInvite` is the caller's word that this is the 777 echo's initial INVITE, the one route that
+	// sends a provisional reliably (#172). Only then is 100rel in a Require header an option tag this gate
+	// honours. Everywhere else it is a 420 at the Require line, in header order, exactly as before #172.
+	HeaderVerdict checkHeaders(std::string_view& unsupported, bool echoTestInvite = false) const;
+	// RFC 3262 §3: a Require header naming 100rel.
 	bool requiresReliableProvisional() const;
 	static const char* headerVerdictText(HeaderVerdict v);
 	// An INVITE whose To is 911/933 or urn:service:sos (the number onInvite
