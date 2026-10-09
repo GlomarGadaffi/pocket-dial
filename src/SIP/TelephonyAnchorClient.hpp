@@ -269,6 +269,16 @@ private:
 	// sequential ~100-150ms resumed ones instead. Guarded by _statusMutex; never touched under _mutex.
 	esp_http_client_handle_t      _statusClient = nullptr;
 	std::mutex                    _statusMutex;
+	// #941 (Rule 5): the 911/933 lane's own status-GET handle, built at start() by
+	// warmStatusConnection() so its TLS ticket starts warm (the #107 re-warm covers the POST slots
+	// only, so after a long idle the first 911 may pay a cold handshake). Only an emergency
+	// makeCall() uses it (httpGetBody sosLane), so a 911 never takes _statusMutex and never waits
+	// behind another task's status GET. No mutex is held across its I/O: _sosStatusBusy is a
+	// lock-free claim, uncontended because tel_sos is one worker. The only other claimant is
+	// closeSosStatusClient() at teardown; it waits for an in-flight 911 GET, and a 911 arriving
+	// during its cleanup waits for that (bounded, no I/O). Never touched under _mutex.
+	esp_http_client_handle_t      _sosStatusClient = nullptr;
+	std::atomic<bool>             _sosStatusBusy{false};
 
 	// #100: the rx task handle, its done-sem, and the stopMediaStreams() single-entry gate are now
 	// per-CallSlot (rxTaskHandle / rxDoneSem / tearingDown in the struct above) — one rx pump per
@@ -382,11 +392,13 @@ private:
 	void closeCtrlClient();      // teardown under _ctrlMutex
 	void closePostClient();      // free the persistent warm _postClient (full teardown only), under _postMutex
 	void closeStatusClient();    // free the persistent warm _statusClient (full teardown only), under _statusMutex
+	void closeSosStatusClient(); // #941: free _sosStatusClient (full teardown only), under the _sosStatusBusy claim
 	bool readJsonStringField(esp_http_client_handle_t client, const std::string& field, std::string& out);
 
 	// Live-state GET helpers (reconcile watchdog + drop-fallback + device resolve). Snapshot
 	// creds under _mutex then do blocking I/O lock-free.
-	bool httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut = nullptr);
+	// sosLane (#941): an emergency makeCall()'s GET; uses _sosStatusClient, never _statusMutex.
+	bool httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut = nullptr, bool sosLane = false);
 	// First participant id currently on our DN (single-leg assumption), or "" if none / on error.
 	std::string reconcileParticipantId();
 	// POST + capture the response body (for makecall result.id). Fresh client (not the persistent
@@ -419,7 +431,7 @@ private:
 	std::string getParticipantCaller(const std::string& legId);
 	// Device-specific makecall transport.
 	std::string pickDeviceId(const std::string& body);   // parse a /devices array → a device_id
-	bool resolveDevice();                                 // GET /devices → pickDeviceId → _deviceId
+	bool resolveDevice(bool sosLane = false);             // GET /devices → pickDeviceId → _deviceId (#941: sosLane = a 911/933 makeCall)
 	// Run on tel_maint (#658) when tick() sees a wedged _outboundActive (see .cpp).
 	static void reconcileTaskTrampoline(void* arg);
 	// #107: idle TLS re-warm — runs on tel_maint (#658) when tick() sees idle; reopens the
