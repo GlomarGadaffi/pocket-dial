@@ -1,9 +1,10 @@
 # #862 hot-path allocations. AllocBaseline_test.cpp (3): Issue862SyslogStampAndLineTakeNoHeap,
 #   Issue862TeardownSnapshotTakesNoHeapForIdsThatFit, Issue862TeardownSnapshotKeepsAnOverlongIdWholeAndFreesIt.
-#   TokenBodyArena_test.cpp (45): TokenBodyArena.* (15: capacity edge, arena full, read error, timeout,
-#   claim), TokenLanes.* (16: the 911/933 lane's own arena, its failure branches, no waiting, the
-#   fetch's overall deadline, a cached token is never fetched ahead of a 911/933, the witness),
-#   Sos401.* (5: a 911/933 POST answered 401 gets one fetch and one retry) and JsonStringField.* (9:
-#   the bounded scanner), the #948 arena contract for the token body.
+#   TokenBodyArena_test.cpp (47): TokenBodyArena.* (15: capacity edge, arena full, read error, timeout,
+#   claim), TokenLanes.* (18: the 911/933 lane's own arena, its failure branches, no waiting, the
+#   fetch's overall deadline, a cached token is never fetched ahead of a 911/933, the witness, no
+#   ordinary refresh while a 911/933 is pending), Sos401.* (5: a 911/933 POST answered 401 gets one
+#   fetch and one retry) and JsonStringField.* (9: the bounded scanner), the #948 arena contract for
+#   the token body.
 #   TelephonyAnchorLogic_test.cpp (2): DecodeJwtLifetime* (realistic claims, three allocations and no JSON tree).
-50
+52

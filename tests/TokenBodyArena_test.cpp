@@ -651,6 +651,51 @@ TEST(TokenLanes, AFreshTokenLeavesNoWitnessAndSpendsNoSample)
 	EXPECT_EQ(pdwitness::count("token_sos_fallback_862"), 1u) << "fresh dials did not use up the first sample";
 }
 
+// ── no ordinary refresh while a 911/933 is pending (#862, Rule 5) ────────────────────
+
+TEST(TokenLanes, AnOrdinaryRefreshDoesNotStartWhileA911IsPendingAndTheSosLaneIsNeverHeldBack)
+{
+	Lanes lanes;
+	Sleeper sleeper;
+	EXPECT_TRUE(lanes.ordinaryRefreshMayStart(false));
+	{
+		Lanes::EmergencyScope sos(lanes, true);
+		EXPECT_FALSE(lanes.ordinaryRefreshMayStart(false)) << "its new token would revoke the one the 911/933's POST carries";
+		EXPECT_TRUE(lanes.ordinaryRefreshMayStart(true)) << "start() is not a refresh ahead of a call: the anchor must come up";
+		Arena::Lease emergency = lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper);
+		EXPECT_TRUE(emergency) << "the 911/933's own fetch is never held back";
+		EXPECT_EQ(sleeper.calls, 0);
+		{
+			Lanes::EmergencyScope second(lanes, true);   // two 911/933 calls at once
+			Lanes::EmergencyScope notSos(lanes, false);   // and an ordinary call's scope does nothing
+		}
+		EXPECT_FALSE(lanes.ordinaryRefreshMayStart(false)) << "the first 911/933 is still pending";
+	}
+	EXPECT_TRUE(lanes.ordinaryRefreshMayStart(false)) << "once the last 911/933 has returned, refreshes start again";
+	Lanes::EmergencyScope ordinaryCall(lanes, false);
+	EXPECT_TRUE(lanes.ordinaryRefreshMayStart(false)) << "an ordinary call holds nothing back";
+}
+
+TEST(TokenLanes, ThePendingCountBalancesWhenManyCallsComeAndGoOnManyThreads)
+{
+	Lanes lanes;
+	std::vector<std::thread> threads;
+	std::atomic<int> sawHeld{0};
+	for (int t = 0; t < 8; ++t)
+	{
+		threads.emplace_back([&] {
+			for (int i = 0; i < 2000; ++i)
+			{
+				Lanes::EmergencyScope sos(lanes, true);
+				if (!lanes.ordinaryRefreshMayStart(false)) sawHeld.fetch_add(1, std::memory_order_relaxed);
+			}
+		});
+	}
+	for (std::thread& th : threads) th.join();
+	EXPECT_EQ(sawHeld.load(), 8 * 2000) << "a pending 911/933 always held an ordinary refresh back";
+	EXPECT_TRUE(lanes.ordinaryRefreshMayStart(false)) << "and the count came back to 0, none leaked";
+}
+
 // ── the 911/933 fetch's overall deadline (#862, Rule 5) ──────────────────────────────
 
 TEST(TokenLanes, AnOperationGetsItsOwnCapWhileTheBudgetHasRoomAndWhatIsLeftAfter)

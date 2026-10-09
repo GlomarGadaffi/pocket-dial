@@ -788,6 +788,38 @@ public:
 		                     "no fresh one (#862)");
 	}
 
+	// Held for the whole of a 911/933 makeCall(): its token step, its POST and a 401 retry. A refresh
+	// grants a new token and Telephony drops the old one at that instant, so one that lands between
+	// the 911/933 reading its token and its POST (or its retry) revokes the token the POST carries.
+	// While one of these is held an ordinary refresh does not start (ordinaryRefreshMayStart): the
+	// 911/933 keeps the token it has and the refresh waits for a later call. Rule 5's safe default.
+	// Not covered: an ordinary fetch already in flight when the 911/933 arrives lands when it lands,
+	// and the 911/933's own fetches are never held back.
+	class EmergencyScope
+	{
+	public:
+		EmergencyScope(TokenLanes& lanes, bool active) : _lanes(active ? &lanes : nullptr)
+		{
+			if (_lanes) _lanes->_emergenciesPending.fetch_add(1, std::memory_order_acq_rel);
+		}
+		~EmergencyScope()
+		{
+			if (_lanes) _lanes->_emergenciesPending.fetch_sub(1, std::memory_order_acq_rel);
+		}
+		EmergencyScope(const EmergencyScope&) = delete;
+		EmergencyScope& operator=(const EmergencyScope&) = delete;
+
+	private:
+		TokenLanes* _lanes;
+	};
+
+	// False while a 911/933 makeCall() is pending, for a refresh ahead of an ordinary call. start()
+	// (startup) is not a refresh ahead of a call and is never held: the anchor must come up.
+	bool ordinaryRefreshMayStart(bool startup) const
+	{
+		return startup || _emergenciesPending.load(std::memory_order_acquire) == 0;
+	}
+
 private:
 	static constexpr std::uint32_t kSosFallbackLogEvery = 16;
 
@@ -796,6 +828,7 @@ private:
 	Arena                      _ordinary;
 	Arena                      _emergency;
 	std::atomic<std::uint32_t> _sosFallbacks{0};
+	std::atomic<int>           _emergenciesPending{0};
 };
 
 // What a 911/933 does about its token before its POST (#862, operator ruling on #945). With any

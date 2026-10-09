@@ -330,6 +330,9 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	// Every other call refreshes if the token is near expiry, as before. Safe here: no media streams
 	// are open at call-origination time, so a re-issue can't kill a live stream.
 	const bool sosDial = pbx::classifyEmergencyDial(destination).isEmergency;
+	// Held to the end of makeCall(): no ordinary refresh starts while this 911/933 is pending, its
+	// 401 retry included, so none can revoke the token its POST carries.
+	telephony::TokenLanes::EmergencyScope sosScope(_tokenLanes, sosDial);
 	if (sosDial)
 	{
 		if (telephony::sosFirstStep(haveCachedToken()) == telephony::SosFirstStep::FetchThenPost)
@@ -977,6 +980,15 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 	{
 		ESP_LOGW(TAG, "Token fetch skipped: another %s fetch is running",
 		         lane == telephony::TokenLane::Emergency ? "911/933" : "ordinary");
+		return false;
+	}
+	// Rule 5: a refresh ahead of an ordinary call does not start while a 911/933 makeCall() is
+	// pending. Its new token would revoke the one the 911/933's POST is about to carry (or has just
+	// carried, for the 401 retry). Checked after the claim and before any I/O, so it also closes
+	// the gap between ensureToken()'s own check and the connect. start() is never held.
+	if (lane == telephony::TokenLane::Ordinary && !_tokenLanes.ordinaryRefreshMayStart(waitForArena))
+	{
+		ESP_LOGW(TAG, "Token refresh skipped: a 911/933 call is being placed, it keeps the token it has");
 		return false;
 	}
 
