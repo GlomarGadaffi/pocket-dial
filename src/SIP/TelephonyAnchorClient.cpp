@@ -242,7 +242,7 @@ bool TelephonyAnchorClient::start()
 	}
 
 	// 1. Fetch OAuth token
-	if (!fetchToken())
+	if (!fetchToken(true))
 	{
 		ESP_LOGE(TAG, "Failed to retrieve OAuth token");
 		std::lock_guard<std::mutex> lock(_mutex);
@@ -960,8 +960,28 @@ void TelephonyAnchorClient::freeSlotLocked(CallSlot& slot)
 
 // ── Private Helper Functions ───────────────────────────────────────────────
 
-bool TelephonyAnchorClient::fetchToken()
+bool TelephonyAnchorClient::fetchToken(bool waitForArena)
 {
+	// #862: claim the token arena before any I/O. A fetch already holds it, and a second one
+	// would only invalidate the first one's token (Telephony drops the old token the moment a
+	// new one is granted), so the loser is turned away here, before it opens a connection, and
+	// carries on with the token it has. Nothing waits for the arena -- except start(), which is
+	// off the 911 lane and would otherwise leave the anchor down after a restart that raced a
+	// makeCall()'s refresh.
+	constexpr int      kClaimWaitPolls  = 50;
+	constexpr uint32_t kClaimWaitPollMs = 100;
+	TokenArena::Lease lease = _tokenArena.tryClaim();
+	for (int i = 0; waitForArena && !lease && i < kClaimWaitPolls; ++i)
+	{
+		vTaskDelay(pdMS_TO_TICKS(kClaimWaitPollMs));
+		lease = _tokenArena.tryClaim();
+	}
+	if (!lease)
+	{
+		ESP_LOGW(TAG, "Token fetch skipped: another fetch is running");
+		return false;
+	}
+
 	std::string tokenUrl;
 	std::string clientId, clientSecret;
 	{
@@ -1000,8 +1020,8 @@ bool TelephonyAnchorClient::fetchToken()
 			         status, fetch_res, esp_http_client_is_chunked_response(client));
 			if (status == 200)
 			{
-				std::string tokenStr;
-				if (readJsonStringField(client, "access_token", tokenStr))
+				std::string_view tokenStr;   // views the arena, which `lease` holds until this returns
+				if (readJsonStringField(client, lease, "access_token", tokenStr))
 				{
 					// This lock guards _accessToken (a std::string, genuinely needs it).
 					// _tokenObtainedUs/_tokenLifetimeUs are std::atomic (#344) and do not
@@ -1009,8 +1029,9 @@ bool TelephonyAnchorClient::fetchToken()
 					// this block already holds it for _accessToken, not because they
 					// require it. Do not read that as redundant and drop the atomics.
 					std::lock_guard<std::mutex> lock(_mutex);
-					_accessToken = tokenStr;
-					_bearerHeader = "Bearer " + _accessToken;
+					_accessToken.assign(tokenStr.data(), tokenStr.size());
+					_bearerHeader.assign("Bearer ");
+					_bearerHeader.append(tokenStr.data(), tokenStr.size());
 					_tokenObtainedUs = esp_timer_get_time();
 					_tokenLifetimeUs = decodeJwtLifetimeUs(_accessToken);
 					if (_wsClient)
@@ -2441,61 +2462,38 @@ void TelephonyAnchorClient::stopAllMediaStreams()
 	}
 }
 
-bool TelephonyAnchorClient::readJsonStringField(esp_http_client_handle_t client, const std::string& field, std::string& out)
+bool TelephonyAnchorClient::readJsonStringField(esp_http_client_handle_t client, TokenArena::Lease& lease,
+                                                std::string_view field, std::string_view& out)
 {
-	// The body is collected into fixed storage, not a growing std::vector (#862). A token
-	// response is well inside telephony::kJsonBodyFixedBytes, so the usual read allocates
-	// nothing. A bigger body spills to the heap and still parses whole. This is never a
-	// refusal. The buffer is static, not on the stack: the anchor's tasks have 6 KB stacks
-	// (tel_maint) and TLS runs below this frame. fetchToken() callers can overlap (start()
-	// creates tel_maint before its own fetchToken()), so s_body is owned through a try-lock:
-	// the winner reads into it, and a loser spills to the heap without waiting. The lock is
-	// held through cJSON_Parse, because the parsed text points into s_body.
-	static std::mutex s_bodyMutex;
-	static char s_body[telephony::kJsonBodyFixedBytes + 1];
-	std::unique_lock<std::mutex> bodyLock(s_bodyMutex, std::try_to_lock);
-	char spillOnly[1];   // 1 byte, not nullptr: BodyCollector writes _fixed[0] when nothing spilled
-
-	telephony::BodyCollector body(bodyLock.owns_lock() ? s_body : spillOnly,
-	                              bodyLock.owns_lock() ? telephony::kJsonBodyFixedBytes : 0);
-	char tempBuf[512];
-	int readBytes = 0;
-	while ((readBytes = esp_http_client_read(client, tempBuf, sizeof(tempBuf))) > 0)
+	// The body goes straight into the claimed arena (#862): no vector, no spill, no lock held,
+	// and no 512-byte stack buffer to copy through. A body that does not fit, a failed read or
+	// a timeout is an error and leaves the arena empty (telephony::BodyArena); this returns
+	// false and fetchToken() keeps the token it has. The scan below needs the whole body.
+	static_assert(-ESP_ERR_HTTP_EAGAIN == telephony::kHttpReadTimedOut,
+	              "esp_http_client_read()'s timeout code moved: update telephony::kHttpReadTimedOut");
+	const telephony::BodyStatus st = lease.collect(
+	    [client](char* dst, std::size_t room) -> int {
+		    const int n = esp_http_client_read(client, dst, static_cast<int>(room));
+		    // A 0 ends the body only if the response says it is whole. Cut short (connection
+		    // closed early), it is an error, never a shorter token.
+		    if (n == 0 && !esp_http_client_is_complete_data_received(client)) return -1;
+		    return n;
+	    },
+	    [] { return static_cast<std::int64_t>(esp_timer_get_time()); },
+	    telephony::kTokenBodyBudgetUs);
+	if (st != telephony::BodyStatus::Ok)
 	{
-		body.append(tempBuf, static_cast<std::size_t>(readBytes));
-	}
-	if (readBytes < 0)
-	{
-		ESP_LOGE(TAG, "HTTP read error: %d", readBytes);
+		ESP_LOGE(TAG, "Token response not read: %s (arena %u bytes)", telephony::bodyStatusName(st),
+		         static_cast<unsigned>(telephony::kTokenBodyBytes));
 		return false;
 	}
-	if (body.size() == 0)
+	if (!telephony::jsonStringField(lease.data(), lease.size(), field, out))
 	{
+		ESP_LOGE(TAG, "Token response (%u bytes) has no usable \"%.*s\" string",
+		         static_cast<unsigned>(lease.size()), static_cast<int>(field.size()), field.data());
 		return false;
 	}
-	if (body.spilled())
-	{
-		// Not an error: the body parses whole, from a heap copy. Logged so the fixed size can be
-		// checked against a real unit (a spill on every fetch means the size is too small).
-		ESP_LOGW(TAG, "token response %u bytes: over the %u-byte fixed buffer, spilled to heap",
-		         static_cast<unsigned>(body.size()), static_cast<unsigned>(telephony::kJsonBodyFixedBytes));
-	}
-	std::string joined;   // holds the body only when it spilled
-	cJSON* root = cJSON_Parse(body.terminated(joined));
-	if (!root)
-	{
-		ESP_LOGE(TAG, "Failed to parse JSON response");
-		return false;
-	}
-	bool found = false;
-	cJSON* item = cJSON_GetObjectItem(root, field.c_str());
-	if (item && item->valuestring)
-	{
-		out = item->valuestring;
-		found = true;
-	}
-	cJSON_Delete(root);
-	return found;
+	return true;
 }
 
 void TelephonyAnchorClient::wsEventTrampoline(void* handlerArgs, esp_event_base_t /*base*/,

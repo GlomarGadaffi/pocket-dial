@@ -393,6 +393,8 @@ add_executable(sip_parser_tests
     UrlEncode_test.cpp
     JsonEscape_test.cpp
     TelephonyAnchorLogic_test.cpp
+    # #862: the token-body arena and its bounded field scanner (the #948 contract).
+    TokenBodyArena_test.cpp
     MixBus_test.cpp
     # Issue #75: MixBus wired into MediaBridge (BUS mode) and made dialable as the
     # 888 meet-me room. Covers the N-way minus-self mix end-to-end through the real

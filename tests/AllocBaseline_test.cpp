@@ -34,7 +34,6 @@
 #include "TelephonyAnchorLogic.hpp"
 #include "TimeSync.hpp"
 
-#include <algorithm>
 #include <string_view>
 
 namespace
@@ -180,9 +179,9 @@ TEST(AllocBaseline, PrintHotPathCounts)
 
 // ── #862: the allocations the table above did not cover ─────────────────────────
 //
-// Three ESP-only call sites now run host-compiled helpers, and these tests drive
-// those helpers: the syslog stamp (TimeSync + Syslog), the teardown snapshot of
-// call ids (telephony::IdSnapshot) and the token body (telephony::BodyCollector).
+// Two ESP-only call sites run host-compiled helpers, and these tests drive those
+// helpers: the syslog stamp (TimeSync + Syslog) and the teardown snapshot of call
+// ids (telephony::IdSnapshot). The token body is in TokenBodyArena_test.cpp.
 // AllocGuard is per thread, so the zero-heap assertions are exact. The live-block
 // checks read process-wide totals, which is why they compare for equality only
 // around a block of work that runs on this thread alone.
@@ -286,118 +285,5 @@ TEST(AllocBaseline, Issue862TeardownSnapshotKeepsAnOverlongIdWholeAndFreesIt)
 	EXPECT_EQ(n, 2u) << "no id is dropped, however long";
 	EXPECT_TRUE(same);
 	EXPECT_EQ(blocks1, blocks0) << "the snapshot must free its overlong copy";
-	EXPECT_EQ(bytes1, bytes0);
-}
-
-// Collects `src` the way readJsonStringField does (512-byte reads) and reports
-// what it cost, whether it spilled, and what came back.
-static void collectBody(const std::string& src, std::size_t& heap, bool& spilled, std::string& got)
-{
-	char fixed[telephony::kJsonBodyFixedBytes + 1];
-	std::string joined;
-	telephony::BodyCollector c(fixed, telephony::kJsonBodyFixedBytes);
-	{
-		AllocGuard g;
-		for (std::size_t off = 0; off < src.size(); off += 512)
-		{
-			c.append(src.data() + off, std::min<std::size_t>(512, src.size() - off));
-		}
-		heap = g.delta();
-	}
-	spilled = c.spilled();
-	got = std::string(c.terminated(joined));
-}
-
-TEST(AllocBaseline, Issue862TokenBodyThatFitsIsCollectedWithoutTheHeap)
-{
-	std::string body;
-	for (std::size_t i = 0; i < 1500; ++i) body.push_back(static_cast<char>('a' + i % 26));
-	const std::string exact(telephony::kJsonBodyFixedBytes, 'z');   // exactly the fixed size: still fits
-
-	std::size_t heap1 = 0, heap2 = 0;
-	bool spilled1 = true, spilled2 = true;
-	std::string got1, got2;
-	collectBody(body, heap1, spilled1, got1);
-	collectBody(exact, heap2, spilled2, got2);
-
-	EXPECT_EQ(heap1, 0u);
-	EXPECT_FALSE(spilled1);
-	EXPECT_EQ(got1, body);
-	EXPECT_EQ(heap2, 0u);
-	EXPECT_FALSE(spilled2);
-	EXPECT_EQ(got2, exact);
-}
-
-TEST(AllocBaseline, Issue862TokenBodyThatSpillsIsKeptWholeAndFreed)
-{
-	if (!heapLiveTracked()) GTEST_SKIP() << "this C library cannot report block sizes";
-	std::string body;
-	for (std::size_t i = 0; i < 5000; ++i) body.push_back(static_cast<char>('a' + i % 26));
-
-	std::size_t heap = 0;
-	std::size_t n = 0;
-	bool spilled = false;
-	bool same = false;
-	const std::size_t blocks0 = heapLiveBlocks();
-	const std::size_t bytes0 = heapLiveBytes();
-	{
-		char fixed[telephony::kJsonBodyFixedBytes + 1];
-		std::string joined;
-		telephony::BodyCollector c(fixed, telephony::kJsonBodyFixedBytes);
-		{
-			AllocGuard g;
-			for (std::size_t off = 0; off < body.size(); off += 512)
-			{
-				c.append(body.data() + off, std::min<std::size_t>(512, body.size() - off));
-			}
-			heap = g.delta();
-		}
-		spilled = c.spilled();
-		n = c.size();
-		same = std::string_view(c.terminated(joined)) == std::string_view(body);
-	}
-	const std::size_t blocks1 = heapLiveBlocks();
-	const std::size_t bytes1 = heapLiveBytes();
-	EXPECT_GT(heap, 0u) << "the spill must really take the heap, or this proves nothing";
-	EXPECT_TRUE(spilled);
-	EXPECT_EQ(n, body.size()) << "a body past the fixed size is still whole, never refused";
-	EXPECT_TRUE(same);
-	EXPECT_EQ(blocks1, blocks0) << "the spilled copy must be freed with the collector";
-	EXPECT_EQ(bytes1, bytes0);
-}
-
-// 700-byte reads: the third read (649 bytes) arrives with 648 bytes of room left in the fixed
-// buffer, so it straddles the edge (0 < now < n). The 512-byte reads above always land on the
-// edge exactly, so this is the only test that copies part of a read into the buffer and spills
-// the rest.
-TEST(AllocBaseline, Issue862TokenBodyThatStraddlesTheFixedEdgeIsKeptWhole)
-{
-	if (!heapLiveTracked()) GTEST_SKIP() << "this C library cannot report block sizes";
-	std::string body;
-	for (std::size_t i = 0; i < 2049; ++i) body.push_back(static_cast<char>('a' + i % 26));
-
-	std::size_t n = 0;
-	bool spilled = false;
-	bool same = false;
-	const std::size_t blocks0 = heapLiveBlocks();
-	const std::size_t bytes0 = heapLiveBytes();
-	{
-		char fixed[telephony::kJsonBodyFixedBytes + 1];
-		std::string joined;
-		telephony::BodyCollector c(fixed, telephony::kJsonBodyFixedBytes);
-		for (std::size_t off = 0; off < body.size(); off += 700)
-		{
-			c.append(body.data() + off, std::min<std::size_t>(700, body.size() - off));
-		}
-		spilled = c.spilled();
-		n = c.size();
-		same = std::string_view(c.terminated(joined)) == std::string_view(body);
-	}
-	const std::size_t blocks1 = heapLiveBlocks();
-	const std::size_t bytes1 = heapLiveBytes();
-	EXPECT_TRUE(spilled);
-	EXPECT_EQ(n, body.size());
-	EXPECT_TRUE(same) << "the byte that spilled must follow the 2048 bytes in the buffer, in order";
-	EXPECT_EQ(blocks1, blocks0);
 	EXPECT_EQ(bytes1, bytes0);
 }

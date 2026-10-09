@@ -19,6 +19,7 @@
 // input maps to a documented, safe return value (the fallback lifetime / empty
 // string / "no match"), never UB.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -551,9 +552,8 @@ struct ListLegCounts
 };
 
 // ── Fixed-storage buffers for the ESP arm (#862) ────────────────────────────────
-// Both helpers exist so the ESP teardown allocates nothing in the common case, and the
-// token read stops growing a body buffer. The "fits or spills" logic is testable here.
-// cJSON still allocates its tree, so the token read is not heap-free overall.
+// The teardown snapshot (IdSnapshot) and the token-body arena (BodyArena) exist so the ESP
+// arm allocates nothing for them in the common case. Their logic is testable here.
 
 // Participant ids up to this many bytes are copied inline by IdSnapshot. Participant
 // ids are short (AnchorOwnLegs uses the same 32 for the same reason). Not checked
@@ -605,56 +605,285 @@ private:
 	std::size_t _n = 0;
 };
 
-// The HTTP body of a token response, collected for one cJSON parse. The first `cap`
-// bytes go into the caller's fixed buffer, which must hold cap + 1 bytes for the NUL
-// terminator. Anything past that spills into a heap string. The size is an estimate, not
-// a measurement: a 3CX token is a JWT (a 256-byte RS256 signature is 342 base64url
-// characters) plus its claims, so a response should be on the order of 1-2 KB. A body
-// that does not fit still parses whole, so the size only decides how often the heap
-// is used, never whether a response is refused. The ESP log line on spill checks it.
-inline constexpr std::size_t kJsonBodyFixedBytes = 2048;
+// ── The token body: one arena and a bounded scanner (#862) ──────────────────────
+// The OAuth token response is read into ONE arena that is reserved with the client and never
+// grows: no std::vector per read and no spill to the heap. The contract is the one recorded
+// on #948 for the 911/933 lane:
+//   * Fits or fails. A body that does not fit is an error (ArenaFull), never a prefix, and a
+//     failed read (an error, a timeout, a stream that stops short) is an error too. After any
+//     error the arena shows no bytes at all, and the caller keeps the token it already has.
+//   * Nobody waits. The arena is claimed with an atomic flag, not a mutex: a second caller is
+//     turned away at once with an empty lease, and the holder is never blocked or slowed by
+//     it. No lock is held across the socket read.
+//   * It is bounded in time as well as in size: the whole body must arrive inside a budget.
 
-class BodyCollector
+// The arena holds a body of exactly this many bytes and refuses one byte more. The size is an
+// estimate, not a measurement: a 3CX token is a JWT (an RS256 signature is 342 base64url
+// characters, an RS4096 one is 683) plus its claims, so a response should be on the order of
+// 1-2 KB. 4 KB leaves margin, because without a spill a body that does not fit is a token that
+// is never fetched. The ESP arm logs a refusal, so a real unit can confirm the size.
+inline constexpr std::size_t kTokenBodyBytes = 4096;
+
+// The whole body must arrive inside this budget. Each socket read already has its own timeout
+// (2 s, makeAuthedClient), but a server that sends one byte per read never trips it; this
+// bounds the sum. The worst case is the budget plus the one read already in progress.
+inline constexpr std::int64_t kTokenBodyBudgetUs = 3LL * 1000 * 1000;
+
+// What esp_http_client_read() returns when its read times out before any data arrived:
+// -ESP_ERR_HTTP_EAGAIN, -0x7007 in ESP-IDF v6.0.1 (esp_http_client.h). The ESP arm static_asserts it.
+inline constexpr int kHttpReadTimedOut = -0x7007;
+
+enum class BodyStatus : std::uint8_t { Ok, ArenaFull, ReadError, Timeout };
+
+inline const char* bodyStatusName(BodyStatus s)
+{
+	switch (s)
+	{
+		case BodyStatus::Ok:        return "ok";
+		case BodyStatus::ArenaFull: return "body larger than the arena";
+		case BodyStatus::ReadError: return "read error";
+		case BodyStatus::Timeout:   return "timeout";
+	}
+	return "?";
+}
+
+template <std::size_t N>
+class BodyArena
 {
 public:
-	BodyCollector(char* fixed, std::size_t cap) : _fixed(fixed), _cap(cap) {}
-
-	void append(const char* data, std::size_t n)
+	// Ownership of the arena. Empty (false) when the claim was refused. Releases on every exit,
+	// so no return path can leave the arena claimed.
+	class Lease
 	{
-		if (n == 0) return;
-		const std::size_t room = _cap - _used;
-		const std::size_t now  = n < room ? n : room;
-		std::memcpy(_fixed + _used, data, now);
-		_used += now;
-		if (now < n)
+	public:
+		Lease() = default;
+		Lease(Lease&& o) noexcept : _a(o._a) { o._a = nullptr; }
+		Lease& operator=(Lease&& o) noexcept
 		{
-			_spill.append(data + now, n - now);
+			if (this != &o)
+			{
+				release();
+				_a = o._a;
+				o._a = nullptr;
+			}
+			return *this;
 		}
-	}
+		Lease(const Lease&) = delete;
+		Lease& operator=(const Lease&) = delete;
+		~Lease() { release(); }
 
-	std::size_t size() const { return _used + _spill.size(); }
-	bool        spilled() const { return !_spill.empty(); }
+		explicit operator bool() const { return _a != nullptr; }
 
-	// The whole body, NUL-terminated. Not spilled: points into the fixed buffer.
-	// Spilled: `joined` receives the whole body, and the pointer points into it.
-	const char* terminated(std::string& joined)
+		// Read the body. read(char* dst, std::size_t room) answers like esp_http_client_read():
+		// n > 0 bytes stored, 0 at the end of the body, kHttpReadTimedOut on a timeout, any
+		// other negative on an error; room is never 0. nowUs() is a monotonic clock in
+		// microseconds. Ok means the whole body is in data()/size(). Anything else leaves
+		// size() at 0.
+		template <class Read, class Now>
+		BodyStatus collect(Read&& read, Now&& nowUs, std::int64_t budgetUs)
+		{
+			BodyArena& a = *_a;
+			a._used = 0;
+			const std::int64_t deadline = nowUs() + budgetUs;
+			for (;;)
+			{
+				// One slot past N is how an oversize body is seen. It is never kept: asking for
+				// 0 bytes instead would read as "end of body" and hand back a truncated one.
+				const int n = read(a._buf + a._used, N + 1 - a._used);
+				if (n == 0) return BodyStatus::Ok;
+				if (n < 0) return fail(n == kHttpReadTimedOut ? BodyStatus::Timeout : BodyStatus::ReadError);
+				a._used += static_cast<std::size_t>(n);
+				if (a._used > N) return fail(BodyStatus::ArenaFull);
+				if (nowUs() >= deadline) return fail(BodyStatus::Timeout);
+			}
+		}
+
+		char*       data() { return _a->_buf; }
+		std::size_t size() const { return _a->_used; }
+
+	private:
+		friend BodyArena;
+		explicit Lease(BodyArena* a) : _a(a) {}
+
+		BodyStatus fail(BodyStatus s)
+		{
+			_a->_used = 0;
+			return s;
+		}
+		void release()
+		{
+			if (!_a) return;
+			_a->_used = 0;
+			_a->_busy.store(false, std::memory_order_release);
+			_a = nullptr;
+		}
+
+		BodyArena* _a = nullptr;
+	};
+
+	// Never waits: a second caller gets an empty lease and carries on with what it has.
+	Lease tryClaim()
 	{
-		if (!spilled())
-		{
-			_fixed[_used] = '\0';
-			return _fixed;
-		}
-		joined.assign(_fixed, _used);
-		joined += _spill;
-		return joined.c_str();
+		return _busy.exchange(true, std::memory_order_acquire) ? Lease() : Lease(this);
 	}
 
 private:
-	char*       _fixed;
-	std::size_t _cap;
-	std::size_t _used = 0;
-	std::string _spill;
+	std::atomic<bool> _busy{false};
+	std::size_t       _used = 0;
+	char              _buf[N + 1] = {};
 };
+
+namespace detail
+{
+	inline constexpr std::size_t kNoPos = static_cast<std::size_t>(-1);
+
+	inline std::size_t skipWs(const char* s, std::size_t i, std::size_t n)
+	{
+		while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+		return i;
+	}
+
+	// s[i] is an opening quote. The index just past the closing quote, or kNoPos.
+	inline std::size_t endOfString(const char* s, std::size_t i, std::size_t n)
+	{
+		for (++i; i < n; ++i)
+		{
+			if (s[i] == '\\') { ++i; continue; }
+			if (s[i] == '"') return i + 1;
+		}
+		return kNoPos;
+	}
+
+	// The index just past the value that starts at s[i], or kNoPos if it never ends.
+	inline std::size_t skipValue(const char* s, std::size_t i, std::size_t n)
+	{
+		if (i >= n) return kNoPos;
+		if (s[i] == '"') return endOfString(s, i, n);
+		if (s[i] == '{' || s[i] == '[')
+		{
+			std::size_t depth = 0;
+			while (i < n)
+			{
+				const char c = s[i];
+				if (c == '"')
+				{
+					i = endOfString(s, i, n);
+					if (i == kNoPos) return kNoPos;
+					continue;
+				}
+				if (c == '{' || c == '[') ++depth;
+				else if ((c == '}' || c == ']') && --depth == 0) return i + 1;
+				++i;
+			}
+			return kNoPos;
+		}
+		while (i < n && s[i] != ',' && s[i] != '}' && s[i] != ']' &&
+		       s[i] != ' ' && s[i] != '\t' && s[i] != '\r' && s[i] != '\n') ++i;
+		return i;
+	}
+
+	// s[start] is the opening quote of a string. Unescapes it where it stands (the result is
+	// never longer than the text it came from) and views it in `out`. A string it cannot
+	// represent exactly is refused: a surrogate pair, a \u0000, an escape JSON does not have.
+	inline bool unescapeInPlace(char* s, std::size_t start, std::size_t n, std::string_view& out)
+	{
+		std::size_t r = start + 1;
+		std::size_t w = start;
+		while (r < n)
+		{
+			char c = s[r++];
+			if (c == '"')
+			{
+				out = std::string_view(s + start, w - start);
+				return true;
+			}
+			if (c != '\\')
+			{
+				s[w++] = c;
+				continue;
+			}
+			if (r >= n) return false;
+			c = s[r++];
+			switch (c)
+			{
+				case '"': case '\\': case '/': s[w++] = c; break;
+				case 'b': s[w++] = '\b'; break;
+				case 'f': s[w++] = '\f'; break;
+				case 'n': s[w++] = '\n'; break;
+				case 'r': s[w++] = '\r'; break;
+				case 't': s[w++] = '\t'; break;
+				case 'u':
+				{
+					if (n - r < 4) return false;
+					unsigned cp = 0;
+					for (int k = 0; k < 4; ++k)
+					{
+						const char h = s[r++];
+						const int d = (h >= '0' && h <= '9') ? h - '0'
+						            : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+						            : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+						if (d < 0) return false;
+						cp = cp * 16 + static_cast<unsigned>(d);
+					}
+					if (cp == 0 || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
+					if (cp < 0x80)
+					{
+						s[w++] = static_cast<char>(cp);
+					}
+					else if (cp < 0x800)
+					{
+						s[w++] = static_cast<char>(0xC0 | (cp >> 6));
+						s[w++] = static_cast<char>(0x80 | (cp & 0x3F));
+					}
+					else
+					{
+						s[w++] = static_cast<char>(0xE0 | (cp >> 12));
+						s[w++] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+						s[w++] = static_cast<char>(0x80 | (cp & 0x3F));
+					}
+					break;
+				}
+				default: return false;
+			}
+		}
+		return false;   // no closing quote: the text was cut short
+	}
+}  // namespace detail
+
+// Finds the top-level member `key` of the JSON object in json[0..len) and, if it is a string,
+// views its unescaped value in `out`. The text is rewritten in place (so json must be
+// writable) and `out` points into it. Replaces cJSON_Parse for the token response: no heap,
+// no recursion, one pass. Anything it cannot place exactly -- truncated or malformed text, a
+// missing member, a member that is not a string, an escape it cannot represent -- returns false
+// and leaves `out` alone: it never returns a prefix. Keys match case-sensitively and the first
+// of two equal keys wins. A key written with escapes is not matched.
+inline bool jsonStringField(char* json, std::size_t len, std::string_view key, std::string_view& out)
+{
+	std::size_t i = detail::skipWs(json, 0, len);
+	if (i >= len || json[i] != '{') return false;
+	++i;
+	for (;;)
+	{
+		i = detail::skipWs(json, i, len);
+		if (i >= len || json[i] != '"') return false;   // '}' lands here too: no such member
+		const std::size_t keyEnd = detail::endOfString(json, i, len);
+		if (keyEnd == detail::kNoPos) return false;
+		const std::string_view k(json + i + 1, keyEnd - i - 2);
+		i = detail::skipWs(json, keyEnd, len);
+		if (i >= len || json[i] != ':') return false;
+		i = detail::skipWs(json, i + 1, len);
+		if (k == key)
+		{
+			if (i >= len || json[i] != '"') return false;   // there, but not a string
+			return detail::unescapeInPlace(json, i, len, out);
+		}
+		i = detail::skipValue(json, i, len);
+		if (i == detail::kNoPos) return false;
+		i = detail::skipWs(json, i, len);
+		if (i >= len || json[i] != ',') return false;
+		++i;
+	}
+}
 
 }  // namespace telephony
 

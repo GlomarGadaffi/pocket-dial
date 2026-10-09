@@ -1,5 +1,5 @@
-# AllocBaseline_test.cpp (6): #862 hot-path allocations. Issue862SyslogStampAndLineTakeNoHeap,
-#   Issue862TeardownSnapshotTakesNoHeapForIdsThatFit, Issue862TeardownSnapshotKeepsAnOverlongIdWholeAndFreesIt,
-#   Issue862TokenBodyThatFitsIsCollectedWithoutTheHeap, Issue862TokenBodyThatSpillsIsKeptWholeAndFreed,
-#   Issue862TokenBodyThatStraddlesTheFixedEdgeIsKeptWhole
-6
+# #862 hot-path allocations. AllocBaseline_test.cpp (3): Issue862SyslogStampAndLineTakeNoHeap,
+#   Issue862TeardownSnapshotTakesNoHeapForIdsThatFit, Issue862TeardownSnapshotKeepsAnOverlongIdWholeAndFreesIt.
+#   TokenBodyArena_test.cpp (24): TokenBodyArena.* (15: capacity edge, arena full, read error, timeout,
+#   claim) and JsonStringField.* (9: the bounded scanner), the #948 arena contract for the token body.
+27
