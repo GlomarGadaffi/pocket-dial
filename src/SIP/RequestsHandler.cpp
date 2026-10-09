@@ -2562,13 +2562,15 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		ringing->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		ringing->setContact(buildContact("777"));
 		// #172, RFC 3262 §3: the echo's 180 is sent reliably when the INVITE asked for it. The clone's
-		// Require lines become exactly one Require: 100rel, and RSeq 1 is in the MUST range (1..2**31-1).
+		// Require lines are dropped (a 180 echoing Require: 100rel with no RSeq would claim to be reliable),
+		// then exactly one Require: 100rel is added, and RSeq 1 is in the MUST range (1..2**31-1).
 		// The RECOMMENDED random value is not drawn, since IDGen::fillRandom is private. No hold: the 180
 		// carries no session description, so §3 lets the 200 go before PRACK, and nothing is retransmitted
 		// once the final is sent (§3: SHOULD NOT continue to retransmit after a final response).
-		if (data->requiresReliableProvisional())
+		// Rule 5: emergency traffic (a PSAP callback is one on any To) keeps the plain 180.
+		ringing->removeHeaders("Require");
+		if (data->requiresReliableProvisional() && !isEmergencyTraffic(*data))
 		{
-			ringing->removeHeaders("Require");
 			ringing->addHeader("Require", "100rel");
 			ringing->setHeaderOnce("RSeq", "1");
 			newSession->openReliableProvisional(1, siphdr::cseqNumber(data->getCSeq()));
@@ -6308,12 +6310,16 @@ void RequestsHandler::onSessionProgress(std::shared_ptr<SipMessage> data)
 	(void)_sipTrunk.handleResponse(data);
 }
 
-// Issue #172, RFC 3262 §3 and §7.2. A PRACK is owned only by a dialog that sent a reliable
-// provisional (the 777 echo). Any other PRACK stays unanswered, as it always was.
+// Issue #172, RFC 3262 §3 and §7.2. The PBX is the UAS of a PRACK only on the 777 echo (its session dest is
+// the virtual 777 peer): a matching RAck gets 200 and every other PRACK there gets 481, whether or not the
+// 180 was reliable. A PRACK on any other session is a relayed dialog's, not ours to answer, and stays
+// silent as it always was; a 481 there would make its sender end an early dialog (RFC 3261 §12.2.1.2).
 void RequestsHandler::onPrack(std::shared_ptr<SipMessage> data)
 {
 	auto session = getSession(data->getCallID());
-	if (!session.has_value() || !session.value()->isReliableDialog()) return;
+	if (!session.has_value()) return;
+	const auto dest = session.value()->getDest();
+	if (!dest || dest->getNumber() != "777") return;
 	if (!isDialogSourceAuthorized(session.value(), data->getSource())) return;
 	uint32_t rseq = 0;
 	uint32_t cseq = 0;

@@ -152,12 +152,10 @@ public:
 
 	// Issue #172, RFC 3262 §3: the 777 echo answered a Require: 100rel INVITE with a
 	// reliable 180. _prackRSeq is that provisional's RSeq while it awaits its PRACK
-	// (0 = none); _prackCSeq is the INVITE CSeq it was sent for. The dialog stays
-	// reliable after the PRACK, so a repeat PRACK gets 481 rather than silence.
-	bool isReliableDialog() const { return _reliableDialog; }
+	// (0 = none); _prackCSeq is the INVITE CSeq it was sent for. Once the PRACK has
+	// matched, _prackRSeq is back to 0, so a repeat PRACK on the echo gets 481.
 	void openReliableProvisional(uint32_t rseq, uint32_t cseq)
 	{
-		_reliableDialog = true;
 		_prackRSeq = rseq;
 		_prackCSeq = cseq;
 	}
@@ -431,7 +429,6 @@ private:
 	bool _isTrunk = false;
 	int  _trunkRelaySlot = -1;
 	bool _isEmergency = false;                          // #604
-	bool _reliableDialog = false;   // #172
 	uint32_t _prackRSeq = 0;        // #172
 	uint32_t _prackCSeq = 0;        // #172
 	std::string_view _emergencyNumber;                  // #879

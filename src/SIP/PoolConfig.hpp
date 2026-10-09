@@ -435,7 +435,8 @@ static_assert(POCKETDIAL_HAS_ANCHOR || POCKETDIAL_HAS_TRUNK,
 // preview), the register beep, and the failure responses the engine mints itself
 // (403/404/486/488/503/603). Second, only the methods where re-processing a
 // duplicate actually does harm get a non-INVITE server transaction — BYE, CANCEL,
-// REFER and UPDATE — while REGISTER, OPTIONS, MESSAGE, INFO and SUBSCRIBE are
+// REFER, UPDATE and PRACK (the 777 echo's, #172) — while REGISTER, OPTIONS,
+// MESSAGE, INFO and SUBSCRIBE are
 // left to be re-processed as before, because they are idempotent enough that a
 // 32 s Timer J slot each would cost far more than it buys. (INFO is the close
 // call: a duplicated DTMF digit is a real bug, but at one slot per keypress for

@@ -85,13 +85,15 @@ TransactionLayer::classify(const sockaddr_in& peer, const std::shared_ptr<SipMes
 		if (method == "INVITE") return Type::InviteServer;
 
 		// Non-INVITE server transactions cost a 32 s Timer J slot each and buy
-		// nothing for an idempotent method, so they are restricted to the four
+		// nothing for an idempotent method, so they are restricted to the five
 		// where re-running the handler on a duplicate does real damage: a doubled
 		// REFER is a double transfer, a doubled BYE/CANCEL answers 481 for a
-		// dialog we tore down cleanly, and a doubled UPDATE re-relays an offer.
-		// See PoolConfig.hpp for why INFO is excluded despite the same argument.
+		// dialog we tore down cleanly, a doubled UPDATE re-relays an offer, and a
+		// doubled PRACK answers 481 for the provisional it already acknowledged
+		// (the 777 echo, #172). See PoolConfig.hpp for why INFO is excluded despite
+		// the same argument.
 		if (method == "BYE" || method == "CANCEL" ||
-		    method == "REFER" || method == "UPDATE")
+		    method == "REFER" || method == "UPDATE" || method == "PRACK")
 		{
 			return Type::NonInviteServer;
 		}
