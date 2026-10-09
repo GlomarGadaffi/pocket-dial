@@ -11,7 +11,11 @@ the only way to attribute a fall to a run):
                   admin/status 15 s, ota/status 15 s (index_html.h, the setInterval block)
   dashboard       those, plus the two that need an open panel: trace 1.5 s (Trace toggle on), moh 3 s
                   (PBX settings open)
-  dashboard-call  the same, with one held call to the designated far end (no hold, no re-INVITE)
+  dashboard-call  the same, with one held call to the designated far end (no hold, no re-INVITE), in one of
+                  two call modes (--call-mode): ringing (the default) is a far end that rings and is not
+                  answered, so the window runs for the planned hold and the harness CANCELs as it closes, a
+                  valid call only if a 180 Ringing was seen (ringing_call below); answered is a far end that
+                  answers, held, then a BYE
 
 One run: a "before" read of /api/status, the pollers, a sequential probe of GET /api/status (the #410 .244
 recipe: back to back, one connection at a time), a burst of concurrent GET /api/status, the rest of the
@@ -36,6 +40,8 @@ import time
 
 MODES = ("idle", "dashboard", "dashboard-call")
 CALL_MODE = "dashboard-call"
+CALL_MODES = ("ringing", "answered")
+WINDOW_SLACK_MS = 500         # the INVITE leaves a few ms after the window's clock starts: not a short window
 STATUS = "/api/status"
 STACK_BYTES = 4096            # HttpServer.hpp kHttpConnStackBytes (test_http_load pins it)
 PER_SOURCE_CAP = 3            # HttpServer.hpp kMaxConnectionsPerSource (pinned too)
@@ -49,7 +55,7 @@ FIELDS = ("uptime", "freeHeapInternal", "minFreeHeapInternal", "largestFreeBlock
           "stackHwm_http_conn", "httpConnWorstRoute", "httpPerSourceRefusals", "httpReadDeadlineDrops",
           "httpStatusRefusals")
 DEFAULTS = {"modes": MODES, "repeats": 3, "run_cap": 9, "window_s": 60.0, "warm_s": 1.0,
-            "probe_polls": 200, "probe_gap_s": 0.0, "burst_workers": 4, "burst_each": 10}
+            "probe_polls": 200, "probe_gap_s": 0.0, "burst_workers": 4, "burst_each": 10, "call_mode": "ringing"}
 
 
 class CapExceeded(Exception):
@@ -97,6 +103,8 @@ def config_problems(cfg):
                    % (BURST_WORKERS_MAX, PER_SOURCE_CAP))
     if not isinstance(cfg["burst_each"], int) or not 1 <= cfg["burst_each"] <= 1000:
         out.append("--burst-each must be 1-1000")
+    if cfg["call_mode"] not in CALL_MODES:
+        out.append("--call-mode must be %s" % " or ".join(CALL_MODES))
     return out
 
 
@@ -110,6 +118,46 @@ class RunBudget:
         if self.used >= self.cap:
             raise CapExceeded("run %d is past --run-cap %d: the run stops here" % (self.used + 1, self.cap))
         self.used += 1
+
+
+# ---------------------------------------------------------------- a ringing-only far end
+def ringing_call(m):
+    """(kind, text) for a ringing-mode call the far end did not answer, from its run record `m`; kind is "valid",
+    "invalid" (the measurement does not count) or "fail" (the far side broke RFC 3261). Valid: a 180 Ringing seen
+    before the window closed, the window held for the planned hold_s, then a CANCEL sent at the planned hold (no
+    dialog, so no BYE; s9.1) that was answered 200 and ended the INVITE with 487 (s9.2). The 180 is the PBX's own local
+    ringback, sent at INVITE time: it does not show the far phone alerting (docs/TEST_HARNESS.md)."""
+    ring, win, cancel, hold = m.get("ring_ms"), m.get("window_ms"), m.get("cancel_ms"), m.get("hold_s")
+    if ring is None:
+        return "invalid", ("no 180 Ringing seen before the INVITE ended (final %s): the far end never rang"
+                           % m.get("final"))
+    if win is None or hold is None:
+        return "invalid", "no window was recorded for the call"
+    if ring > win:
+        return "invalid", ("the 180 Ringing came at +%d ms, after the window closed at +%d ms" % (ring, win))
+    if win < hold * 1000 - WINDOW_SLACK_MS:
+        return "invalid", "the window held %.1f s of the planned %g s" % (win / 1000.0, hold)
+    if cancel is None:
+        return "invalid", ("the INVITE ended %s before the planned hold, with no CANCEL sent (the syslog says "
+                           "who ended it)" % m.get("final"))
+    if cancel < hold * 1000 - WINDOW_SLACK_MS:
+        return "invalid", ("the CANCEL went at +%d ms, before the planned hold of %g s" % (cancel, hold))
+    if m.get("cancel_status") != 200:
+        return "fail", "the CANCEL was answered %s, not 200 (RFC 3261 s9.2)" % m.get("cancel_status")
+    if m.get("final") != 487:
+        return "fail", "the INVITE ended %s after the CANCEL, not 487 (RFC 3261 s9.1)" % m.get("final")
+    return "valid", ("180 Ringing at +%d ms, window held %.1f s, CANCEL at +%d ms answered 200, INVITE ended 487, "
+                     "no BYE" % (ring, win / 1000.0, cancel))
+
+
+def call_text(m):
+    """The summary line's account of a ringing-mode call, or None: any other run says nothing about its call."""
+    if m.get("call_mode") != "ringing":
+        return None
+    if m.get("answered"):
+        return "ringing: the far end answered (final %s), held, then BYE" % m.get("final")
+    kind, text = ringing_call(m)
+    return "ringing: %s, %s" % (kind if kind == "valid" else kind.upper(), text)
 
 
 # ---------------------------------------------------------------- the two reductions
@@ -339,7 +387,7 @@ def run_stats(d):
 
     def edge(label, key):
         return next((_int(s.get(key)) for s in st if s.get("label") == label), None)
-    return {"run": d["run"], "mode": d["mode"], "rep": meta.get("rep"),
+    return {"run": d["run"], "mode": d["mode"], "rep": meta.get("rep"), "call": call_text(meta),
             "peak": peak_concurrency([(r["t"], r["t"] + r["ms"] / 1000.0) for r in served]),
             "peak_poll": peak_concurrency([(r["t"], r["t"] + r["ms"] / 1000.0) for r in polls
                                            if r in served]),
@@ -378,6 +426,11 @@ def judge_log(recs):
                          % (tag, u0, u1))
         if s["probe"]["n"] == 0:
             invalid.append("%s: no GET /api/status probe was answered 200" % tag)
+        m = d["meta"] or {}
+        if m.get("call_mode") == "ringing" and not m.get("answered"):
+            kind, text = ringing_call(m)
+            if kind != "valid":
+                (fails if kind == "fail" else invalid).append("%s: ringing call: %s" % (tag, text))
         if d["mode"] in MODES:
             for path, _, _ in polls_for(d["mode"]):
                 codes = collections.Counter(r.get("code") for r in d["reqs"]
@@ -436,7 +489,7 @@ def render(recs, log_name="http-load.jsonl"):
                           s["refused_poll"], s["errors"],
                           _pct(s["probe"], s["probe_done"][1]), _pct(s["burst"], s["burst_done"][1]),
                           s["free_min"], s["free_max"], s["min_free"][0], s["min_free"][1],
-                          s["stack"][0], s["stack"][1]))
+                          s["stack"][0], s["stack"][1]) + (" | call " + s["call"] if s["call"] else ""))
         out.append("  spread over %d run(s): peak all %s, polls %s; probe p50 %s, p99 %s; burst p50 %s, p99 %s; "
                    "freeHeapInternal swing %s" % (
                        len(mine), _spread([s["peak"] for s in mine]), _spread([s["peak_poll"] for s in mine]),

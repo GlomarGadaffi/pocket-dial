@@ -56,8 +56,12 @@ h947_http_load (#947, for #410) measures the board's HTTP server, not a SIP path
 dashboard-call runs (tests/load/http_load.py holds the traffic, the percentiles and the summary), each
 repeated --repeats times (default 3), at most --run-cap runs in all (default 9; one past it is refused before
 anything is sent, and the run loop stops at it). Only dashboard-call rings the far end: once a run, held
-hold_s (24 s) inside the 30 s call cap, with every refusal above. It starts no status_logger.sh (a second
-poller is load on the thing measured) and reads the board from its own /api/status requests.
+hold_s (24 s) inside the 30 s call cap, with every refusal above. --call-mode says what the far end does:
+ringing (the default) rings and is not answered, so the window runs for hold_s and the harness CANCELs as it
+closes (no dialog, so no BYE), a valid call only if a 180 Ringing was seen (http_load.ringing_call); answered
+expects an answer and hangs up with a BYE after the hold. A far end that answers in ringing mode is held and
+BYEd as in answered mode. It starts no status_logger.sh (a second poller is load on the thing measured) and
+reads the board from its own /api/status requests.
 
 Syslog carries esp_log lines only. RequestsHandler's queueLog() lines (e.g. "anchor
 call torn down: ...", "no rx audio, dropping leg") go to stdout and never reach it
@@ -2519,7 +2523,7 @@ def h947_from_args(sc, args):
     cfg = dict(http_load.DEFAULTS, modes=tuple(m for m in args.http_modes.split(",") if m),
                repeats=args.repeats, run_cap=args.run_cap, window_s=args.window_s,
                probe_polls=args.probe_polls, probe_gap_s=args.probe_gap_ms / 1000.0,
-               burst_workers=args.burst_workers, burst_each=args.burst_each)
+               burst_workers=args.burst_workers, burst_each=args.burst_each, call_mode=args.call_mode)
     runs = http_load.plan(cfg) if 1 <= cfg["repeats"] <= http_load.RUN_CAP_MAX else []
     rings = sum(1 for mode, _ in runs if mode == http_load.CALL_MODE)
     problems = http_load.config_problems(cfg)
@@ -2527,8 +2531,9 @@ def h947_from_args(sc, args):
     lines = [] if problems else [
         "plan      %d run(s), cap %d: %s" % (len(runs), cfg["run_cap"], ", ".join(
             "%s x%d" % (m, cfg["repeats"]) for m in http_load.MODES if m in cfg["modes"])),
-        "traffic   window %g s a run; probe %d x GET /api/status; burst %d x %d; %d ring(s), one held %g s each"
-        % (cfg["window_s"], cfg["probe_polls"], cfg["burst_workers"], cfg["burst_each"], rings, sc["hold_s"])]
+        "traffic   window %g s a run; probe %d x GET /api/status; burst %d x %d; %d ring(s), one held %g s each, "
+        "call mode %s" % (cfg["window_s"], cfg["probe_polls"], cfg["burst_workers"], cfg["burst_each"], rings,
+                          sc["hold_s"], cfg["call_mode"])]
     return dict(sc, cfg=cfg, calls=rings, ring_required=rings > 0, plan_lines=lines, config_problems=problems,
                 extra_s=0 if problems else (len(runs) - rings) * (cfg["window_s"] + sc["gap_s"] + 30))
 
@@ -2558,38 +2563,104 @@ def h947_checkpoint(run, tries=3):
                 raise
 
 
+def h947_watch(run, load):
+    """The window's per-tick checks, on the run's thread: a signal, a phantom inbound, the S1 pin."""
+    nxt = [time.monotonic() + run.a.pin_check_s]
+
+    def watch():
+        if run.stopped():
+            return h947_halt_on_stop(run, load)
+        if run.phantoms():
+            raise run_soak.Abort("FAIL", "a phantom inbound reached a test UA during the call: the run stops")
+        if time.monotonic() >= nxt[0] and not load.bursting.is_set():   # the burst holds every slot
+            t0 = time.monotonic()
+            h947_checkpoint(run)                  # the S1 pin; its requests are load too
+            load.safety(t0, time.monotonic())
+            nxt[0] = time.monotonic() + run.a.pin_check_s
+    return watch
+
+
+def h947_ringing(run, sc, load, caller, cfg):
+    """Ringing mode: the far end rings and is not answered. invite() blocks until a final response, so it runs
+    on a thread while this one runs the window for hold_s from the INVITE. The CANCEL (RFC 3261 s9.1: no
+    dialog yet, so no BYE) is due at INVITE + hold_s, the window's planned end, NOT when window() returns: its
+    teardown joins pollers that can sit in a 5 s request on a slow board, and the ring must not outlast the
+    hold. It goes at once if the window is cut short (an abort), and the INVITE ends 487 (s9.2). The agent's own
+    INVITE bound (16 s) would end the wait before hold_s, so this call gets hold_s plus the hangup margin,
+    inside the call cap. A 200 that arrives is the answered case: the window still runs to hold_s and
+    finish_call BYEs. -> (dlg, rec)"""
+    hold = sc["hold_s"]
+    rec = {"call": 1, "t_start": time.monotonic(), "final": None, "call_mode": "ringing"}
+    run.calls.append(rec)
+    rec["call"] = len(run.calls)
+    closed, box = threading.Event(), []
+
+    def cancel_due(since):                        # None until due: the agent sleeps to any time it is given
+        return time.monotonic() if closed.is_set() or time.monotonic() >= since + hold else None
+
+    def invite():
+        try:
+            box.append(caller.invite(run.far_end, cancel_when=cancel_due, cancel_when_timeout_s=hold + 1.0,
+                                     invite_timeout=hold + HANGUP_MARGIN_S))
+        except Exception as e:  # noqa: BLE001 -- raised again on the run's thread once it has been joined
+            box.append(e)
+    worker = threading.Thread(target=invite, name="h947-invite", daemon=True)
+    worker.start()
+    try:
+        load.window(cfg, rec["t_start"] + hold, h947_watch(run, load))
+    finally:
+        window_end = time.monotonic()
+        closed.set()                              # the CANCEL goes now, whatever stopped the window
+        worker.join(hold + HANGUP_MARGIN_S + caller.timeout + 2.0)
+    if worker.is_alive():
+        raise run_soak.Abort("INVALID", "the INVITE transaction did not end within %g s of the window: its "
+                                        "CANCEL state is unknown" % (hold + HANGUP_MARGIN_S + caller.timeout + 2.0))
+    dlg = box[0]
+    if isinstance(dlg, Exception):
+        raise dlg
+    t0, ring_at = dlg.invite_sent_at, next((t for t, s in dlg.responses if s == 180), None)
+    rec.update(_call_id=dlg.call_id, final=dlg.final_status, provisional=[s for _, s in dlg.responses if s < 200],
+               ring_ms=ms_since(t0, ring_at), window_ms=ms_since(t0, window_end),
+               cancel_ms=ms_since(t0, dlg.cancel_sent_at), cancel_status=dlg.cancel_status,
+               ended_early=dlg.ended.is_set())
+    finish_call(caller, dlg, rec)
+    return dlg, rec
+
+
 def h947_call(run, sc, load, caller, cfg):
-    """One held call: the window runs from the answer to hold_s after the INVITE. The caller never holds or
-    re-INVITEs (a SIP hold would start music on hold and change what is measured)."""
+    """One call to the far end with the window inside it, in the mode cfg says (h947_ringing for ringing). The
+    caller never holds or re-INVITEs (a SIP hold would start music on hold and change what is measured).
+    Answered: the window runs from the answer to hold_s after the INVITE, then the harness BYEs."""
     h947_ring_gate(run)
     base = run.session_count()
-    dlg, rec = start_call(run, sc, caller)
-    k = rec["call"] = len(run.calls)
-    try:
-        if dlg.ok:
-            nxt = [time.monotonic() + run.a.pin_check_s]
-
-            def watch():
-                if run.stopped():
-                    return h947_halt_on_stop(run, load)
-                if run.phantoms():
-                    raise run_soak.Abort("FAIL", "a phantom inbound reached a test UA during the call: the run stops")
-                if time.monotonic() >= nxt[0] and not load.bursting.is_set():   # the burst holds every slot
-                    t0 = time.monotonic()
-                    h947_checkpoint(run)                  # the S1 pin; its requests are load too
-                    load.safety(t0, time.monotonic())
-                    nxt[0] = time.monotonic() + run.a.pin_check_s
-            load.window(cfg, rec["t_start"] + sc["hold_s"], watch)
-            rec["ended_early"] = dlg.ended.is_set()
-    finally:
-        finish_call(caller, dlg, rec)
+    ringing = cfg["call_mode"] == "ringing"
+    if ringing:
+        dlg, rec = h947_ringing(run, sc, load, caller, cfg)
+    else:
+        dlg, rec = start_call(run, sc, caller)
+        rec["call_mode"] = "answered"
+        rec["call"] = len(run.calls)
+        try:
+            if dlg.ok:
+                load.window(cfg, rec["t_start"] + sc["hold_s"], h947_watch(run, load))
+                rec["ended_early"] = dlg.ended.is_set()
+        finally:
+            finish_call(caller, dlg, rec)
+    k = rec["call"]
     run.pull_pcap("call-%02d" % k)
     rec["pcap_byes"] = run.pcap_count("BYE", caller, rec.get("_call_id"))
     rec["sessions"] = run.sessions_settle(base, caller.ext, sc["settle_s"])
-    run.say("call %d: final %s, %s" % (k, rec["final"], "ended by the far side early" if rec.get("ended_early")
-                                       else "hung up after %s ms (BYE %s)" % (rec.get("hangup_ms"),
-                                                                              rec.get("hangup_bye"))))
-    return {"call": k, "answered": answered(rec)}
+    extra = {"call": k, "call_mode": rec["call_mode"], "answered": answered(rec)}
+    if ringing:
+        extra.update({key: rec[key] for key in ("final", "ring_ms", "window_ms", "cancel_ms", "cancel_status")},
+                     hold_s=sc["hold_s"])
+    if ringing and not extra["answered"]:
+        run.say("call %d: %s" % (k, http_load.call_text(extra)))
+    else:
+        run.say("call %d: final %s, %s" % (k, rec["final"], "ended by the far side early" if rec.get("ended_early")
+                                           else "hung up after %s ms (BYE %s)" % (rec.get("hangup_ms"),
+                                                                                  rec.get("hangup_bye"))))
+    return extra
 
 
 def h947_run(run, sc):
@@ -2630,11 +2701,13 @@ def h947_judge(run, sc, lines):
     more_fails, invalid = http_load.judge_log(recs)
     fails += more_fails
     for c in run.calls:
-        if not answered(c):
+        if not answered(c) and c.get("call_mode") != "ringing":
             invalid.append("call %s: the far end did not answer (final %s): no call was up for that run"
                            % (c.get("call"), c.get("final")))
             continue
-        if c.get("ended_early"):
+        if not answered(c):
+            pass                       # ringing mode: judge_log read the call's verdict from the run record
+        elif c.get("ended_early"):
             invalid.append("call %s ended from the far side before its window closed" % c.get("call"))
         elif c.get("hangup_bye") != 200:
             fails.append("call %s: the harness's BYE got %s, not 200" % (c.get("call"), c.get("hangup_bye")))
@@ -2653,7 +2726,8 @@ def h947_judge(run, sc, lines):
 
 scenario(name="h947_http_load", issues=("#947", "#410"), part_of="#947",
          about="the HTTP server under load, before #410 picks a connection design: idle, dashboard and "
-               "dashboard-call runs (6101 -> the designated far end, held, in the last), peak concurrency, "
+               "dashboard-call runs (6101 -> the designated far end, held, in the last; --call-mode ringing "
+               "is the default), peak concurrency, "
                "p50/p99 of GET /api/status, the http_conn stack and internal-DRAM watermarks",
          uas={"caller": "6101", "detector": PIN_UA}, calls=3, max_calls=10, min_calls=0, call_cap_s=30,
          hold_s=24.0, gap_s=5.0, settle_s=5.0, path_counter="initiated", ring_required=True,
@@ -2704,6 +2778,10 @@ def build_parser():
     ap.add_argument("--burst-workers", type=int, default=d["burst_workers"],
                     help="h947_http_load: concurrent clients in the burst (the board serves 3 per source)")
     ap.add_argument("--burst-each", type=int, default=d["burst_each"], help="h947_http_load: requests per burst client")
+    ap.add_argument("--call-mode", default=d["call_mode"],
+                    help="h947_http_load: what dashboard-call's far end does: %s (default %s). ringing rings and is "
+                         "not answered: the window runs for the hold, then a CANCEL; answered answers, then a BYE"
+                         % (" or ".join(http_load.CALL_MODES), d["call_mode"]))
     return ap
 
 

@@ -122,6 +122,13 @@ class PlanAndCapTest(unittest.TestCase):
             self.assertTrue(any(needle in p for p in problems), (key, bad, problems))
         self.assertEqual(hl.config_problems(dict(hl.DEFAULTS, repeats=4, run_cap=12)), [])
 
+    def test_the_call_mode_defaults_to_ringing_and_a_stray_number_is_never_echoed(self):
+        self.assertEqual((hl.DEFAULTS["call_mode"], hl.CALL_MODES), ("ringing", ("ringing", "answered")))
+        self.assertEqual(hl.config_problems(dict(hl.DEFAULTS, call_mode="answered")), [])
+        for bad in ("held", "", None, "15550104242"):
+            self.assertEqual(hl.config_problems(dict(hl.DEFAULTS, call_mode=bad)),
+                             ["--call-mode must be ringing or answered"], bad)
+
 
 # ---------------------------------------------------------------- the refusals, through main()
 class CliRefusalTest(unittest.TestCase):
@@ -205,6 +212,27 @@ class CliRefusalTest(unittest.TestCase):
         self.refused(cli("--burst-workers", "9"), base.base_env(), "--burst-workers must be 1-8")
         self.refused(cli("--window-s", "0"), base.base_env(), "--window-s")
         self.refused(cli("--repeats", "0"), base.base_env(), "--repeats")
+
+    def test_the_call_mode_flag_defaults_to_ringing_and_is_on_the_plan_line(self):
+        rc, out = base.run_main(cli("--dry-run"), base.base_env(), http=base.NoNetwork())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("3 ring(s), one held 24 s each, call mode ringing", out)
+        rc, out = base.run_main(cli("--dry-run", "--call-mode", "answered"), base.base_env(), http=base.NoNetwork())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("one held 24 s each, call mode answered", out)
+
+    def test_a_bad_call_mode_is_refused_and_a_number_pasted_into_it_is_not_echoed(self):
+        self.refused(cli("--call-mode", "held"), base.base_env(), "--call-mode must be ringing or answered")
+        other = "15559998888"                      # a number never goes on an argv, even in a flag that is not numeric
+        out = self.refused(cli("--call-mode", other), base.base_env(), "is number-shaped")
+        self.assertNotIn(other, out)
+
+    def test_every_forbidden_far_end_is_refused_in_both_call_modes(self):
+        for mode in hl.CALL_MODES:
+            for num in ("911", "933", "113", "1001"):
+                out = self.refused(cli("--call-mode", mode), base.base_env(PD_ANCHOR_FAR_END=num),
+                                   "owner extension" if num == "1001" else "emergency or never-dial")
+                self.assertIn("nothing was sent", out, (mode, num))
 
     def test_the_numeric_flags_are_not_taken_for_a_far_end(self):
         rc, out = base.run_main(cli("--dry-run", "--probe-polls", "200", "--window-s", "120", "--burst-each", "100"),
@@ -291,6 +319,35 @@ class CheckpointRetryTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class InviteBoundTest(unittest.TestCase):
+    """invite(invite_timeout=N): this call's INVITE transaction bound, for a call that must ring past the agent's
+    default (16 s) before its CANCEL. Every other caller keeps the agent's own bound."""
+
+    def test_a_per_call_bound_outlasts_the_agents_default(self):
+        peer = base.Peer(base.ringing_then_487)                 # rings; ends 487 only once it is CANCELled
+        self.addCleanup(peer.close)
+        agent = an.sip_agent.Agent("6101", "127.0.0.1", peer.port, local_ip="127.0.0.1", timeout=1.0,
+                                   invite_timeout=0.6)
+        self.addCleanup(agent.close)
+        due = threading.Event()
+        threading.Timer(1.2, due.set).start()                   # well past the default bound
+        dlg = agent.invite(FAR, cancel_when=lambda since: time.monotonic() if due.is_set() else None,
+                           cancel_when_timeout_s=3.0, invite_timeout=3.0)
+        self.assertEqual((dlg.final_status, dlg.cancel_status), (487, 200))
+        self.assertFalse(dlg.cancel_when_expired)
+        self.assertGreaterEqual(dlg.cancel_sent_at - dlg.invite_sent_at, 1.2)
+        self.assertEqual(len(peer.all("CANCEL")), 1)
+
+    def test_without_it_the_agents_own_bound_still_gives_up_and_cancels(self):
+        peer = base.Peer(base.ringing_then_487)
+        self.addCleanup(peer.close)
+        agent = an.sip_agent.Agent("6101", "127.0.0.1", peer.port, local_ip="127.0.0.1", timeout=1.0,
+                                   invite_timeout=0.6)
+        self.addCleanup(agent.close)
+        dlg = agent.invite(FAR, cancel_when=lambda since: None, cancel_when_timeout_s=0.8)
+        self.assertIsNone(dlg.final_status, "the 0.6 s default bound ended the wait before the 487 could be read")
+
+
 class RingGateTest(unittest.TestCase):
     """The last check before the one INVITE, in case anything upstream of main()'s refusals is bypassed."""
 
@@ -309,13 +366,16 @@ class RingGateTest(unittest.TestCase):
         an.h947_ring_gate(self.run_with(FAR))
         an.h947_ring_gate(self.run_with(FAR, FAR2))
 
-    def test_a_call_run_with_a_forbidden_far_end_never_sends_an_invite(self):
-        caller = mock.Mock()
-        caller.invite.side_effect = AssertionError("an INVITE was sent to a forbidden number")
-        run = types.SimpleNamespace(far_ends=("911",), far_end="911")
-        with self.assertRaises(an.run_soak.Abort):
-            an.h947_call(run, an.SCENARIOS[S], mock.Mock(), caller, hl.DEFAULTS)
-        caller.invite.assert_not_called()
+    def test_a_call_run_with_a_forbidden_far_end_never_sends_an_invite_in_either_call_mode(self):
+        for mode in hl.CALL_MODES:
+            for num in ("911", "933", "113", "1001"):
+                caller = mock.Mock()
+                caller.invite.side_effect = AssertionError("an INVITE was sent to a forbidden number")
+                run = types.SimpleNamespace(far_ends=(num,), far_end=num, calls=[])
+                with self.assertRaises(an.run_soak.Abort, msg=(mode, num)):
+                    an.h947_call(run, an.SCENARIOS[S], mock.Mock(), caller, dict(hl.DEFAULTS, call_mode=mode))
+                caller.invite.assert_not_called()
+                self.assertEqual(run.calls, [], "no call record either")
 
 
 # ---------------------------------------------------------------- the log and the summary
@@ -510,6 +570,112 @@ class JudgeLogTest(unittest.TestCase):
         self.assertEqual(self.judge(lines), ([], []))
 
 
+# ---------------------------------------------------------------- a ringing-only far end: when the call counts
+def ringing_meta(**kw):
+    """The run record of a ringing-mode call that rang the planned 24 s and was CANCELled: the 180 at +6 ms, the
+    window held until +24010 ms, the CANCEL went as it closed and was answered 200, the INVITE ended 487."""
+    m = {"k": "run", "run": 1, "mode": "dashboard-call", "rep": 1, "probe": [3, 3], "burst": [0, 0], "call": 1,
+         "call_mode": "ringing", "answered": False, "hold_s": 24.0, "ring_ms": 6, "window_ms": 24010,
+         "cancel_ms": 24020, "cancel_status": 200, "final": 487}
+    m.update(kw)
+    return m
+
+
+def ringing_lines(**kw):
+    return full_run(1, "dashboard-call")[:-1] + [json.dumps(ringing_meta(**kw), sort_keys=True)]
+
+
+class RingingCallTest(unittest.TestCase):
+    """The rule: a 180 Ringing seen, the window held for the planned hold, then a CANCEL (no dialog, so no BYE)
+    that the far side answers 200 and ends with 487, is a valid call. No 180 is INVALID."""
+
+    def verdict(self, **kw):
+        return hl.ringing_call(ringing_meta(**kw))
+
+    def judge(self, **kw):
+        return hl.judge_log(hl.read_log(ringing_lines(**kw)))
+
+    def test_a_180_and_no_answer_held_for_the_window_then_cancelled_is_valid(self):
+        kind, text = self.verdict()
+        self.assertEqual(kind, "valid")
+        self.assertEqual(text, "180 Ringing at +6 ms, window held 24.0 s, CANCEL at +24020 ms answered 200, "
+                               "INVITE ended 487, no BYE")
+        self.assertEqual(self.judge(), ([], []))
+
+    def test_no_180_is_invalid_and_says_so(self):
+        for kw in ({"ring_ms": None}, {"ring_ms": None, "final": 503, "cancel_ms": None, "cancel_status": None}):
+            kind, text = self.verdict(**kw)
+            self.assertEqual(kind, "invalid", kw)
+            self.assertIn("no 180 Ringing seen", text)
+            self.assertIn("final %s" % kw.get("final", 487), text)
+            fails, invalid = self.judge(**kw)
+            self.assertEqual(fails, [])
+            self.assertEqual(len(invalid), 1, kw)
+            self.assertIn("run 1 (dashboard-call): ringing call: no 180 Ringing seen", invalid[0])
+
+    def test_a_180_after_the_window_closed_is_no_ringing_window(self):
+        kind, text = self.verdict(ring_ms=24500)
+        self.assertEqual(kind, "invalid")
+        self.assertIn("180 Ringing came at +24500 ms, after the window closed at +24010 ms", text)
+
+    def test_a_window_cut_short_did_not_hold_the_planned_hold(self):
+        kind, text = self.verdict(window_ms=9000, cancel_ms=9010)
+        self.assertEqual(kind, "invalid")
+        self.assertIn("window held 9.0 s of the planned 24 s", text)
+        self.assertEqual(self.verdict(window_ms=23600, cancel_ms=23610)[0], "valid", "a few ms of INVITE skew is not a cut")
+
+    def test_an_invite_that_ended_before_the_window_closed_is_invalid(self):
+        kind, text = self.verdict(final=486, cancel_ms=None, cancel_status=None)
+        self.assertEqual(kind, "invalid")
+        self.assertIn("ended 486 before the planned hold, with no CANCEL sent", text)
+
+    def test_a_cancel_before_the_planned_hold_is_invalid(self):
+        kind, text = self.verdict(cancel_ms=20000)
+        self.assertEqual(kind, "invalid")
+        self.assertIn("CANCEL went at +20000 ms, before the planned hold of 24 s", text)
+
+    def test_a_slow_window_teardown_does_not_make_a_cancel_at_the_hold_invalid(self):
+        kind, text = self.verdict(window_ms=27000, cancel_ms=24020)
+        self.assertEqual(kind, "valid", text)
+
+    def test_a_cancel_the_far_side_mishandles_is_a_fail_not_a_measurement(self):
+        for kw, needle in (({"cancel_status": 481}, "the CANCEL was answered 481, not 200"),
+                           ({"cancel_status": None}, "the CANCEL was answered None, not 200"),
+                           ({"final": 503}, "the INVITE ended 503 after the CANCEL, not 487"),
+                           ({"final": None}, "the INVITE ended None after the CANCEL, not 487")):
+            kind, text = self.verdict(**kw)
+            self.assertEqual(kind, "fail", kw)
+            self.assertIn(needle, text)
+            fails, invalid = self.judge(**kw)
+            self.assertEqual((len(fails), invalid), (1, []), kw)
+
+    def test_an_answered_call_is_not_judged_here(self):
+        self.assertEqual(self.judge(answered=True, final=200, ring_ms=None, cancel_ms=None, cancel_status=None),
+                         ([], []))
+
+    def test_the_other_call_mode_and_a_record_without_one_are_not_judged_here(self):
+        self.assertEqual(self.judge(call_mode="answered", ring_ms=None), ([], []))
+        m = ringing_meta(ring_ms=None)
+        del m["call_mode"]
+        self.assertEqual(hl.judge_log(hl.read_log(full_run(1, "dashboard-call")[:-1] + [json.dumps(m)])), ([], []))
+
+    def test_the_summary_line_carries_the_outcome_and_its_reason(self):
+        text = hl.render(hl.read_log(ringing_lines()))
+        self.assertIn(" | call ringing: valid, 180 Ringing at +6 ms, window held 24.0 s, CANCEL at +24020 ms "
+                      "answered 200, INVITE ended 487, no BYE", text)
+        text = hl.render(hl.read_log(ringing_lines(ring_ms=None)))
+        self.assertIn(" | call ringing: INVALID, no 180 Ringing seen before the INVITE ended (final 487): the far "
+                      "end never rang", text)
+        text = hl.render(hl.read_log(ringing_lines(cancel_status=481)))
+        self.assertIn(" | call ringing: FAIL, the CANCEL was answered 481, not 200", text)
+        text = hl.render(hl.read_log(ringing_lines(answered=True, final=200)))
+        self.assertIn(" | call ringing: the far end answered (final 200), held, then BYE", text)
+
+    def test_a_run_with_no_call_record_has_no_call_clause(self):
+        self.assertNotIn(" | call ", hl.render(hl.read_log(excerpt())))
+        self.assertNotIn(" | call ", hl.render(hl.read_log(ringing_lines(call_mode="answered"))))
+
+
 # ---------------------------------------------------------------- the generator, on a server with the board's cap
 class _Server(ThreadingHTTPServer):
     request_queue_size = 64                                 # a burst must not overflow the SYN backlog
@@ -670,13 +836,35 @@ class LoadBoard(base.FakeProbeBoard):
     def __init__(self):
         super().__init__("h947")
         self.deny_trace, self.reboot_on_trace, self.reads = False, False, 0
+        self.invite_at, self.byes_seen = None, 0
 
     def _call_h947(self, c):
+        self.invite_at = time.monotonic()
         self.initiated(c)
         if self.knobs.get("refuse"):
             self.refuse(c, 503)
             return self.drop(c)                          # the board drops the leg it opened
+        if self.knobs.get("ring_only"):                  # the far end rings and is never answered
+            if not self.knobs.get("no_180"):             # (the 100 Trying went out already)
+                self._reply(c["req"], c["addr"], 180, "Ringing", to_tag=c["tag"])
+            if self.knobs.get("phantom"):
+                threading.Timer(0.2, self.phantom).start()
+            return
         self.answer(c)
+
+    def _on_cancel(self, req, addr):
+        c = self.calls.get(req.call_id())
+        if c is None or c.get("state") != "ringing":
+            return super()._on_cancel(req, addr)
+        self._reply(req, addr, 200, "OK")                # RFC 3261 s9.2: 200 to the CANCEL, 487 to the INVITE
+        self.cancels.append(time.monotonic())
+        self._reply(c["req"], c["addr"], 487, "Request Terminated", to_tag=c["tag"])
+        c["state"] = "ended"
+        self.drop(c)                                     # the anchor drops the leg it opened
+
+    def _on_bye(self, req, addr):
+        self.byes_seen += 1
+        super()._on_bye(req, addr)
 
     def public_status(self):
         st = super().public_status()
@@ -758,7 +946,7 @@ class ScenarioRunTest(unittest.TestCase):
         self.assert_no_secret_anywhere(out)
 
     def test_a_held_call_is_one_invite_one_bye_and_a_window_inside_it(self):
-        rc, out = self.go("--http-modes", "dashboard-call")
+        rc, out = self.go("--http-modes", "dashboard-call", "--call-mode", "answered")
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.board.invite_users, [FAR], "exactly one ring")
         self.assertIn("RING-REQUIRED", out)
@@ -791,7 +979,8 @@ class ScenarioRunTest(unittest.TestCase):
             loads.append(load_self)
             return window(load_self, *a, **kw)
         with mock.patch.object(an.AnchorRun, "checkpoint", spy), mock.patch.object(hl.RunLoad, "window", stash):
-            rc, out = self.go("--http-modes", "dashboard-call", "--burst-workers", "3", "--burst-each", "40")
+            rc, out = self.go("--http-modes", "dashboard-call", "--call-mode", "answered", "--burst-workers", "3",
+                              "--burst-each", "40")
         self.assertEqual(rc, 0, out)
         self.assertGreater(len(seen), 3, "the checkpoints went on all through the call")
         self.assertNotIn(True, seen, "one was made during the burst")
@@ -808,9 +997,87 @@ class ScenarioRunTest(unittest.TestCase):
 
     def test_a_call_the_far_end_does_not_answer_is_invalid(self):
         self.board.knobs["refuse"] = True
-        rc, out = self.go("--http-modes", "dashboard-call")
+        rc, out = self.go("--http-modes", "dashboard-call", "--call-mode", "answered")
         self.assertEqual(rc, an.EXIT["INVALID"], out)
         self.assertIn("the far end did not answer (final 503)", out)
+
+    # ---- ringing mode (the default): the far end rings and is not answered
+    def ring_only(self, **knobs):
+        self.board.knobs.update(ring_only=True, **knobs)
+        return self.go("--http-modes", "dashboard-call")
+
+    def test_a_ringing_only_far_end_is_a_valid_call_cancelled_at_the_window_end(self):
+        rc, out = self.ring_only()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.manifest["verdict"], "PASS")
+        self.assertEqual(self.board.invite_users, [FAR], "exactly one ring")
+        self.assertEqual(len(self.board.cancels), 1, "one CANCEL")
+        self.assertEqual(self.board.byes_seen, 0, "no BYE: an unanswered INVITE has no dialog to end")
+        sent = self.board.cancels[0] - self.board.invite_at
+        self.assertGreaterEqual(sent, self.FAST["hold_s"] - 0.2, "the CANCEL went before the window closed")
+        self.assertLess(sent, self.FAST["hold_s"] + 1.0, "and not long after")
+        with open(os.path.join(self.res, "calls.json"), encoding="utf-8") as f:
+            calls = json.load(f)
+        self.assertEqual(len(calls), 1)
+        c = calls[0]
+        self.assertEqual((c["final"], c["cancel_status"], c["call_mode"]), (487, 200, "ringing"))
+        self.assertNotIn("hangup_bye", c, "the harness sent no BYE")
+        self.assertLessEqual(c["duration_s"], an.MAX_CALL_S)
+        meta = [r for r in self.log() if r["k"] == "run"][0]
+        self.assertEqual((meta["call_mode"], meta["answered"], meta["final"], meta["hold_s"]),
+                         ("ringing", False, 487, self.FAST["hold_s"]))
+        self.assertIsNotNone(meta["ring_ms"])
+        self.assertGreaterEqual(meta["window_ms"], self.FAST["hold_s"] * 1000 - hl.WINDOW_SLACK_MS)
+        self.assertGreaterEqual(meta["cancel_ms"], self.FAST["hold_s"] * 1000 - hl.WINDOW_SLACK_MS,
+                                "the CANCEL is due at the planned hold")
+        self.assertEqual(self.poll_paths(1), {p for p, _, _ in hl.POLLS}, "the dashboard's load ran in the ring")
+        self.assertEqual(self.manifest["log_counters"]["initiated"], 1)
+        self.assertEqual(self.manifest["log_counters"]["dropped"], 1)
+        with open(os.path.join(self.res, "http-summary.txt"), encoding="utf-8") as f:
+            self.assertIn(" | call ringing: valid, 180 Ringing at +", f.read())
+        self.assertEqual(self.board.bindings, {}, "both test UAs de-registered")
+        self.assert_no_secret_anywhere(out)
+
+    def test_a_slow_window_teardown_does_not_keep_the_phone_ringing_past_the_hold(self):
+        real = hl.RunLoad.window
+
+        def slow_teardown(load_self, *a, **kw):
+            real(load_self, *a, **kw)
+            time.sleep(1.6)           # pollers stuck in a request on a slow board, then the `after` read
+        with mock.patch.object(hl.RunLoad, "window", slow_teardown):
+            rc, out = self.ring_only()
+        self.assertEqual(rc, 0, out)
+        sent = self.board.cancels[0] - self.board.invite_at
+        self.assertGreaterEqual(sent, self.FAST["hold_s"] - 0.2)
+        self.assertLess(sent, self.FAST["hold_s"] + 0.5, "the CANCEL waited for the window's teardown")
+        meta = [r for r in self.log() if r["k"] == "run"][0]
+        self.assertGreater(meta["window_ms"], meta["cancel_ms"] + 1000, "the teardown outlasted the CANCEL")
+
+    def test_a_ringing_call_with_no_180_is_invalid_with_the_reason_and_is_still_cancelled(self):
+        rc, out = self.ring_only(no_180=True)
+        self.assertEqual(rc, an.EXIT["INVALID"], out)
+        self.assertIn("ringing call: no 180 Ringing seen before the INVITE ended (final 487)", out)
+        self.assertEqual(len(self.board.cancels), 1, "a phone is never left ringing")
+        self.assertEqual(self.board.byes_seen, 0)
+
+    def test_a_far_end_that_answers_in_ringing_mode_is_held_then_hung_up_with_a_bye(self):
+        rc, out = self.go("--http-modes", "dashboard-call")             # the fake board answers at once
+        self.assertEqual(rc, 0, out)
+        with open(os.path.join(self.res, "calls.json"), encoding="utf-8") as f:
+            c = json.load(f)[0]
+        self.assertEqual((c["final"], c["hangup_bye"], c["call_mode"]), (200, 200, "ringing"))
+        self.assertGreaterEqual(c["hangup_ms"], self.FAST["hold_s"] * 1000 - 300, "the BYE came after the hold")
+        self.assertEqual((self.board.cancels, self.board.byes_seen), ([], 1), "no CANCEL once answered; one BYE")
+        self.assertIn(" | call ringing: the far end answered (final 200), held, then BYE", out)
+
+    def test_a_phantom_during_the_ring_cancels_it_at_once_not_at_the_hold(self):
+        rc, out = self.ring_only(phantom=True)
+        self.assertEqual(rc, an.EXIT["FAIL"], out)
+        self.assertIn("a phantom inbound reached a test UA during the call", out)
+        self.assertEqual(len(self.board.cancels), 1)
+        self.assertLess(self.board.cancels[0] - self.board.invite_at, self.FAST["hold_s"] - 1.0,
+                        "the phone kept ringing to the end of the hold")
+        self.assertEqual(self.board.byes_seen, 0)
 
     def test_a_reboot_inside_a_run_is_a_fail(self):
         self.board.reboot_on_trace = True
