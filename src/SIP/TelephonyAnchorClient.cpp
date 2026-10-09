@@ -312,6 +312,7 @@ void TelephonyAnchorClient::shutdownImpl()
 	closePostClient();   // free every slot's persistent warm POST/GET handle
 	closeCtrlClient();
 	closeStatusClient();
+	closeSosStatusClient();
 
 	if (_wsClient)
 	{
@@ -393,7 +394,9 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	// Prefer the device-specific makecall endpoint (the recommended Telephony transport) over the legacy
 	// /callcontrol/{dn}/makecall. Resolve the device_id lazily — makeCall runs on a tel_ctl
 	// worker, so the blocking GET is fine here.
-	if (deviceId.empty() && resolveDevice())
+	// #941: a 911/933's GETs here and in resolveOutboundLeg use the sos lane's own handle, never _statusMutex.
+	const bool sosLane = pbx::classifyEmergencyDial(destination).isEmergency;
+	if (deviceId.empty() && resolveDevice(sosLane))
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		deviceId = _deviceId;
@@ -441,7 +444,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 			_deviceId.clear();
 		}
 		std::string freshId;
-		if (resolveDevice())
+		if (resolveDevice(sosLane))
 		{
 			std::lock_guard<std::mutex> lock(_mutex);
 			freshId = _deviceId;
@@ -1226,6 +1229,23 @@ bool TelephonyAnchorClient::connectWs()
 // upset handler) was migrated to the list-based getLegStatus(legId) in PR #39.
 // Deleted so a future caller can't reintroduce the wrong-leg 403.
 
+namespace {
+// #941: exclusive use of the 911 lane's _sosStatusClient without a mutex held across its socket
+// I/O. A lock-free claim; a null flag claims nothing. Uncontended in service (tel_sos is one
+// worker); the only other claimant is closeSosStatusClient() at teardown, whose cleanup does no I/O.
+struct SosStatusClaim
+{
+	std::atomic<bool>* flag;
+	explicit SosStatusClaim(std::atomic<bool>* f) : flag(f)
+	{
+		while (flag && flag->exchange(true, std::memory_order_acquire)) vTaskDelay(1);
+	}
+	~SosStatusClaim() { if (flag) flag->store(false, std::memory_order_release); }
+	SosStatusClaim(const SosStatusClaim&) = delete;
+	SosStatusClaim& operator=(const SosStatusClaim&) = delete;
+};
+}   // namespace
+
 // Generalized authed GET → full response body. Snapshots the token under _mutex, then does all
 // blocking I/O lock-free. close()+cleanup() on every exit path. Returns true only on a 2xx with a
 // clean body read; *statusOut carries the HTTP status (or -1) so callers can distinguish "no
@@ -1238,7 +1258,9 @@ bool TelephonyAnchorClient::connectWs()
 // this same path, so a burst of N concurrent calls each resolving their own leg's status now pays
 // N sequential ~100-150ms resumed opens instead of N concurrent ~800ms-1s cold ECDHEs fighting the
 // S3's single crypto-bound core for CPU.
-bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut)
+// #941 (Rule 5): sosLane (an emergency makeCall's GET) drives _sosStatusClient instead and never
+// touches _statusMutex, so a 911/933 cannot wait behind another task's status GET.
+bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut, bool sosLane)
 {
 	if (statusOut) *statusOut = -1;
 	bodyOut.clear();
@@ -1249,15 +1271,21 @@ bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bod
 		bearerHeader = _bearerHeader;
 	}
 
-	std::lock_guard<std::mutex> statusLock(_statusMutex);
+	// #941: the shared lock is held across this GET's open and read (2 s timeouts), so a 911's
+	// makeCall (resolveDevice, resolveOutboundLeg) used to wait on it behind any other task's status
+	// GET. The 911 lane takes its own handle under a lock-free claim instead.
+	esp_http_client_handle_t& client = sosLane ? _sosStatusClient : _statusClient;
+	std::unique_lock<std::mutex> statusLock(_statusMutex, std::defer_lock);
+	if (!sosLane) statusLock.lock();
+	SosStatusClaim sosClaim(sosLane ? &_sosStatusBusy : nullptr);
 
 	bool ok = false;
 	for (int attempt = 0; attempt < 2; ++attempt)
 	{
-		if (!_statusClient)
+		if (!client)
 		{
-			_statusClient = makeAuthedClient(url, HTTP_METHOD_GET, 1024, bearerHeader);
-			if (!_statusClient)
+			client = makeAuthedClient(url, HTTP_METHOD_GET, 1024, bearerHeader);
+			if (!client)
 			{
 				ESP_LOGE(TAG, "httpGetBody: failed to init HTTP client");
 				return false;
@@ -1265,30 +1293,30 @@ bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bod
 		}
 		else
 		{
-			esp_http_client_set_url(_statusClient, url.c_str());
-			esp_http_client_set_method(_statusClient, HTTP_METHOD_GET);
+			esp_http_client_set_url(client, url.c_str());
+			esp_http_client_set_method(client, HTTP_METHOD_GET);
 			// Token may have rotated since the handle was created.
 			if (!bearerHeader.empty())
 			{
-				esp_http_client_set_header(_statusClient, "Authorization", bearerHeader.c_str());
+				esp_http_client_set_header(client, "Authorization", bearerHeader.c_str());
 			}
 		}
 
-		esp_err_t err = esp_http_client_open(_statusClient, 0);
+		esp_err_t err = esp_http_client_open(client, 0);
 		if (err == ESP_OK)
 		{
-			esp_http_client_fetch_headers(_statusClient);
-			int status = esp_http_client_get_status_code(_statusClient);
+			esp_http_client_fetch_headers(client);
+			int status = esp_http_client_get_status_code(client);
 
 			// Drain the whole body regardless of status so the connection is left clean.
 			std::vector<char> buffer;
 			char tempBuf[512];
 			int readBytes = 0;
-			while ((readBytes = esp_http_client_read(_statusClient, tempBuf, sizeof(tempBuf))) > 0)
+			while ((readBytes = esp_http_client_read(client, tempBuf, sizeof(tempBuf))) > 0)
 			{
 				buffer.insert(buffer.end(), tempBuf, tempBuf + readBytes);
 			}
-			esp_http_client_close(_statusClient);   // keep handle+session warm; NOT cleanup
+			esp_http_client_close(client);   // keep handle+session warm; NOT cleanup
 
 			if (readBytes < 0)
 			{
@@ -1311,8 +1339,8 @@ bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bod
 		// Open or read failed: the reused handle may be riding a connection the server already
 		// idled out. Rebuild fresh and retry once (degrades to a cold handshake, never a failed
 		// call) rather than leaving a poisoned handle warm for next time.
-		esp_http_client_cleanup(_statusClient);
-		_statusClient = nullptr;
+		esp_http_client_cleanup(client);
+		client = nullptr;
 	}
 
 	return ok;
@@ -1546,7 +1574,7 @@ static std::string legIdOf(cJSON* elem)
 // on the callee/FAR leg — exactly the leg class that 403'd in #40 — so a legacy-path guess could
 // re-trigger the wrong-leg 403. If no controllable leg is found we FAIL CLOSED (return "") and
 // let the reconcile/watchdog teardown handle it, rather than drop a guessed id.
-std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecallRespBody, const std::string& /*destination*/,
+std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecallRespBody, const std::string& destination,
                                                        int* listStatusOut, telephony::OwnLegSource* sourceOut,
                                                        telephony::ListLegCounts* countsOut, bool skipOurs)
 {
@@ -1591,7 +1619,8 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 
 	std::string body;
 	int status = 0;
-	const bool got = httpGetBody(url, body, &status);
+	// #941: a 911/933 reads the list on the sos lane's own handle (destination is used for nothing else).
+	const bool got = httpGetBody(url, body, &status, pbx::classifyEmergencyDial(destination).isEmergency);
 	// Report the list's own status before ANY of the early returns below, so a caller
 	// can tell "3CX never answered" (status <= 0, transient) from "3CX answered and
 	// there is no leg" (status > 0, definitive). Everything past this point already
@@ -1698,7 +1727,7 @@ std::string TelephonyAnchorClient::pickDeviceId(const std::string& body)
 }
 
 // GET /callcontrol/{dn}/devices → pickDeviceId → cache in _deviceId. Returns true on success.
-bool TelephonyAnchorClient::resolveDevice()
+bool TelephonyAnchorClient::resolveDevice(bool sosLane)
 {
 	std::string url;
 	{
@@ -1708,7 +1737,7 @@ bool TelephonyAnchorClient::resolveDevice()
 
 	std::string body;
 	int status = 0;
-	if (!httpGetBody(url, body, &status) || status != 200)
+	if (!httpGetBody(url, body, &status, sosLane) || status != 200)
 	{
 		ESP_LOGW(TAG, "resolveDevice: GET /devices failed (status=%d)", status);
 		return false;
@@ -2367,6 +2396,12 @@ void TelephonyAnchorClient::warmStatusConnection()
 	int status = 0;
 	httpGetBody(url, body, &status);
 	ESP_LOGI(TAG, "Status connection pre-warmed (HTTP %d)", status);
+
+	// #941: the 911/933 lane's own handle, built here (init) rather than on the first emergency
+	// call, so that call resumes a warm session instead of paying a cold ECDHE.
+	status = 0;
+	httpGetBody(url, body, &status, /*sosLane=*/true);
+	ESP_LOGI(TAG, "Sos status connection pre-warmed (HTTP %d)", status);
 }
 
 void TelephonyAnchorClient::closeCtrlClient()
@@ -2386,6 +2421,16 @@ void TelephonyAnchorClient::closeStatusClient()
 	{
 		esp_http_client_cleanup(_statusClient);
 		_statusClient = nullptr;
+	}
+}
+
+void TelephonyAnchorClient::closeSosStatusClient()
+{
+	SosStatusClaim sosClaim(&_sosStatusBusy);   // waits for an in-flight 911 GET before freeing the handle
+	if (_sosStatusClient)
+	{
+		esp_http_client_cleanup(_sosStatusClient);
+		_sosStatusClient = nullptr;
 	}
 }
 
