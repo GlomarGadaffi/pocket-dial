@@ -536,4 +536,13 @@ static_assert(POCKETDIAL_HAS_ANCHOR || POCKETDIAL_HAS_TRUNK,
 #define POCKETDIAL_MIN_PSTN_AOR_DIGITS 7
 #endif
 
+// BENCH-ONLY (#410, #328; docs/BENCH_PROBE.md): 1 makes HttpServer.cpp keep
+// per-consumer internal-DRAM counters for the HTTP path and report them as
+// "httpDramAccount" on /api/status. 0 (the shipped default) compiles all of it
+// out: no counter, no field, the same code and the same output as without it.
+// Read it only in HttpServer.cpp, after this header is included.
+#ifndef POCKETDIAL_HTTP_DRAM_ACCOUNT
+#define POCKETDIAL_HTTP_DRAM_ACCOUNT 0
+#endif
+
 #endif

@@ -102,6 +102,9 @@ add_executable(sip_parser_tests
     # sendmsg() (byte-identical, short writes resumed, zero allocation).
     HttpSendPath_test.cpp
     HttpStatusAlloc_test.cpp
+    # Issue #410/#328: the bench-only HTTP internal-DRAM accounting (counter
+    # arithmetic always; the HttpServer wiring only with the guard on).
+    HttpDramAccount_test.cpp
     # Issue #410 done-when 4: the per-route allocation gate.
     HttpRouteAlloc_test.cpp
     # Issue #412: every allocateVirtualPeer() caller must survive an exhausted

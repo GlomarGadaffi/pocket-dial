@@ -979,6 +979,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `l2Tx.mohSockErrors` | Integer or `null` | Hold-music `sendto()` calls that failed outright (`HoldMusic::_txErrors`). The board logs these only once per 250 failures, so this is the complete count. `null` on builds with no pacing task. |
 | `coredump` | Object | (#382) Stored panic coredump: `present` (a dump is stored), `size` (its bytes), `supported` (#514: `false` when the board has no coredump partition, so `present:false` does not mean "no crash"). Ungated; the dump itself stays behind `/api/coredump*`. |
 | `memory` | Object | (#466) Memory placement: `clipRefusals` (clip buffers refused for want of PSRAM or over the internal cap), `mohClipRefused` / `greetingRefused` (booleans: hold music plays silence, or deposits record without a greeting), `psramFallbacks` (PSRAM-preferred buffers internal DRAM had to hold; always `0` without PSRAM). |
+| `httpDramAccount` | Object, **bench images only** | (#410, #328) Last key of the object, present only in an image built with `POCKETDIAL_HTTP_DRAM_ACCOUNT=1`; a release image does not emit it. Per consumer, the internal-DRAM bytes the HTTP path holds (`now`, `hwm`, `atPeak`), plus `total`, `respBodyMax`, `conns` and `spawnFailures`. How to build, read and interpret it: [BENCH_PROBE.md](BENCH_PROBE.md#http-dram-accounting-pocketdial_http_dram_account). |
 
 > **Task-Watchdog coverage (issue #185).** `sip_server_task` is subscribed to
 > the IDF Task Watchdog Timer (`esp_task_wdt_add()` + a per-tick
