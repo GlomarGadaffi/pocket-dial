@@ -355,7 +355,9 @@ private:
 	void runRxLoop(CallSlot* slot);
 
 	bool startMediaStreams(const std::string& participantId);
-	void stopMediaStreams(const std::string& participantId);
+	// A view, not a string (#862): the teardown path passes ids from a fixed-storage snapshot,
+	// and a view costs no copy. The view must stay valid for the call. Nothing keeps it.
+	void stopMediaStreams(std::string_view participantId);
 	// Tear down EVERY active call slot (shutdown + WS-disconnect). Snapshots the active
 	// participant ids under _mutex, then stopMediaStreams() each (can't hold _mutex across them).
 	void stopAllMediaStreams();

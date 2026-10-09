@@ -1,0 +1,4 @@
+# AllocBaseline_test.cpp (5): #862 hot-path allocations. Issue862SyslogStampAndLineTakeNoHeap,
+#   Issue862TeardownSnapshotTakesNoHeapForIdsThatFit, Issue862TeardownSnapshotKeepsAnOverlongIdWholeAndFreesIt,
+#   Issue862TokenBodyThatFitsIsCollectedWithoutTheHeap, Issue862TokenBodyThatSpillsIsKeptWholeAndFreed
+5

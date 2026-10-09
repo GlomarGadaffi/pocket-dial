@@ -1,9 +1,13 @@
-// AllocBaseline_test.cpp -- MEASUREMENT ONLY (not a gate): per-operation heap
-// allocation counts on the SIP task's hot path, for #284 / #462 / #463 / #464.
+// AllocBaseline_test.cpp -- per-operation heap allocation counts on the SIP task's
+// hot path, for #284 / #462 / #463 / #464.
 //
-// Prints counts; asserts nothing except that the positive control moved. The
-// gates live in the batch PRs. This exists so every batch measures against the
-// same numbers, taken the same way.
+// The table (PrintHotPathCounts) is MEASUREMENT ONLY: it prints counts and asserts
+// nothing except that the positive control moved. It exists so every batch measures
+// against the same numbers, taken the same way.
+//
+// The Issue862 tests at the end ASSERT. They cover the host-compiled halves of the
+// #862 paths: zero heap where the path must not allocate, and no live block left
+// behind where it must free what it took (#837's leak got past count-only gates).
 //
 // Method: warm each operation once (pools, vector capacities, session entries),
 // then count a second identical operation on the calling thread (AllocGuard is
@@ -26,6 +30,12 @@
 #include "AllocCounter.hpp"
 #include "RequestsHandler.hpp"
 #include "SipMessage.hpp"
+#include "Syslog.hpp"
+#include "TelephonyAnchorLogic.hpp"
+#include "TimeSync.hpp"
+
+#include <algorithm>
+#include <string_view>
 
 namespace
 {
@@ -166,4 +176,192 @@ TEST(AllocBaseline, PrintHotPathCounts)
 	report("REGISTER (refresh)", measure(h, kA, [](int n) { return reg("500", kA, n + 10); }, 1));
 	report("OPTIONS", measure(h, kA, [](int n) { return options(kA, n); }, 100));
 	report("200 OK (unmatched)", measure(h, kA, [](int n) { return strayOk(n); }, 200));
+}
+
+// ── #862: the allocations the table above did not cover ─────────────────────────
+//
+// Three ESP-only call sites now run host-compiled helpers, and these tests drive
+// those helpers: the syslog stamp (TimeSync + Syslog), the teardown snapshot of
+// call ids (telephony::IdSnapshot) and the token body (telephony::BodyCollector).
+// AllocGuard is per thread, so the zero-heap assertions are exact. The live-block
+// checks read process-wide totals, which is why they compare for equality only
+// around a block of work that runs on this thread alone.
+
+TEST(AllocBaseline, Issue862SyslogStampAndLineTakeNoHeap)
+{
+	// 1700000000 = 2023-11-14T22:13:20Z: the synced branch, which the host never
+	// reaches through rfc3339NowInto() because isSynced() is always false off-device.
+	char stamp[timesync::kRfc3339Bytes];
+	std::size_t nSynced = 0;
+	std::size_t heapSynced = 0;
+	{
+		AllocGuard g;
+		nSynced = timesync::formatNowOrNil(true, 1700000000, stamp, sizeof(stamp));
+		heapSynced = g.delta();
+	}
+	EXPECT_EQ(heapSynced, 0u) << "a 20-character stamp must be built on the stack";
+	EXPECT_EQ(std::string(stamp, nSynced), "2023-11-14T22:13:20Z");
+
+	// The unsynced branch, through the entry point the syslog send path calls.
+	char nil[timesync::kRfc3339Bytes];
+	std::size_t nNil = 0;
+	std::size_t heapNil = 0;
+	{
+		AllocGuard g;
+		nNil = timesync::rfc3339NowInto(nil, sizeof(nil));
+		heapNil = g.delta();
+	}
+	EXPECT_EQ(heapNil, 0u);
+	EXPECT_EQ(std::string(nil, nNil), "-");
+
+	// A synced stamp inside a finished frame (the buffer form send() writes into).
+	char frame[Syslog::kMaxFrameBytes];
+	std::size_t nFrame = 0;
+	std::size_t heapFrame = 0;
+	{
+		AllocGuard g;
+		nFrame = Syslog::formatFrame(frame, sizeof(frame), Syslog::Severity::Info,
+		                             Syslog::kDefaultFacility, "pbx-call", "caller=310", stamp);
+		heapFrame = g.delta();
+	}
+	EXPECT_EQ(heapFrame, 0u);
+	EXPECT_EQ(std::string(frame, nFrame).rfind("<134>1 2023-11-14T22:13:20Z - pbx-call", 0), 0u);
+
+	// The whole send() path with a sink configured. Nothing leaves the host, but the
+	// frame is built as on the board. The first call sits outside the guard.
+	ASSERT_TRUE(Syslog::configure("192.168.7.1"));
+	Syslog::send(Syslog::Severity::Info, "pbx-call", "caller=310 callee=210 result=answered");
+	std::size_t heapSend = 0;
+	{
+		AllocGuard g;
+		Syslog::send(Syslog::Severity::Info, "pbx-call", "caller=310 callee=210 result=answered");
+		heapSend = g.delta();
+	}
+	ASSERT_TRUE(Syslog::configure(""));   // leave the sink clean for the other tests
+	EXPECT_EQ(heapSend, 0u);
+}
+
+TEST(AllocBaseline, Issue862TeardownSnapshotTakesNoHeapForIdsThatFit)
+{
+	// Built outside the guard, so only the snapshot's own work is counted.
+	const std::string ids[] = {"1001", "2002", std::string(telephony::kParticipantIdBytes, '7')};
+	telephony::IdSnapshot<4, telephony::kParticipantIdBytes> snap;
+	std::size_t heap = 0;
+	{
+		AllocGuard g;
+		for (const std::string& id : ids) snap.add(id);
+		heap = g.delta();
+	}
+	EXPECT_EQ(heap, 0u) << "an id of kParticipantIdBytes or fewer is copied inline";
+	ASSERT_EQ(snap.size(), 3u);
+	for (std::size_t i = 0; i < 3; ++i)
+	{
+		EXPECT_EQ(std::string(snap.at(i)), ids[i]);
+	}
+}
+
+TEST(AllocBaseline, Issue862TeardownSnapshotKeepsAnOverlongIdWholeAndFreesIt)
+{
+	if (!heapLiveTracked()) GTEST_SKIP() << "this C library cannot report block sizes";
+	const std::string longId(200, 'x');   // past kParticipantIdBytes: the one case that takes the heap
+	std::size_t heap = 0;
+	std::size_t n = 0;
+	bool same = false;
+	const std::size_t blocks0 = heapLiveBlocks();
+	const std::size_t bytes0 = heapLiveBytes();
+	{
+		telephony::IdSnapshot<4, telephony::kParticipantIdBytes> snap;
+		snap.add("1001");
+		{
+			AllocGuard g;
+			snap.add(longId);
+			heap = g.delta();
+		}
+		n = snap.size();
+		same = snap.at(1) == std::string_view(longId);
+	}
+	const std::size_t blocks1 = heapLiveBlocks();
+	const std::size_t bytes1 = heapLiveBytes();
+	EXPECT_GT(heap, 0u) << "the overlong copy must really take the heap, or this proves nothing";
+	EXPECT_EQ(n, 2u) << "no id is dropped, however long";
+	EXPECT_TRUE(same);
+	EXPECT_EQ(blocks1, blocks0) << "the snapshot must free its overlong copy";
+	EXPECT_EQ(bytes1, bytes0);
+}
+
+// Collects `src` the way readJsonStringField does (512-byte reads) and reports
+// what it cost, whether it spilled, and what came back.
+static void collectBody(const std::string& src, std::size_t& heap, bool& spilled, std::string& got)
+{
+	char fixed[telephony::kJsonBodyFixedBytes + 1];
+	std::string joined;
+	telephony::BodyCollector c(fixed, telephony::kJsonBodyFixedBytes);
+	{
+		AllocGuard g;
+		for (std::size_t off = 0; off < src.size(); off += 512)
+		{
+			c.append(src.data() + off, std::min<std::size_t>(512, src.size() - off));
+		}
+		heap = g.delta();
+	}
+	spilled = c.spilled();
+	got = std::string(c.terminated(joined));
+}
+
+TEST(AllocBaseline, Issue862TokenBodyThatFitsIsCollectedWithoutTheHeap)
+{
+	std::string body;
+	for (std::size_t i = 0; i < 1500; ++i) body.push_back(static_cast<char>('a' + i % 26));
+	const std::string exact(telephony::kJsonBodyFixedBytes, 'z');   // exactly the fixed size: still fits
+
+	std::size_t heap1 = 0, heap2 = 0;
+	bool spilled1 = true, spilled2 = true;
+	std::string got1, got2;
+	collectBody(body, heap1, spilled1, got1);
+	collectBody(exact, heap2, spilled2, got2);
+
+	EXPECT_EQ(heap1, 0u);
+	EXPECT_FALSE(spilled1);
+	EXPECT_EQ(got1, body);
+	EXPECT_EQ(heap2, 0u);
+	EXPECT_FALSE(spilled2);
+	EXPECT_EQ(got2, exact);
+}
+
+TEST(AllocBaseline, Issue862TokenBodyThatSpillsIsKeptWholeAndFreed)
+{
+	if (!heapLiveTracked()) GTEST_SKIP() << "this C library cannot report block sizes";
+	std::string body;
+	for (std::size_t i = 0; i < 5000; ++i) body.push_back(static_cast<char>('a' + i % 26));
+
+	std::size_t heap = 0;
+	std::size_t n = 0;
+	bool spilled = false;
+	bool same = false;
+	const std::size_t blocks0 = heapLiveBlocks();
+	const std::size_t bytes0 = heapLiveBytes();
+	{
+		char fixed[telephony::kJsonBodyFixedBytes + 1];
+		std::string joined;
+		telephony::BodyCollector c(fixed, telephony::kJsonBodyFixedBytes);
+		{
+			AllocGuard g;
+			for (std::size_t off = 0; off < body.size(); off += 512)
+			{
+				c.append(body.data() + off, std::min<std::size_t>(512, body.size() - off));
+			}
+			heap = g.delta();
+		}
+		spilled = c.spilled();
+		n = c.size();
+		same = std::string_view(c.terminated(joined)) == std::string_view(body);
+	}
+	const std::size_t blocks1 = heapLiveBlocks();
+	const std::size_t bytes1 = heapLiveBytes();
+	EXPECT_GT(heap, 0u) << "the spill must really take the heap, or this proves nothing";
+	EXPECT_TRUE(spilled);
+	EXPECT_EQ(n, body.size()) << "a body past the fixed size is still whole, never refused";
+	EXPECT_TRUE(same);
+	EXPECT_EQ(blocks1, blocks0) << "the spilled copy must be freed with the collector";
+	EXPECT_EQ(bytes1, bytes0);
 }

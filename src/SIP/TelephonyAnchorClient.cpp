@@ -2423,44 +2423,63 @@ void TelephonyAnchorClient::closePostClient()
 
 void TelephonyAnchorClient::stopAllMediaStreams()
 {
-	// Snapshot the active participant ids under _mutex (fixed array, no heap), then stop each slot
-	// (stopMediaStreams takes _mutex itself, so we can't hold it across the calls). Used by
-	// shutdown and the WS-disconnect handler.
-	std::string parts[POCKETDIAL_MAX_ANCHOR_CALLS];
-	int n = 0;
+	// Snapshot the active participant ids under _mutex, then stop each one (stopMediaStreams takes
+	// _mutex itself, so we can't hold it across the calls). Used by shutdown and the WS-disconnect
+	// handler. The snapshot is fixed storage (#862): an id up to kParticipantIdBytes takes no heap,
+	// and one slot per id, so it can never run out.
+	telephony::IdSnapshot<POCKETDIAL_MAX_ANCHOR_CALLS, telephony::kParticipantIdBytes> ids;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		for (auto& s : _calls)
 		{
-			if (!s.participantId.empty() && n < POCKETDIAL_MAX_ANCHOR_CALLS) parts[n++] = s.participantId;
+			if (!s.participantId.empty()) ids.add(s.participantId);
 		}
 	}
-	for (int i = 0; i < n; ++i)
+	for (std::size_t i = 0; i < ids.size(); ++i)
 	{
-		stopMediaStreams(parts[i]);
+		stopMediaStreams(ids.at(i));
 	}
 }
 
 bool TelephonyAnchorClient::readJsonStringField(esp_http_client_handle_t client, const std::string& field, std::string& out)
 {
-	std::vector<char> buffer;
+	// The body is collected into fixed storage, not a growing std::vector (#862). A token
+	// response is well inside telephony::kJsonBodyFixedBytes, so the usual read allocates
+	// nothing. A bigger body spills to the heap and still parses whole. This is never a
+	// refusal. The buffer is static, not on the stack: the anchor's tasks have 6 KB stacks
+	// (tel_maint) and TLS runs below this frame. One lock serialises every fetchToken()
+	// caller: start() creates tel_maint before its own fetchToken(), so the two can overlap.
+	// The lock is held across the network read. fetchToken is the only caller and runs
+	// about once an hour.
+	static std::mutex s_bodyMutex;
+	static char s_body[telephony::kJsonBodyFixedBytes + 1];
+	std::lock_guard<std::mutex> bodyLock(s_bodyMutex);
+
+	telephony::BodyCollector body(s_body, telephony::kJsonBodyFixedBytes);
 	char tempBuf[512];
 	int readBytes = 0;
 	while ((readBytes = esp_http_client_read(client, tempBuf, sizeof(tempBuf))) > 0)
 	{
-		buffer.insert(buffer.end(), tempBuf, tempBuf + readBytes);
+		body.append(tempBuf, static_cast<std::size_t>(readBytes));
 	}
 	if (readBytes < 0)
 	{
 		ESP_LOGE(TAG, "HTTP read error: %d", readBytes);
 		return false;
 	}
-	if (buffer.empty())
+	if (body.size() == 0)
 	{
 		return false;
 	}
-	buffer.push_back('\0');
-	cJSON* root = cJSON_Parse(buffer.data());
+	if (body.spilled())
+	{
+		// Not an error: the body parses whole, from a heap copy. Logged so the fixed size can be
+		// checked against a real unit (a spill on every fetch means the size is too small).
+		ESP_LOGW(TAG, "token response %u bytes: over the %u-byte fixed buffer, spilled to heap",
+		         static_cast<unsigned>(body.size()), static_cast<unsigned>(telephony::kJsonBodyFixedBytes));
+	}
+	std::string joined;   // holds the body only when it spilled
+	cJSON* root = cJSON_Parse(body.terminated(joined));
 	if (!root)
 	{
 		ESP_LOGE(TAG, "Failed to parse JSON response");
@@ -3333,7 +3352,7 @@ bool TelephonyAnchorClient::startMediaStreams(const std::string& participantId)
 	return true;
 }
 
-void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
+void TelephonyAnchorClient::stopMediaStreams(std::string_view participantId)
 {
 	// Find this call's slot (snapshot under _mutex; the slot array never moves).
 	CallSlot* slot = nullptr;
@@ -3409,8 +3428,8 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 				slot->rxDetached = true;   // reapParkedRxLocked() takes it back out
 				detached = _leakedGetClients.fetch_add(1, std::memory_order_relaxed) + 1;
 			}
-			ESP_LOGE(TAG, "Rx task for %s did not exit in 2 s -- detached, slot held until it parks (%d detached)",
-			         participantId.c_str(), detached);
+			ESP_LOGE(TAG, "Rx task for %.*s did not exit in 2 s -- detached, slot held until it parks (%d detached)",
+			         static_cast<int>(participantId.size()), participantId.data(), detached);
 			if (detached >= kLeakRestartThreshold)
 			{
 				_restartRequested.store(true, std::memory_order_release);
@@ -3449,7 +3468,7 @@ void TelephonyAnchorClient::stopMediaStreams(const std::string& participantId)
 		std::lock_guard<std::mutex> lock(_mutex);
 		freeSlotLocked(*slot);
 	}
-	ESP_LOGI(TAG, "Media streams stopped for %s", participantId.c_str());
+	ESP_LOGI(TAG, "Media streams stopped for %.*s", static_cast<int>(participantId.size()), participantId.data());
 }
 
 void TelephonyAnchorClient::rxTaskTrampoline(void* arg)

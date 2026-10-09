@@ -550,6 +550,112 @@ struct ListLegCounts
 	}
 };
 
+// ── Fixed-storage buffers for the ESP arm (#862) ────────────────────────────────
+// Both helpers exist so the ESP teardown allocates nothing in the common case, and the
+// token read stops growing a body buffer. The "fits or spills" logic is testable here.
+// cJSON still allocates its tree, so the token read is not heap-free overall.
+
+// Participant ids up to this many bytes are copied inline by IdSnapshot. Participant
+// ids are short (AnchorOwnLegs uses the same 32 for the same reason). Not checked
+// against a live 3CX capture; a longer id still works, it just takes the heap.
+inline constexpr std::size_t kParticipantIdBytes = 32;
+
+// Participant ids copied out of the call slots under _mutex, to be stopped after it is
+// released (stopMediaStreams() takes _mutex itself). Holds up to N ids (N is the call-slot
+// count, so add() cannot run out). An id of Len bytes or fewer is copied inline, which
+// is the common case and allocates nothing. A longer one goes into a std::string, which
+// allocates only for that id. No id is dropped, because a dropped id would leave its call
+// running.
+template <std::size_t N, std::size_t Len>
+class IdSnapshot
+{
+public:
+	void add(std::string_view id)
+	{
+		if (_n == N) return;   // unreachable: callers add at most one id per slot
+		Entry& e = _e[_n++];
+		e.len = id.size();
+		if (id.size() <= Len)
+		{
+			std::memcpy(e.buf, id.data(), id.size());
+		}
+		else
+		{
+			e.big.assign(id.data(), id.size());
+		}
+	}
+
+	std::size_t size() const { return _n; }
+
+	// Valid while the snapshot lives. It does not move, so the view stays valid.
+	std::string_view at(std::size_t i) const
+	{
+		const Entry& e = _e[i];
+		return e.len <= Len ? std::string_view(e.buf, e.len) : std::string_view(e.big);
+	}
+
+private:
+	struct Entry
+	{
+		char        buf[Len] = {};
+		std::size_t len      = 0;
+		std::string big;
+	};
+	Entry       _e[N];
+	std::size_t _n = 0;
+};
+
+// The HTTP body of a token response, collected for one cJSON parse. The first `cap`
+// bytes go into the caller's fixed buffer, which must hold cap + 1 bytes for the NUL
+// terminator. Anything past that spills into a heap string. The size is an estimate, not
+// a measurement: a 3CX token is a JWT (a 256-byte RS256 signature is 342 base64url
+// characters) plus its claims, so a response should be on the order of 1-2 KB. A body
+// that does not fit still parses whole, so the size only decides how often the heap
+// is used, never whether a response is refused. The ESP log line on spill checks it.
+inline constexpr std::size_t kJsonBodyFixedBytes = 2048;
+
+class BodyCollector
+{
+public:
+	BodyCollector(char* fixed, std::size_t cap) : _fixed(fixed), _cap(cap) {}
+
+	void append(const char* data, std::size_t n)
+	{
+		if (n == 0) return;
+		const std::size_t room = _cap - _used;
+		const std::size_t now  = n < room ? n : room;
+		std::memcpy(_fixed + _used, data, now);
+		_used += now;
+		if (now < n)
+		{
+			_spill.append(data + now, n - now);
+		}
+	}
+
+	std::size_t size() const { return _used + _spill.size(); }
+	bool        spilled() const { return !_spill.empty(); }
+
+	// The whole body, NUL-terminated. Not spilled: points into the fixed buffer.
+	// Spilled: `joined` receives the whole body, and the pointer points into it.
+	const char* terminated(std::string& joined)
+	{
+		if (!spilled())
+		{
+			_fixed[_used] = '\0';
+			return _fixed;
+		}
+		joined.assign(_fixed, _used);
+		joined += _spill;
+		return joined.c_str();
+	}
+
+private:
+	char*       _fixed;
+	std::size_t _cap;
+	std::size_t _used = 0;
+	std::string _spill;
+};
+
 }  // namespace telephony
 
 #endif // TELEPHONY_ANCHOR_LOGIC_HPP
