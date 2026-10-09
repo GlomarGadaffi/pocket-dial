@@ -1045,18 +1045,31 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 				std::string_view tokenStr;   // views the arena, which `lease` holds until this returns
 				if (readJsonStringField(client, lease, "access_token", tokenStr, deadlineUs))
 				{
-					// This lock guards _accessToken (a std::string, genuinely needs it).
+					// _mutex guards _accessToken/_bearerHeader (std::strings, genuinely need it).
 					// _tokenObtainedUs/_tokenLifetimeUs are std::atomic (#344) and do not
 					// need it -- they're written here under the lock anyway only because
 					// this block already holds it for _accessToken, not because they
 					// require it. Do not read that as redundant and drop the atomics.
-					std::lock_guard<std::mutex> lock(_mutex);
-					_accessToken.assign(tokenStr.data(), tokenStr.size());
-					_bearerHeader.assign("Bearer ");
-					_bearerHeader.append(tokenStr.data(), tokenStr.size());
-					_tokenObtainedUs = esp_timer_get_time();
-					_tokenLifetimeUs = telephony::decodeJwtLifetimeUs(_accessToken);
-					if (_wsClient)
+					std::string wsHeaders;   // built under the lock, sent after it is released
+					esp_websocket_client_handle_t ws = nullptr;
+					int      tokenLen = 0;
+					int64_t  lifetimeUs = 0;
+					{
+						std::lock_guard<std::mutex> lock(_mutex);
+						_accessToken.assign(tokenStr.data(), tokenStr.size());
+						_bearerHeader.assign("Bearer ");
+						_bearerHeader.append(tokenStr.data(), tokenStr.size());
+						_tokenObtainedUs = esp_timer_get_time();
+						lifetimeUs = telephony::decodeJwtLifetimeUs(_accessToken);
+						_tokenLifetimeUs = lifetimeUs;
+						tokenLen = static_cast<int>(_accessToken.length());
+						if (_wsClient)
+						{
+							ws = _wsClient;
+							wsHeaders = "Authorization: " + _bearerHeader + "\r\n";
+						}
+					}
+					if (ws)
 					{
 						// Issue #336 caveat, found reviewing this call while fixing that issue:
 						// per connectWs()'s own comment on this same API,
@@ -1070,12 +1083,17 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 						// requestRestartIfTokenStale()/WEBSOCKET_EVENT_DISCONNECTED below is what
 						// actually handles the disconnected case, via a full stop()/start() that
 						// rebuilds wsCfg.headers fresh at init time rather than patching this handle.
-						std::string wsHeaders = "Authorization: " + _bearerHeader + "\r\n";
-						esp_websocket_client_set_headers(_wsClient, wsHeaders.c_str());
+						//
+						// #862: called with _mutex RELEASED. set_headers takes the WS client's own lock
+						// with portMAX_DELAY (verified in the esp_websocket_client component), which the
+						// WS task holds while it sends and receives, so under _mutex it could stall every
+						// taker of _mutex, a 911/933 makeCall() included, for as long as the WS task holds
+						// it. The handle was read under _mutex; shutdownImpl() destroys it without that
+						// lock, a race this block already had and does not widen.
+						esp_websocket_client_set_headers(ws, wsHeaders.c_str());
 					}
-					ESP_LOGI(TAG, "Retrieved access token (len=%d, lifetime=%llds)",
-					         (int)_accessToken.length(),
-					         (long long)(_tokenLifetimeUs / 1000000));
+					ESP_LOGI(TAG, "Retrieved access token (len=%d, lifetime=%llds)", tokenLen,
+					         static_cast<long long>(lifetimeUs / 1000000));
 					success = true;
 				}
 			}
