@@ -1,2 +1,2 @@
-# Prack100rel_test.cpp: 16 new tests (Require: 100rel on the 777 echo, PRACK handling, unchanged-behaviour guards)
-16
+# Prack100rel_test.cpp: 26 tests (Require: 100rel on the 777 echo, PRACK handling, Rule 5 emergency dialogs, 2xx-only Timer J, unchanged-behaviour guards)
+26
