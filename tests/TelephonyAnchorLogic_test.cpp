@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "AllocCounter.hpp"
 #include "TelephonyAnchorLogic.hpp"
 
 namespace
@@ -122,6 +123,41 @@ TEST(TelephonyLogic, DecodeJwtFallbackOnInsaneSpan)
 	          kTokenFallbackLifetimeUs);
 	EXPECT_EQ(decodeJwtLifetimeUs(makeJwt("{\"iat\":1700000000,\"exp\":1700200000}")),
 	          kTokenFallbackLifetimeUs);   // ~55h
+}
+
+TEST(TelephonyLogic, DecodeJwtLifetimeFromARealisticPayload)
+{
+	// More members than exp and iat, in the order an issuer writes them, with a space and an
+	// array in the way. This is what the cJSON version it replaced (#862) read on the board.
+	const std::string payload =
+	    "{\"iss\":\"https://pbx.example.com\",\"aud\":[\"call_control\"],\"nbf\":1700000000,"
+	    "\"exp\": 1700003600,\"iat\":1700000000,\"client_id\":\"900\",\"scope\":\"exp iat\"}";
+	EXPECT_EQ(decodeJwtLifetimeUs(makeJwt(payload)), 3600LL * 1000000);
+	// A fraction is cut, not rounded: 3600.9 s - 0.2 s is 3600 s here (cJSON gave 3600.7 s).
+	EXPECT_EQ(decodeJwtLifetimeUs(makeJwt("{\"iat\":1700000000.2,\"exp\":1700003600.9}")),
+	          3600LL * 1000000);
+}
+
+TEST(TelephonyLogic, DecodeJwtLifetimeTakesThreeAllocationsAndNoJsonTree)
+{
+	// The token path decodes this on every fetch. payload, decoded bytes and json text are the
+	// three; the cJSON tree and the vector's growth steps are gone.
+	const std::string jwt = makeJwt(
+	    "{\"iss\":\"https://pbx.example.com\",\"aud\":[\"call_control\"],\"nbf\":1700000000,"
+	    "\"exp\":1700003600,\"iat\":1700000000,\"client_id\":\"900\"}");
+	int64_t lifetime = 0;
+	std::size_t heap = 0;
+	{
+		AllocGuard g;
+		lifetime = decodeJwtLifetimeUs(jwt);
+		heap = g.delta();
+	}
+	EXPECT_EQ(lifetime, 3600LL * 1000000);
+#if !(defined(_MSC_VER) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL > 0)
+	EXPECT_LE(heap, 3u);   // MSVC debug iterators allocate a proxy per container, so the count is not portable there
+#else
+	(void)heap;
+#endif
 }
 
 // ── entity-path tokenizer + participant parse ───────────────────────────────

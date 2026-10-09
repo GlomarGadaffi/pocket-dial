@@ -11,9 +11,9 @@
 // This header extracts those three concerns as DEPENDENCY-FREE free functions
 // (C++17 stdlib only — no cJSON, no mbedTLS, no ESP headers) so the same code
 // runs on the device AND in the host GoogleTest suite. The ESP .cpp arm calls
-// these for the URL builders and the entity-path parse; decodeJwtLifetimeUs has
-// a self-contained base64url + a minimal exp/iat scan that matches the on-device
-// mbedTLS/cJSON path for well-formed tokens, with the SAME fallback contract.
+// these for the URL builders, the entity-path parse and the token's JWT lifetime
+// (decodeJwtLifetimeUs: a self-contained base64url + a minimal exp/iat scan; the
+// cJSON/mbedTLS version it replaced is gone, #862).
 //
 // Everything here is intentionally allocation-light and total: every malformed
 // input maps to a documented, safe return value (the fallback lifetime / empty
@@ -33,8 +33,7 @@ namespace telephony
 
 // Fallback token lifetime when the JWT can't be decoded: 50 minutes (µs). This
 // is the JWT's real ~1h validity minus margin, deliberately NOT the OAuth
-// expires_in (Telephony reports 60s there, which would cause a refresh storm). Mirrors
-// kTokenFallbackLifetimeUs in TelephonyAnchorClient.cpp.
+// expires_in (Telephony reports 60s there, which would cause a refresh storm).
 inline constexpr int64_t kTokenFallbackLifetimeUs = 50LL * 60 * 1000000;
 
 // ── base64url decode (no padding required) ───────────────────────────────────
@@ -74,8 +73,7 @@ inline bool base64UrlDecode(const std::string& in, std::vector<uint8_t>& out)
 // write it to `out`. Minimal, allocation-free: finds "\"key\"", skips ':' and
 // whitespace, parses an integer (optionally signed). Returns false if the key
 // is absent or the value is not numeric. Sufficient for JWT `exp`/`iat` claims,
-// which are always integer seconds. (The on-device path uses cJSON; for the
-// well-formed tokens Telephony issues the two agree.)
+// which are integer seconds as Telephony issues them. A fraction is cut, not rounded.
 inline bool scanJsonNumber(const std::string& json, const std::string& key, int64_t& out)
 {
 	const std::string needle = "\"" + key + "\"";
@@ -113,9 +111,8 @@ inline bool scanJsonNumber(const std::string& json, const std::string& key, int6
 }
 
 // Decode a JWT's declared lifetime (exp - iat) in microseconds from its payload
-// segment. Returns kTokenFallbackLifetimeUs if anything is unparseable. Same
-// contract and sanity window (positive, under a day) as the on-device
-// decodeJwtLifetimeUs.
+// segment. Returns kTokenFallbackLifetimeUs if anything is unparseable. The span
+// must be positive and under a day, else the fallback.
 inline int64_t decodeJwtLifetimeUs(const std::string& jwt)
 {
 	size_t firstDot = jwt.find('.');
@@ -127,6 +124,7 @@ inline int64_t decodeJwtLifetimeUs(const std::string& jwt)
 	if (payload.empty()) return kTokenFallbackLifetimeUs;
 
 	std::vector<uint8_t> decoded;
+	decoded.reserve(payload.size());   // one allocation, not a doubling series
 	if (!base64UrlDecode(payload, decoded) || decoded.empty())
 	{
 		return kTokenFallbackLifetimeUs;

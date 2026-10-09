@@ -2,4 +2,5 @@
 #   Issue862TeardownSnapshotTakesNoHeapForIdsThatFit, Issue862TeardownSnapshotKeepsAnOverlongIdWholeAndFreesIt.
 #   TokenBodyArena_test.cpp (24): TokenBodyArena.* (15: capacity edge, arena full, read error, timeout,
 #   claim) and JsonStringField.* (9: the bounded scanner), the #948 arena contract for the token body.
-27
+#   TelephonyAnchorLogic_test.cpp (2): DecodeJwtLifetime* (realistic claims, three allocations and no JSON tree).
+29

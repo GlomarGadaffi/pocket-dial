@@ -82,7 +82,6 @@ void TelephonyAnchorClient::setRewarmIntervalSec(uint32_t)
 #include <cstdint>
 #include "esp_crt_bundle.h"
 #include "esp_timer.h"
-#include "mbedtls/base64.h"
 #include "TelephonyAnchorLogic.hpp"   // host-tested entity-path tokenizer + URL builders (issue #49)
 #include "PsramTask.hpp"            // #100: PSRAM-backed task stacks (off the scarce internal-RAM heap)
 #include "RtpTaskSlots.hpp"         // #479: pd::rtpslots::kAnchorRxStackBytes (counted in the 72 KB budget)
@@ -116,60 +115,6 @@ enum TelephonyEventType {
 	TEL_EV_DTMF        = 2,
 	TEL_EV_PROMPT_DONE = 3,
 };
-
-// Fallback token lifetime when the JWT can't be decoded: 50 minutes. This is
-// deliberately the JWT's real ~1h validity minus margin, NOT the OAuth
-// expires_in (Telephony reports 60s there, which is wrong and would cause a refresh
-// storm that kills the active media streams).
-static constexpr int64_t kTokenFallbackLifetimeUs = 50LL * 60 * 1000000;
-
-// Decode a JWT's declared lifetime (exp - iat) in microseconds from its payload
-// segment. Returns kTokenFallbackLifetimeUs if anything about the token is
-// unparseable. Uses the JWT's own claims so no wall-clock/SNTP is required —
-// the result is compared against the monotonic esp_timer.
-static int64_t decodeJwtLifetimeUs(const std::string& jwt)
-{
-	size_t firstDot = jwt.find('.');
-	if (firstDot == std::string::npos) return kTokenFallbackLifetimeUs;
-	size_t secondDot = jwt.find('.', firstDot + 1);
-	if (secondDot == std::string::npos) return kTokenFallbackLifetimeUs;
-
-	std::string payload = jwt.substr(firstDot + 1, secondDot - firstDot - 1);
-	if (payload.empty()) return kTokenFallbackLifetimeUs;
-
-	// base64url -> base64, then pad to a multiple of 4.
-	for (char& c : payload)
-	{
-		if (c == '-') c = '+';
-		else if (c == '_') c = '/';
-	}
-	while (payload.size() % 4 != 0) payload.push_back('=');
-
-	std::vector<unsigned char> decoded(payload.size()); // decoded is always smaller
-	size_t outLen = 0;
-	int rc = mbedtls_base64_decode(decoded.data(), decoded.size(), &outLen,
-	                               reinterpret_cast<const unsigned char*>(payload.data()),
-	                               payload.size());
-	if (rc != 0 || outLen == 0) return kTokenFallbackLifetimeUs;
-
-	std::string json(reinterpret_cast<char*>(decoded.data()), outLen);
-	cJSON* root = cJSON_Parse(json.c_str());
-	if (!root) return kTokenFallbackLifetimeUs;
-
-	int64_t lifetimeUs = kTokenFallbackLifetimeUs;
-	cJSON* exp = cJSON_GetObjectItem(root, "exp");
-	cJSON* iat = cJSON_GetObjectItem(root, "iat");
-	if (cJSON_IsNumber(exp) && cJSON_IsNumber(iat))
-	{
-		double span = exp->valuedouble - iat->valuedouble; // seconds
-		if (span > 0 && span < 86400) // sanity: positive, under a day
-		{
-			lifetimeUs = static_cast<int64_t>(span * 1000000.0);
-		}
-	}
-	cJSON_Delete(root);
-	return lifetimeUs;
-}
 
 TelephonyAnchorClient::TelephonyAnchorClient()
 {
@@ -1033,7 +978,7 @@ bool TelephonyAnchorClient::fetchToken(bool waitForArena)
 					_bearerHeader.assign("Bearer ");
 					_bearerHeader.append(tokenStr.data(), tokenStr.size());
 					_tokenObtainedUs = esp_timer_get_time();
-					_tokenLifetimeUs = decodeJwtLifetimeUs(_accessToken);
+					_tokenLifetimeUs = telephony::decodeJwtLifetimeUs(_accessToken);
 					if (_wsClient)
 					{
 						// Issue #336 caveat, found reviewing this call while fixing that issue:
