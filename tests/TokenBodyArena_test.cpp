@@ -1175,8 +1175,10 @@ TEST(JsonStringField, AMemberThatIsNotAStringIsNotAToken)
 	EXPECT_FALSE(scan("{\"access_token\":[\"y\"]}", "access_token", v));
 }
 
-TEST(JsonStringField, TruncatedOrMalformedInputIsAnErrorAndNeverAPrefix)
+TEST(JsonStringField, ABodyCutShortBeforeTheTokenStringIsClosedIsAnErrorAndNeverAPrefix)
 {
+	// Every input here ends, or goes wrong, before the access_token string is closed (or before it
+	// starts): there is no whole token in it, and a prefix of one must never come back as one.
 	const char* bad[] = {
 	    "", "   ", "[]", "\"access_token\"", "{", "{\"access_token", "{\"access_token\"", "{\"access_token\":",
 	    "{\"access_token\":\"abc", "{\"access_token\":\"abc\\", "{\"access_token\" \"abc\"}", "{access_token:\"abc\"}",
@@ -1189,6 +1191,20 @@ TEST(JsonStringField, TruncatedOrMalformedInputIsAnErrorAndNeverAPrefix)
 		EXPECT_FALSE(telephony::jsonStringField(copy.data(), copy.size(), "access_token", out)) << "input: " << b;
 		EXPECT_TRUE(out.empty()) << "no partial value for: " << b;
 	}
+}
+
+TEST(JsonStringField, ABodyCutShortAfterTheTokenStringIsClosedStillHasTheWholeToken)
+{
+	// Pinned, so the test above is not read to say more than it does: a body that stops after the
+	// token's closing quote (no closing brace, or cut in a later member) returns true with the whole
+	// token. That is the entire string, not a prefix of it. A body cut short never reaches the scanner
+	// from the device anyway: a read that ends before the response is whole is an error (httpReadResult).
+	std::string v;
+	ASSERT_TRUE(scan("{\"access_token\":\"abc\"", "access_token", v));
+	EXPECT_EQ(v, "abc");
+	ASSERT_TRUE(scan("{\"token_type\":\"Bearer\",\"access_token\":\"abc\",\"expires_in\":6", "access_token", v));
+	EXPECT_EQ(v, "abc");
+	EXPECT_FALSE(scan("{\"access_token\":\"ab", "access_token", v)) << "cut inside the token is the error";
 }
 
 TEST(JsonStringField, TheFirstOfTwoMembersWithTheSameKeyWins)
