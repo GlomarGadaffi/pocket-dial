@@ -658,6 +658,34 @@ inline int httpReadResult(int n, bool bodyComplete)
 	return n == kHttpReadTimedOut ? kHttpReadTimedOut : -1;
 }
 
+// Whether an access_token from the token response is worth installing (#862). It has to be
+// non-empty and have the two dots of a JWT's three segments, which is what decodeJwtLifetimeUs()
+// and Telephony's tokens assume. Anything else is not installed and the caller keeps the token it
+// has: an empty or garbled one would replace a working token with one every request answers 401.
+enum class TokenCheck : std::uint8_t { Ok, Empty, NotAJwt };
+
+inline TokenCheck checkToken(std::string_view token)
+{
+	if (token.empty()) return TokenCheck::Empty;
+	const std::size_t first = token.find('.');
+	if (first == std::string_view::npos || token.find('.', first + 1) == std::string_view::npos)
+	{
+		return TokenCheck::NotAJwt;
+	}
+	return TokenCheck::Ok;
+}
+
+inline const char* tokenCheckName(TokenCheck c)
+{
+	switch (c)
+	{
+		case TokenCheck::Ok:      return "ok";
+		case TokenCheck::Empty:   return "empty";
+		case TokenCheck::NotAJwt: return "not a JWT (no two dots)";
+	}
+	return "?";
+}
+
 enum class BodyStatus : std::uint8_t { Ok, ArenaFull, ReadError, Timeout };
 
 inline const char* bodyStatusName(BodyStatus s)

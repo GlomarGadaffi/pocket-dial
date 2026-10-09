@@ -1045,6 +1045,34 @@ TEST(Sos401, ACachedTokenNeverMeansAFetchBeforeThePostAndNoTokenMeansExactlyOne)
 	}
 }
 
+// ── a token is installed only if it looks like a JWT (#862) ────────────────────────────
+
+TEST(TokenCheck, AJwtShapedTokenIsAccepted)
+{
+	EXPECT_EQ(telephony::checkToken("eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjF9.c2ln"), telephony::TokenCheck::Ok);
+	EXPECT_EQ(telephony::checkToken("a.b.c"), telephony::TokenCheck::Ok);
+	EXPECT_EQ(telephony::checkToken("a.b.c.d"), telephony::TokenCheck::Ok) << "more than two dots still has two";
+}
+
+TEST(TokenCheck, AnEmptyTokenIsRejectedWithItsReason)
+{
+	// What jsonStringField() hands back for {"access_token":""}: found, a string, and nothing in it.
+	std::string json = "{\"token_type\":\"Bearer\",\"access_token\":\"\"}";
+	std::string_view tok = "x";
+	ASSERT_TRUE(telephony::jsonStringField(json.data(), json.size(), "access_token", tok));
+	EXPECT_EQ(telephony::checkToken(tok), telephony::TokenCheck::Empty);
+	EXPECT_STREQ(telephony::tokenCheckName(telephony::TokenCheck::Empty), "empty");
+}
+
+TEST(TokenCheck, ATokenWithoutTwoDotsIsRejectedWithItsReason)
+{
+	for (const char* t : {"abc", "a.b", ".", "opaque-token-with-no-dots", "a"})
+	{
+		EXPECT_EQ(telephony::checkToken(t), telephony::TokenCheck::NotAJwt) << t;
+	}
+	EXPECT_NE(std::string(telephony::tokenCheckName(telephony::TokenCheck::NotAJwt)).find("JWT"), std::string::npos);
+}
+
 // ── the bounded field scanner ──────────────────────────────────────────────────────
 
 namespace

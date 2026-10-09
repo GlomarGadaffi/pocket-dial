@@ -961,6 +961,19 @@ static bool armTokenOpTimeout(esp_http_client_handle_t client, int64_t deadlineU
 	return true;
 }
 
+// #862: only a token shaped like a JWT is installed (telephony::checkToken); an empty or garbled
+// one is logged with the reason and the caller keeps the token it has.
+static bool acceptToken(std::string_view token)
+{
+	const telephony::TokenCheck check = telephony::checkToken(token);
+	if (check != telephony::TokenCheck::Ok)
+	{
+		ESP_LOGE(TAG, "Token response rejected: access_token is %s (%u bytes), keeping the token we have",
+		         telephony::tokenCheckName(check), static_cast<unsigned>(token.size()));
+	}
+	return check == telephony::TokenCheck::Ok;
+}
+
 bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForArena)
 {
 	// #862: claim the lane's token arena before any I/O. A fetch on this lane already holds it,
@@ -1043,7 +1056,7 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 			if (status == 200)
 			{
 				std::string_view tokenStr;   // views the arena, which `lease` holds until this returns
-				if (readJsonStringField(client, lease, "access_token", tokenStr, deadlineUs))
+				if (readJsonStringField(client, lease, "access_token", tokenStr, deadlineUs) && acceptToken(tokenStr))
 				{
 					// _mutex guards _accessToken/_bearerHeader (std::strings, genuinely need it).
 					// _tokenObtainedUs/_tokenLifetimeUs are std::atomic (#344) and do not
