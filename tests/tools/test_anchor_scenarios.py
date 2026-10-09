@@ -2114,7 +2114,10 @@ class FakeProbeBoard(FakeBoard):
     # #379/#518: the GET loop with get_status / get_max_attempts
     def _call_x379(self, c):
         self.initiated(c)
-        self.answer(c)
+        if self.knobs.get("pre_answer"):                # #937: the far end has not answered yet
+            self._reply(c["req"], c["addr"], 180, "Ringing", to_tag=c["tag"])
+        else:
+            self.answer(c)
         status, budget = self.fire("get_status"), self.fire("get_max_attempts")
         threading.Thread(target=self._get_loop, args=(c, status, budget), daemon=True).start()
 
@@ -2153,6 +2156,16 @@ class FakeProbeBoard(FakeBoard):
                 self.log("TelephonyAnchor: GET stream: could not rebuild client after transport failure %s "
                          "giving up" % EM_DASH)
             self.log("TelephonyAnchor: GET (Telephony->device) stream never opened %s no inbound audio" % EM_DASH)
+            if k.get("pre_answer"):
+                # #937/#880: MediaNeverOpened on a ringing leg: the drop, 3CX's Remove, endCall, and a final
+                # 503 to the caller with no BYE (there is no dialog).
+                c["released"] = True
+                self.drop(c)
+                self.endcall(c, "anchor dropped the leg before it connected")
+                if not k.get("no_880_line"):
+                    self.log("pbx: anchor dropped a ringing outbound leg: final 503 to the caller, no BYE (#880)")
+                self.refuse(c, 503)
+                return
             if branch != "budget" or n == 240 or k.get("no_board_drop"):
                 return
             # MediaNeverOpened: RequestsHandler stops the bridge and drops the leg (no endCall);
@@ -2496,6 +2509,35 @@ class NeverOpenedTest(ProbeRunCase):
                          ("failfast", an.GET_FORBIDDEN_FAILFAST, 1, 1))
         self.assertTrue(ev["dropped_by_the_board_on_its_own"])
         self.assert_clean_probe(out)
+
+    def test_x518_pass_when_the_give_up_comes_before_the_answer(self):
+        # #937: the 403 fail-fast fires about 3 s after dial, before the far end answers: a final 503
+        # to the caller, no BYE, one drop, the ringing-leg drop line.
+        self.board.knobs["pre_answer"] = True
+        rc, out = self.go(scenario="x518_403_clean_giveup")
+        self.assertEqual(rc, 0, out)
+        ev = self.calls[0]["log"]
+        self.assertTrue(ev["pre_answer"])
+        self.assertEqual((ev["branch"], ev["max_attempt"], ev["failfast_lines"], ev["drops"]),
+                         ("failfast", an.GET_FORBIDDEN_FAILFAST, 1, 1))
+        self.assertEqual(ev["anchor_drop_880_lines"], 1)
+        self.assertEqual(self.calls[0]["final"], 503)
+        self.assertFalse(self.calls[0].get("pbx_byes"))
+        self.assert_clean_probe(out)
+
+    def test_x518_fails_before_the_answer_without_the_ringing_drop_line(self):
+        self.board.knobs["pre_answer"] = True
+        self.board.knobs["no_880_line"] = True
+        rc, out = self.go(scenario="x518_403_clean_giveup")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ringing-leg drop line is missing", out)
+
+    def test_x379_is_still_invalid_when_the_far_end_does_not_answer(self):
+        # the 404 scenario never takes the pre-answer branch: only the 403 fail-fast can end a ringing leg this way
+        self.board.knobs["pre_answer"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("the far end did not answer", out)
 
     def test_x518_invalid_when_the_budget_was_spent_instead_of_the_fail_fast(self):
         self.board.knobs["refused_status"] = 403

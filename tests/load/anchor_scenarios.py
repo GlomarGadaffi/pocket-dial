@@ -2045,7 +2045,12 @@ def never_opened_judge(run, sc, lines):
     legs = started_legs(ents)
     ev = {"legs": len(legs)}
     c["log"] = ev
-    if not answered(c):
+    # #937: since #932 the 403 fail-fast also fires before the answer (about 3 s after dial, usually
+    # before the far end picks up). A ringing leg dropped that way has no dialog to BYE: the caller
+    # gets a final 503 (#880). Only the 403 scenario can take this branch, and only with that 503.
+    pre_answer = bool(sc.get("expect_failfast")) and not answered(c) and c.get("final") == 503
+    ev["pre_answer"] = pre_answer
+    if not answered(c) and not pre_answer:
         invalid.append("the far end did not answer (final %s): a give-up would have no dialog to BYE" % c["final"])
         return fails, invalid, ev
     if len(legs) != 1:
@@ -2092,7 +2097,7 @@ def never_opened_judge(run, sc, lines):
                      % sc["get_status"])
     if sc.get("expect_failfast"):
         if branch != "failfast":
-            invalid.append("no 403 fail-fast line (branch %s): the budget was spent before the answer, or this "
+            invalid.append("no 403 fail-fast line (branch %s): the budget was spent instead, or this "
                            "image has no #902 (get_403_failfast_902 is 0)" % branch)
             return fails, invalid, ev
         if int(failfast[0][1].group(1)) != GET_FORBIDDEN_FAILFAST or int(failfast[0][1].group(3)) != n:
@@ -2119,6 +2124,24 @@ def never_opened_judge(run, sc, lines):
     if drops and not on_its_own:
         fails.append("the GET budget was spent but leg %s was dropped only by a teardown or the harness's "
                       "hangup, not by the board on its own (MediaNeverOpened, #379)" % leg)
+    if pre_answer:
+        # #937/#880: a ringing outbound leg dropped before the answer: the caller's INVITE gets a
+        # final 503 and no BYE (there is no dialog), one endCall for "anchor dropped the leg before it
+        # connected", and the board's own ringing-leg drop line.
+        ringing_drop = matches(ents, "anchor_drop_ringing_880")
+        ev.update(anchor_drop_880_lines=len(ringing_drop))
+        if not ringing_drop:
+            fails.append("the give-up came before the answer but the board's ringing-leg drop line is missing "
+                         "(final 503, no BYE, #880)")
+        if not any("before it connected" in r for _, r in ends):
+            fails.append("no endCall with reason 'anchor dropped the leg before it connected' for this call "
+                         "(reasons: %s)" % (", ".join(r for _, r in ends) or "none"))
+        if c.get("pbx_byes"):
+            fails.append("%s got %s BYE(s) for a call that never connected" % (caller.ext, c["pbx_byes"]))
+        if c.get("pcap_byes"):
+            fails.append("/api/pcap shows %s BYE(s) for a call that never connected" % c["pcap_byes"])
+        sf, si = session_problems(c, caller.ext)
+        return fails + sf, invalid + si, ev
     if t_hang is not None:
         fails.append("no BYE reached %s within the %d s cap after the give-up: the harness hung up"
                      % (caller.ext, sc["call_cap_s"]))
@@ -2147,7 +2170,8 @@ scenario(name="x518_403_clean_giveup", issues=("#518", "#379", "#902"), require_
          expect_failfast=True,
          about="x379_never_opened with every answer a 403 plus the 'GET stream refused (HTTP 403)' line (#519): "
                "%d consecutive 403s give up cleanly by the #902 fail-fast (not the 12-attempt "
-               "budget): one drop, one BYE" % GET_FORBIDDEN_FAILFAST,
+               "budget): one drop, and either one BYE (answered first) or a final 503 and no BYE "
+               "(the usual case: the give-up comes before the answer, #937)" % GET_FORBIDDEN_FAILFAST,
          path_counter="get_403_failfast_902", **NEVER_OPENED)(probe_run(never_opened_run))
 
 
