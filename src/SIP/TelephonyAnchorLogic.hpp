@@ -993,8 +993,9 @@ struct PostResult
 // settles whether a fetch really tears a live call down). Never do anything that can tear down a
 // live 911; then never refuse or delay a new one; where they conflict under uncertainty the live
 // call wins. A fetch grants a new token and Telephony drops the old one at that instant, so
-// anotherSosLive() (asked after a 401 only, because the caller's answer takes _mutex) says whether
-// another 911/933 is pending in makeCall() or has its streams up. If so this call fetches nothing,
+// anotherSosLive() says whether another 911/933 is pending in makeCall() or has its streams up
+// (the ESP arm: a pending-count read and one atomic load per call slot, no lock). It is asked after
+// a 401 only, so a POST that was not answered 401 never pays for it. When one is, this call fetches nothing,
 // retries nothing and returns the 401: it fails like any failed makecall, to #880 (NOT ROUTED). One
 // witness line names the call that lost (callId, EmergencyScope::id()) and why. Where two 911/933s
 // are pending at once each sees the other as live, so neither fetches: the ruling as given.
