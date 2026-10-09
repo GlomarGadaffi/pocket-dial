@@ -864,7 +864,9 @@ public:
 	public:
 		EmergencyScope(TokenLanes& lanes, bool active) : _lanes(active ? &lanes : nullptr)
 		{
-			if (_lanes) _lanes->_emergenciesPending.fetch_add(1, std::memory_order_acq_rel);
+			if (!_lanes) return;
+			_lanes->_emergenciesPending.fetch_add(1, std::memory_order_acq_rel);
+			_id = _lanes->_sosCalls.fetch_add(1, std::memory_order_relaxed) + 1;
 		}
 		~EmergencyScope()
 		{
@@ -873,8 +875,20 @@ public:
 		EmergencyScope(const EmergencyScope&) = delete;
 		EmergencyScope& operator=(const EmergencyScope&) = delete;
 
+		// This 911/933's number among those since boot (1, 2, ...); 0 for an ordinary call's scope.
+		// The witnesses name a call by it: makeCall() is not given the SIP Call-ID, and passing it
+		// through AnchorClient::makeCall() would touch every implementation.
+		std::uint32_t id() const { return _id; }
+
+		// Is another 911/933 makeCall() pending beside this one? The scope counts itself.
+		bool anotherPending() const
+		{
+			return _lanes && _lanes->_emergenciesPending.load(std::memory_order_acquire) > 1;
+		}
+
 	private:
-		TokenLanes* _lanes;
+		TokenLanes*   _lanes;
+		std::uint32_t _id = 0;
 	};
 
 	// False while a 911/933 makeCall() is pending, for a refresh ahead of an ordinary call. start()
@@ -893,6 +907,7 @@ private:
 	Arena                      _emergency;
 	std::atomic<std::uint32_t> _sosFallbacks{0};
 	std::atomic<int>           _emergenciesPending{0};
+	std::atomic<std::uint32_t> _sosCalls{0};
 };
 
 // What a 911/933 does about its token before its POST (#862, operator ruling on #945). With any
@@ -923,10 +938,27 @@ struct PostResult
 // answers (a second 401 included), the failed result is returned and the call fails the way any
 // failed makecall does, which the caller handles (#880): not a refusal made here, not a second
 // fetch, not a second retry. Any answer other than a 401 is returned untouched.
-template <class Fetch, class Retry>
-PostResult sosRetryOn401(PostResult first, Fetch&& fetch, Retry&& retry)
+//
+// Not while another 911/933 is live (interim operator ruling on #945; #952's hardware reproduction
+// settles whether a fetch really tears a live call down). Never do anything that can tear down a
+// live 911; then never refuse or delay a new one; where they conflict under uncertainty the live
+// call wins. A fetch grants a new token and Telephony drops the old one at that instant, so
+// anotherSosLive() (asked after a 401 only, because the caller's answer takes _mutex) says whether
+// another 911/933 is pending in makeCall() or has its streams up. If so this call fetches nothing,
+// retries nothing and returns the 401: it fails like any failed makecall, to #880 (NOT ROUTED). One
+// witness line names the call that lost (callId, EmergencyScope::id()) and why. Where two 911/933s
+// are pending at once each sees the other as live, so neither fetches: the ruling as given.
+template <class OtherLive, class Fetch, class Retry>
+PostResult sosRetryOn401(PostResult first, std::uint32_t callId, OtherLive&& anotherSosLive, Fetch&& fetch, Retry&& retry)
 {
 	if (first.ok || first.status != 401) return first;
+	if (anotherSosLive())
+	{
+		PD_WITNESS_W("e911", "token_sos_401_skip_862: 911/933 call %u lost its 401 recovery: another 911/933 is live and a "
+		                     "new token would revoke the one it holds, so no fetch and no retry; this call fails to NOT ROUTED "
+		                     "(#880) (#862)", static_cast<unsigned>(callId));
+		return first;
+	}
 	PD_WITNESS_W("e911", "token_sos_401_fetch_862: a 911/933 POST was answered 401, fetching one token on its own arena (#862)");
 	if (!fetch()) return first;
 	PD_WITNESS_W("e911", "token_sos_401_retry_862: a new token is in hand, retrying the 911/933 POST once (#862)");
