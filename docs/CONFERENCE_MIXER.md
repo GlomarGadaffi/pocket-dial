@@ -313,6 +313,15 @@ that are actually speaking. That drops the noise floor and the clip risk simulta
 the per-frame energy test is **sum-of-squares**, a clean vector MAC (`ee.vmulas.s16.accx`),
 which is the same kernel shape as a Goertzel/correlation detector.
 
+**Scalar gate shipped, default off (Issue #169).** `MixBus(bool vadGate = false)`; on, `tick()`
+asks `pd::vad::step()` (`src/SIP/VadGate.hpp`, pure) per port per frame. Energy is sum-of-squares
+in int64; the gate opens on the first loud frame and holds for `kHangoverFrames` (10 = 200 ms)
+quiet frames. A gated port's frame is zeroed before the accumulate but the port stays present,
+so it still hears the others and minus-self stays exact. `kOpenEnergy` and the hangover are
+**unmeasured placeholders** pending the .244 idle-vs-speaking energy measurement; an all-quiet room
+becomes digital silence. `MixBus::setEmergency()` exempts a port (Rule 5); no call path sets it
+today. No PIE energy kernel is built.
+
 ## 7. Integration with `MediaBridge` (the diff)
 
 **Shipped** (Issue #75). `MediaBridge` gained a BUS mode: `init()` takes an optional `MixBus*`,

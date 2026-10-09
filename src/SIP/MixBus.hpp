@@ -4,6 +4,7 @@
 #include <cstdint>
 #include "PoolConfig.hpp"     // POCKETDIAL_CONF_LEGS (#479)
 #include "PlayoutBuffer.hpp"  // pocket-dial's existing ring (src/SIP/PlayoutBuffer.hpp)
+#include "VadGate.hpp"        // #169
 
 // ── Conference mix bus ───────────────────────────────────────────────────────
 // The summing junction. Sits between the decode edge (RtpReceiver / anchor rx)
@@ -25,11 +26,18 @@ public:
     // room at boot, so unused ports were pure internal DRAM on a no-PSRAM build.
     static constexpr int MAX_PORTS = POCKETDIAL_CONF_LEGS;
 
-    MixBus() = default;
+    // vadGate (#169): when true, tick() leaves a port out of the mix while its VAD gate
+    // (VadGate.hpp) is closed. Default off: the mix is exactly the ungated sum.
+    explicit MixBus(bool vadGate = false) : _vadGate(vadGate) {}
 
     // Cold path (SIP signaling threads).
     int  attach();                 // -> portId in [0,MAX_PORTS), or -1 if full
     void detach(int port);         // non-blocking; tick reclaims at next boundary
+
+    // Rule 5 (e911): an emergency port is never VAD-gated. NO call path sets this today
+    // (888 never carries 911/933); it exists so one that does can opt out of the gate.
+    // Cleared when the slot is reclaimed.
+    void setEmergency(int port, bool on);
 
     // Hot path (decode / encode tasks). Per-port jitter-absorbing rings.
     bool inputFrame (int port, const int16_t* pcm, size_t n);  // leg -> bus
@@ -48,8 +56,11 @@ private:
         std::atomic<State> state{State::Free};
         PlayoutBuffer      in;     // leg -> bus  (the input direction a 1:1 MediaBridge doesn't need)
         PlayoutBuffer      out;    // bus -> leg  (same role as MediaBridge's playout buffer)
+        std::atomic<bool>  emergency{false};   // #169: bypasses the VAD gate; written by signaling, read by tick
+        uint8_t            hang = 0;           // #169: VAD hangover frames left; tick-only, 0 = gate closed
     };
 
+    const bool _vadGate;
     Port    _ports[MAX_PORTS];
     int32_t _mix[FRAME] = {};      // wide accumulator — clipped once, at output
 
