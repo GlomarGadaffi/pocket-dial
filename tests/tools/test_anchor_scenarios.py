@@ -585,7 +585,8 @@ class RefusalTest(unittest.TestCase):
                         call_cap_s=10, judge=lambda *a: ([], [], {}))(lambda run, sc: None)
         self.assertNotIn("x_none", an.SCENARIOS)
         # x379_cancel_before_leg joined the registry with this change (the CANCEL-before-the-leg race)
-        self.assertEqual(sorted(an.SCENARIOS), ["x279_degraded_bye", "x349_unread_makecall",
+        # h947_http_load joined the registry with #947 (the HTTP-under-load measurement; tests/tools/test_http_load.py)
+        self.assertEqual(sorted(an.SCENARIOS), ["h947_http_load", "x279_degraded_bye", "x349_unread_makecall",
                                                 "x379_cancel_before_leg", "x379_never_opened",
                                                 "x4_cancel_ringing", "x518_403_clean_giveup",
                                                 "x888_ws_upsert"])
