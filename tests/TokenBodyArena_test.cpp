@@ -1253,6 +1253,73 @@ TEST(Sos401, TheLoserOfTwoFetchesIsTurnedAwayAtTheArenaClaimAndFallsToNotRouted)
 	EXPECT_TRUE(why) << "and the line says why";
 }
 
+TEST(Sos401, TwoCallsWithNoTokenTheLoserIsRefusedAtOnceAndPostsOnTheBestTokenItHas)
+{
+	ASSERT_EQ(telephony::sosFirstStep(false), telephony::SosFirstStep::FetchThenPost);
+	auto namesOnlyCall2 = [](std::size_t& n) {
+		n = 0;
+		bool all = true;
+		for (const std::string& l : pdwitness::lines())
+		{
+			if (l.find("token_sos_claim_lost_862") == std::string::npos) continue;
+			++n;
+			all = all && l.find("call 2 ") != std::string::npos && l.find("refused at once") != std::string::npos;
+		}
+		return all;
+	};
+
+	{   // call 1's fetch is still running when call 2's POST goes out: no bearer, so a 401
+		Lanes lanes;
+		Sleeper sleeper;
+		Lanes::EmergencyScope one(lanes, true);
+		Lanes::EmergencyScope two(lanes, true);
+		Arena::Lease onesFetch = lanes.claim(TokenLane::Emergency);
+		ASSERT_TRUE(onesFetch);
+		Net net;
+		net.cachedToken.clear();
+		pdwitness::clear();
+		EXPECT_FALSE(lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper, two.id()))
+		    << "the first step's fetch is refused the arena";
+		const telephony::PostResult r = telephony::sosRetryOn401(
+		    net.post(), two.id(), [] { return 0u; },
+		    [&] {
+			    Arena::Lease l = lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper, two.id());
+			    return l ? net.fetch() : false;
+		    },
+		    [&] { return net.post(); });
+		EXPECT_EQ(sleeper.calls, 0) << "neither claim waited";
+		const std::vector<std::string> want = {"post:"};
+		EXPECT_EQ(net.events, want) << "the POST went out on the best token it has: none, so no usable bearer";
+		EXPECT_FALSE(r.ok);
+		EXPECT_EQ(r.status, 401) << "the existing failure path: the 401 step's fetch is refused too, and #880 takes it";
+		std::size_t lost = 0;
+		EXPECT_TRUE(namesOnlyCall2(lost));
+		EXPECT_EQ(lost, 2u) << "the first step's claim and the 401 step's, both naming call 2";
+	}
+	{   // call 1's fetch lands before call 2's POST goes out: the best token call 2 has is call 1's
+		Lanes lanes;
+		Sleeper sleeper;
+		Lanes::EmergencyScope one(lanes, true);
+		Lanes::EmergencyScope two(lanes, true);
+		Arena::Lease onesFetch = lanes.claim(TokenLane::Emergency);
+		ASSERT_TRUE(onesFetch);
+		Net net;
+		net.cachedToken.clear();
+		pdwitness::clear();
+		EXPECT_FALSE(lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper, two.id()));
+		net.fetch();                 // call 1's fetch lands and installs
+		onesFetch = Arena::Lease();
+		const telephony::PostResult r = telephony::sosRetryOn401(
+		    net.post(), two.id(), [] { return 0u; }, [&] { return net.fetch(); }, [&] { return net.post(); });
+		EXPECT_TRUE(r.ok);
+		const std::vector<std::string> want = {"fetch", "post:new"};
+		EXPECT_EQ(net.events, want) << "call 2 posted on call 1's token and needed no 401 step";
+		std::size_t lost = 0;
+		EXPECT_TRUE(namesOnlyCall2(lost));
+		EXPECT_EQ(lost, 1u);
+	}
+}
+
 TEST(TokenLanes, Every911ScopeGetsItsOwnNumberAndAnOrdinaryCallGetsNone)
 {
 	Lanes lanes;
