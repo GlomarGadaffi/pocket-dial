@@ -810,6 +810,32 @@ inline SosFirstStep sosFirstStep(bool haveCachedToken)
 	return haveCachedToken ? SosFirstStep::PostNow : SosFirstStep::FetchThenPost;
 }
 
+// A POST's answer, as the 401 step needs it: whether it was a 2xx, and the status (negative or 0
+// when no response was parsed).
+struct PostResult
+{
+	bool ok;
+	int  status;
+};
+
+// A 911/933's makecall POST has been sent at once on the token it had (SosFirstStep::PostNow).
+// If it was answered 401 that token was dead, and (operator ruling on #945) there is exactly one
+// recovery: ONE token fetch on the 911/933 arena (fetch(), which is bounded by
+// kSosTokenBudgetUs), then ONE retry of the POST (retry(), which must read the new bearer
+// afterwards). One witness line per step. If the fetch fails, or the retry fails whatever it
+// answers (a second 401 included), the failed result is returned and the call fails the way any
+// failed makecall does, which the caller handles (#880): not a refusal made here, not a second
+// fetch, not a second retry. Any answer other than a 401 is returned untouched.
+template <class Fetch, class Retry>
+PostResult sosRetryOn401(PostResult first, Fetch&& fetch, Retry&& retry)
+{
+	if (first.ok || first.status != 401) return first;
+	PD_WITNESS_W("e911", "token_sos_401_fetch_862: a 911/933 POST was answered 401, fetching one token on its own arena (#862)");
+	if (!fetch()) return first;
+	PD_WITNESS_W("e911", "token_sos_401_retry_862: a new token is in hand, retrying the 911/933 POST once (#862)");
+	return retry();
+}
+
 // ── A 911/933 token fetch has an overall deadline (#862, Rule 5) ─────────────────
 // The HTTP client's timeouts are per operation (connect and handshake, the request, the response
 // headers, each body read), so a fetch of four or more operations at 2 s each can run for ten

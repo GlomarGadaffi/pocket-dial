@@ -390,6 +390,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		return _wsSeq;
 	};
 	uint64_t postSeq = readPostSeq();
+	std::string postedUrl = makeCallUrl;   // the URL of the latest POST: a 401 retry (#862) goes back to it
 	bool success = httpPostBody(makeCallUrl, "application/json", postData, respBody, &status, &requestSent);
 
 	// A device-path 404 means the cached device_id went stale (registration flap). Re-resolve once
@@ -411,15 +412,37 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		{
 			status = 0; respBody.clear(); requestSent = false;
 			postSeq = readPostSeq();
-			success = httpPostBody(deviceUrl(freshId), "application/json", postData, respBody, &status, &requestSent);
+			postedUrl = deviceUrl(freshId);
+			success = httpPostBody(postedUrl, "application/json", postData, respBody, &status, &requestSent);
 		}
 		if (!success)
 		{
 			ESP_LOGW(TAG, "makeCall: falling back to legacy makecall endpoint");
 			status = 0; respBody.clear(); requestSent = false;
 			postSeq = readPostSeq();
-			success = httpPostBody(legacyUrl, "application/json", postData, respBody, &status, &requestSent);
+			postedUrl = legacyUrl;
+			success = httpPostBody(postedUrl, "application/json", postData, respBody, &status, &requestSent);
 		}
+	}
+
+	// #862 (Rule 5, operator ruling on #945): a 911/933 POST answered 401 went out on a dead
+	// token. Exactly one token fetch on the 911/933 arena (inside kSosTokenBudgetUs), then
+	// exactly one retry of the POST, which httpPostBody() sends with _bearerHeader read again.
+	// A fetch or a retry that fails leaves `success` false, and the call fails the way any failed
+	// makecall does (the #880 handling is the caller's): no second retry, no refusal made here.
+	if (sosDial)
+	{
+		const telephony::PostResult after = telephony::sosRetryOn401(
+		    telephony::PostResult{success, status},
+		    [this] { return fetchToken(telephony::TokenLane::Emergency); },
+		    [&] {
+			    status = 0; respBody.clear(); requestSent = false;
+			    postSeq = readPostSeq();
+			    success = httpPostBody(postedUrl, "application/json", postData, respBody, &status, &requestSent);
+			    return telephony::PostResult{success, status};
+		    });
+		success = after.ok;
+		status = after.status;
 	}
 
 #if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)

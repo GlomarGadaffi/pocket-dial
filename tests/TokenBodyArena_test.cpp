@@ -700,6 +700,152 @@ TEST(TokenLanes, AServerThatStallsEveryOperationCannotTakeMoreThanTheBudget)
 	}
 }
 
+// ── a 911/933 POST answered 401: one fetch, one retry (#862, operator ruling on #945) ─────
+// makeCall() (ESP arm) drives telephony::sosRetryOn401 with the real fetchToken() and
+// httpPostBody(); here both are a small fake "network" whose bearer is read at each POST, as
+// httpPostBody() does. What happens after a failure here (the final response to the caller, the
+// NOT ROUTED correction) is RequestsHandler's, pinned by the #880 tests in EmergencyNotify_test.cpp;
+// these tests pin that the failed result comes back unchanged and that nothing retries again.
+
+namespace
+{
+	struct Net
+	{
+		std::string              cachedToken = "old";   // _bearerHeader
+		std::string              grantedByFetch = "new";
+		bool                     fetchLands = true;
+		bool                     retryFails = false;    // the second POST answers retryAnswer, whatever the bearer
+		int                      retryAnswer = 0;
+		std::vector<std::string> events;                // "post:<bearer>" and "fetch", in order
+		int                      fetches = 0, posts = 0;
+
+		// 200 iff the bearer is the one a fetch grants, else 401: a dead token.
+		telephony::PostResult post()
+		{
+			++posts;
+			events.push_back("post:" + cachedToken);
+			if (retryFails && posts > 1) return {false, retryAnswer};
+			return cachedToken == grantedByFetch ? telephony::PostResult{true, 200} : telephony::PostResult{false, 401};
+		}
+		bool fetch()
+		{
+			++fetches;
+			events.push_back("fetch");
+			if (fetchLands) cachedToken = grantedByFetch;
+			return fetchLands;
+		}
+	};
+
+	// The sequence makeCall() runs for a 911/933: the first step by token state, the first POST,
+	// then the 401 step on whatever the POST answered.
+	telephony::PostResult sosDial(Net& n, bool haveToken)
+	{
+		if (telephony::sosFirstStep(haveToken) == telephony::SosFirstStep::FetchThenPost) n.fetch();
+		const telephony::PostResult first = n.post();
+		return telephony::sosRetryOn401(first, [&] { return n.fetch(); }, [&] { return n.post(); });
+	}
+}
+
+TEST(Sos401, FetchAfter401SucceedsAndTheRetryUsesTheNewToken)
+{
+	Net net;
+	pdwitness::clear();
+	const telephony::PostResult r = sosDial(net, /*haveToken=*/true);
+	EXPECT_TRUE(r.ok);
+	EXPECT_EQ(r.status, 200);
+	const std::vector<std::string> want = {"post:old", "fetch", "post:new"};
+	EXPECT_EQ(net.events, want) << "the first POST goes out at once on the cached token, then one fetch, then one retry";
+	EXPECT_EQ(net.fetches, 1);
+	EXPECT_EQ(net.posts, 2);
+	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 1u);
+}
+
+TEST(Sos401, AFetchThatFailsLeavesTheFailedPostAndTheCallFailsLikeAnyFailedMakecall)
+{
+	Net net;
+	net.fetchLands = false;
+	pdwitness::clear();
+	const telephony::PostResult r = sosDial(net, true);
+	EXPECT_FALSE(r.ok);
+	EXPECT_EQ(r.status, 401) << "the caller sees the 401 it would have seen, and handles it as a failed makecall (#880)";
+	const std::vector<std::string> want = {"post:old", "fetch"};
+	EXPECT_EQ(net.events, want) << "no retry without a new token";
+	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 0u);
+}
+
+TEST(Sos401, ARetryThatFailsIsTheEndNoSecondFetchAndNoSecondRetry)
+{
+	for (const int retryAnswer : {401, 403, 500, -1})
+	{
+		Net net;
+		net.retryFails = true;
+		net.retryAnswer = retryAnswer;
+		pdwitness::clear();
+		const telephony::PostResult r = sosDial(net, true);
+		EXPECT_FALSE(r.ok) << retryAnswer;
+		EXPECT_EQ(r.status, retryAnswer) << "the retry's own answer is what the caller handles";
+		EXPECT_EQ(net.fetches, 1) << retryAnswer;
+		EXPECT_EQ(net.posts, 2) << retryAnswer << ": exactly one retry, even when it is a 401 again";
+		EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 1u);
+		EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 1u);
+	}
+}
+
+TEST(Sos401, AnyAnswerButA401IsReturnedUntouchedWithNoFetchAndNoWitness)
+{
+	using telephony::PostResult;
+	for (const PostResult first : {PostResult{true, 200}, PostResult{true, 201}, PostResult{false, 403},
+	                               PostResult{false, 404}, PostResult{false, 500}, PostResult{false, -1},
+	                               PostResult{false, 0}})
+	{
+		int fetches = 0, retries = 0;
+		pdwitness::clear();
+		const PostResult r = telephony::sosRetryOn401(
+		    first, [&] { ++fetches; return true; }, [&] { ++retries; return PostResult{true, 200}; });
+		EXPECT_EQ(r.ok, first.ok);
+		EXPECT_EQ(r.status, first.status);
+		EXPECT_EQ(fetches + retries, 0) << first.status;
+		EXPECT_EQ(pdwitness::count("_862"), 0u) << first.status;
+	}
+}
+
+TEST(Sos401, ACachedTokenNeverMeansAFetchBeforeThePostAndNoTokenMeansExactlyOne)
+{
+	{   // alive: one POST, no fetch at all
+		Net net;
+		net.grantedByFetch = "old";
+		const telephony::PostResult r = sosDial(net, true);
+		EXPECT_TRUE(r.ok);
+		const std::vector<std::string> want = {"post:old"};
+		EXPECT_EQ(net.events, want);
+	}
+	{   // dead: the POST goes first, the fetch only after its 401
+		Net net;
+		sosDial(net, true);
+		ASSERT_FALSE(net.events.empty());
+		EXPECT_EQ(net.events.front(), "post:old") << "never a fetch ahead of the POST";
+	}
+	{   // no token: the one inline fetch, then the POST on what it granted, and no 401 step to spend
+		Net net;
+		net.cachedToken.clear();
+		const telephony::PostResult r = sosDial(net, false);
+		EXPECT_TRUE(r.ok);
+		const std::vector<std::string> want = {"fetch", "post:new"};
+		EXPECT_EQ(net.events, want);
+	}
+	{   // no token and the inline fetch fails: still POSTs (Rule 5), 401, and then the one recovery
+		Net net;
+		net.cachedToken.clear();
+		net.fetchLands = false;
+		const telephony::PostResult r = sosDial(net, false);
+		EXPECT_FALSE(r.ok);
+		const std::vector<std::string> want = {"fetch", "post:", "fetch"};
+		EXPECT_EQ(net.events, want) << "it dialled without a token rather than refusing, then recovered once";
+	}
+}
+
 // ── the bounded field scanner ──────────────────────────────────────────────────────
 
 namespace
