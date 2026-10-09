@@ -115,6 +115,9 @@ add_executable(sip_parser_tests
     Invite777SessionPool_test.cpp
     # Issue #172: RFC 3262 Require: 100rel is honoured on the 777 echo route only.
     Prack100rel_test.cpp
+    # Issue #172 step 3: with the default-off flag, a plain extension call carrying
+    # Require: 100rel is forwarded without it and its 180 is made reliable here.
+    Forward100rel_test.cpp
     # Relay codec policy: filterAudioCodecs()/offersSupportedAudio() replaced the
     # blind enforceG711() "0 8 101" rewrite on peer-to-peer legs -- offer order
     # preserved, G.722 admitted, unsupported payloads (and their rtpmap/fmtp)

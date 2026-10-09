@@ -765,6 +765,11 @@ public:
 	// Trunk dial-plan rule) may still depend on it.
 	std::string setSbcMode(bool enabled, size_t route);
 
+	// ── RFC 3262 100rel on a forwarded call (Issue #172, step 3) ──────────────
+	// Off in a shipped image; in memory only (see PbxFeatureConfig::setForward100rel()).
+	bool getForward100rel();
+	void setForward100rel(bool on);
+
 #if POCKETDIAL_MULTICAST_PAGING
 	// ── Multicast paging (Issue #800) ─────────────────────────────────────────
 	// "" on success, else why the config was refused (it is then unchanged). A
@@ -1074,7 +1079,9 @@ private:
 	void onMessage(std::shared_ptr<SipMessage> data); // inbound MESSAGE (RFC 3428): ack 200 OK
 	void onReinvite(std::shared_ptr<SipMessage> data);  // mid-dialog re-INVITE (hold/resume, RFC 3261 §14)
 	void onUpdate(std::shared_ptr<SipMessage> data);    // RFC 3311 mid-dialog UPDATE
-	void onPrack(std::shared_ptr<SipMessage> data);     // RFC 3262 PRACK: answered on the 777 echo test's own dialog only (#172)
+	void onPrack(std::shared_ptr<SipMessage> data);     // RFC 3262 PRACK: answered on the 777 echo test's own dialog, and on a relayed call whose caller required 100rel (#172)
+	// #172 step 3: the PRACK of a relayed call whose caller required 100rel (Session::isForwardedReliable).
+	void answerForwardedPrack(const std::shared_ptr<SipMessage>& data, const std::shared_ptr<Session>& session);
 
 	// Issue #218: onReinvite()/onUpdate() share this for the anchored-media
 	// (555) leg. The board built the ORIGINAL 200 OK for that leg itself
@@ -1973,6 +1980,16 @@ private:
 	// callback by #659's window (#818) or a 911 a dial-plan rule produces (#834).
 	// Caller holds _mutex.
 	bool isEmergencyTraffic(const SipMessage& m);
+
+	// Issue #172 step 3, RFC 3262 §3: with the default-off flag on, does the PBX take over 100rel for this
+	// INVITE instead of answering 420? True only for a plain call from a registered phone to another
+	// registered extension, the one route that forwards the caller's INVITE to a single phone and relays
+	// its answers back. Everything else keeps its 420: ring and hunt groups, paging, call forward (a
+	// redirect allocates a fresh Session, which would lose the state), dial rules, the special extensions,
+	// the trunk, and all emergency traffic (isEmergencyTraffic, a PSAP callback included). handle()'s
+	// header gate and onInvite's forward path both ask this, so the two cannot disagree. The exclusion list
+	// mirrors dialRuleMakesEmergency()'s, which mirrors onInvite's dispatch order. Caller holds _mutex.
+	bool forwardHonours100rel(const SipMessage& m);
 	// #897: a response to OUR trunk INVITE for a live emergency session (keyed
 	// on our trunk dialog's Call-ID and its carrier's address, never on To).
 	// The SDP gate yields every verdict for it. Caller holds _mutex.
@@ -2314,6 +2331,10 @@ private:
 
 	void endHandle(std::string_view destNumber, std::shared_ptr<SipMessage> message);
 	std::string buildContact(std::string_view number) const;
+	// Sets `msg`'s Contact to the one buildContact(number) builds, writing the line in its own buffer
+	// instead of through a temporary string (#172 step 3: once per reliable 180, #284). Falls back to
+	// buildContact() for a number too long for the stack buffer.
+	void presentContact(SipMessage& msg, std::string_view number) const;
 
 	bool isValidAor(std::string_view s) const;
 	void queueLog(std::string msg, bool isError = false);

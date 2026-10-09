@@ -55,6 +55,10 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_echoDialog = false;      // #172
 	_prackRSeq = 0;           // #172
 	_prackCSeq = 0;           // #172
+	_fwdReliable = false;     // #172 step 3
+	_fwdPending = false;
+	_fwdCSeq = 0;
+	_fwdRSeq = 0;
 	_rtpWatchArmed = false;   // #604
 
 	// Issue #353. These survived reset() and nothing else ever cleared them --
