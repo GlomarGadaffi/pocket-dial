@@ -455,22 +455,14 @@ public:
 	//
 	// Where a 911/933 dial can go right now. Anchor: the boot-selected
 	// telephony provider places real calls (telephonyProviderPlacesRealCalls).
-	// Trunk: no such anchor, but a valid generic SIP trunk is configured.
-	// None: neither -- the board has only the loopback simulator, which answers
-	// every call it is handed, so an emergency dial is refused with 503 rather
-	// than "connected" to nothing. /api/status reports this so the dashboard
-	// can keep a warning up for as long as it is None, and
-	// applyStoredTrunkConfig() logs a WARN at boot and on every trunk save that
-	// leaves it None. Anchor with a trunk also configured still reports Anchor;
-	// routeEmergencyCall() falls through to the trunk when that anchor is down.
-	// Issue #546: TrunkUnverified -- a valid trunk is CONFIGURED but has not
-	// answered a single INVITE 2xx since boot (or since its config last
-	// changed). Routing is the same as Trunk (the call is still tried); the
-	// report differs because "configured" is not "can complete a call": the
-	// generic trunk cannot answer a 401/407 yet (#399), so a digest-auth
-	// carrier fails every 911 with 502 while the route read "trunk".
+	// None: no such anchor -- the board has only the loopback simulator, which
+	// answers every call it is handed, so an emergency dial is refused with 503
+	// rather than "connected" to nothing. A SIP trunk never carries 911/933
+	// (desmo, 2026-10-08), so a configured trunk does not make a route.
+	// /api/status reports this so the dashboard can keep a warning up for as
+	// long as it is None, and applyStoredTrunkConfig() logs a WARN at boot.
 	// Takes _mutex, so it must NOT be called with _mutex already held.
-	enum class EmergencyRoute : uint8_t { None, Anchor, Trunk, TrunkUnverified };
+	enum class EmergencyRoute : uint8_t { None, Anchor };
 	EmergencyRoute emergencyRoute();
 	// #652: true while any 911/933 session is live (Session::isEmergency(), #604).
 	// A reboot or factory reset checks this first. Takes _mutex, like emergencyRoute().
@@ -486,7 +478,7 @@ public:
 			if (s && s->isEmergency()) return true;
 		return false;
 	}
-	// "anchor", "trunk", "trunk-unverified" or "none": the /api/status spelling.
+	// "anchor" or "none": the /api/status spelling.
 	static const char* emergencyRouteName(EmergencyRoute r);
 
 	// #657: the anchor's call-control pool (see startTelCtl()). makeCall and
@@ -919,6 +911,26 @@ public:
 	bool sendMessageToForTest(const std::string& ext, const std::string& text)
 	{
 		return sendMessageTo(ext, text);
+	}
+
+	// Test-only (#930): placeSipTrunkCall() is private and its one caller,
+	// routeTrunkCall(), classifies an emergency destination first, so this is the
+	// only way a test reaches the backstop inside it. Drains the way handle()
+	// does. Not compiled into device firmware.
+	bool placeSipTrunkCallForTest(const std::shared_ptr<SipMessage>& data,
+	                              const std::string& callerExt, const std::string& destination,
+	                              bool* placedOut)
+	{
+		bool handled = false;
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			auto caller = findClient(callerExt);
+			if (!caller.has_value()) return false;
+			handled = placeSipTrunkCall(data, caller.value(), destination, placedOut);
+			drainPassLocked(_rxOutboxScratch, _rxLogScratch);
+		}
+		flushPass(_rxOutboxScratch, _rxLogScratch);
+		return handled;
 	}
 
 	// Test-only (issue #379): what the anchor event callback does on
@@ -2005,12 +2017,13 @@ private:
 	EmergencyRoute emergencyRouteLocked() const;
 
 	// The generic-SIP-trunk half of routeTrunkCall(): everything after its
-	// "is a trunk configured" check. Split out so routeEmergencyCall() can
-	// reach the trunk directly (Issue #521) and learn whether a carrier INVITE
-	// actually went out -- routeTrunkCall()'s bool, like originateAnchorCall()'s,
-	// means only "took ownership of the INVITE". `placedOut`, when non-null, is
-	// true only on the one path that hands the call to the carrier. Caller
-	// holds _mutex.
+	// "is a trunk configured" check. Split out so a caller can learn whether a
+	// carrier INVITE actually went out -- routeTrunkCall()'s bool, like
+	// originateAnchorCall()'s, means only "took ownership of the INVITE".
+	// `placedOut`, when non-null, is true only on the one path that hands the
+	// call to the carrier. A 911/933 (by `destination` or by isEmergencyTraffic())
+	// is never handed over (#930): it is answered 503, placedOut stays false, and
+	// the return is true. Caller holds _mutex.
 	bool placeSipTrunkCall(const std::shared_ptr<SipMessage>& data,
 		const std::shared_ptr<SipClient>& caller, const std::string& destination,
 		bool* placedOut);
@@ -2722,10 +2735,6 @@ private:
 	// window. Written by routeEmergencyCall(), read where an inbound call to an
 	// extension creates its session (isEmergencyCallback()); under _mutex.
 	pbx::EmergencyCallbacks _emergencyCallbacks;
-	// Issue #546: the SIP trunk has answered an INVITE with a 2xx since boot /
-	// since setTrunkConfig(). Set in onTrunkAnswered(), cleared by
-	// setTrunkConfig(); under _mutex.
-	bool _trunkVerified = false;
 
 	// Stage B of the TelephonyAnchorClient port: sends that originate OFF the SIP
 	// receive thread (the CallEvent callback, which runs on the anchor's own WS

@@ -4743,11 +4743,6 @@ namespace
 		const size_t end = to.find_first_of("@;>");
 		return end == std::string_view::npos ? std::string() : std::string(to.substr(0, end));
 	}
-	constexpr std::string_view kAnchorThenTrunkRefused =
-		"the 3CX anchor could not place the call; the trunk refused it";
-	constexpr std::string_view kAnchorNoTrunk =
-		"the 3CX anchor could not place the call; no trunk is configured";
-	constexpr std::string_view kTrunkRefused = "the trunk refused it";
 }
 
 // ── Emergency call routing (Issue #166) ──────────────────────────────────────
@@ -4777,10 +4772,9 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// The loopback simulator answers whatever it is handed, so giving it 911
 	// "connects" the caller to nothing: they wait on a line no one will pick
 	// up instead of reaching for another phone. That is worse than any
-	// refusal. Order: a real anchor first (it is what has always carried 911,
-	// and when it is down it returns having sent nothing, so a fallback is
-	// still possible); then the generic SIP trunk, whose refusals answer the
-	// INVITE themselves and so must come last; then the 503 below.
+	// refusal. The real anchor is the only route: when it is down it returns
+	// having sent nothing, and the 503 below answers. No SIP trunk fallback
+	// (desmo, 2026-10-08).
 	const EmergencyRoute route = emergencyRouteLocked();
 	// #604: flag the session the route just made, so tick()'s RTP-inactivity
 	// reap never hangs up a 911 (the dialed number alone misses a dial-plan
@@ -4806,8 +4800,8 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		// takes its shared_ptr by value, and `data` is still needed below.
 		// #878 Phase A: only a refusal that sent nothing (the anchor not
 		// connected, or a capacity refusal before dispatch) sets the flag, and
-		// only then may the trunk below take the call. Any other false return is
-		// the anchor's own answer: never a second route (review S-B3).
+		// only then does the 503 below answer. Any other false return is the
+		// anchor's own answer: never a second route (review S-B3).
 		bool refusedBeforeDispatch = false;
 		const bool owned = originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false,
 			&placed, &codecRejected, &refusedBeforeDispatch);
@@ -4830,36 +4824,9 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		}
 	}
 
-	// A codec-rejected offer is not retried on the trunk: the trunk RELAYS the
-	// handset's audio rather than transcoding it, so an offer the anchor cannot
-	// carry is no better there, and the 503 below says exactly why.
-	//
-	if (!codecRejected && _sipTrunk.config().valid())
-	{
-		// #538 review M1: the anchor's gate only runs when the anchor is real AND
-		// up, so the trunk needs its own. onTrunkAnswered answers the handset with
-		// buildMediaSdp's PCMU-only SDP, so a PCMA- or G.722-only 911 would
-		// otherwise CONNECT with dead audio while the front desk is told ROUTED TO
-		// TRUNK. Checked here, inside the trunk branch, so a board with no route
-		// at all still says "no emergency route configured" below.
-		if (data->hasSdp() &&
-			!data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
-		{
-			codecRejected = true;   // the 503 below says why
-		}
-		else
-		{
-			// Always owns the INVITE: every refusal on this path answers it, and
-			// logs which one it was ("trunk: <why> for <ext> -> 911").
-			(void)placeSipTrunkCall(data, caller, bare, &placed);
-			markEmergency();   // #604
-			const std::string_view note = route == EmergencyRoute::Anchor
-				? (placed ? kAnchorNotPlaced : kAnchorThenTrunkRefused)
-				: (placed ? std::string_view() : kTrunkRefused);
-			notifyEmergency(emergency, from, dialed, /*routed=*/placed, note);
-			return;
-		}
-	}
+	// No trunk fallback: a 911/933 never goes out over a real SIP trunk (desmo,
+	// 2026-10-08). The anchor is the only route; when it takes nothing the 503
+	// below says so.
 
 	// ── No route. 503, and specifically not 404 ──────────────────────────────
 	//
@@ -4892,15 +4859,12 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// actually went wrong -- a codec-rejected offer is not a trunk outage, and
 	// telling the caller's UA the wrong reason is the same honesty failure the
 	// 503-vs-404 rationale above was written to avoid.
-	const char* warningDetail = codecRejected
+	const std::string warningDetail = codecRejected
 		? "no G.711 codec offered"
 		: (route == EmergencyRoute::None
 			? "no emergency route configured"   // Issue #521: loopback only
-			: "no outbound trunk connected");
-	// Only the anchor route reaches here with neither a codec nor a missing
-	// route to blame: its anchor took nothing and no trunk is configured.
-	const std::string_view notRouted = (!codecRejected && route == EmergencyRoute::Anchor)
-		? kAnchorNoTrunk : std::string_view(warningDetail);
+			: "the 3CX anchor could not place the call");
+	const std::string_view notRouted = warningDetail;
 	auto response = getMessageFromPool(*data);
 	if (!response)
 	{
@@ -12963,8 +12927,6 @@ void RequestsHandler::setTrunkConfig(const SipTrunk::Config& cfg)
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
-	// Issue #546: and whatever proved the OLD trunk proves nothing about this one.
-	_trunkVerified = false;
 }
 
 SipTrunk::Config RequestsHandler::getTrunkConfig()
@@ -13025,8 +12987,6 @@ void RequestsHandler::applyStoredTrunkConfig()
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
-	// Issue #546: and whatever proved the OLD trunk proves nothing about this one.
-	_trunkVerified = false;
 
 	// Checked, not discarded. The HTTP route caps the password well below
 	// kMaxSecret, but this path reads raw NVS, which an older or different
@@ -13050,7 +13010,7 @@ void RequestsHandler::applyStoredTrunkConfig()
 	{
 		queueLog("WARN: EMERGENCY CALLING IS NOT CONFIGURED -- 911/933 calls will be "
 		         "refused (503). Only the loopback test provider is present; configure "
-		         "a SIP trunk (/setup/trunk) or a telephony provider.", true);
+		         "a telephony provider (the 3CX anchor). A SIP trunk never carries 911.", true);
 	}
 }
 
@@ -13062,10 +13022,8 @@ RequestsHandler::EmergencyRoute RequestsHandler::emergencyRoute()
 
 RequestsHandler::EmergencyRoute RequestsHandler::emergencyRouteLocked() const
 {
-	if (_anchorPlacesRealCalls) return EmergencyRoute::Anchor;
-	if (_sipTrunk.config().valid())
-		return _trunkVerified ? EmergencyRoute::Trunk : EmergencyRoute::TrunkUnverified;
-	return EmergencyRoute::None;
+	// Only the 3CX anchor carries 911/933. A SIP trunk never does (desmo, 2026-10-08).
+	return _anchorPlacesRealCalls ? EmergencyRoute::Anchor : EmergencyRoute::None;
 }
 
 const char* RequestsHandler::emergencyRouteName(EmergencyRoute r)
@@ -13073,8 +13031,6 @@ const char* RequestsHandler::emergencyRouteName(EmergencyRoute r)
 	switch (r)
 	{
 	case EmergencyRoute::Anchor: return "anchor";
-	case EmergencyRoute::Trunk:  return "trunk";
-	case EmergencyRoute::TrunkUnverified: return "trunk-unverified";
 	case EmergencyRoute::None:   return "none";
 	}
 	return "none";
@@ -13562,6 +13518,25 @@ bool RequestsHandler::placeSipTrunkCall(const std::shared_ptr<SipMessage>& data,
 	// the call to the carrier, and only that one sets it.
 	if (placedOut) *placedOut = false;
 
+	// Backstop (#930, #873): a 911/933 never goes over a real trunk, whoever
+	// called. routeTrunkCall() classifies first and hands it to the anchor; this
+	// holds for a caller that does not, as originateAnchorCall() holds for the
+	// anchor. Before any state: nothing to unwind. Same 503 as routeEmergencyCall().
+	if (pbx::classifyEmergencyDial(destination).isEmergency || isEmergencyTraffic(*data))
+	{
+		if (auto msg = getMessageFromPool(*data))   // pool exhausted: drop, peer retransmits (#101A)
+		{
+			msg->setHeader("SIP/2.0 503 Emergency Call Not Routable");
+			msg->clearBody();
+			msg->addHeader("Warning", "399 " + _localIp +
+				" \"Emergency call could not be routed: a 911/933 never goes over a trunk\"");
+			msg->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+			_outbox.emplace_back(data->getSource(), std::move(msg));
+		}
+		queueLog("trunk: a 911/933 never goes over a trunk", true);
+		return true;
+	}
+
 	const std::string callID(data->getCallID());
 
 	auto refuse = [&](const char* statusLine, const char* why) {
@@ -13778,10 +13753,6 @@ void RequestsHandler::onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyM
 void RequestsHandler::onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 	const std::shared_ptr<SipMessage>& ok)
 {
-	// Issue #546: a carrier 2xx to our INVITE is the proof "configured" lacks.
-	// Recorded before anything below can bail out: the route works whether or
-	// not this particular handset leg is still there to connect.
-	_trunkVerified = true;
 	const std::string handsetCallID(ev.handsetCallID);
 	auto sit = _sessions.find(handsetCallID);
 	if (sit == _sessions.end() || !sit->second) return;

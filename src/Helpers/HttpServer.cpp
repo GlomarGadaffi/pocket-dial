@@ -2192,7 +2192,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 #else
 	json.s("\"wifiCapable\":false,");
 #endif
-	// Issue #521: where a 911 dial would go -- "anchor", "trunk" or "none".
+	// Issue #521: where a 911 dial would go -- "anchor" or "none".
 	// "none" means the board refuses it with 503 (only the loopback simulator
 	// is configured), and the dashboard keeps a warning banner up for as long
 	// as it says so. Ungated like the rest of this block: whether this phone
