@@ -26,6 +26,7 @@
 
 #include "AllocCounter.hpp"
 #include "TelephonyAnchorLogic.hpp"
+#include "Witness.hpp"
 
 namespace
 {
@@ -389,6 +390,13 @@ namespace
 		Arena::Lease again = lanes.claim(TokenLane::Emergency);
 		EXPECT_TRUE(again) << "a failed 911/933 read must not leave its arena claimed";
 		EXPECT_EQ(again.size(), 0u);
+
+		// The failed read installed nothing, so the 911/933 dials on the token it had: here one
+		// with 4 minutes of life, inside the 5 minute refresh margin. It dials, and leaves the witness.
+		constexpr std::int64_t kMin = 60LL * 1000000;
+		pdwitness::clear();
+		lanes.noteSosDial(telephony::tokenIsExpiringSoon(156 * kMin, 100 * kMin, 60 * kMin, 5 * kMin));
+		EXPECT_EQ(pdwitness::count("token_sos_fallback_862"), 1u);
 	}
 }
 
@@ -575,6 +583,72 @@ TEST(TokenLanes, TheTwoArenasAreTheWholeCost)
 	EXPECT_LE(sizeof(Arena), kN + 1 + 3 * sizeof(void*));
 	EXPECT_GE(sizeof(Lanes), 2 * sizeof(Arena));
 	EXPECT_LE(sizeof(Lanes), 2 * sizeof(Arena) + 16) << "two arenas and nothing that grows";
+}
+
+// ── a 911/933 with a token POSTs at once; no token is the only reason to fetch first ─────
+
+TEST(TokenLanes, ASosDialWithAnyCachedTokenNeverFetchesFirstWhateverItsAge)
+{
+	using telephony::SosFirstStep;
+	constexpr std::int64_t kMinute = 60LL * 1000000;
+	constexpr std::int64_t kMargin = 5 * kMinute;
+	// A token fetched at t=100 min with an hour of life: fresh, near expiry, just expired, long dead.
+	for (const std::int64_t nowMin : {100, 140, 156, 160, 161, 400})
+	{
+		const bool cached = true;
+		const bool stale = telephony::tokenIsExpiringSoon(nowMin * kMinute, 100 * kMinute, 60 * kMinute, kMargin);
+		EXPECT_EQ(telephony::sosFirstStep(cached), SosFirstStep::PostNow)
+		    << "at " << nowMin << " min (stale=" << stale << ") a 911/933 still POSTs at once, 401 is how it learns";
+	}
+	EXPECT_EQ(telephony::sosFirstStep(false), SosFirstStep::FetchThenPost) << "no token at all is the one exception";
+}
+
+TEST(TokenLanes, NoFreshTokenReachesTheWitnessFirstThenEverySixteenth)
+{
+	constexpr std::int64_t kMinute = 60LL * 1000000;
+	constexpr std::int64_t kMargin = 5 * kMinute;
+	// The three states with no fresh token: never fetched, inside the refresh margin, past expiry.
+	struct State { std::int64_t now, obtained, lifetime; const char* what; };
+	const State states[] = {
+	    {1000, 0, 0, "never fetched"},
+	    {156 * kMinute, 100 * kMinute, 60 * kMinute, "4 minutes of life left"},
+	    {300 * kMinute, 100 * kMinute, 60 * kMinute, "expired"},
+	};
+	for (const State& s : states)
+	{
+		Lanes lanes;
+		pdwitness::clear();
+		const bool stale = telephony::tokenIsExpiringSoon(s.now, s.obtained, s.lifetime, kMargin);
+		ASSERT_TRUE(stale) << s.what;
+		lanes.noteSosDial(stale);
+		EXPECT_EQ(pdwitness::count("token_sos_fallback_862"), 1u) << s.what << ": the first fallback of a boot is logged";
+		for (int i = 2; i <= 40; ++i) lanes.noteSosDial(stale);
+		EXPECT_EQ(pdwitness::count("token_sos_fallback_862"), 3u) << s.what << ": calls 1, 17 and 33 of 40";
+	}
+	// The line carries no number or credential (Witness.hpp): the only digits are the issue number
+	// and the 911/933 it names. And nothing in it reads as the harness's upset counter.
+	pdwitness::clear();
+	Lanes lanes;
+	lanes.noteSosDial(true);
+	const std::vector<std::string> lines = pdwitness::lines();
+	ASSERT_EQ(lines.size(), 1u);
+	std::string body = lines[0].substr(lines[0].find(": ") + 2);   // past the "e911" tag
+	for (const char* known : {"862", "911/933"})
+	{
+		for (std::size_t p; (p = body.find(known)) != std::string::npos;) body.erase(p, std::strlen(known));
+	}
+	EXPECT_EQ(body.find_first_of("0123456789"), std::string::npos) << lines[0];
+	EXPECT_EQ(lines[0].find("pset"), std::string::npos);
+}
+
+TEST(TokenLanes, AFreshTokenLeavesNoWitnessAndSpendsNoSample)
+{
+	Lanes lanes;
+	pdwitness::clear();
+	for (int i = 0; i < 100; ++i) lanes.noteSosDial(false);
+	EXPECT_EQ(pdwitness::count("token_sos_fallback_862"), 0u);
+	lanes.noteSosDial(true);
+	EXPECT_EQ(pdwitness::count("token_sos_fallback_862"), 1u) << "fresh dials did not use up the first sample";
 }
 
 // ── the 911/933 fetch's overall deadline (#862, Rule 5) ──────────────────────────────

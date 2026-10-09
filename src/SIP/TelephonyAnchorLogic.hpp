@@ -9,7 +9,9 @@
 // but never exercised the logic — the exact bug class issue #40 fixed.
 //
 // This header extracts those three concerns as DEPENDENCY-FREE free functions
-// (C++17 stdlib only — no cJSON, no mbedTLS, no ESP headers) so the same code
+// (C++17 stdlib only — no cJSON, no mbedTLS; the one ESP header is Witness.hpp,
+// which pulls esp_log.h on the board and a host ring in tests, and is only for
+// the 911/933 path witnesses of #862) so the same code
 // runs on the device AND in the host GoogleTest suite. The ESP .cpp arm calls
 // these for the URL builders, the entity-path parse and the token's JWT lifetime
 // (decodeJwtLifetimeUs: a self-contained base64url + a minimal exp/iat scan; the
@@ -27,6 +29,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "Witness.hpp"   // #862: the 911/933 token witnesses (one-line, no numbers)
 
 namespace telephony
 {
@@ -772,12 +776,39 @@ public:
 		return lease;
 	}
 
+	// A 911/933 is about to POST on the token it has. If that token is stale (near or past expiry,
+	// or none: tokenStale), no fresh one was in hand and the call goes out regardless; this only
+	// leaves a witness, sampled so a run of them cannot flood the log: the first of a boot, then
+	// every kSosFallbackLogEvery-th. It returns nothing, so nothing can refuse a call on it.
+	void noteSosDial(bool tokenStale)
+	{
+		if (!tokenStale) return;
+		if (_sosFallbacks.fetch_add(1, std::memory_order_relaxed) % kSosFallbackLogEvery != 0) return;
+		PD_WITNESS_W("e911", "token_sos_fallback_862: a 911/933 goes out on the token it has, near or past expiry or none, "
+		                     "no fresh one (#862)");
+	}
+
 private:
+	static constexpr std::uint32_t kSosFallbackLogEvery = 16;
+
 	Arena& arena(TokenLane lane) { return lane == TokenLane::Emergency ? _emergency : _ordinary; }
 
-	Arena _ordinary;
-	Arena _emergency;
+	Arena                      _ordinary;
+	Arena                      _emergency;
+	std::atomic<std::uint32_t> _sosFallbacks{0};
 };
+
+// What a 911/933 does about its token before its POST (#862, operator ruling on #945). With any
+// token cached, even one past expiry, it POSTs at once: it does not fetch inline, because a
+// fetch in front of a 911 is a TLS handshake it need not wait for, and a dead token is
+// recovered after the POST is answered 401 (sosRetryOn401). Only with no token at all does it
+// fetch first, on its own arena, inside kSosTokenBudgetUs.
+enum class SosFirstStep : std::uint8_t { PostNow, FetchThenPost };
+
+inline SosFirstStep sosFirstStep(bool haveCachedToken)
+{
+	return haveCachedToken ? SosFirstStep::PostNow : SosFirstStep::FetchThenPost;
+}
 
 // ── A 911/933 token fetch has an overall deadline (#862, Rule 5) ─────────────────
 // The HTTP client's timeouts are per operation (connect and handshake, the request, the response

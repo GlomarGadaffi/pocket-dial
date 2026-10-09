@@ -356,8 +356,9 @@ private:
 	// waitForArena, and only the Ordinary lane honours it: start() is off the 911 lane, and a
 	// restart that lost the claim would leave the anchor down. The Emergency lane never waits.
 	bool fetchToken(telephony::TokenLane lane = telephony::TokenLane::Ordinary, bool waitForArena = false);
-	bool ensureToken(telephony::TokenLane lane = telephony::TokenLane::Ordinary);   // refresh iff expiring AND no media streams active
+	bool ensureToken();          // refresh iff expiring AND no media streams active (the ordinary lane)
 	bool tokenExpiringSoon() const; // true when within the refresh margin of JWT exp
+	bool haveCachedToken() const;   // any token installed, even one past expiry (under _mutex)
 	bool connectWs();
 	// getParticipantStatus() removed (chore #75): the specific-id GET 403s for a
 	// non-controlled leg (issue #40). Use getLegStatus() (list-based) instead.

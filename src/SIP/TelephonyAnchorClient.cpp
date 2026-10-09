@@ -317,21 +317,31 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 
 #if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
 	// #384 H1 (rule 5): a 911/933 shuts the probe's gate before any I/O: every fault
-	// disarmed, the ballast released, a token_age undone so ensureToken() below
-	// does not refetch ahead of it.
+	// disarmed, the ballast released, a token_age undone (a 911/933 refreshes nothing
+	// ahead of its POST while it has a token, #862).
 	const bool benchEmergency = pbx::classifyEmergencyDial(destination).isEmergency;
 	pd::benchprobe::EmergencyDialScope benchEmergencyScope(benchEmergency);
 #endif
 
-	// Refresh the OAuth token if it's near expiry. Safe here: no media streams are
-	// open at call-origination time, so a re-issue can't kill a live stream.
-	// #862 (Rule 5): a 911/933 refreshes on its own token arena, so an ordinary fetch neither
-	// holds it up nor turns it away. The result is not used either way: a refresh that does not
-	// land never refuses the call, which goes out on the token already cached.
-	const telephony::TokenLane tokenLane = pbx::classifyEmergencyDial(destination).isEmergency
-	                                           ? telephony::TokenLane::Emergency
-	                                           : telephony::TokenLane::Ordinary;
-	ensureToken(tokenLane);
+	// #862 (Rule 5): a 911/933 does not refresh ahead of its POST while it has any token to send.
+	// It goes out at once on the cached one, near or past expiry, and a stale one is logged
+	// (token_sos_fallback_862). Only with no token at all does it fetch first, on its own arena and
+	// inside kSosTokenBudgetUs; that fetch's result is not used either: nothing here refuses the call.
+	// Every other call refreshes if the token is near expiry, as before. Safe here: no media streams
+	// are open at call-origination time, so a re-issue can't kill a live stream.
+	const bool sosDial = pbx::classifyEmergencyDial(destination).isEmergency;
+	if (sosDial)
+	{
+		if (telephony::sosFirstStep(haveCachedToken()) == telephony::SosFirstStep::FetchThenPost)
+		{
+			fetchToken(telephony::TokenLane::Emergency);
+		}
+		_tokenLanes.noteSosDial(tokenExpiringSoon());
+	}
+	else
+	{
+		ensureToken();
+	}
 
 	std::string baseUrl, sourceDn, deviceId;
 	{
@@ -1064,7 +1074,13 @@ bool TelephonyAnchorClient::tokenExpiringSoon() const
 	                                       _tokenLifetimeUs, kRefreshMarginUs);
 }
 
-bool TelephonyAnchorClient::ensureToken(telephony::TokenLane lane)
+bool TelephonyAnchorClient::haveCachedToken() const
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return !_bearerHeader.empty();
+}
+
+bool TelephonyAnchorClient::ensureToken()
 {
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
@@ -1093,7 +1109,7 @@ bool TelephonyAnchorClient::ensureToken(telephony::TokenLane lane)
 	}
 
 	ESP_LOGI(TAG, "Access token near expiry — refreshing");
-	return fetchToken(lane);
+	return fetchToken();
 }
 
 // Issue #336: connectWs() bakes _accessToken into wsCfg.headers once, at
