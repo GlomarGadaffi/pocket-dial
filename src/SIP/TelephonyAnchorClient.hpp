@@ -284,8 +284,15 @@ private:
 	// #948: the sos GET's body arena, reserved with the handle (start()'s warm GET is the first to
 	// need it) and freed with it, both under the claim. A body that does not fit is an error, never
 	// truncated. 16 participant objects at 768 B: telephony::sosBodyArenaBytes() gives the basis.
+	// ~BodyArena frees it without the claim, which is safe: this client is a member of
+	// RequestsHandler (RequestsHandler.hpp:2483), whose destructor stops the anchor first
+	// (RequestsHandler.cpp:765, _anchorClient->stop(), which drains through closeSosStatusClient())
+	// and which on the device never runs at all (RequestsHandler.hpp:2203, "the handler lives as
+	// long as the device"). A GET in flight at destruction would already be a use of a destroyed
+	// `this` (makeCall and httpGetBody read _mutex, _baseUrl and the callbacks), claim or no claim.
 	telephony::BodyArena          _sosBody;
 	telephony::SosWitness         _sosWitness;
+	telephony::SosBodyWitness     _sosBodyWitness;   // #948: the largest sos body this boot, for sizing the arena
 	static constexpr std::size_t  kSosBodyArenaBytes = telephony::sosBodyArenaBytes(POCKETDIAL_MAX_ANCHOR_CALLS);
 
 	// #100: the rx task handle, its done-sem, and the stopMediaStreams() single-entry gate are now
@@ -406,7 +413,10 @@ private:
 	// Live-state GET helpers (reconcile watchdog + drop-fallback + device resolve). Snapshot
 	// creds under _mutex then do blocking I/O lock-free.
 	// sosLane (#941): an emergency makeCall()'s GET; uses _sosStatusClient, never _statusMutex.
-	bool httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut = nullptr, bool sosLane = false);
+	// warm (#948): start()'s warm GET on the sos handle. Not a 911: if it loses the claim it records no
+	// fallback witness line.
+	bool httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut = nullptr, bool sosLane = false,
+	                 bool warm = false);
 	// First participant id currently on our DN (single-leg assumption), or "" if none / on error.
 	std::string reconcileParticipantId();
 	// POST + capture the response body (for makecall result.id). Fresh client (not the persistent

@@ -643,6 +643,9 @@ class WitnessSampleTest(unittest.TestCase):
                                        "call takes the conservative route (#948)",
         "start_heap_948": "I (9210) TelephonyAnchor: start: free heap 183520 B, internal min free 61044 B, "
                           "sos status arena 12288 B (#948)",
+        "sos_status_body_max_948": "I (9300) anchor: 911 status body: 612 B, the largest this boot, in a 12288 B arena (#948)",
+        "sos_status_body_oversize_948": "W (9301) anchor: 911 status body over the 12288 B arena: content-length 13000 B, "
+                                        "-1 is unknown (#948)",
     }
 
     def test_each_witness_regex_matches_the_line_the_firmware_formats(self):

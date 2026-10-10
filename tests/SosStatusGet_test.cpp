@@ -458,7 +458,6 @@ struct Timed
 TEST(SosStatusTeardown, ReturnsWithinTenMsWhileAnotherHolderHoldsTheClaimAndTakesTheFallback)
 {
 	pdwitness::clear();
-	int64_t best = INT64_MAX;
 	int64_t worst = 0;
 	for (int run = 0; run < 5; ++run)
 	{
@@ -473,14 +472,12 @@ TEST(SosStatusTeardown, ReturnsWithinTenMsWhileAnotherHolderHoldsTheClaimAndTake
 		EXPECT_FALSE(t.freed);
 		EXPECT_EQ(freeCalls, 0) << "the handle is not freed under another holder's read";
 		EXPECT_EQ(witness.count(SosFallback::Teardown), 1u);
-		best  = std::min(best, t.us);
 		worst = std::max(worst, t.us);
 	}
-	RecordProperty("measured_wait_best_us", static_cast<int>(best));
 	RecordProperty("measured_wait_worst_us", static_cast<int>(worst));
-	std::fprintf(stderr, "[ #948 ] teardown wait with the claim held: best %lld us, worst %lld us over 5 runs (bound 10000)\n",
-	             static_cast<long long>(best), static_cast<long long>(worst));
-	EXPECT_LE(best, 10'000) << "closeSosStatusClient returns within 10 ms";
+	std::fprintf(stderr, "[ #948 ] teardown wait with the claim held: worst of 5 runs %lld us (bound 10000)\n",
+	             static_cast<long long>(worst));
+	EXPECT_LE(worst, 10'000) << "closeSosStatusClient returns within 10 ms, every run";
 	EXPECT_EQ(pdwitness::count("teardown claim not won within the bound"), 5u) << "one witness line per fallback";
 }
 
@@ -499,7 +496,7 @@ TEST(SosStatusTeardown, FreesOnceWhenTheClaimIsFree)
 TEST(SosStatusTeardown, TheNinetyOneOneGetTakesTheFallbackWithoutWaiting)
 {
 	// The operator: a 911 is never delayed (<= 10 ms), no wait of any length on the 911 path.
-	int64_t best = INT64_MAX;
+	int64_t worst = 0;
 	for (int run = 0; run < 5; ++run)
 	{
 		std::atomic<bool> flag{true};
@@ -512,11 +509,11 @@ TEST(SosStatusTeardown, TheNinetyOneOneGetTakesTheFallbackWithoutWaiting)
 		EXPECT_FALSE(t.freed) << "held() must be false: the GET falls back";
 		EXPECT_EQ(pauses.load(), 0) << "the 911 path never waits for the claim";
 		EXPECT_TRUE(flag.load());
-		EXPECT_LE(t.us, 10'000);
-		best = std::min(best, t.us);
+		worst = std::max(worst, t.us);
 	}
-	std::fprintf(stderr, "[ #948 ] 911 GET with the claim held: best %lld us over 5 runs\n", static_cast<long long>(best));
-	EXPECT_LT(best, 1'000) << "no pause is taken at all";
+	std::fprintf(stderr, "[ #948 ] 911 GET with the claim held: worst of 5 runs %lld us (limit 10000)\n",
+	             static_cast<long long>(worst));
+	EXPECT_LE(worst, 10'000) << "every run returns within the 10 ms bound; zero pauses is what keeps it there";
 }
 
 // ── The #349 window: every list read failing is the usual 503, 911/933 included ──────
@@ -648,6 +645,87 @@ TEST(SosStatusUnread, TheOutcomeTable)
 {
 	EXPECT_EQ(unreadOutcome(true), UnreadOutcome::Adopt);
 	EXPECT_EQ(unreadOutcome(false), UnreadOutcome::Fail) << "the 503 stands for a 911/933 as for any call";
+}
+
+// ── start()'s warm GET ───────────────────────────────────────────────────────
+
+// The warm GET runs before the WS connects (TelephonyAnchorClient.cpp start(), step 1b), when
+// makeCall() refuses every call, so a 911 cannot meet it. The source order is pinned by
+// test_anchor_sos_status_bounded.py; the host cannot run start(). These pin what happens at the
+// claim if one ever did.
+TEST(SosStatusWarm, A911GetDuringTheWarmGetFallsBackAtOnceAndReadsNothing)
+{
+	SosListRead list;
+	ASSERT_TRUE(reserveReal(list.arena, 4096));
+	list.response.body = patternBody(300);
+	list.claim.store(true);   // the warm GET holds the claim
+
+	const std::string leg = list();
+	EXPECT_TRUE(leg.empty()) << "no status read: an error, not a stale answer";
+	EXPECT_EQ(list.gets, 0);
+	EXPECT_EQ(list.pauses.load(), 0) << "the 911 does not wait for the warm GET";
+	EXPECT_LE(list.slowestUs, 10'000);
+	EXPECT_EQ(list.witness.count(SosFallback::Get), 1u) << "a real 911 fallback, so it is counted";
+	EXPECT_TRUE(list.claim.load()) << "the warm GET's claim is untouched";
+}
+
+TEST(SosStatusWarm, AWarmGetThatLosesTheClaimBurnsNoWitnessLine)
+{
+	pdwitness::clear();
+	SosWitness w;
+	std::atomic<bool> claim{true};   // somebody holds it
+	for (int i = 0; i < 5; ++i)
+	{
+		SosStatusClaim c(&claim, kSosGetClaimBoundUs, 1000, steadyUs, pauseOneMs);
+		ASSERT_FALSE(c.held());
+		noteGetFallback(w, /*warm=*/true);
+	}
+	EXPECT_EQ(w.count(SosFallback::Get), 0u) << "the warm GET is not a 911";
+	EXPECT_EQ(pdwitness::count("911 status GET: handle claim held"), 0u);
+
+	// the three lines a real 911 fallback is entitled to are all still there
+	for (int i = 0; i < 4; ++i) noteGetFallback(w, /*warm=*/false);
+	EXPECT_EQ(w.count(SosFallback::Get), 4u);
+	EXPECT_EQ(pdwitness::count("911 status GET: handle claim held"), static_cast<std::size_t>(SosWitness::kLinesPerSite));
+}
+
+// ── The largest body read this boot ──────────────────────────────────────────
+
+TEST(SosStatusBodyWitness, TheMaxTracksAndALineIsWrittenOnlyWhenItGrows)
+{
+	pdwitness::clear();
+	SosBodyWitness w;
+	EXPECT_TRUE(w.noteBody(430, 12288));
+	EXPECT_FALSE(w.noteBody(430, 12288)) << "no growth, no line";
+	EXPECT_FALSE(w.noteBody(100, 12288));
+	EXPECT_TRUE(w.noteBody(2000, 12288));
+	EXPECT_EQ(w.maxBody(), 2000u);
+	EXPECT_EQ(pdwitness::count("911 status body: "), 2u);
+	EXPECT_EQ(pdwitness::count("911 status body: 2000 B, the largest this boot, in a 12288 B arena"), 1u);
+}
+
+TEST(SosStatusBodyWitness, TheLineCapHoldsButTheMaxKeepsTracking)
+{
+	pdwitness::clear();
+	SosBodyWitness w;
+	for (std::size_t i = 1; i <= 12; ++i) w.noteBody(i * 100, 12288);
+	EXPECT_EQ(w.growLines(), SosBodyWitness::kLinesPerKind);
+	EXPECT_EQ(pdwitness::count("911 status body: "), static_cast<std::size_t>(SosBodyWitness::kLinesPerKind));
+	EXPECT_EQ(w.maxBody(), 1200u) << "the cap limits the log, not the tracking";
+	EXPECT_EQ(SosBodyWitness::kLinesPerKind, 8u);
+}
+
+TEST(SosStatusBodyWitness, AnOversizeBodyLogsItsContentLengthOnItsOwnCap)
+{
+	pdwitness::clear();
+	SosBodyWitness w;
+	for (int i = 0; i < 12; ++i) w.noteBody(static_cast<std::size_t>(i + 1) * 10, 12288);   // spend the growth lines
+	EXPECT_TRUE(w.noteOversize(13000, 12288)) << "not starved by the growth lines";
+	EXPECT_TRUE(w.noteOversize(-1, 12288));
+	EXPECT_EQ(pdwitness::count("911 status body over the 12288 B arena: content-length 13000 B"), 1u);
+	EXPECT_EQ(pdwitness::count("content-length -1 B, -1 is unknown"), 1u);
+	for (int i = 0; i < 10; ++i) w.noteOversize(20000, 12288);
+	EXPECT_EQ(w.oversizeLines(), SosBodyWitness::kLinesPerKind);
 }
 
 // ── Witness ──────────────────────────────────────────────────────────────────

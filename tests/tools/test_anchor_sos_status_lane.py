@@ -60,7 +60,7 @@ class AnchorSosStatusLaneTest(unittest.TestCase):
 
     def test_the_sos_handle_is_built_at_init_and_freed_at_teardown(self):
         warm = code_only(body_of(self.src, "void TelephonyAnchorClient::warmStatusConnection("))
-        self.assertIn("httpGetBody(url, body, &status, /*sosLane=*/true)", warm,
+        self.assertIn("httpGetBody(url, body, &status, /*sosLane=*/true, /*warm=*/true)", warm,
                       "start() must build the sos handle, so the first 911 resumes a warm session")
         shutdown = code_only(body_of(self.src, "void TelephonyAnchorClient::shutdownImpl("))
         self.assertIn("closeSosStatusClient();", shutdown)

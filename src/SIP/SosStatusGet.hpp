@@ -49,6 +49,8 @@ public:
 	BodyArena() = default;
 	BodyArena(const BodyArena&) = delete;
 	BodyArena& operator=(const BodyArena&) = delete;
+	// Frees the block without the sos claim. Safe because the owner is destroyed only with no GET
+	// in flight: see the note at TelephonyAnchorClient::_sosBody.
 	~BodyArena() { release(); }
 
 	// True when the block is there. A block already reserved is kept, so a handle rebuild or a
@@ -248,6 +250,57 @@ public:
 
 private:
 	std::atomic<uint32_t> _n[2] = {};
+};
+
+// A status GET that did not get the claim and took the fallback. Only a 911's GET counts and
+// writes a line: start()'s warm GET (warm) is not a 911, and one lost claim there must not use up
+// one of the kLinesPerSite lines a real 911 fallback is entitled to.
+inline void noteGetFallback(SosWitness& witness, bool warm)
+{
+	if (!warm) witness.note(SosFallback::Get);
+}
+
+// The largest sos body read this boot (participants and devices both), so the arena can be sized
+// from what .244 actually returns instead of the derived figure. A line each time the max grows,
+// at most kLinesPerKind per boot; a body over the arena writes its Content-Length (-1: unknown,
+// chunked) on its own cap, so the oversize line cannot be starved by the growth lines. Called
+// under the sos claim, so one writer at a time.
+class SosBodyWitness
+{
+public:
+	static constexpr uint32_t kLinesPerKind = 8;
+
+	// A whole body of `bytes` was read into an arena of arenaBytes. True when it grew the max and a
+	// line was written.
+	bool noteBody(std::size_t bytes, std::size_t arenaBytes)
+	{
+		if (bytes <= _max.load(std::memory_order_relaxed)) return false;
+		_max.store(bytes, std::memory_order_relaxed);
+		if (_growLines.load(std::memory_order_relaxed) >= kLinesPerKind) return false;
+		_growLines.fetch_add(1, std::memory_order_relaxed);
+		PD_WITNESS_I("anchor", "911 status body: %u B, the largest this boot, in a %u B arena (#948)",
+		             static_cast<unsigned>(bytes), static_cast<unsigned>(arenaBytes));
+		return true;
+	}
+
+	// A body did not fit the arena. contentLength is the response's, or -1 when it did not say.
+	bool noteOversize(int64_t contentLength, std::size_t arenaBytes)
+	{
+		if (_oversizeLines.load(std::memory_order_relaxed) >= kLinesPerKind) return false;
+		_oversizeLines.fetch_add(1, std::memory_order_relaxed);
+		PD_WITNESS_W("anchor", "911 status body over the %u B arena: content-length %lld B, -1 is unknown (#948)",
+		             static_cast<unsigned>(arenaBytes), static_cast<long long>(contentLength));
+		return true;
+	}
+
+	std::size_t maxBody() const { return _max.load(std::memory_order_relaxed); }
+	uint32_t    growLines() const { return _growLines.load(std::memory_order_relaxed); }
+	uint32_t    oversizeLines() const { return _oversizeLines.load(std::memory_order_relaxed); }
+
+private:
+	std::atomic<std::size_t> _max{0};
+	std::atomic<uint32_t>    _growLines{0};
+	std::atomic<uint32_t>    _oversizeLines{0};
 };
 
 // closeSosStatusClient()'s body. freeAll() runs once, under the claim. If the claim is not won

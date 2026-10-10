@@ -254,6 +254,15 @@ bool TelephonyAnchorClient::start()
 		return false;
 	}
 
+	// 1b. #948: prime the status-GET connections (the shared handle and the 911/933 lane's own) now,
+	// with the token in hand but BEFORE connectWs(): makeCall() refuses unless _running AND _connected
+	// (audit #66), and _connected is set only by the WS connect event (handleWsEvent), so no 911 can be
+	// in flight and nothing else holds the sos claim while this warm GET does. After connectWs() a
+	// 911 arriving during the warm GET would find the claim held and take the fallback. It cannot move
+	// above `_running = true`: there is no token yet, so the GET would answer 401. A 911 dialled during
+	// these ~2 cold handshakes is refused as "anchor not connected" instead (see the PR body).
+	warmStatusConnection();
+
 	// 2. Connect to control WebSocket
 	if (!connectWs())
 	{
@@ -270,10 +279,8 @@ bool TelephonyAnchorClient::start()
 	// 3. Prime the control handle's TLS session ticket so the first dropCall/answerCall after
 	// boot reconnects by resumption instead of a cold handshake (makeCall uses its own fresh client).
 	warmCtrlConnection();
-	// 3b. Same idea for the status-GET connection (getLegStatus/reconcile/caller-lookup/device
-	// resolve) — without this the FIRST post-boot status check still cold-handshakes even though
-	// every later one on this handle resumes.
-	warmStatusConnection();
+	// (3b, the status-GET connection warm — getLegStatus/reconcile/caller-lookup/device resolve —
+	// runs at 1b above, before the WS connects, so no 911 can meet it.)
 
 	// 4. #100: cold-prime EVERY call slot's POST TLS session (keep-alive) in the background so a
 	// cold-start concurrent burst RESUMES each per-call POST open instead of paying the S3's ~1s
@@ -1268,7 +1275,7 @@ void sosPause() { vTaskDelay(1); }
 // S3's single crypto-bound core for CPU.
 // #941 (Rule 5): sosLane (an emergency makeCall's GET) drives _sosStatusClient instead and never
 // touches _statusMutex, so a 911/933 cannot wait behind another task's status GET.
-bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut, bool sosLane)
+bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut, bool sosLane, bool warm)
 try
 {
 	if (statusOut) *statusOut = -1;
@@ -1292,7 +1299,7 @@ try
 	telephony::SosStatusClaim sosClaim(sosLane ? &_sosStatusBusy : nullptr, telephony::kSosGetClaimBoundUs, kSosTickUs, sosNowUs, sosPause);
 	if (!sosClaim.held())
 	{
-		_sosWitness.note(telephony::SosFallback::Get);
+		telephony::noteGetFallback(_sosWitness, warm);   // start()'s warm GET is not a 911: no line
 		return false;
 	}
 	// #948: the sos lane reads into an arena reserved with its handle: by start()'s warm GET, the
@@ -1341,6 +1348,7 @@ try
 				// bodyOut empty, *statusOut still -1 (a status above 0 would read as 3CX's definitive
 				// answer to resolveOutboundLeg). A short read (a peer FIN before the response was
 				// complete) is an error too: esp_http_client_read returns 0 for it.
+				const int64_t contentLen = esp_http_client_get_content_length(client);   // -1: chunked or not said
 				const telephony::BodyRead rd = telephony::readSosBody(
 					_sosBody,
 					[client](char* p, int n) { return esp_http_client_read(client, p, n); },
@@ -1350,9 +1358,11 @@ try
 				if (rd == telephony::BodyRead::Ok)
 				{
 					if (statusOut) *statusOut = status;
+					_sosBodyWitness.noteBody(bodyOut.size(), _sosBody.capacity());
 					ok = (status >= 200 && status < 300);
 					break;
 				}
+				if (rd == telephony::BodyRead::TooBig) _sosBodyWitness.noteOversize(contentLen, _sosBody.capacity());
 				ESP_LOGE(TAG, "httpGetBody: sos status GET %s (status=%d), no status read (#948)",
 				         telephony::bodyReadName(rd), status);
 				// Not transient: the same body would not fit again, and a missing arena stays missing.
@@ -2467,7 +2477,7 @@ void TelephonyAnchorClient::warmStatusConnection()
 	// #941: the 911/933 lane's own handle, built here (init) rather than on the first emergency
 	// call, so that call resumes a warm session instead of paying a cold ECDHE.
 	status = 0;
-	httpGetBody(url, body, &status, /*sosLane=*/true);
+	httpGetBody(url, body, &status, /*sosLane=*/true, /*warm=*/true);
 	ESP_LOGI(TAG, "Sos status connection pre-warmed (HTTP %d)", status);
 }
 

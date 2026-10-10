@@ -72,7 +72,7 @@ class AnchorSosStatusBoundedTest(unittest.TestCase):
         self.assertRegex(
             self.get_body,
             r"SosStatusClaim sosClaim\(sosLane \? &_sosStatusBusy : nullptr, telephony::kSosGetClaimBoundUs,[^;]*\);\s*"
-            r"if \(!sosClaim\.held\(\)\)\s*\{\s*_sosWitness\.note\(telephony::SosFallback::Get\);\s*return false;")
+            r"if \(!sosClaim\.held\(\)\)\s*\{\s*telephony::noteGetFallback\(_sosWitness, warm\);\s*return false;")
         self.assertNotIn("flag->exchange(true", code_only(self.src), "no claim spin is left in the anchor client")
         self.assertNotIn("struct SosStatusClaim", self.src)
         self.assertNotIn("vTaskDelay(1)", self.get_body)
@@ -130,6 +130,54 @@ class AnchorSosStatusBoundedTest(unittest.TestCase):
             self.assertEqual(an.count_lines(["W (1) anchor: " + needle]).get(
                 "sos_status_teardown_fallback_948" if "teardown" in needle else "sos_status_get_fallback_948"), 1)
         self.assertIn("kLinesPerSite = 3", self.sos_hpp, "capped per boot")
+
+    def test_the_warm_get_runs_before_the_ws_connects_so_no_911_can_meet_it(self):
+        start = code_only(body_of(self.src, "bool TelephonyAnchorClient::start("))
+        self.assertEqual(start.count("warmStatusConnection();"), 1)
+        warm_at = start.index("warmStatusConnection();")
+        # with the token in hand (a 401 warms nothing and the bench line would not read HTTP 200) ...
+        self.assertGreater(warm_at, start.index("fetchToken()"))
+        # ... and before the WS connect event can open makeCall()'s gate
+        self.assertLess(warm_at, start.index("connectWs()"), "the warm GET must come before connectWs()")
+        self.assertLess(warm_at, start.index("warmCtrlConnection();"))
+        # the premise: makeCall() refuses unless _running AND _connected, and only the WS event sets _connected
+        make = code_only(body_of(self.src, "bool TelephonyAnchorClient::makeCall("))
+        self.assertRegex(make, r"!_running\.load\(std::memory_order_acquire\)\s*\|\|\s*"
+                               r"!_connected\.load\(std::memory_order_acquire\)")
+        self.assertEqual(code_only(self.src).count("_connected.store(true"), 1)
+        ws = code_only(body_of(self.src, "void TelephonyAnchorClient::handleWsEvent("))
+        self.assertIn("_connected.store(true", ws)
+
+    def test_the_warm_get_is_not_a_911_and_logs_the_line_the_bench_gate_reads(self):
+        warm = code_only(body_of(self.src, "void TelephonyAnchorClient::warmStatusConnection("))
+        self.assertIn("httpGetBody(url, body, &status, /*sosLane=*/true, /*warm=*/true);", warm)
+        self.assertIn('ESP_LOGI(TAG, "Sos status connection pre-warmed (HTTP %d)", status);', warm,
+                      "the operator's bench gate looks for this line, with HTTP 200 on success")
+        self.assertNotIn("_sosWitness", warm, "the warm GET records no 911 fallback")
+        self.assertRegex(code_only(self.sos_hpp), r"inline void noteGetFallback\(SosWitness& witness, bool warm\)\s*\{\s*"
+                                                  r"if \(!warm\) witness\.note\(SosFallback::Get\);")
+
+    def test_the_largest_sos_body_is_witnessed(self):
+        self.assertLess(self.sos_read.index("esp_http_client_get_content_length(client)"),
+                        self.sos_read.index("telephony::readSosBody("), "read before the connection is closed")
+        ok_at = self.sos_read.index("rd == telephony::BodyRead::Ok")
+        self.assertTrue(ok_at < self.sos_read.index("_sosBodyWitness.noteBody(bodyOut.size(), _sosBody.capacity());")
+                        < self.sos_read.index("ESP_LOGE("))
+        self.assertIn("if (rd == telephony::BodyRead::TooBig) _sosBodyWitness.noteOversize(contentLen, _sosBody.capacity());",
+                      self.sos_read)
+        hpp = code_only(self.sos_hpp)
+        self.assertIn("kLinesPerKind = 8", hpp)
+        for line, counter in (("911 status body: %u B, the largest this boot, in a %u B arena (#948)",
+                               "sos_status_body_max_948"),
+                              ("911 status body over the %u B arena: content-length %lld B, -1 is unknown (#948)",
+                               "sos_status_body_oversize_948")):
+            self.assertIn(line, self.sos_hpp)
+            self.assertIn(counter, an.LOG_COUNTERS)
+        sample = "I (9300) anchor: 911 status body: 612 B, the largest this boot, in a 12288 B arena (#948)"
+        self.assertEqual(an.count_lines([sample])["sos_status_body_max_948"], 1)
+        sample = ("W (9301) anchor: 911 status body over the 12288 B arena: content-length 13000 B, "
+                  "-1 is unknown (#948)")
+        self.assertEqual(an.count_lines([sample])["sos_status_body_oversize_948"], 1)
 
 
 if __name__ == "__main__":
