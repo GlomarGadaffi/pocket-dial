@@ -2936,11 +2936,14 @@ class X370Test(ProbeRunCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.manifest["summary"]["witness"]["attempts"], 1)
 
-    def test_pass_when_the_rebuild_failed_and_the_board_gave_up_cleanly(self):
+    def test_invalid_when_the_rebuild_returned_false_it_may_be_a_teardown(self):
         self.board.knobs["x370_rebuild_fail"] = True
         rc, out = self.go()
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(self.manifest["summary"]["outcome"], "rebuild failed, the board gave up cleanly")
+        self.assertEqual(rc, 3, out)
+        self.assertIn("recreateGetClient() returned false", out)
+        self.assertIn("the log cannot tell which", out)
+        self.assertIsNone(self.manifest["summary"]["outcome"])
+        self.assertEqual(self.manifest["summary"]["witness"]["failed"], 1, "the count stays in the summary")
         self.assertEqual(self.manifest["log_counters"]["get_rebuild_giveup"], 1)
 
     def test_invalid_when_the_ballast_never_made_the_open_fail(self):

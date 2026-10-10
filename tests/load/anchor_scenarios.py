@@ -2613,16 +2613,17 @@ def x370_config_problems(sc):
     return out
 
 
-def x370_witness(entries, cancel_t=None):
+def x370_witness(entries):
     """What the board's log shows of the GET handle's rebuild: [(t, line)] -> counts.
     attempts: transport-failure lines. rebuilt: of those, the ones whose next attempt (k+1, same budget) was
     logged, so recreateGetClient() returned true. answered: of those, the next attempt got a parsed HTTP answer
-    (the fresh handshake finished). failed: 'could not rebuild' lines before the CANCEL (after it the loop is
-    being torn down and logs the same line). giveups: the third failure in a row, which gives up unrebuilt.
+    (the fresh handshake finished). failed: 'could not rebuild' lines: recreateGetClient() returned false, for
+    a handle that would not init or because the loop is being torn down (:3764), and the log cannot tell which.
+    giveups: the third failure in a row, which gives up unrebuilt.
     ponytail: one stream per run; a #554 rx restart would start its attempt numbers over."""
     fails, seen, answered = [], set(), set()
     failed = giveups = 0
-    for t, line in entries:
+    for _, line in entries:
         m = _RX["get_transport_fail"].search(line)
         if m:
             fails.append((int(m.group(1)), int(m.group(2))))
@@ -2634,7 +2635,7 @@ def x370_witness(entries, cancel_t=None):
             answered.add((int(m.group(2)), int(m.group(3))))
         elif _RX["get_transport_giveup"].search(line):
             giveups += 1
-        elif _RX["get_rebuild_giveup"].search(line) and (cancel_t is None or t < cancel_t):
+        elif _RX["get_rebuild_giveup"].search(line):
             failed += 1
     nxt = [(k + 1, n) for k, n in fails if (k + 1, n) in seen]
     return {"attempts": len(fails), "rebuilt": len(nxt), "answered": sum(1 for a in nxt if a in answered),
@@ -2648,7 +2649,9 @@ def x370_path(w):
     if w["rebuilt"]:
         return "rebuilt, the open after it failed again", ""
     if w["failed"]:
-        return "rebuild failed, the board gave up cleanly", ""
+        return None, ("recreateGetClient() returned false ('could not rebuild' x%d): a handle that would not init "
+                      "under pressure, or a teardown racing the loop, and the log cannot tell which; either way "
+                      "no handshake was made, so the rebuild is not shown to have run" % w["failed"])
     if w["attempts"]:
         return None, ("%d transport failure line(s), but no next attempt after one and no 'could not rebuild' "
                       "line: the rebuild is not shown to have run (a lost syslog line, or the CANCEL came first)"
@@ -2729,7 +2732,7 @@ def x370_run(run, sc):
                             cancel_when_timeout_s=sc["call_fire_wait_s"])
         try:
             rec.update(_call_id=dlg.call_id, final=dlg.final_status, cancel_status=dlg.cancel_status,
-                       _t_cancel=dlg.cancel_sent_at, cancel_when_expired=bool(dlg.cancel_when_expired),
+                       cancel_when_expired=bool(dlg.cancel_when_expired),
                        provisional=[s for _, s in dlg.responses if s < 200])
         finally:
             finish_call(caller, dlg, rec)
@@ -2754,7 +2757,7 @@ def x370_judge(run, sc, lines):
     c, caller = run.calls[0], run.agents["caller"]
     ents = run.syslog.entries(c["t_start"]) if run.syslog else []
     legs = started_legs(ents)
-    w = x370_witness(ents, c.get("_t_cancel"))
+    w = x370_witness(ents)
     outcome, why = x370_path(w)
     summary = {"outcome": outcome, "witness": w, "legs": len(legs),
                "rebuild_success_line": "none on main (TelephonyAnchorClient.cpp:3895-3899 logs only the failure): "

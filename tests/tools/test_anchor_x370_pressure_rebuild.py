@@ -50,10 +50,9 @@ GIVEUP3 = ("W (1) TelephonyAnchor: GET stream: 3 consecutive transport failures 
 NO_REBUILD = "W (1) TelephonyAnchor: GET stream: could not rebuild client after transport failure %s giving up" % EM_DASH
 
 
-def witness(lines, cancel_t=None, times=None):
-    """x370_witness over [(t, line)]; times defaults to 1.0, 2.0, ... in order."""
-    ents = [(times[i] if times else float(i + 1), ln) for i, ln in enumerate(lines)]
-    return an.x370_witness(ents, cancel_t)
+def witness(lines):
+    """x370_witness over [(t, line)], t = 1.0, 2.0, ... in order."""
+    return an.x370_witness([(float(i + 1), ln) for i, ln in enumerate(lines)])
 
 
 class GateTest(unittest.TestCase):
@@ -141,17 +140,25 @@ class WitnessTest(unittest.TestCase):
         self.assertIsNone(outcome)
         self.assertIn("no next attempt after one and no 'could not rebuild' line", why)
 
-    def test_the_rebuild_giveup_line_is_the_failed_outcome(self):
+    def test_a_could_not_rebuild_alone_is_invalid_it_may_be_a_teardown_and_no_handshake_ran(self):
+        # recreateGetClient() returns false for a handle that would not init AND when stop was requested
+        # (TelephonyAnchorClient.cpp:3764), and logs the same line: it proves neither the rebuild nor a handshake
         w = witness([fail(1), NO_REBUILD])
         self.assertEqual((w["attempts"], w["rebuilt"], w["failed"]), (1, 0, 1))
-        self.assertEqual(an.x370_path(w)[0], "rebuild failed, the board gave up cleanly")
+        outcome, why = an.x370_path(w)
+        self.assertIsNone(outcome)
+        self.assertIn("the log cannot tell which", why)
+        self.assertIn("no handshake was made", why)
 
-    def test_a_could_not_rebuild_after_the_cancel_is_the_teardown_not_the_path(self):
-        # recreateGetClient() also returns false when stop was requested, and logs the same line
-        lines = [fail(1), NO_REBUILD]
-        self.assertEqual(witness(lines, cancel_t=1.5)["failed"], 0)         # the line came at t=2.0, after it
-        self.assertEqual(witness(lines, cancel_t=2.5)["failed"], 1)
-        self.assertIsNone(an.x370_path(witness(lines, cancel_t=1.5))[0])
+    def test_a_could_not_rebuild_line_alone_is_invalid_too(self):
+        outcome, why = an.x370_path(witness([NO_REBUILD]))
+        self.assertIsNone(outcome)
+        self.assertIn("returned false", why)
+
+    def test_a_rebuild_that_worked_still_passes_beside_a_later_could_not_rebuild(self):
+        w = witness([fail(1), ready(2), fail(3), NO_REBUILD])
+        self.assertEqual((w["attempts"], w["rebuilt"], w["answered"], w["failed"]), (2, 1, 1, 1))
+        self.assertEqual(an.x370_path(w)[0], "rebuilt, the fresh handshake was answered")
 
     def test_the_last_attempt_has_no_next_attempt(self):
         w = witness([fail(8, n=8)])
@@ -210,7 +217,7 @@ class WiredToTheFirmwareTest(unittest.TestCase):
         self.assertEqual(self.src.count("recreateGetClient()"), 1, "one call; the lambda is a variable")
 
     def test_a_rebuild_that_worked_logs_nothing_of_its_own(self):
-        # the premise of the derivation: when it changes (a success line is added), the witness gets a direct line
+        # the premise of the derivation: when it changes (a success line is added), the witness can be made direct
         after = self.loop[self.loop.index("if (!recreateGetClient())"):]
         block = after[:after.index("if (keepRunning())")]
         self.assertEqual(block.count("ESP_LOG"), 1, "only the failure line (the give-up)")

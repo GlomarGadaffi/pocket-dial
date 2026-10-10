@@ -187,18 +187,19 @@ transport failure (or at 10 s if there is none), and releases the ballast the mo
   | transport failure (the path counter `get_transport_fail`; 0 is INVALID) | `GET stream transport failure (no HTTP response, status=-1), attempt k/N` or `GET stream open failed (...), attempt k/N` |
   | rebuilt | such a line at k, then any attempt line at k+1 of the same N |
   | fresh handshake answered | the k+1 line is `GET stream not ready (HTTP ...), attempt k+1/N`, a parsed answer |
-  | rebuild failed | `GET stream: could not rebuild client after transport failure` before the CANCEL (after it, the same line is the teardown) |
+  | `recreateGetClient()` returned false | `GET stream: could not rebuild client after transport failure`: a handle that would not init, or a teardown racing the loop (`:3764`); the log cannot tell which, and no handshake ran, so it is not a witness |
   | third in a row | `GET stream: 3 consecutive transport failures`: gives up without a rebuild (`:3888-3894`) |
 
-  A failure with no next attempt and no "could not rebuild" line is not a witness (a lost UDP line, or the CANCEL
-  came first): INVALID. `test_anchor_x370_pressure_rebuild.py` pins every one of these lines, the `3`, and the
-  absence of a `continue` in the loop to the source, and fails if a success line is added so the witness can be
-  made direct. The line to add would sit in the `else` of `if (!recreateGetClient())` at `:3895`.
-- **Verdicts.** PASS: both faults fired, exactly one anchored leg, a rebuild witness (rebuilt, or failed cleanly),
+  A failure with no next attempt (a lost UDP line, or the CANCEL came first) and a "could not rebuild" line with
+  no rebuild beside it are INVALID, never PASS; the counts stay in the summary. `test_anchor_x370_pressure_rebuild.py`
+  pins every one of these lines, the `3`, and the absence of a `continue` in the loop to the source, and fails if a
+  success line is added, so the witness can then be made direct. The line would go right after the
+  `if (!recreateGetClient()) {... break;}` block at `:3895-3899` (no `else`: the `if` breaks).
+- **Verdicts.** PASS: both faults fired, exactly one anchored leg, a rebuild witness (a failure followed by the next attempt),
   the board answered `/api/status` after the release with a later uptime and the same reset reason, no panic line,
   no coredump, no `ORPHANED` line, one drop. FAIL: any of the last five, a hang or reboot after the release, a
   second rx task on the leg (#370's shape), a CANCEL not answered 200. INVALID: no transport failure (the
-  ballast did not bite), a failure with no next attempt, no leg (the far end never rang; with the ballast held
+  ballast did not bite), a failure with no next attempt, a lone "could not rebuild", no leg (the far end never rang; with the ballast held
   across `makeCall()`'s POST that can be the pressure itself), the ballast not taking (`held` false), a `409`, the
   dead-man releasing it first.
 - **Pressure rules.** The board's HTTP may not answer while the ballast is held. The run makes no HTTP request
