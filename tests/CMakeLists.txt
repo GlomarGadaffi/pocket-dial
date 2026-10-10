@@ -406,6 +406,9 @@ add_executable(sip_parser_tests
     UrlEncode_test.cpp
     JsonEscape_test.cpp
     TelephonyAnchorLogic_test.cpp
+    # #862: the token-body arena and its bounded field scanner (the #948 contract).
+    TokenBodyArena_test.cpp
+    FetchTokenOwnCode_test.cpp
     MixBus_test.cpp
     # Issue #169: VAD energy-gating of mix participation (default off).
     VadGate_test.cpp

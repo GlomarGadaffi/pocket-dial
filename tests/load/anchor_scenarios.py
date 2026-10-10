@@ -245,6 +245,10 @@ LOG_COUNTERS = {
     # #884: one line per successful control request (drop/answer): group 1 = the attempt, 2 = reused (no connect),
     # resumed (connected <= 400 ms on a kept handle) or cold, 3 = elapsed ms.
     "ctrl_request_884": r"ctrl request: attempt (\d+) (reused|resumed|cold) in (\d+) ms \(#884\)",
+    # #951: the token's lifetime fields, one line per fetch for the first eight of a boot, in seconds (-1: not
+    # read): group 1 = the response's expires_in, 2 = exp - iat of the claims, 3 = the lifetime installed.
+    "token_lifetime_fields_951": r"token_lifetime_fields_951: expires_in=(-?\d+) exp_minus_iat=(-?\d+) "
+                                 r"lifetime_used=(-?\d+) \(seconds; -1: not read\) \(#951\)",
     # #533/#603's esp_log witnesses: every session teardown names its reason; a bridge stop.
     "endcall": r"endCall (?:Call-ID:\s*)?(\S+) reason=",
     "degraded_endcall": r"endCall (?:Call-ID:\s*)?(\S+) reason=anchor audio write failure",

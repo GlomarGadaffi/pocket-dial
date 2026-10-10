@@ -5,6 +5,7 @@
 #include "RecentIdRing.hpp"   // Issue #554
 #include "ParkedTaskReap.hpp" // Issue #553: pd::ReapDecision
 #include "AnchorWedge.hpp"    // Issue #667: pd::anchorSlotLooksWedged
+#include "TelephonyAnchorLogic.hpp"   // #951: telephony::BearerHeader (the ESP block below includes it again)
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -82,9 +83,12 @@ private:
 
 	std::atomic<bool> _running{false};
 	std::atomic<bool> _connected{false};
-	std::string       _accessToken;
-	// #465: cached "Bearer " + _accessToken once per token fetch, avoiding per-request heap allocation; guarded by _mutex.
-	std::string       _bearerHeader;
+	// #465: cached "Bearer <token>" once per token fetch, avoiding per-request heap allocation; guarded by _mutex.
+	// #951: reserved once by init() for the longest token accepted, so the install assigns inside its
+	// capacity and _mutex never covers a reallocation; its storage is PSRAM where there is any. It is the
+	// only copy of the token (the raw one is gone). The readers copy it out as before: `std::string s =
+	// _bearerHeader;` converts through BearerHeader::operator std::string.
+	telephony::BearerHeader _bearerHeader;
 	// #100: count of outbound makeCall()s in flight whose own leg is NOT yet resolved (the window
 	// between the makecall POST and resolveOutboundLeg keying the slot). While > 0, the WS
 	// classifier treats an UNmatched upset as a probable far-leg of an in-flight outbound call
@@ -153,6 +157,18 @@ private:
 	std::atomic<int64_t> _tokenLifetimeUs{0};
 
 #if defined(ESP_PLATFORM) || defined(ESP32)
+	// #862: the token response is read into one of these three arenas, which live as long as the
+	// client, so the body read allocates no buffer. #951 slice 1: fetchToken also builds its request,
+	// the lifetime decode's scratch and the WebSocket header in the claimed arena; what stays is
+	// esp_http_client_init and TLS. One is for the
+	// ordinary lane, one for a 911/933, one for the background refresh. Each is claimed with an
+	// atomic flag (never a mutex) and held across the socket read; a second fetch on the same lane is
+	// turned away. The 911/933 lane never waits for, and is never turned away by, an ordinary fetch.
+	telephony::TokenLanes _tokenLanes;
+	// #862 (ruling 2 on #945): a token response is installed only if its request was issued after the
+	// installed token's. installIfNewer() is called under _mutex, with the token's own assignment.
+	telephony::TokenInstallGate _tokenGate;
+
 	esp_websocket_client_handle_t _wsClient   = nullptr;
 	// ── #100: per-call media slot ────────────────────────────────────────────────
 	// The anchor shares ONE control plane (WS + ctrl HTTPS + token) but bridges up to
@@ -216,6 +232,14 @@ private:
 		// gives up early (telephony::getForbiddenGivesUp). False for a 911/933
 		// and for every inbound leg, which keep the whole budget.
 		std::atomic<bool>        getFailFast{false};
+		// #862 (ruling 1 on #945): non-zero when this is makeCall's own leg for a 911/933, from the moment
+		// its slot is keyed until the slot is freed; the value is that call's number (EmergencyScope::id()).
+		// A 911/933 whose POST is answered 401 fetches regardless; when it does and this slot's media is up
+		// (postLive, or an open GET handle) it leaves token_sos_live_fetch_862 naming both calls, for #952's
+		// bench to count (telephony::sosRetryOn401). The inbound legs, a PSAP callback among them, are not
+		// marked: the client cannot tell them from any other inbound leg, so this sees only the 911/933s
+		// the anchor placed.
+		std::atomic<std::uint32_t> emergency{0};
 		mutable std::mutex       postMutex;              // guards postClient (writeAudio/stop)
 		std::mutex               getMutex;                // guards getClient (runRxLoop/stop)
 	};
@@ -307,14 +331,22 @@ private:
 	static constexpr int kLeakRestartThreshold = 3;
 	// The full stop()/start() reclaim cycle; runs on tel_maint, off-SIP.
 	static void restartTaskTrampoline(void* arg);
-	// #658: one persistent tel_maint task runs restart, re-warm and reconcile. tick() sets the
+	// #658: one persistent tel_maint task runs restart, re-warm, reconcile and token refresh. tick() sets the
 	// job's in-flight gate and a notify bit; the task runs the body and clears the gate. Created
 	// once by the first start() and never deleted (restart runs stop()/start() on it).
 	static constexpr uint32_t kMaintRestart   = 1u << 0;
 	static constexpr uint32_t kMaintRewarm    = 1u << 1;
 	static constexpr uint32_t kMaintReconcile = 1u << 2;
+	// #862 (#945): the background token refresh. tick() wakes it when the token is within
+	// kMaintRefreshMarginUs of expiry (telephony::maintRefreshWakeDue) and sets _maintRefreshInFlight;
+	// the job decides again (telephony::TokenLanes::maintRefreshWanted), fetches on the Maintenance lane
+	// if it should, and clears the gate last. _lastMaintRefreshUs is the floor's stamp (0: never woken).
+	static constexpr uint32_t kMaintTokenRefresh = 1u << 3;
+	std::atomic<bool>    _maintRefreshInFlight{false};
+	std::atomic<int64_t> _lastMaintRefreshUs{0};
 	std::atomic<TaskHandle_t> _maintHandle{nullptr};
 	static void maintTaskTrampoline(void* arg);
+	static void maintRefreshTaskTrampoline(void* arg);
 	bool wakeMaint(uint32_t job);   // false: no tel_maint task; the caller releases its gate
 	// Issue #336: same _restartRequested mechanism as the leak-count path above,
 	// triggered instead by a disconnected/errored WS with an expiring/expired
@@ -365,9 +397,22 @@ private:
 	void runWsWorker();
 	void processWsWork(const WsWorkItem& w);       // the blocking body, off the WS task
 
-	bool fetchToken();
-	bool ensureToken();             // refresh iff expiring AND no media streams active
+	// Claims the lane's arena in _tokenLanes before any I/O; a fetch already running on that lane
+	// means this one returns false at once (the caller keeps its cached token). Only start() passes
+	// waitForArena, and only the Ordinary lane honours it: start() is off the 911 lane, and a
+	// restart that lost the claim would leave the anchor down. The Emergency lane never waits, nor
+	// does the Maintenance lane (the background refresh: a refused claim is a skipped tick).
+	// sosCallId (EmergencyScope::id()) names the 911/933 in the witness when its claim is refused.
+	bool fetchToken(telephony::TokenLane lane = telephony::TokenLane::Ordinary, bool waitForArena = false,
+	                std::uint32_t sosCallId = 0);
+	bool ensureToken();          // refresh iff expiring AND no media streams active (the ordinary lane)
+	// Any slot with a live POST stream (postLive) or an open GET handle: the definition ensureToken()
+	// and the background refresh share. Takes each slot's getMutex for a pointer read, never nested
+	// and never across I/O; the SIP task must not call it (tick() does not).
+	bool mediaStreamsLive();
+	bool anySosSlot() const;     // any slot holds a live 911/933 (CallSlot::emergency); atomic loads only
 	bool tokenExpiringSoon() const; // true when within the refresh margin of JWT exp
+	bool haveCachedToken() const;   // any token installed, even one past expiry (under _mutex)
 	bool connectWs();
 	// getParticipantStatus() removed (chore #75): the specific-id GET 403s for a
 	// non-controlled leg (issue #40). Use getLegStatus() (list-based) instead.
@@ -376,7 +421,9 @@ private:
 	void runRxLoop(CallSlot* slot);
 
 	bool startMediaStreams(const std::string& participantId);
-	void stopMediaStreams(const std::string& participantId);
+	// A view, not a string (#862): the teardown path passes ids from a fixed-storage snapshot,
+	// and a view costs no copy. The view must stay valid for the call. Nothing keeps it.
+	void stopMediaStreams(std::string_view participantId);
 	// Tear down EVERY active call slot (shutdown + WS-disconnect). Snapshots the active
 	// participant ids under _mutex, then stopMediaStreams() each (can't hold _mutex across them).
 	void stopAllMediaStreams();
@@ -391,8 +438,14 @@ private:
 	bool startRxIfNeeded(const std::string& participantId);
 
 	// onEvent/eventUser: optional esp_http_client event hook (performCtrl's connect witness, #884).
-	esp_http_client_handle_t makeAuthedClient(const std::string& url, esp_http_client_method_t method, int txBufSize, const std::string& token = "",
+	esp_http_client_handle_t makeAuthedClient(const char* url, esp_http_client_method_t method, int txBufSize, const std::string& token = "",
 	                                          http_event_handle_cb onEvent = nullptr, void* eventUser = nullptr);
+	// #951: fetchToken() passes the URL it built in the arena; every other caller keeps its std::string.
+	esp_http_client_handle_t makeAuthedClient(const std::string& url, esp_http_client_method_t method, int txBufSize, const std::string& token = "",
+	                                          http_event_handle_cb onEvent = nullptr, void* eventUser = nullptr)
+	{
+		return makeAuthedClient(url.c_str(), method, txBufSize, token, onEvent, eventUser);
+	}
 	bool performAuthedRequest(esp_http_client_handle_t client, int* statusCodeOut = nullptr);
 	// One-shot POST on the control handle (closes the connection after each success; creates or
 	// rebuilds the handle as needed, retries once after a failure). contentType may be
@@ -403,7 +456,12 @@ private:
 	void closeCtrlClient();      // teardown under _ctrlMutex
 	void closePostClient();      // free the persistent warm _postClient (full teardown only), under _postMutex
 	void closeStatusClient();    // free the persistent warm _statusClient (full teardown only), under _statusMutex
-	bool readJsonStringField(esp_http_client_handle_t client, const std::string& field, std::string& out);
+	// Reads the token response into the claimed arena and views the string member `field` in `out`
+	// (a view into the arena: valid while `lease` is). False, with nothing in `out`, when the
+	// body does not fit, the read fails or times out, or the member is missing or not a string.
+	// deadlineUs != 0 (esp_timer): the fetch's overall deadline, which the body shares (a 911/933).
+	bool readJsonStringField(esp_http_client_handle_t client, telephony::TokenLanes::Lease& lease,
+	                         std::string_view field, std::string_view& out, int64_t deadlineUs);
 
 	// Live-state GET helpers (reconcile watchdog + drop-fallback + device resolve). Snapshot
 	// creds under _mutex then do blocking I/O lock-free.

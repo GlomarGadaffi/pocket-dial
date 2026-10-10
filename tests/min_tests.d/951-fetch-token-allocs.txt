@@ -1,0 +1,16 @@
+# #951 slice 1, fetchToken's own allocations and the lifetime rule. FetchTokenOwnCode_test.cpp: FetchTokenOwnCode.* (18: the
+#   whole own-code path with no heap, an older response discarded with no heap, the positive control, the request bytes
+#   against the strings it replaced, an exact-fit and a one-short request, a request too big for the arena, urlEncodeInto
+#   against urlEncode for every byte, the token limit and the header at it, a token one byte over refused with the cache and
+#   the install stamp kept, a token at the limit cached whole, a short read, the decode's three-quarters bound, scanJsonNumber
+#   with a long key, the reserved BearerHeader, its copy-out as a std::string, the WebSocket header in place, the wipe, the
+#   failure witness) and FetchTokenLifetime.* (10: the claims are the lifetime and expires_in is not used (end to end, no
+#   heap), a too-big payload with its claims at the start, a too-big payload with unreadable claims on the 5 minute fallback
+#   whatever expires_in says, the same with a token cached (the fresh token is installed and the stamp moves), a number the
+#   scratch cuts through never read, a normal payload read as before and an unparseable one on the old fallback (#975),
+#   token_lifetime_fields_951 logs the three numbers and nothing else, token_lifetime_fields_951 is capped at 8 per boot, a
+#   5 minute token never due for the background refresh, the background refresh woken at most once a minute).
+#   TelephonyAnchorLogic_test.cpp (1): Base64UrlRefusesWhatDoesNotFitTheBufferLentToIt. (DecodeJwtLifetimeTakesThreeAllocationsAndNoJsonTree
+#   became DecodeJwtLifetimeTakesNoHeap, and TokenLanes.TheThreeArenasAreTheWholeCost allows 8 bytes more for the witness counter:
+#   no count change.) tests/tools/test_anchor_fetch_token_wiring.py (9) is Python, not a gtest, and is not in this count.
+29
