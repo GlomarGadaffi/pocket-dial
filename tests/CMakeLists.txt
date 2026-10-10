@@ -105,6 +105,8 @@ add_executable(sip_parser_tests
     # Issues #410/#328: the per-connection read buffer is reserved per slot (PSRAM
     # where there is some), not allocated per request.
     HttpReadBuf_test.cpp
+    # Issues #410/#328: 3 concurrent connections, 2 per source, the 4th gets 503.
+    HttpConnCap_test.cpp
     # Issue #410/#328: the bench-only HTTP internal-DRAM accounting (counter
     # arithmetic always; the HttpServer wiring only with the guard on).
     HttpDramAccount_test.cpp

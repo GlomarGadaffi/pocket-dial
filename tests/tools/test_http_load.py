@@ -445,7 +445,7 @@ EXPECTED_SUMMARY = "\n".join([
     "uptime at the first read: 7200 s",
     "503s: this client saw 1; the board's httpPerSourceRefusals moved by 3 (its global-cap refusals are not emitted)",
     "both watermarks are since boot and only fall: a run shows a low-water only if it went below every earlier run;"
-    " the board serves 3 connection(s) per source and refuses the rest with 503",
+    " the board serves 2 connection(s) per source and refuses the rest with 503",
     "not emitted by the firmware, so not reported: a peak or active-connection count, a per-request thread cost;"
     " a SIP reply time during the burst is not measured here",
 ])

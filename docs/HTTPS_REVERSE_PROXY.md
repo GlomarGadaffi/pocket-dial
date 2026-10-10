@@ -58,7 +58,7 @@ server {
     proxy_set_header Origin $pd_origin;         # empty value means the header is not sent
 
     client_max_body_size 16k;    # the board's own cap (HS:825); firmware/MoH uploads go direct
-    limit_conn pd_conn 3;        # the board allows 3 of its 4 slots per source (HH:110)
+    limit_conn pd_conn 2;        # the board allows 2 of its 3 slots per source (HH:110)
     limit_conn_status 503;       # same code the board gives when busy
 
     # Plain HTTP only. See section 5.
@@ -111,9 +111,9 @@ can still lock out every proxied user (D:137-141).
 
 ### The connection cap and header size
 
-The board holds 4 connections, at most 3 per source address (HH:99, 110; HS:467-476). The proxy is one
-source, so it gets 3, and every open dashboard tab shares them. The board's own cap keeps the fourth slot
-free for a direct client; `limit_conn 3` only makes nginx refuse first.
+The board holds 3 connections, at most 2 per source address (HH:99, 110; HS:467-476). The proxy is one
+source, so it gets 2, and every open dashboard tab shares them. The board's own cap keeps the third slot
+free for a direct client; `limit_conn 2` only makes nginx refuse first.
 
 The board reads request headers from one 4095-byte `recv` and has no loop that reads on until the header
 terminator (HS:697-714, 834-838). Cookies from a parent domain (SSO, analytics) that the proxy forwards can

@@ -349,7 +349,7 @@ percentiles and the summary; its self-test is `tests/tools/test_http_load.py`. E
 `/api/status`, the dashboard's pollers (the `setInterval` block of `index_html.h`: status 2 s, cdr 5 s,
 admin/status 15 s, ota/status 15 s, and with a panel open trace 1.5 s, moh 3 s), a sequential probe of
 `GET /api/status` (the #410 `.244` recipe, 200 back to back by default), a burst of concurrent
-`GET /api/status` (4 clients by default; the board serves 3 per source and refuses the rest with 503), the rest of
+`GET /api/status` (4 clients by default; the board serves 2 per source and refuses the rest with 503), the rest of
 the window, an `after` read. `idle` polls the always-on four; `dashboard` all six; `dashboard-call` all six
 with one held call. The pollers send the admin session (a logged-in dashboard's `fetch()` does; cdr, trace and
 moh answer 401 without one and never run their handler); the probe and the burst do not. The scenario starts
