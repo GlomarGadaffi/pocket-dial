@@ -1,0 +1,2 @@
+# SosStatusGet_test.cpp: 19 (body arena failure contract 9, claim 6, teardown 3, witness 1). tests/tools/test_anchor_sos_status_bounded.py (unittest, 8 tests) pins the ESP-only wiring: 0 to the gtest floor.
+19

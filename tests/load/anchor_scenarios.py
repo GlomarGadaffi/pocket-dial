@@ -221,6 +221,14 @@ LOG_COUNTERS = {
     # #884: one line per successful control request (drop/answer): group 1 = the attempt, 2 = reused (no connect),
     # resumed (connected <= 400 ms on a kept handle) or cold, 3 = elapsed ms.
     "ctrl_request_884": r"ctrl request: attempt (\d+) (reused|resumed|cold) in (\d+) ms \(#884\)",
+    # #948: the 911/933 status handle's claim was held. Teardown gave up at its 8 ms bound and left the
+    # handle to the in-flight GET; or a 911's status GET took the fallback (no status read). Each capped per boot.
+    "sos_status_teardown_fallback_948": r"911 status handle: teardown claim not won within the bound, handle and arena "
+                                        r"left to the in-flight GET \(#948\)",
+    "sos_status_get_fallback_948": r"911 status GET: handle claim held, no status read, the call takes the "
+                                   r"conservative route \(#948\)",
+    # #948: the end of start(): group 1 = free heap, 2 = internal min free, 3 = the sos status arena, in bytes.
+    "start_heap_948": r"start: free heap (\d+) B, internal min free (\d+) B, sos status arena (\d+) B \(#948\)",
     # #533/#603's esp_log witnesses: every session teardown names its reason; a bridge stop.
     "endcall": r"endCall (?:Call-ID:\s*)?(\S+) reason=",
     "degraded_endcall": r"endCall (?:Call-ID:\s*)?(\S+) reason=anchor audio write failure",

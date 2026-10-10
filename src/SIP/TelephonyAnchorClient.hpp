@@ -20,6 +20,7 @@
 #include "freertos/semphr.h"  // #43: worker-pool done semaphore (+ existing _rxDoneSem)
 #include "PsramTask.hpp"      // #479: pd::StaticTaskSlot (the slot's tel_media_rx stack + TCB)
 #include "TelephonyAnchorLogic.hpp"   // #379: telephony::AnchorOwnLegs
+#include "SosStatusGet.hpp"           // #948: telephony::BodyArena, SosWitness
 #endif
 
 #include "PoolConfig.hpp"     // #100: POCKETDIAL_MAX_ANCHOR_CALLS (per-call slot count)
@@ -274,11 +275,18 @@ private:
 	// only, so after a long idle the first 911 may pay a cold handshake). Only an emergency
 	// makeCall() uses it (httpGetBody sosLane), so a 911 never takes _statusMutex and never waits
 	// behind another task's status GET. No mutex is held across its I/O: _sosStatusBusy is a
-	// lock-free claim, uncontended because tel_sos is one worker. The only other claimant is
-	// closeSosStatusClient() at teardown; it waits for an in-flight 911 GET, and a 911 arriving
-	// during its cleanup waits for that (bounded, no I/O). Never touched under _mutex.
+	// lock-free claim. #948: nothing on the 911 path waits for it. A GET that finds it held takes
+	// the fallback (an error, the call takes the conservative route); closeSosStatusClient() waits
+	// at most telephony::kSosClaimBoundUs, then leaves the handle to the GET that holds it. Never
+	// touched under _mutex.
 	esp_http_client_handle_t      _sosStatusClient = nullptr;
 	std::atomic<bool>             _sosStatusBusy{false};
+	// #948: the sos GET's body arena, reserved with the handle (start()'s warm GET is the first to
+	// need it) and freed with it, both under the claim. A body that does not fit is an error, never
+	// truncated. 16 participant objects at 768 B: telephony::sosBodyArenaBytes() gives the basis.
+	telephony::BodyArena          _sosBody;
+	telephony::SosWitness         _sosWitness;
+	static constexpr std::size_t  kSosBodyArenaBytes = telephony::sosBodyArenaBytes(POCKETDIAL_MAX_ANCHOR_CALLS);
 
 	// #100: the rx task handle, its done-sem, and the stopMediaStreams() single-entry gate are now
 	// per-CallSlot (rxTaskHandle / rxDoneSem / tearingDown in the struct above) — one rx pump per
@@ -392,7 +400,7 @@ private:
 	void closeCtrlClient();      // teardown under _ctrlMutex
 	void closePostClient();      // free the persistent warm _postClient (full teardown only), under _postMutex
 	void closeStatusClient();    // free the persistent warm _statusClient (full teardown only), under _statusMutex
-	void closeSosStatusClient(); // #941: free _sosStatusClient (full teardown only), under the _sosStatusBusy claim
+	void closeSosStatusClient(); // #941: free _sosStatusClient and its arena (full teardown only), under the _sosStatusBusy claim; #948: waits at most kSosClaimBoundUs
 	bool readJsonStringField(esp_http_client_handle_t client, const std::string& field, std::string& out);
 
 	// Live-state GET helpers (reconcile watchdog + drop-fallback + device resolve). Snapshot

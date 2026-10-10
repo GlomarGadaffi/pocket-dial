@@ -87,6 +87,10 @@ void TelephonyAnchorClient::setRewarmIntervalSec(uint32_t)
 #include "PsramTask.hpp"            // #100: PSRAM-backed task stacks (off the scarce internal-RAM heap)
 #include "RtpTaskSlots.hpp"         // #479: pd::rtpslots::kAnchorRxStackBytes (counted in the 72 KB budget)
 #include "EmergencyCall.hpp"        // #743: an emergency makeCall() waits out a tearing-down slot
+#include "SosStatusGet.hpp"         // #948: the sos lane's body arena, bounded claim and fallback witness
+#include "PsramAllocator.hpp"       // #948: the arena's allocator (psram::allocPreferPsram)
+#include "esp_heap_caps.h"          // #948: start()'s heap witness
+#include "esp_system.h"
 #if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
 #include "BenchProbe.hpp"           // #384 H1: bench-only anchor faults (docs/BENCH_PROBE.md)
 #endif
@@ -278,6 +282,12 @@ bool TelephonyAnchorClient::start()
 	{
 		ESP_LOGW(TAG, "start: failed to spawn slot pre-warm worker (first concurrent burst pays cold handshakes)");
 	}
+
+	// #948 witness: the heap with the sos status handle and arena built (warmStatusConnection above).
+	ESP_LOGI(TAG, "start: free heap %u B, internal min free %u B, sos status arena %u B (#948)",
+	         static_cast<unsigned>(esp_get_free_heap_size()),
+	         static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
+	         static_cast<unsigned>(_sosBody.capacity()));
 
 	return true;
 }
@@ -1230,20 +1240,15 @@ bool TelephonyAnchorClient::connectWs()
 // Deleted so a future caller can't reintroduce the wrong-leg 403.
 
 namespace {
-// #941: exclusive use of the 911 lane's _sosStatusClient without a mutex held across its socket
-// I/O. A lock-free claim; a null flag claims nothing. Uncontended in service (tel_sos is one
-// worker); the only other claimant is closeSosStatusClient() at teardown, whose cleanup does no I/O.
-struct SosStatusClaim
-{
-	std::atomic<bool>* flag;
-	explicit SosStatusClaim(std::atomic<bool>* f) : flag(f)
-	{
-		while (flag && flag->exchange(true, std::memory_order_acquire)) vTaskDelay(1);
-	}
-	~SosStatusClaim() { if (flag) flag->store(false, std::memory_order_release); }
-	SosStatusClaim(const SosStatusClaim&) = delete;
-	SosStatusClaim& operator=(const SosStatusClaim&) = delete;
-};
+// #941/#948: exclusive use of the 911 lane's _sosStatusClient and body arena without a mutex held
+// across socket I/O is the lock-free claim in telephony::SosStatusClaim (SosStatusGet.hpp). The
+// claimants are the sos lane's GETs, start()'s warm GET and closeSosStatusClient(). Usually that is
+// one tel_sos worker, but a lane left without a worker at boot runs its 911s on tel_ctl, so two 911s
+// can overlap: the second finds the claim held and its status GET takes the fallback (an error).
+// This target's clock and tick for it.
+constexpr int64_t kSosTickUs = int64_t{portTICK_PERIOD_MS} * 1000;
+int64_t sosNowUs() { return esp_timer_get_time(); }
+void sosPause() { vTaskDelay(1); }
 }   // namespace
 
 // Generalized authed GET → full response body. Snapshots the token under _mutex, then does all
@@ -1277,7 +1282,25 @@ bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bod
 	esp_http_client_handle_t& client = sosLane ? _sosStatusClient : _statusClient;
 	std::unique_lock<std::mutex> statusLock(_statusMutex, std::defer_lock);
 	if (!sosLane) statusLock.lock();
-	SosStatusClaim sosClaim(sosLane ? &_sosStatusBusy : nullptr);
+	// #948 (Rule 5): the 911 lane never waits for its claim. Held by another GET or by teardown:
+	// no status read, an error, and makeCall() takes the conservative route (it never assumes its
+	// own leg answered); the call itself is not refused.
+	telephony::SosStatusClaim sosClaim(sosLane ? &_sosStatusBusy : nullptr, /*boundUs=*/0, kSosTickUs, sosNowUs, sosPause);
+	if (!sosClaim.held())
+	{
+		_sosWitness.note(telephony::SosFallback::Get);
+		return false;
+	}
+	// #948: the sos lane reads into an arena reserved with its handle: by start()'s warm GET, the
+	// first time this runs. Under the claim, so closeSosStatusClient() cannot free it from under a
+	// read. If the block cannot be had there is no status read. A failed start()-time reserve is
+	// retried here, the one allocation left on the 911 path, and it too ends in an error, not a wait.
+	if (sosLane && !_sosBody.reserve(kSosBodyArenaBytes, &psram::allocPreferPsram, &psram::freePreferPsram))
+	{
+		ESP_LOGE(TAG, "httpGetBody: sos status arena (%u B) not allocated, no status read (#948)",
+		         static_cast<unsigned>(kSosBodyArenaBytes));
+		return false;
+	}
 
 	bool ok = false;
 	for (int attempt = 0; attempt < 2; ++attempt)
@@ -1307,6 +1330,33 @@ bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bod
 		{
 			esp_http_client_fetch_headers(client);
 			int status = esp_http_client_get_status_code(client);
+
+			if (sosLane)
+			{
+				// #948: the failure contract. The whole body fits the arena or this is an error:
+				// bodyOut empty, *statusOut still -1 (a status above 0 would read as 3CX's definitive
+				// answer to resolveOutboundLeg). A short read (a peer FIN before the response was
+				// complete) is an error too: esp_http_client_read returns 0 for it.
+				const telephony::BodyRead rd = telephony::readSosBody(
+					_sosBody,
+					[client](char* p, int n) { return esp_http_client_read(client, p, n); },
+					[client] { return esp_http_client_is_complete_data_received(client); },
+					bodyOut);
+				esp_http_client_close(client);   // the connection may be mid-body; the handle and its session ticket stay
+				if (rd == telephony::BodyRead::Ok)
+				{
+					if (statusOut) *statusOut = status;
+					ok = (status >= 200 && status < 300);
+					break;
+				}
+				ESP_LOGE(TAG, "httpGetBody: sos status GET %s (status=%d), no status read (#948)",
+				         telephony::bodyReadName(rd), status);
+				// Not transient: the same body would not fit again, and a missing arena stays missing.
+				if (rd == telephony::BodyRead::TooBig || rd == telephony::BodyRead::NoArena) break;
+				esp_http_client_cleanup(client);
+				client = nullptr;
+				continue;
+			}
 
 			// Drain the whole body regardless of status so the connection is left clean.
 			std::vector<char> buffer;
@@ -2426,12 +2476,21 @@ void TelephonyAnchorClient::closeStatusClient()
 
 void TelephonyAnchorClient::closeSosStatusClient()
 {
-	SosStatusClaim sosClaim(&_sosStatusBusy);   // waits for an in-flight 911 GET before freeing the handle
-	if (_sosStatusClient)
-	{
-		esp_http_client_cleanup(_sosStatusClient);
-		_sosStatusClient = nullptr;
-	}
+	// #948: waits at most telephony::kSosClaimBoundUs (8 ms) for an in-flight 911 GET, not as long
+	// as it takes. If the claim is not won the handle and arena are left to that GET: they stay
+	// owned by this client, the next start()'s warm GET reuses them and the next close that wins
+	// the claim frees them. The witness line records it (capped per boot).
+	telephony::closeWithinBound(
+		_sosStatusBusy, kSosTickUs, sosNowUs, sosPause,
+		[this] {
+			if (_sosStatusClient)
+			{
+				esp_http_client_cleanup(_sosStatusClient);
+				_sosStatusClient = nullptr;
+			}
+			_sosBody.release();
+		},
+		_sosWitness);
 }
 
 void TelephonyAnchorClient::closePostClient()

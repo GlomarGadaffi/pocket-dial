@@ -11,6 +11,7 @@ import unittest
 from test_anchor_own_leg_not_inbound import body_of, code_only
 
 SRC = os.path.join(os.path.dirname(__file__), "..", "..", "src", "SIP", "TelephonyAnchorClient.cpp")
+HPP = os.path.join(os.path.dirname(__file__), "..", "..", "src", "SIP", "SosStatusGet.hpp")   # #948: the claim lives here
 
 
 class AnchorSosStatusLaneTest(unittest.TestCase):
@@ -41,11 +42,12 @@ class AnchorSosStatusLaneTest(unittest.TestCase):
         self.assertIn("defer_lock", self.get_body)
 
     def test_the_sos_lane_holds_no_mutex_across_its_io(self):
-        self.assertIn("SosStatusClaim sosClaim(sosLane ? &_sosStatusBusy : nullptr);", self.get_body,
+        self.assertIn("telephony::SosStatusClaim sosClaim(sosLane ? &_sosStatusBusy : nullptr,", self.get_body,
                       "exclusion on the sos handle is the lock-free claim")
-        claim = body_of(self.src, "struct SosStatusClaim")
-        self.assertIn("exchange(true", claim)
-        self.assertNotRegex(code_only(claim), r"mutex|lock_guard|unique_lock")
+        with open(HPP, encoding="utf-8") as f:
+            claim_hpp = code_only(f.read())
+        self.assertIn("exchange(true", body_of(claim_hpp, "bool claimWithin("))
+        self.assertNotRegex(claim_hpp, r"mutex|lock_guard|unique_lock")
 
     def test_makecall_marks_an_emergency_and_forwards_it_to_both_resolvers(self):
         self.assertIn("const bool sosLane = pbx::classifyEmergencyDial(destination).isEmergency;", self.make)
@@ -63,8 +65,8 @@ class AnchorSosStatusLaneTest(unittest.TestCase):
         shutdown = code_only(body_of(self.src, "void TelephonyAnchorClient::shutdownImpl("))
         self.assertIn("closeSosStatusClient();", shutdown)
         close = code_only(body_of(self.src, "void TelephonyAnchorClient::closeSosStatusClient("))
-        self.assertIn("SosStatusClaim sosClaim(&_sosStatusBusy);", close,
-                      "teardown must not free the handle under an in-flight 911 GET")
+        self.assertRegex(close, r"telephony::closeWithinBound\(\s*_sosStatusBusy,",
+                         "teardown must not free the handle under an in-flight 911 GET")
         self.assertIn("esp_http_client_cleanup(_sosStatusClient);", close)
 
 

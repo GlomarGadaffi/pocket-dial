@@ -393,6 +393,9 @@ add_executable(sip_parser_tests
     UrlEncode_test.cpp
     JsonEscape_test.cpp
     TelephonyAnchorLogic_test.cpp
+    # Issue #948: the 911/933 lane's status GET -- the failure contract on its body arena and the
+    # bounded claim (src/SIP/SosStatusGet.hpp), the code the anchor client's sos lane calls.
+    SosStatusGet_test.cpp
     MixBus_test.cpp
     # Issue #75: MixBus wired into MediaBridge (BUS mode) and made dialable as the
     # 888 meet-me room. Covers the N-way minus-self mix end-to-end through the real
