@@ -131,22 +131,33 @@ class AnchorSosStatusBoundedTest(unittest.TestCase):
                 "sos_status_teardown_fallback_948" if "teardown" in needle else "sos_status_get_fallback_948"), 1)
         self.assertIn("kLinesPerSite = 3", self.sos_hpp, "capped per boot")
 
-    def test_the_warm_get_runs_before_the_ws_connects_so_no_911_can_meet_it(self):
+    def test_the_warm_get_follows_the_ws_connect_and_a_911_during_it_still_routes(self):
         start = code_only(body_of(self.src, "bool TelephonyAnchorClient::start("))
         self.assertEqual(start.count("warmStatusConnection();"), 1)
         warm_at = start.index("warmStatusConnection();")
-        # with the token in hand (a 401 warms nothing and the bench line would not read HTTP 200) ...
+        # after the token, so the warm GET reads HTTP 200 (the bench line), and after the WS connect
         self.assertGreater(warm_at, start.index("fetchToken()"))
-        # ... and before the WS connect event can open makeCall()'s gate
-        self.assertLess(warm_at, start.index("connectWs()"), "the warm GET must come before connectWs()")
-        self.assertLess(warm_at, start.index("warmCtrlConnection();"))
-        # the premise: makeCall() refuses unless _running AND _connected, and only the WS event sets _connected
+        self.assertGreater(warm_at, start.index("connectWs()"), "the warm GET follows connectWs()")
+        self.assertGreater(warm_at, start.index("startWsWorkers();"))
+        self.assertGreater(warm_at, start.index("warmCtrlConnection();"), "main's order: ctrl warm, then status warm")
+        self.assertLess(warm_at, start.index("createTaskPreferPsram("), "and before the slot pre-warm task")
+        # _connected is set exactly where it was: only the WS connect event, never start()
+        self.assertEqual(code_only(self.src).count("_connected.store(true"), 1)
+        self.assertIn("_connected.store(true", code_only(body_of(self.src, "void TelephonyAnchorClient::handleWsEvent(")))
+        self.assertNotIn("_connected", start.replace("_connected = false", ""), "start() does not touch _connected")
+        # a 911 landing while the warm GET holds the sos claim is never refused for it: its status GET fails
+        # at once (the claim, above), resolveDevice() fails, and makeCall() takes the legacy makecall endpoint
         make = code_only(body_of(self.src, "bool TelephonyAnchorClient::makeCall("))
+        m = re.search(r"if \(deviceId\.empty\(\) && resolveDevice\(sosLane\)\)\s*\{(.*?)\n\t\}\n", make, re.S)
+        self.assertIsNotNone(m, "the lazy device resolve")
+        self.assertNotIn("return", m.group(1), "a refused resolveDevice() does not end the call")
+        self.assertIn("std::string makeCallUrl = deviceId.empty() ? legacyUrl : deviceUrl(deviceId);", make,
+                      "an unresolved device id means the legacy makecall endpoint")
+        resolve = code_only(body_of(self.src, "bool TelephonyAnchorClient::resolveDevice("))
+        self.assertRegex(resolve, r"if \(!httpGetBody\(url, body, &status, sosLane\) \|\| status != 200\)\s*\{[^}]*return false;")
+        # makeCall() still refuses unless _running AND _connected, which the connect event satisfies
         self.assertRegex(make, r"!_running\.load\(std::memory_order_acquire\)\s*\|\|\s*"
                                r"!_connected\.load\(std::memory_order_acquire\)")
-        self.assertEqual(code_only(self.src).count("_connected.store(true"), 1)
-        ws = code_only(body_of(self.src, "void TelephonyAnchorClient::handleWsEvent("))
-        self.assertIn("_connected.store(true", ws)
 
     def test_the_warm_get_is_not_a_911_and_logs_the_line_the_bench_gate_reads(self):
         warm = code_only(body_of(self.src, "void TelephonyAnchorClient::warmStatusConnection("))

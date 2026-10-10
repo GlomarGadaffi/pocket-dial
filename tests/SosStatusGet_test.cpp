@@ -649,11 +649,12 @@ TEST(SosStatusUnread, TheOutcomeTable)
 
 // ── start()'s warm GET ───────────────────────────────────────────────────────
 
-// The warm GET runs before the WS connects (TelephonyAnchorClient.cpp start(), step 1b), when
-// makeCall() refuses every call, so a 911 cannot meet it. The source order is pinned by
-// test_anchor_sos_status_bounded.py; the host cannot run start(). These pin what happens at the
-// claim if one ever did.
-TEST(SosStatusWarm, A911GetDuringTheWarmGetFallsBackAtOnceAndReadsNothing)
+// The warm GET runs after the WS connects (TelephonyAnchorClient.cpp start(), step 3b), so for about a
+// second a 911 can land while it holds the sos claim. The reviewed fast-fail: the 911's status GET
+// fails at once, resolveDevice() fails and makeCall() uses the legacy makecall endpoint, and the call
+// still routes. The host cannot run makeCall()/resolveDevice(); test_anchor_sos_status_bounded.py pins
+// that wiring by source text. These pin the claim, the GET result, and the #349 window.
+TEST(SosStatusWarm, A911GetDuringTheWarmGetFailsAtOnceAndReadsNothing)
 {
 	SosListRead list;
 	ASSERT_TRUE(reserveReal(list.arena, 4096));
@@ -667,6 +668,28 @@ TEST(SosStatusWarm, A911GetDuringTheWarmGetFallsBackAtOnceAndReadsNothing)
 	EXPECT_LE(list.slowestUs, 10'000);
 	EXPECT_EQ(list.witness.count(SosFallback::Get), 1u) << "a real 911 fallback, so it is counted";
 	EXPECT_TRUE(list.claim.load()) << "the warm GET's claim is untouched";
+}
+
+TEST(SosStatusWarm, A911InTheUnreadWindowDuringTheWarmGetIsNotRefused)
+{
+	// The warm GET holds the claim for about a second: the first reads of the #349 window fail at once,
+	// then it lets go and a real read finds the leg. The window is 3.6 s, so the warm GET alone cannot
+	// run it out.
+	SosListRead list;
+	ASSERT_TRUE(reserveReal(list.arena, 4096));
+	list.response.body = patternBody(300);
+	list.claim.store(true);
+	int reads = 0;
+	const PlacedCall call = placeUnreadCall([&] {
+		if (++reads == 4) list.claim.store(false);   // after 3 refused reads and 3 pauses of 400 ms: 1.2 s
+		return list();
+	});
+	EXPECT_TRUE(call.success) << "not refused: the call routes";
+	EXPECT_EQ(call.ownLeg, "517") << "and its own leg is adopted";
+	EXPECT_EQ(call.reads, 4);
+	EXPECT_EQ(list.witness.count(SosFallback::Get), 3u) << "three reads fast-failed";
+	EXPECT_EQ(list.pauses.load(), 0);
+	EXPECT_LT(call.windowUs, kUnreadAdoptWindowUs);
 }
 
 TEST(SosStatusWarm, AWarmGetThatLosesTheClaimBurnsNoWitnessLine)

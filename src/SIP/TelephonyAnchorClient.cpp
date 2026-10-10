@@ -254,15 +254,6 @@ bool TelephonyAnchorClient::start()
 		return false;
 	}
 
-	// 1b. #948: prime the status-GET connections (the shared handle and the 911/933 lane's own) now,
-	// with the token in hand but BEFORE connectWs(): makeCall() refuses unless _running AND _connected
-	// (audit #66), and _connected is set only by the WS connect event (handleWsEvent), so no 911 can be
-	// in flight and nothing else holds the sos claim while this warm GET does. After connectWs() a
-	// 911 arriving during the warm GET would find the claim held and take the fallback. It cannot move
-	// above `_running = true`: there is no token yet, so the GET would answer 401. A 911 dialled during
-	// these ~2 cold handshakes is refused as "anchor not connected" instead (see the PR body).
-	warmStatusConnection();
-
 	// 2. Connect to control WebSocket
 	if (!connectWs())
 	{
@@ -279,8 +270,13 @@ bool TelephonyAnchorClient::start()
 	// 3. Prime the control handle's TLS session ticket so the first dropCall/answerCall after
 	// boot reconnects by resumption instead of a cold handshake (makeCall uses its own fresh client).
 	warmCtrlConnection();
-	// (3b, the status-GET connection warm — getLegStatus/reconcile/caller-lookup/device resolve —
-	// runs at 1b above, before the WS connects, so no 911 can meet it.)
+	// 3b. Same idea for the status-GET connection (getLegStatus/reconcile/caller-lookup/device
+	// resolve) — without this the FIRST post-boot status check still cold-handshakes even though
+	// every later one on this handle resumes. After connectWs(), so the token exists and the warm GET
+	// reads HTTP 200; _connected is set exactly when it was. #948: a 911 landing while this holds the sos
+	// claim (about a second) is never refused for it: its status GET fails at once, resolveDevice
+	// falls back to the legacy makecall endpoint, and the call still routes.
+	warmStatusConnection();
 
 	// 4. #100: cold-prime EVERY call slot's POST TLS session (keep-alive) in the background so a
 	// cold-start concurrent burst RESUMES each per-call POST open instead of paying the S3's ~1s

@@ -1,2 +1,2 @@
-# SosStatusGet_test.cpp: 33 (body arena failure contract 11, claim 7, teardown 3, #349 window 6: ASosCallIs503When{TheListIsOverTheArena,TheListReadIsShort,AnOverlapping911HoldsTheClaim}, AnyOtherCallWhoseReadsAllFailIsRefusedTheSameWay, AListedLegIsAdopted, TheOutcomeTable; warm GET 2, largest-body witness 3, fallback witness 1). tests/tools/test_anchor_sos_status_bounded.py (unittest, 13 tests) pins the ESP-only wiring: 0 to the gtest floor.
-33
+# SosStatusGet_test.cpp: 34 (body arena failure contract 11, claim 7, teardown 3, #349 window 6: ASosCallIs503When{TheListIsOverTheArena,TheListReadIsShort,AnOverlapping911HoldsTheClaim}, AnyOtherCallWhoseReadsAllFailIsRefusedTheSameWay, AListedLegIsAdopted, TheOutcomeTable; warm GET 3, largest-body witness 3, fallback witness 1). tests/tools/test_anchor_sos_status_bounded.py (unittest, 13 tests) pins the ESP-only wiring: 0 to the gtest floor.
+34
