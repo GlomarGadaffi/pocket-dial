@@ -401,6 +401,12 @@ endif()
 # cache variable and the build would silently carry the default 0.
 if(POCKETDIAL_HTTP_DRAM_ACCOUNT)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_HTTP_DRAM_ACCOUNT=1)
+    # lwIP's pool counters (httpDramAccount.memp): HttpServer.cpp must see the same
+    # MEMP_STATS as lwIP itself, which the top-level CMakeLists.txt sets under the same
+    # conditions -- only with CONFIG_LWIP_STATS (sdkconfig.defaults.accounting).
+    if(CONFIG_LWIP_STATS)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE MEMP_STATS=1)
+    endif()
     message(WARNING "SipServer: HTTP DRAM ACCOUNTING image -- bench only, httpDramAccount on /api/status (#410, #328)")
 endif()
 

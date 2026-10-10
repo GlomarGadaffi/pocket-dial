@@ -238,6 +238,142 @@ TEST(HttpDramAccount, TheStatusFragmentHasAPinnedShape)
 		"\"spawnFailures\":0}");
 }
 
+// ---- The probes: heap, thread-create cost and lwIP send queues (#410, #328) ----
+//
+// The device-side readers (heap_caps, the lwIP lists) are not run here; what they
+// feed is: the gauge, the TCP queue arithmetic, the memp row, and where the JSON
+// lands inside the object.
+
+TEST(HttpDramAccount, AGaugeKeepsTheLastLowestAndHighestAndCountsSamples)
+{
+	httpdram::Gauge g;
+	EXPECT_EQ(g.n(), 0u);
+	EXPECT_EQ(g.min(), 0u) << "min reads 0 until the first sample, not the initial UINT32_MAX";
+	g.sample(5000);
+	g.sample(300);
+	g.sample(7000);
+	g.sample(6500);
+	EXPECT_EQ(g.n(), 4u);
+	EXPECT_EQ(g.last(), 6500u);
+	EXPECT_EQ(g.min(), 300u);
+	EXPECT_EQ(g.max(), 7000u);
+	g.reset();
+	EXPECT_EQ(g.n(), 0u);
+	EXPECT_EQ(g.max(), 0u);
+	g.sample(9);
+	EXPECT_EQ(g.min(), 9u) << "reset puts the minimum back to 'no sample yet'";
+}
+
+TEST(HttpDramAccount, GaugeSamplersOnSeveralThreadsKeepTheExtremes)
+{
+	httpdram::Gauge g;
+	constexpr int kThreads = 4, kLaps = 2000;
+	std::vector<std::thread> ts;
+	for (int t = 0; t < kThreads; ++t)
+		ts.emplace_back([&g, t] { for (int i = 0; i < kLaps; ++i) g.sample(1000u + static_cast<uint32_t>(t) * 100u + static_cast<uint32_t>(i % 7)); });
+	for (auto& t : ts) t.join();
+	EXPECT_EQ(g.n(), static_cast<uint32_t>(kThreads * kLaps));
+	EXPECT_EQ(g.min(), 1000u);
+	EXPECT_EQ(g.max(), 1000u + 3u * 100u + 6u);
+}
+
+TEST(HttpDramAccount, ATcpSendQueueIsTheBufferMinusWhatIsStillFreeAndNeverWraps)
+{
+	EXPECT_EQ(httpdram::queuedBytesOf(5760, 5760), 0u);
+	EXPECT_EQ(httpdram::queuedBytesOf(5760, 2880), 2880u);
+	EXPECT_EQ(httpdram::queuedBytesOf(5760, 0), 5760u);
+	EXPECT_EQ(httpdram::queuedBytesOf(5760, 6000), 0u) << "more free than the buffer is a bookkeeping slip, not a negative queue";
+
+	// Three connections: two on the HTTP port (one with its whole buffer queued, one half),
+	// one elsewhere and idle.
+	httpdram::TcpSnapshot t;
+	httpdram::addPcb(t, true, 5760, 0, 4);
+	httpdram::addPcb(t, true, 5760, 2880, 2);
+	httpdram::addPcb(t, false, 5760, 5760, 0);
+	EXPECT_EQ(t.pcbs, 3u);
+	EXPECT_EQ(t.httpPcbs, 2u);
+	EXPECT_EQ(t.queuedBytes, 8640u);
+	EXPECT_EQ(t.httpQueuedBytes, 8640u);
+	EXPECT_EQ(t.queuedBufs, 6u);
+	httpdram::addPcb(t, false, 5760, 1000, 1);   // a non-HTTP queue counts in the totals only
+	EXPECT_EQ(t.queuedBytes, 8640u + 4760u);
+	EXPECT_EQ(t.httpQueuedBytes, 8640u);
+	EXPECT_EQ(t.httpPcbs, 2u);
+}
+
+TEST(HttpDramAccount, AMempRowHasAPinnedShapeAndItsByteColumnsSaturate)
+{
+	StrOut o;
+	httpdram::writeMempRow(o, httpdram::MempRow{"TCP_PCB", 2, 5, 1, 200});
+	EXPECT_EQ(o.out, "{\"name\":\"TCP_PCB\",\"used\":2,\"max\":5,\"err\":1,\"size\":200,\"bytesNow\":400,\"bytesMax\":1000}");
+
+	EXPECT_EQ(httpdram::saturatingMul(65535, 65535), 4294836225u);
+	EXPECT_EQ(httpdram::saturatingMul(4294967295u, 2), 4294967295u);
+	StrOut big;
+	httpdram::writeMempRow(big, httpdram::MempRow{"X", 4294967295u, 4294967295u, 0, 3});
+	EXPECT_NE(big.out.find("\"bytesNow\":4294967295,\"bytesMax\":4294967295"), std::string::npos) << big.out;
+}
+
+TEST(HttpDramAccount, TheProbesLandInsideTheObjectAfterSpawnFailuresInAPinnedShape)
+{
+	// httpDramAccount stays ONE key of /api/status: the probes' members are written
+	// by the tail hook, before the object's closing brace, so the top-level key list
+	// (pinned in HttpStatusAlloc_test.cpp) is untouched.
+	Account a;
+	httpdram::Probes p;
+	p.sampleHeap(10000, 4000, 20);
+	p.sampleHeap(8000, 3000, 22);
+	p.connCreated(20000, 14500);
+	httpdram::TcpSnapshot t;
+	httpdram::addPcb(t, true, 5760, 0, 4);
+	httpdram::addPcb(t, true, 5760, 2880, 2);
+	httpdram::addPcb(t, false, 5760, 5760, 0);
+	p.sampleTcp(t);
+
+	StrOut o;
+	a.writeJson(o, [&p](StrOut& out) {
+		p.writeJson(out);
+		out.s(",\"memp\":[");
+		httpdram::writeMempRow(out, httpdram::MempRow{"TCP_PCB", 2, 5, 1, 200});
+		out.s("]");
+	});
+	EXPECT_EQ(o.out,
+		",\"httpDramAccount\":{\"conns\":{\"now\":0,\"hwm\":0},"
+		"\"taskStack\":{\"now\":0,\"hwm\":0,\"atPeak\":0},"
+		"\"reqBuf\":{\"now\":0,\"hwm\":0,\"atPeak\":0},"
+		"\"reqRaw\":{\"now\":0,\"hwm\":0,\"atPeak\":0},"
+		"\"reqParsed\":{\"now\":0,\"hwm\":0,\"atPeak\":0},"
+		"\"respBody\":{\"now\":0,\"hwm\":0,\"atPeak\":0},"
+		"\"total\":{\"now\":0,\"hwm\":0},\"respBodyMax\":0,\"spawnFailures\":0,"
+		"\"heap\":{\"free\":{\"n\":2,\"last\":8000,\"min\":8000,\"max\":10000},"
+		"\"largest\":{\"n\":2,\"last\":3000,\"min\":3000,\"max\":4000}},"
+		"\"connCreate\":{\"n\":1,\"last\":5500,\"min\":5500,\"max\":5500},"
+		"\"tasks\":{\"n\":2,\"last\":22,\"min\":20,\"max\":22},"
+		"\"tcp\":{\"pcbs\":{\"n\":1,\"last\":3,\"min\":3,\"max\":3},"
+		"\"httpPcbs\":{\"n\":1,\"last\":2,\"min\":2,\"max\":2},"
+		"\"queuedBytes\":{\"n\":1,\"last\":8640,\"min\":8640,\"max\":8640},"
+		"\"httpQueuedBytes\":{\"n\":1,\"last\":8640,\"min\":8640,\"max\":8640},"
+		"\"queuedBufs\":{\"n\":1,\"last\":6,\"min\":6,\"max\":6}},"
+		"\"memp\":[{\"name\":\"TCP_PCB\",\"used\":2,\"max\":5,\"err\":1,\"size\":200,\"bytesNow\":400,\"bytesMax\":1000}]}");
+}
+
+TEST(HttpDramAccount, AThreadCreateThatFreedMoreThanItTookIsZeroAndResetClearsTheProbes)
+{
+	httpdram::Probes p;
+	p.connCreated(100, 200);   // other tasks freed 100 B more than the thread took
+	EXPECT_EQ(p.connCreate.n(), 1u);
+	EXPECT_EQ(p.connCreate.last(), 0u);
+	p.connCreated(9000, 4300);
+	EXPECT_EQ(p.connCreate.last(), 4700u);
+	EXPECT_EQ(p.connCreate.max(), 4700u);
+	p.sampleHeap(1, 2, 3);
+	p.sampleTcp(httpdram::TcpSnapshot{1, 1, 10, 10, 1});
+	p.reset();
+	for (const httpdram::Gauge* g : { &p.heapFree, &p.heapLargest, &p.connCreate, &p.tasks, &p.tcpPcbs,
+	                                  &p.tcpHttpPcbs, &p.tcpQueuedBytes, &p.tcpHttpQueuedBytes, &p.tcpQueuedBufs })
+		EXPECT_EQ(g->n(), 0u);
+}
+
 #if POCKETDIAL_HTTP_DRAM_ACCOUNT && !defined(_WIN32) && !defined(_WIN64)
 
 // The wiring, with the guard on. HttpServer.cpp feeds the process-wide

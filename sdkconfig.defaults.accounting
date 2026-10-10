@@ -1,0 +1,20 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# BENCH-ONLY overlay for the HTTP DRAM accounting image (#410, #328;
+# docs/BENCH_PROBE.md). Layered ON TOP of sdkconfig.defaults, and used ONLY with
+# -DPOCKETDIAL_HTTP_DRAM_ACCOUNT=1: a release image never lists this file, so its
+# sdkconfig is unchanged. Build:
+#   idf.py -B build-acct -D SIP_TRANSPORT=eth -D POCKETDIAL_HTTP_DRAM_ACCOUNT=1 \
+#          -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.accounting" \
+#          set-target esp32s3 build
+# Use a fresh build directory: a build directory that already has an sdkconfig keeps
+# its old values for keys the defaults files set, so the overlay would not apply.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# lwIP's own counters. This alone gives lwip_stats.{link,ip,tcp,udp,...} error
+# counts; the per-pool memp used/max/err that httpDramAccount.memp reads also need
+# MEMP_STATS=1, which IDF's Kconfig cannot set and the top-level CMakeLists.txt
+# adds when POCKETDIAL_HTTP_DRAM_ACCOUNT is on (lwIP's default is
+# (MEMP_MEM_MALLOC == 0), and IDF builds with MEMP_MEM_MALLOC=1). Without this
+# line the image still builds and reports "memp":null; the TCP send-queue readings
+# in httpDramAccount.tcp need no statistics at all.
+CONFIG_LWIP_STATS=y

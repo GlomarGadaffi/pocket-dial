@@ -126,7 +126,10 @@ namespace httpdram
 		}
 
 		// ,"httpDramAccount":{...} for a writer with s(string_view) and n(number).
-		template <class Out> void writeJson(Out& out) const
+		// `tail(out)` writes more members INSIDE the object, each starting with a
+		// comma, after spawnFailures (the Probes below): the object stays one key of
+		// /api/status, so the top-level key list is not touched.
+		template <class Out, class Tail> void writeJson(Out& out, Tail&& tail) const
 		{
 			out.s(",\"httpDramAccount\":{\"conns\":{\"now\":").n(connsNow()).s(",\"hwm\":").n(connsHwm()).s("}");
 			for (unsigned i = 0; i < kSlotCount; ++i)
@@ -136,8 +139,11 @@ namespace httpdram
 				   .s(",\"atPeak\":").n(atPeak(s)).s("}");
 			}
 			out.s(",\"total\":{\"now\":").n(totalNow()).s(",\"hwm\":").n(totalHwm())
-			   .s("},\"respBodyMax\":").n(bodyMax()).s(",\"spawnFailures\":").n(spawnFailures()).s("}");
+			   .s("},\"respBodyMax\":").n(bodyMax()).s(",\"spawnFailures\":").n(spawnFailures());
+			tail(out);
+			out.s("}");
 		}
+		template <class Out> void writeJson(Out& out) const { writeJson(out, [](Out&) {}); }
 
 	private:
 		static constexpr std::memory_order kRelaxed = std::memory_order_relaxed;
@@ -184,6 +190,138 @@ namespace httpdram
 	// The process-wide account HttpServer.cpp feeds. Constant-initialised: no
 	// guard variable, no allocation, usable before main().
 	inline Account gAccount;
+
+	// ---- Probes: the share the five consumers above cannot see (#410, #328) ----
+	//
+	// On .244 the HTTP-load drop of minFreeHeapInternal was 38.4 KB with 16.9 KB
+	// accounted: about 21.5 KB elastic and unattributed. Candidates are the lwIP
+	// send queues (a socket send COPIES the response into heap pbufs, from PSRAM
+	// or not, and holds them until the peer acknowledges), the per-thread cost
+	// beyond the stack (TCB, pthread state), heap fragmentation and the task
+	// count. These are sampled readings, not holds: each Gauge keeps the last,
+	// lowest and highest value it was given and how many samples that was.
+
+	// Fixed atomics, no allocation. min reads 0 until the first sample.
+	class Gauge
+	{
+	public:
+		void sample(uint32_t v)
+		{
+			_last.store(v, kRelaxed);
+			uint32_t h = _max.load(kRelaxed);
+			while (v > h && !_max.compare_exchange_weak(h, v, kRelaxed)) {}
+			uint32_t l = _min.load(kRelaxed);
+			while (v < l && !_min.compare_exchange_weak(l, v, kRelaxed)) {}
+			_n.fetch_add(1, kRelaxed);
+		}
+		uint32_t n() const { return _n.load(kRelaxed); }
+		uint32_t last() const { return _last.load(kRelaxed); }
+		uint32_t min() const { return n() != 0 ? _min.load(kRelaxed) : 0u; }
+		uint32_t max() const { return _max.load(kRelaxed); }
+		void reset() { _n = 0; _last = 0; _max = 0; _min = UINT32_MAX; }
+		template <class Out> void writeJson(Out& out) const
+		{
+			out.s("{\"n\":").n(n()).s(",\"last\":").n(last()).s(",\"min\":").n(min()).s(",\"max\":").n(max()).s("}");
+		}
+
+	private:
+		static constexpr std::memory_order kRelaxed = std::memory_order_relaxed;
+		std::atomic<uint32_t> _n{0}, _last{0}, _max{0}, _min{UINT32_MAX};
+	};
+
+	// One walk of the TCP control blocks: how many there are and what their send
+	// queues hold. `http` marks the ones on the HTTP server's port.
+	struct TcpSnapshot
+	{
+		uint32_t pcbs = 0, httpPcbs = 0;
+		uint32_t queuedBytes = 0, httpQueuedBytes = 0;   // written and not yet acknowledged
+		uint32_t queuedBufs = 0;                         // pbufs in those queues (snd_queuelen)
+	};
+
+	// Bytes in one pcb's send queue: the buffer it was given minus what is still
+	// free. Saturating, so a pcb reporting more free than its size holds 0.
+	inline uint32_t queuedBytesOf(uint32_t sndBufMax, uint32_t sndBufFree)
+	{
+		return sndBufFree < sndBufMax ? sndBufMax - sndBufFree : 0u;
+	}
+	inline void addPcb(TcpSnapshot& t, bool http, uint32_t sndBufMax, uint32_t sndBufFree, uint32_t queueLen)
+	{
+		const uint32_t q = queuedBytesOf(sndBufMax, sndBufFree);
+		++t.pcbs;
+		t.queuedBytes += q;
+		t.queuedBufs += queueLen;
+		if (http) { ++t.httpPcbs; t.httpQueuedBytes += q; }
+	}
+
+	// One lwIP memp pool as lwIP counts it (needs LWIP_STATS and MEMP_STATS; see
+	// docs/BENCH_PROBE.md). `size` is the element size, 0 if not known: the byte
+	// columns are used*size and max*size, saturating. max is that pool's own
+	// high-water; the pools' maxima peak at different instants.
+	struct MempRow { const char* name; uint32_t used, max, err, size; };
+	inline uint32_t saturatingMul(uint32_t a, uint32_t b)
+	{
+		const uint64_t p = static_cast<uint64_t>(a) * b;
+		return p > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(p);
+	}
+	template <class Out> void writeMempRow(Out& out, const MempRow& r)
+	{
+		out.s("{\"name\":\"").s(r.name).s("\",\"used\":").n(r.used).s(",\"max\":").n(r.max).s(",\"err\":").n(r.err)
+		   .s(",\"size\":").n(r.size).s(",\"bytesNow\":").n(saturatingMul(r.used, r.size))
+		   .s(",\"bytesMax\":").n(saturatingMul(r.max, r.size)).s("}");
+	}
+
+	class Probes
+	{
+	public:
+		Gauge heapFree, heapLargest;   // internal, 8-bit capable
+		Gauge connCreate;              // internal bytes the heap lost across one std::thread creation
+		Gauge tasks;                   // FreeRTOS task count
+		Gauge tcpPcbs, tcpHttpPcbs, tcpQueuedBytes, tcpHttpQueuedBytes, tcpQueuedBufs;
+
+		void sampleHeap(uint32_t freeInternal, uint32_t largestInternal, uint32_t taskCount)
+		{
+			heapFree.sample(freeInternal);
+			heapLargest.sample(largestInternal);
+			tasks.sample(taskCount);
+		}
+		// before/after: free internal bytes either side of creating one connection
+		// thread (stack, TCB, pthread state, the std::thread state). 0 if other tasks
+		// freed more in that instant than the thread took; allocations other tasks
+		// make in it are included, so the lowest value is the best estimate.
+		void connCreated(uint32_t freeBefore, uint32_t freeAfter)
+		{
+			connCreate.sample(freeBefore > freeAfter ? freeBefore - freeAfter : 0u);
+		}
+		void sampleTcp(const TcpSnapshot& t)
+		{
+			tcpPcbs.sample(t.pcbs);
+			tcpHttpPcbs.sample(t.httpPcbs);
+			tcpQueuedBytes.sample(t.queuedBytes);
+			tcpHttpQueuedBytes.sample(t.httpQueuedBytes);
+			tcpQueuedBufs.sample(t.queuedBufs);
+		}
+		void reset()
+		{
+			heapFree.reset(); heapLargest.reset(); connCreate.reset(); tasks.reset();
+			tcpPcbs.reset(); tcpHttpPcbs.reset(); tcpQueuedBytes.reset(); tcpHttpQueuedBytes.reset(); tcpQueuedBufs.reset();
+		}
+
+		// Members for the inside of the httpDramAccount object, each led by a comma.
+		template <class Out> void writeJson(Out& out) const
+		{
+			out.s(",\"heap\":{\"free\":"); heapFree.writeJson(out);
+			out.s(",\"largest\":"); heapLargest.writeJson(out);
+			out.s("},\"connCreate\":"); connCreate.writeJson(out);
+			out.s(",\"tasks\":"); tasks.writeJson(out);
+			out.s(",\"tcp\":{\"pcbs\":"); tcpPcbs.writeJson(out);
+			out.s(",\"httpPcbs\":"); tcpHttpPcbs.writeJson(out);
+			out.s(",\"queuedBytes\":"); tcpQueuedBytes.writeJson(out);
+			out.s(",\"httpQueuedBytes\":"); tcpHttpQueuedBytes.writeJson(out);
+			out.s(",\"queuedBufs\":"); tcpQueuedBufs.writeJson(out);
+			out.s("}");
+		}
+	};
+	inline Probes gProbes;
 }
 
 #endif

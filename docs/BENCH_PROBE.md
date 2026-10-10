@@ -233,6 +233,23 @@ idf.py -B build-acct -D SIP_TRANSPORT=<the board's transport> [-D PD_ETH_BOARD=<
   would accept this image as a release candidate. The field is how you tell: a release image has
   no `httpDramAccount`. Flash a release image back when the run is over.
 - The host equivalent is `-DCMAKE_CXX_FLAGS=-DPOCKETDIAL_HTTP_DRAM_ACCOUNT=1`.
+- For the lwIP pool counters (`memp` below) add the overlay, the way the constrained profile
+  adds its own, and start from a **fresh** build directory (a directory that already has an
+  `sdkconfig` keeps its old values and the overlay is not applied):
+
+  ```
+  idf.py -B build-acct -D SIP_TRANSPORT=<...> -D POCKETDIAL_HTTP_DRAM_ACCOUNT=1 \
+         -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.accounting" set-target esp32s3
+  ```
+
+  `sdkconfig.defaults.accounting` is one line, `CONFIG_LWIP_STATS=y`. lwIP only keeps per-pool
+  counts when `MEMP_STATS` is 1, its default is `(MEMP_MEM_MALLOC == 0)` and IDF builds with
+  `MEMP_MEM_MALLOC=1`, and IDF's Kconfig has no switch for it, so the top-level `CMakeLists.txt`
+  (for lwIP) and `main/CMakeLists.txt` (for `HttpServer.cpp`, which must agree on the struct
+  layout) add `MEMP_STATS=1` themselves, under the same option and only when `CONFIG_LWIP_STATS`
+  is on. Without the overlay the image still builds, `memp` reads `null`, a `CMake Warning` says
+  so, and every other probe is unaffected. A release image lists neither the overlay nor the
+  define: its sdkconfig and its lwIP objects are not touched by this option.
 
 ### What it reports
 
@@ -264,6 +281,46 @@ also inside `taskStack`, so `total` can read a few hundred bytes high.
 roughly thirty `std::ostringstream` response builders allocate. It is a lower bound for what the
 builders held.
 
+### The probes: the share the rows above cannot see
+
+The consumers above are holds the code makes. The rest of the drop is elastic and held by the
+heap, the task layer and lwIP, so these members are **readings**: each `{"n","last","min","max"}`
+is a gauge of the values sampled (n of them), not a hold that was added up. They sit inside the
+`httpDramAccount` object after `spawnFailures`; `/api/status` gains no top-level key.
+
+| Member | What it reads | Device or host |
+|---|---|---|
+| `heap.free`, `heap.largest` | `heap_caps_get_free_size()` and `heap_caps_get_largest_free_block()`, both `MALLOC_CAP_INTERNAL \| MALLOC_CAP_8BIT`, sampled by the accept thread 50 times a second, when a connection thread has been created, when one ends and at every `/api/status` read (beside the route's other heap figures). `largest.min` is the fragmentation floor that the point reading `largestFreeBlockInternal` cannot show. `free.min` is never below `minFreeHeapInternal`, which IDF tracks continuously. | device; host `n` is 0 |
+| `connCreate` | Internal bytes the heap lost across creating one connection thread: free before minus free after `std::thread`, in the accept thread. That is the stack **plus** the TCB, the pthread and `std::thread` state: `taskStack` counts only `kHttpConnStackBytes`. Allocations other tasks make in that instant are included, so `min` is the best estimate; `min - 4096` is what `taskStack` misses per connection. | device |
+| `tasks` | `uxTaskGetNumberOfTasks()`, sampled with the heap. | device |
+| `tcp.pcbs`, `tcp.httpPcbs` | Active TCP control blocks, all and on the HTTP port. | device |
+| `tcp.queuedBytes`, `tcp.httpQueuedBytes` | The bytes written to sockets and not yet acknowledged: the sum over pcbs of `TCP_SND_BUF - snd_buf`, all and on the HTTP port. A send **copies** the response into heap pbufs and keeps them until the peer acknowledges, whatever the source buffer's region. Read on the lwIP thread (`tcpip_api_call`) by the accept thread, 50 times a second. Needs no lwIP statistics. | device |
+| `tcp.queuedBufs` | The pbufs in those queues (`snd_queuelen`). | device |
+| `memp` | An array, one row per lwIP pool ever drawn from: its `name`, `used` now, `max` (lwIP's own high-water, unlike the gauges), `err` (draws that failed), element `size`, and `bytesNow`/`bytesMax` as used or max times size (the pools' maxima peak at different instants). **`null` unless the image was built with the overlay** (see Building it). | device |
+
+Notes on reading them:
+
+- `tcp.*` gauges hold the value **at a sampling instant**, every 20 ms, so `max` is a lower bound for
+  the true peak of the queues. A page load keeps the queues full for far longer than that; a short
+  burst can be missed.
+- The samples are taken on the **accept thread** (8 KB stack), never on a connection thread: some routes
+  are down to about 470 B of the `http_conn` thread's 4096 B stack (#405) and the lwIP call needs more
+  than that. The accept loop's `select()` wait is 20 ms instead of 250 ms in this image to give the
+  sampling rate; a status read shows what was sampled at most 20 ms before.
+- Not in `memp`: `PBUF_RAM`, i.e. every TCP send segment, which `MEM_LIBC_MALLOC` takes straight from
+  the heap (and there is no `lwip_stats.mem` either). That is why `tcp.queuedBytes` exists.
+- Not read: the receive side. A pcb's receive window is advertised space, not held memory; data
+  waiting for the application sits in the netconn's mailbox, which no pcb field sizes.
+- Cost: 50 times a second the accept thread does a `tcpip_api_call` (a message to the lwIP thread
+  and a wait) and walks the heap. It is a bench image: `/api/status` is also about 2.5 KB longer,
+  which a no-PSRAM profile's 16 KB buffer may not take with an office-sized roster (then a counted
+  500, never a truncated body).
+- Per-task attribution: `connCreate` and the existing `stackHwm_http_conn` cover the HTTP threads.
+  The `tel_*` tasks are created at boot, before any load, so their stacks are in `F0` and not in the
+  drop; `tasks.max - tasks.min` says whether anything else was created during the run (more than the
+  HTTP threads would mean yes). FreeRTOS keeps no per-task heap figure, so a task that allocates from
+  the heap while running cannot be attributed here.
+
 ### Reading it on `.244`
 
 `minFreeHeapInternal` and every `hwm` are since boot and only ever fall, so compare windows, not
@@ -286,15 +343,46 @@ instants:
    first read in #947. That is arithmetic from the code, a candidate to confirm or reject with
    the reading, not a finding.
 
+### The lwIP share, and choosing a fix
+
+After #974 moved the read buffer to PSRAM the `.244` bench read `reqBuf` 0 and an accounted peak
+of 16930 B, but the drop under load was 38.4 KB: about 21.5 KB unaccounted (it was 5.4 KB). The
+probes above exist to name that share. This section is the **candidate** and what to read to
+confirm it; the numbers are arithmetic from the code and the config, not readings.
+
+**Candidate.** A socket send copies the response into heap pbufs and holds them until the peer
+acknowledges (`tcp_write` with `TCP_WRITE_FLAG_COPY`). Each connection can queue up to
+`CONFIG_LWIP_TCP_SND_BUF_DEFAULT` = 5760 B, four 1440 B segments, each with about 80 B of pbuf,
+header room and `tcp_seg` around it: about 1.06 B of heap per queued byte, 6.1 KB for a full queue.
+The dashboard document is sent in place from flash but still goes through that queue at the pace
+the peer acknowledges, so four browsers loading it hold four full queues for the whole load:
+4 x 6.1 = about 24 KB at the peak, the size of the unaccounted share. Each connection also costs
+what `connCreate` reads beyond its 4096 B stack (the TCB and pthread state) and about 0.7 KB of
+`tcp_pcb`, `netconn`, mailbox and semaphore (the `memp` rows size the pools).
+
+**Read after the harness run**, in one `/api/status`: `tcp.httpQueuedBytes.max`, `tcp.queuedBufs.max`,
+`memp` (`TCP_SEG`, `PBUF_REF/ROM`, `NETCONN`, `TCP_PCB` `bytesMax`), `connCreate.min`, `heap.largest.min`,
+`conns.hwm`, `httpPerSourceRefusals` and the busy refusals in the log.
+
+**Proposals** (none applied: no default changes in this change):
+
+| Option | Expected saving at the four-connection peak | Costs | Pick it when the bench shows |
+|---|---|---|---|
+| Smaller send buffer: `CONFIG_LWIP_TCP_SND_BUF_DEFAULT` 5760 to 2880 (the constrained profile's value), with `CONFIG_LWIP_TCP_WND_DEFAULT` left alone | Up to 4 x (5760 - 2880) x 1.06 = 12.2 KB, but only what was queued: about 1.06 x (`httpQueuedBytes.max` - min(`httpQueuedBytes.max`, 11520)) | Throughput of large downloads (two segments in flight; the document and `/api/coredump`, not the polled JSON); no concurrency lost | `tcp.httpQueuedBytes.max` near 4 x 5760 = 23040 (say 17 KB or more): the queues are the eater |
+| Connection cap 4 to 3 (`kMaxConcurrentConnections`) | One connection's whole cost: `connCreate.min` (about 4.7 KB if it reads the TCB at about 600 B) + a full queue 6.1 KB + 0.7 KB = about 11.5 KB | The fourth concurrent request is refused 503, and `kMaxConnectionsPerSource` falls from 3 to 2: a browser's third parallel connection is refused | `conns.hwm` is 4 only briefly, `httpPerSourceRefusals` reads 0 under the real dashboard load at cap 4, and the busy-refusal log is empty |
+| Both | 4 x (4.7 + 6.1 + 0.7) = 46 KB to 3 x (4.7 + 3.1 + 0.7) = 25.4 KB, about 20.6 KB | The two costs above | The first row's condition holds and the second row's saving alone is not enough |
+| Neither | none | | `tcp.httpQueuedBytes.max` is small (under about 8 KB) while the unaccounted share is still large: the queues are not it. Read `heap.largest.min` and `tasks` next and look at the response builders' transients (`std::ostringstream` plus `str()`, see below); do not change either knob on this evidence |
+
 ### What it cannot see
 
-- The task control block, the `esp_pthread` entry and the `std::thread` state of every connection.
+- The task control block, the `esp_pthread` entry and the `std::thread` state of every connection,
+  one by one. Together they are `connCreate.min - 4096` per connection.
 - Stacks and TCBs of finished threads. A FreeRTOS task frees them when the idle task reaps it,
   after `taskStack.now` has already dropped, so under load internal DRAM can stay low while the
   counters read zero.
-- lwIP: the socket, netconn and PCB per connection and, above all, the TCP send and receive
-  pbufs (a send window of `CONFIG_LWIP_TCP_SND_BUF_DEFAULT` per connection, 5760 B by default,
-  comes from the same internal heap while the peer has not ACKed).
+- lwIP: the pools and the TCP send queues are read by `memp` and `tcp` (above). Not read: data
+  waiting in a netconn's receive mailbox, the mailboxes and semaphores themselves (FreeRTOS
+  objects, not lwIP pools) and `PBUF_RAM` other than the TCP send queues.
 - The Ethernet driver's TX/RX buffers and the SPI DMA bounce buffer #328 is about.
 - Transients inside a request: `parseRequest()`'s per-header `line`/`hName`/`hVal`, `getFormParam()`
   and `jsonEscape()` strings, the OTA/MoH branch's `otaReq`, and the `std::ostringstream` stream
@@ -317,3 +405,23 @@ with it on, code grows by 2653 B and `.bss` by 84 B, and `-fstack-usage` gives `
 448 -> 496 B and `sendResponseWithHeader()` 240 -> 256 B. Not done: a link or a full image
 (so no app-slot margin for the option-on image), the classic-ESP32 / `lan8720` and
 `SIP_CONSTRAINED` profiles, any run on a board, and the first reading on `.244`.
+
+The probes (this section's second half) add to that:
+
+- Host-tested: the gauge, the TCP queue arithmetic, the `memp` row and where the JSON lands
+  (`HttpDramAccount_test.cpp`, six tests, built with the option on and off). The device readers
+  (`heap_caps`, `tcp_active_pcbs` through `tcpip_api_call`, `lwip_stats.memp`) cannot run on the host.
+- With the option off nothing changes: `HttpServer.cpp` compiled for the ESP32-S3 is identical to
+  `origin/main`'s once the DWARF is stripped (the full objects differ only in line tables, which the
+  guarded code shifts), `-fstack-usage` frames are the same, and the generated `sdkconfig` of a
+  fresh `idf.py reconfigure` is identical to `origin/main`'s.
+- With the option on and the overlay, `sdkconfig` differs from the option-off one by the single line
+  `CONFIG_LWIP_STATS=y`; `MEMP_STATS=1` reaches lwIP's and `main`'s compile commands and, without
+  the overlay, neither (the configure prints the warning). lwIP's `memp.c` and `stats.c` compile with
+  `MEMP_STATS=1` under `MEMP_MEM_MALLOC`, and fail with `'MEMP_STATS' redefined` if it is set
+  without `LWIP_STATS`, which is why the CMake sets it only when `CONFIG_LWIP_STATS` is on.
+- A full option-on ESP32-S3 `eth` image builds and links (`SipServer.bin` 2302448 B in a 6 MB app
+  slot, 63% free; the option-on image of #973 was 2297136 B).
+- Not done: any run on a board, so no `memp`, `tcp` or `connCreate` value has been read; every number
+  in the fix table above is arithmetic. The accept loop's 20 ms `select()` and the `tcpip_api_call`
+  every 20 ms have not been timed.
