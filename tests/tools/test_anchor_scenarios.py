@@ -586,9 +586,10 @@ class RefusalTest(unittest.TestCase):
         self.assertNotIn("x_none", an.SCENARIOS)
         # x379_cancel_before_leg joined the registry with this change (the CANCEL-before-the-leg race)
         # h947_http_load joined the registry with #947 (the HTTP-under-load measurement; tests/tools/test_http_load.py)
+        # x370_pressure_rebuild joined the registry with #370 (the GET handle's rebuild under a DRAM ballast)
         self.assertEqual(sorted(an.SCENARIOS), ["h947_http_load", "x279_degraded_bye", "x349_unread_makecall",
-                                                "x379_cancel_before_leg", "x379_never_opened",
-                                                "x4_cancel_ringing", "x518_403_clean_giveup",
+                                                "x370_pressure_rebuild", "x379_cancel_before_leg",
+                                                "x379_never_opened", "x4_cancel_ringing", "x518_403_clean_giveup",
                                                 "x888_ws_upsert"])
 
     def test_dry_run_prints_the_plan_and_the_ring_required_banner(self):
@@ -1865,7 +1866,7 @@ class X379RefusalTest(unittest.TestCase):
 
 # ---------------------------------------------------------------- the probe scenarios (#384 H1)
 PROBE_SCENARIOS = ("x349_unread_makecall", "x379_never_opened", "x518_403_clean_giveup", "x279_degraded_bye",
-                   "x888_ws_upsert")
+                   "x888_ws_upsert", "x370_pressure_rebuild")
 PROBE_VERSION = "v1.5.0-fake-probe"
 EM_DASH = "—"
 
@@ -2011,9 +2012,29 @@ class FakeProbeBoard(FakeBoard):
                 self.on_arm(fault)
             return (200, self.counters())
         if not fault and ballast == "release":
+            if self.knobs.get("release_503", 0) > 0:      # "counters busy": the release has to be repeated
+                self.knobs["release_503"] -= 1
+                return (503, {"error": "counters busy"})
             if self.ballast["held"]:
                 self.ballast["held"] = False
                 self.ballast["released"]["api"] += 1
+                self.log("BenchProbe: BENCHFAULT ballast released (api): 90000 bytes")
+            return (200, self.counters())
+        if not fault and ballast.isdigit():
+            # BenchProbe.cpp armBallast(): a floor of 8192, 409 while an emergency is live or one is held, and a
+            # 200 with nothing held when the board is already at or under the target
+            deadman = form.get("deadman", "")
+            if int(ballast) < 8192 or (deadman and not (deadman.isdigit() and 1 <= int(deadman) <= 600)):
+                return (400, {"error": "bad request"})
+            if self.emergency_live or self.knobs.get("emergency_on_arm"):
+                return (409, {"error": "emergency call in progress"})
+            if self.ballast["held"] or self.knobs.get("ballast_409"):
+                return (409, {"error": "ballast already held"})
+            if not self.knobs.get("ballast_noop"):
+                self.ballast.update(held=True, bytes=90000, blocks=30, target=int(ballast),
+                                    deadmanS=int(deadman or 120))
+                self.log("BenchProbe: BENCHFAULT ballast held: 90000 bytes in 30 blocks, free internal %s, "
+                         "dead-man %s s" % (ballast, deadman or 120))
             return (200, self.counters())
         return (400, {"error": "bad request"})
 
@@ -2062,7 +2083,7 @@ class FakeProbeBoard(FakeBoard):
         return "https://%s/callcontrol/%s/participants/%s/stream" % (TENANT, self.route_dn, leg)
 
     def _on_invite(self, req, addr):
-        if self.mode == "x888":                          # the plain ringing anchor call: CANCEL -> 487, one drop
+        if self.mode in ("x888", "x370"):                # the plain ringing anchor call: CANCEL -> 487, one drop
             return FakeBoard._on_invite(self, req, addr)
         c = self.calls.get(req.call_id())
         if tag_of(req.get("to")):
@@ -2081,6 +2102,42 @@ class FakeProbeBoard(FakeBoard):
         self.calls[req.call_id()] = c
         self._reply(req, addr, 100, "Trying")
         getattr(self, "_call_" + self.mode)(c)
+
+    # #370: the rx task's GET loop on a ringing leg, under the ballast. With nothing held the open survives; held,
+    # it fails x370_fails times in a row (the rebuild runs after each but the third), then the knobs say how it ends.
+    def _leg_up(self, c):
+        super()._leg_up(c)
+        if self.mode == "x370":
+            threading.Thread(target=self._pressure_loop, args=(c,), daemon=True).start()
+
+    def _pressure_loop(self, c):
+        time.sleep(0.05)
+        k = self.knobs
+        with self.lock:
+            status, budget = self.fire("get_status"), self.fire("get_max_attempts")
+            n, code = budget or 240, status or 404
+            fails = k.get("x370_fails", 1) if self.ballast["held"] else 0
+            how = ("open failed (ESP_ERR_HTTP_CONNECT)" if k.get("x370_open_failed")
+                   else "transport failure (no HTTP response, status=-1)")
+            for a in range(1, fails + 1):
+                self.log("TelephonyAnchor: GET stream %s, attempt %d/%d" % (how, a, n))
+            if fails >= 3:
+                self.log("TelephonyAnchor: GET stream: 3 consecutive transport failures %s giving up rather than "
+                         "reopening a dead connection %d more times" % (EM_DASH, n - 3))
+            elif fails and k.get("x370_rebuild_fail"):
+                self.log("TelephonyAnchor: GET stream: could not rebuild client after transport failure %s "
+                         "giving up" % EM_DASH)
+            elif not (fails and k.get("x370_no_followup")):
+                for b in range(fails + 1, min(n, fails + 3) + 1):
+                    self.log("TelephonyAnchor: GET stream not ready (HTTP %d), attempt %d/%d" % (code, b, n))
+            if k.get("x370_panic"):
+                self.log("E (1) boot: Guru Meditation Error: Core 1 panic'ed (LoadProhibited)")
+            if k.get("x370_orphan"):
+                self.log("TelephonyAnchor: makeCall: request reached 3CX but no response and no reconcilable leg "
+                         "after 3 attempts %s a call may be ORPHANED on 3CX (#349/#328)" % EM_DASH)
+            if k.get("x370_deadman_early"):                     # the dead-man fired before the harness released
+                self.ballast["held"] = False
+                self.ballast["released"]["deadman"] += 1
 
     def answer(self, c):
         self._reply(c["req"], c["addr"], 180, "Ringing", to_tag=c["tag"])
@@ -2823,6 +2880,179 @@ class X888Test(ProbeRunCase):
         self.assertEqual(rc, 3, out)
         self.assertEqual(self.board.armed(), [])
         self.assertIn("did NOT fire within", out)
+
+
+class X370Test(ProbeRunCase):
+    """x370_pressure_rebuild against a fake board whose GET loop fails its open while the ballast is held, the
+    way the log of a squeezed board reads (#370): the rebuild witness is the board's own lines."""
+    MODE = "x370"
+    SCENARIO = "x370_pressure_rebuild"
+    FAST = {"call_fire_wait_s": 3.0, "cancel_after_fire_s": 0.3, "recover_wait_s": 3.0, "settle_s": 0.4,
+            "drop_wait_s": 1.0}
+
+    def posts(self):
+        return self.board.bench_posts
+
+    def test_pass_a_rebuild_whose_fresh_handshake_was_answered_under_one_ring(self):
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.manifest["verdict"], "PASS")
+        self.assertEqual(self.manifest["summary"]["outcome"], "rebuilt, the fresh handshake was answered")
+        self.assertEqual(self.manifest["summary"]["witness"],
+                         {"attempts": 1, "rebuilt": 1, "answered": 1, "failed": 0, "giveups": 0})
+        self.assertEqual(self.manifest["probe"]["fired"], {"get_status": 1, "get_max_attempts": 1})
+        self.assertEqual(self.manifest["probe"]["ballast"]["target"], 8192)
+        self.assertEqual(self.manifest["probe"]["ballast"]["deadman_s"], 35)
+        self.assertEqual(len(self.calls), 1)
+        c = self.calls[0]
+        self.assertEqual((c["final"], c["cancel_status"], self.board.invite_users), (487, 200, [FAR]))
+        self.assertFalse(c["cancel_when_expired"], "the CANCEL followed the failure line, not the wait bound")
+        self.assertEqual(len(self.board.cancels), 1, "one ring")
+        self.assertEqual(c["alive_problems"], [])
+        self.assertNotIn("_call_id", c)
+        self.assertFalse(os.path.exists(os.path.join(self.res, "status.jsonl")), "no second poller on a squeezed board")
+        self.assert_clean_probe(out)
+
+    def test_the_arms_hold_and_release_go_in_order_and_the_release_precedes_the_disarm(self):
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        p = self.posts()
+        self.assertEqual(p[:3], [{"fault": "get_status", "value": "404"}, {"fault": "get_max_attempts", "value": "8"},
+                                 {"ballast": "8192", "deadman": "35"}])
+        self.assertLess(p.index({"ballast": "8192", "deadman": "35"}), p.index({"ballast": "release"}))
+        self.assertLess(p.index({"ballast": "release"}), p.index({"fault": "disarm"}))
+        self.assertEqual(self.board.ballast["released"]["api"], 1)
+
+    def test_pass_when_the_next_open_fails_again_and_the_third_in_a_row_gives_up(self):
+        self.board.knobs["x370_fails"] = 3
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.manifest["summary"]["outcome"], "rebuilt, the open after it failed again")
+        self.assertEqual(self.manifest["summary"]["witness"]["giveups"], 1)
+
+    def test_an_open_failed_line_is_a_transport_failure_too(self):
+        self.board.knobs["x370_open_failed"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.manifest["summary"]["witness"]["attempts"], 1)
+
+    def test_invalid_when_the_rebuild_returned_false_it_may_be_a_teardown(self):
+        self.board.knobs["x370_rebuild_fail"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("recreateGetClient() returned false", out)
+        self.assertIn("the log cannot tell which", out)
+        self.assertIsNone(self.manifest["summary"]["outcome"])
+        self.assertEqual(self.manifest["summary"]["witness"]["failed"], 1, "the count stays in the summary")
+        self.assertEqual(self.manifest["log_counters"]["get_rebuild_giveup"], 1)
+
+    def test_invalid_when_the_ballast_never_made_the_open_fail(self):
+        self.board.knobs["x370_fails"] = 0
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("0 'transport failure' or 'open failed' lines", out)
+        self.assertIn("get_transport_fail is 0", out)
+        self.assertTrue(self.calls[0]["cancel_when_expired"], "no failure line: the CANCEL went at the wait bound")
+        self.assertEqual(self.calls[0]["final"], 487, "and the far end is not left ringing")
+        self.assert_clean_probe(out)
+
+    def test_invalid_when_a_failure_has_no_next_attempt_and_no_giveup(self):
+        self.board.knobs["x370_no_followup"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("no next attempt after one and no 'could not rebuild' line", out)
+
+    def test_invalid_when_the_call_never_rings(self):
+        self.board.refuse_calls = {0}                          # 180, then a 503 before any leg exists
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("0 anchored legs started during the call, not 1", out)
+        self.assertEqual(self.board.ballast["released"]["api"], 1, "the ballast was held across it and released")
+        self.assert_clean_probe(out)
+
+    def test_invalid_when_the_ballast_did_not_take(self):
+        self.board.knobs["ballast_noop"] = True               # already at or under the target
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("do not show it held", out)
+        self.assertEqual(self.board.invite_users, [])
+        self.assert_clean_probe(out)
+
+    def test_a_409_on_the_hold_stops_before_the_call_and_the_finally_releases(self):
+        self.board.knobs["ballast_409"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("holding the ballast: 409", out)
+        self.assertEqual(self.board.invite_users, [])
+        self.assertIn({"ballast": "release"}, self.posts())
+        self.assert_clean_probe(out)
+
+    def test_a_409_on_a_fault_arm_stops_before_the_hold_and_the_call(self):
+        self.board.knobs["emergency_on_arm"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("arming get_status: 409", out)
+        self.assertNotIn("ballast held", out)
+        self.assertEqual(self.board.invite_users, [])
+        self.assertIn({"ballast": "release"}, self.posts(), "the scenario's own finally releases whatever it may hold")
+
+    def test_the_ballast_is_released_when_the_call_raises(self):
+        def boom(*a, **kw):
+            raise RuntimeError("the UA blew up mid-call")
+        with mock.patch.object(sip_agent.Agent, "invite", boom):
+            rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("harness exception", out)
+        self.assertEqual(self.board.ballast["released"]["api"], 1)
+        self.assertLess(self.posts().index({"ballast": "8192", "deadman": "35"}), self.posts().index({"ballast": "release"}))
+        self.assert_clean_probe(out)
+
+    def test_a_release_the_board_answers_busy_is_repeated(self):
+        self.board.knobs["release_503"] = 2
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertGreaterEqual(self.posts().count({"ballast": "release"}), 3, "two busy answers, then the 200")
+        self.assertEqual(self.board.ballast["released"]["api"], 1)
+
+    def test_fail_on_a_panic_line(self):
+        self.board.knobs["x370_panic"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("a panic line reached the syslog", out)
+
+    def test_fail_when_the_board_rebooted(self):
+        self.board.reboot_after_call = 0                       # its uptime goes back after the CANCEL
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("the board rebooted", out)
+
+    def test_fail_on_a_possible_orphan_under_the_ballast(self):
+        self.board.knobs["x370_orphan"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("possible ORPHAN", out)
+        self.assertTrue(any("ORPHAN WARNING" in n for n in self.manifest["notes"]))
+
+    def test_invalid_when_the_dead_man_released_the_ballast_first(self):
+        self.board.knobs["x370_deadman_early"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("the dead-man released the ballast before the harness did", out)
+
+    def test_no_http_request_reaches_the_board_while_the_ballast_is_held(self):
+        # between the hold and the release the harness sends SIP and reads its own syslog; the one request
+        # the board may get is the release itself
+        calls, orig = [], an.BoardHttp._req
+
+        def spy(http, method, path, fields=None, auth=False, csrf=False):
+            calls.append((method, path, dict(fields or {}), self.board.ballast["held"]))
+            return orig(http, method, path, fields, auth, csrf)
+        with mock.patch.object(an.BoardHttp, "_req", spy):
+            rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        during = [(m, p, f) for m, p, f, held in calls if held]
+        self.assertEqual(during, [("POST", an.BENCH_PATH, {"ballast": "release"})])
+        self.assertTrue(any(p == "/api/status" and not held for _, p, _, held in calls), "read after the release")
 
 
 class ProbeSafetyTest(ProbeRunCase):
