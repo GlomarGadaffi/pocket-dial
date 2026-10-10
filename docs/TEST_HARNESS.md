@@ -342,6 +342,67 @@ syslog. A run whose counter is 0 is INVALID, never PASS.
 | `x518_403_clean_giveup` | #518, #379, #902 | the same run with `get_status=403` | `get_403_failfast_902`: `GET stream: HTTP 403 on 6 consecutive attempts for /callcontrol/<dn>/participants/<leg>/stream -- giving up now, not at attempt 12 (#902)` | everything `x379_never_opened` needs, but the give-up is the fail-fast line (6 consecutive 403s, counted before the answer too since #932), not the spent budget; the `GET stream refused (HTTP 403) for …` line (`get_refused_403`, #518) for that leg is still required. Two outcomes are valid (#937): the give-up comes after the answer (one BYE at 6101, as `x379`), or, usually, before it, about 3 s after dial: a final 503 to the caller, no BYE, one drop, `endCall … reason=anchor dropped the leg before it connected` and the `anchor dropped a ringing outbound leg` line (#880). No fail-fast line (the 12 attempts were spent instead) is INVALID; the fail-fast on `x379` (a 404) is a FAIL |
 | `x279_degraded_bye` | #279 (Connected variant) | 1 answered call, 6101 sends RTP (Contact `;line=pd6101`); `post_stream_fail` armed 1.5 s after its POST stream opens; the BYE due within 3 s | `degraded_endcall`: `endCall <Call-ID> reason=anchor audio write failure` | `fired` ≥ 1; exactly one BYE at 6101, matching Call-ID and tags, Request-URI = its registered Contact with its parameters, answered 200; the leg dropped once (syslog only); sessionCount back to baseline; a re-INVITE on the dead dialog gets 481 |
 | `x888_ws_upsert` | #888 | three synthetic upserts through `handleWsEvent()` with `ws_upsert` armed once per case (1 an unknown participant, no call; 2 the same while 6101's one call to the far end rings; 3 our own leg, no call); case 2 is CANCELled 0.5 s after the fire (one short ring, call cap 1, ≤ 30 s). 911, 933, 113, 1001 and any emergency number are refused as the far end before anything is armed or dialled | `bench_ws_upsert`: `BENCHFAULT ws_upsert fired` | `fired` = 3; each case's branch logs **exactly one** witness line for its own synthetic part id (`pdb-u<case>-<n>`): `Upset dropped, work item not queued` (1), `Upset absorbed while an outbound is in flight` (2), `Upset dropped as own leg with no outbound slot` (3). A branch with 0 lines is INVALID for that case, never PASS; a second line, or a line in another branch for the same upsert, is a FAIL; a synthetic participant in an `Inbound call on DN` line is a FAIL. The call ends 487 (CANCEL answered 200) or, if the far end answered first, is BYEd; the leg is dropped once; no INVITE at 6101 or 6104 but the register beep. One line per case and a summary are printed |
+| `h947_http_load` | #947, for #410 | idle, dashboard and dashboard-call runs, `--repeats` (3) of each, at most `--run-cap` (9) runs in all; only dashboard-call rings: 6101 → the designated far end, one call per run held `hold_s` (24 s, inside the 30 s cap), never put on SIP hold; `--call-mode ringing` (default: the far end rings and is not answered, a CANCEL at the window's end) or `answered` | `initiated` (INVALID if 0 when a call was placed) | `answered`: a call that answers and ends once (a harness BYE answered 200, one drop, sessionCount back to baseline); `ringing`: a 180 Ringing seen, the window held for `hold_s`, one CANCEL as it closes answered 200, the INVITE ended 487, no BYE, one drop, sessionCount back to baseline (no 180 is INVALID; a far end that answers anyway is held and BYEd as in `answered`); every dashboard path answers 200 at least once (else INVALID: its handler never ran; a path only the per-source cap refused with 503 is not held against it); no uptime drop inside a run (a reboot is a FAIL); at least one probe answered per run; no panic line; the usual S1/phantom/coredump checks. A slow or refused (503) answer is a measurement, not a failure |
+
+**HTTP under load (`h947_http_load`, #947 for #410).** `tests/load/http_load.py` holds the traffic, the
+percentiles and the summary; its self-test is `tests/tools/test_http_load.py`. Every run: a `before` read of
+`/api/status`, the dashboard's pollers (the `setInterval` block of `index_html.h`: status 2 s, cdr 5 s,
+admin/status 15 s, ota/status 15 s, and with a panel open trace 1.5 s, moh 3 s), a sequential probe of
+`GET /api/status` (the #410 `.244` recipe, 200 back to back by default), a burst of concurrent
+`GET /api/status` (4 clients by default; the board serves 3 per source and refuses the rest with 503), the rest of
+the window, an `after` read. `idle` polls the always-on four; `dashboard` all six; `dashboard-call` all six
+with one held call. The pollers send the admin session (a logged-in dashboard's `fetch()` does; cdr, trace and
+moh answer 401 without one and never run their handler); the probe and the burst do not. The scenario starts
+no `status_logger.sh` (a second poller is load on the thing measured). Runs go lightest first, `--repeats` of
+a mode before the next mode, because both watermarks only fall.
+
+What it reads, from `/api/status` as `sendApiStatus` writes it on main: `freeHeapInternal` (a gauge, so its
+per-run min and max are the swing), `minFreeHeapInternal` and `stackHwm_http_conn` (since boot, never rise:
+a run shows a low-water only if it went below every earlier run, so the summary prints each run's
+before and after), `httpConnWorstRoute`, `httpPerSourceRefusals`, `httpReadDeadlineDrops`,
+`httpStatusRefusals`, `uptime`. **Not emitted, so never reported:** a peak or active-connection count
+(`_activeConnections` has only `activeConnectionsForTest()`), the global 503-busy count (stderr, at powers of
+two), a per-request thread cost. Peak concurrency is therefore the harness's own: the most served requests
+(any answer but 503) in flight at once from the one address it runs on, which is at most the per-source cap.
+It is printed twice per run: `polls` (the dashboard's own traffic alone, where "an open dashboard reaches the
+per-source cap by itself" would show) and `all` (with the harness's probe, burst, reads and S1 checkpoints), with
+the 503 counts split the same way.
+During a call the S1 checkpoint (`GET /api/did-mapping` and an authed status) is skipped while the burst holds
+every slot and tried again, up to 3 times, after a 503; a probe or poll landing on the same instant can still
+clash. A reboot is a FAIL inside a run or between two runs (the watchdog `status_logger.sh` used to be the
+only check for it). A SIP reply time during the burst (#947 item 3) is not measured. p50 and p99 are nearest-rank
+(`sorted[ceil(p·n/100) − 1]`, integers); p99 of fewer than 100 samples is the maximum and the summary says so.
+`stackHwm_http_conn` is the smallest free stack any connection thread has had, of `kHttpConnStackBytes`
+(4096); the summary prints the lowest reading with the log line it came from (`http-load.jsonl`) and the route
+that produced it. A reading within an hour of boot is flagged (#405): re-read after hours of use.
+
+**Call mode** (`--call-mode`, default `ringing`). A far end that only rings (a 180, never answered) was INVALID
+before this flag: the agent's own 16 s INVITE bound CANCELled it before the window ran at all. It is a valid
+`dashboard-call` in `ringing` mode: the INVITE waits on a thread for `hold_s + 2` s (the agent's
+`invite(invite_timeout=)`, the call cap still 30 s), the dashboard window runs on the run's thread for `hold_s`
+from the INVITE, and the CANCEL goes at the planned hold, INVITE + `hold_s`, not when the window's teardown ends
+(its pollers can sit in a 5 s request on a slow board, and the ring must not outlast the hold); or at once if the
+window is cut short: a phantom, a signal, a lapsed pin. There is no dialog, so no BYE (RFC 3261 s9.1); the far side must answer the CANCEL 200 and the
+INVITE 487 (s9.2), else a FAIL. The call is valid only with a 180 Ringing seen before the window closed and the
+window held for the planned hold (`http_load.ringing_call`; the reason is on the run's summary line and in the
+verdict: `| call ringing: valid, 180 Ringing at +6 ms, window held 24.0 s, CANCEL at +24020 ms answered 200,
+INVITE ended 487, no BYE`, or `INVALID, no 180 Ringing seen ...`). A final before the planned hold (486, 503,
+a 487 nobody asked for) is INVALID, since the ring did not last the hold; the syslog (for the pre-answer drop,
+`anchor dropped a ringing outbound leg`) says who ended it. **The 180 is the PBX's own local ringback**,
+sent at INVITE time (see CANCEL timing below): it does not show the far phone alerting; the `initiated` path
+counter and the one drop line are the only evidence of the anchored leg. A 200 in ringing mode is the answered
+case: the window still runs to `hold_s`, then the harness BYEs. `answered` is the previous behaviour, unchanged:
+the far end must answer, else INVALID. The ring is bounded the same either way: one INVITE,
+`hold_s` (24 s) plus the CANCEL round trip, and at worst `hold_s` + 2 s (the CANCEL's own backstops: +1 s if the
+window overruns, +2 s if no provisional ever arrives), inside the 30 s cap; the ring gate refuses 911, 933, 113,
+1001 and the rest before the INVITE in both modes.
+
+Ring OK is per run with a cap. `--run-cap` (default 9, at most 30) bounds the runs in all: modes × repeats past
+it is refused before anything is sent, and the run loop takes one budget unit per run and stops at the cap.
+Only `dashboard-call` rings, once a run, and `calls` follows the plan (at most 10). The far end carries every
+refusal above (911/933 anywhere in it, 112, 113, 999, 1001-1003, PBX numbers), and the ring itself checks it
+again just before the INVITE. Evidence adds `http-load.jsonl` (every request and every status reading, raw)
+and `http-summary.txt`.
 
 **CANCEL timing.** 3CX's makecall response took 1.8-3.2 s on a real tenant (Stray's corrections on
 [#379](https://github.com/GlomarGadaffi/pocket-dial/issues/379#issuecomment-5985894096) and

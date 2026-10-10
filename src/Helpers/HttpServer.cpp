@@ -51,6 +51,9 @@
 // comment on the HA1-export/no-import asymmetry this implies.
 #include "SipSecretStore.hpp"
 #include "PoolConfig.hpp"    // POCKETDIAL_PARK_TIMEOUT_SEC (informational export field)
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+#include "HttpDramAccount.hpp"   // #410/#328: bench-only per-consumer DRAM counters
+#endif
 #include "JsonReader.hpp"    // strict, dependency-free JSON reader for /api/config/import
 #include <cctype>
 #include <cstdio>        // snprintf: sendStaticHtml's allocation-free head (#410)
@@ -518,6 +521,9 @@ void HttpServer::acceptLoop()
 		// on every exit path, and the catch below releases it if no thread was
 		// ever created.
 		_activeConnections.fetch_add(1, std::memory_order_acq_rel);
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+		httpdram::gAccount.opened(kHttpConnStackBytes);   // the stack exists from pthread_create on
+#endif
 
 		try
 		{
@@ -530,6 +536,12 @@ void HttpServer::acceptLoop()
 				if (_afterCloseHookForTest) _afterCloseHookForTest();
 #endif
 				finishConnSlot(connIdx);
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+				// Before the decrement below: once it lands the server may be destroyed.
+				// The stack itself is only freed when the idle task reaps this task, a
+				// little after this line (docs/BENCH_PROBE.md).
+				httpdram::gAccount.closed(kHttpConnStackBytes);
+#endif
 				_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			}).detach();
 		}
@@ -537,6 +549,9 @@ void HttpServer::acceptLoop()
 		{
 			// No thread was created, so nothing will ever decrement for this one.
 			finishConnSlot(connIdx);
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+			httpdram::gAccount.spawnFailed(kHttpConnStackBytes);
+#endif
 			_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			std::cerr << "[HttpServer] connection thread spawn failed: " << e.what()
 				<< " — dropping connection\n";
@@ -716,6 +731,13 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 		return;
 	}
 
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+	// #410/#328 bench accounting: what this request holds on the heap, released on
+	// every return below by the holders' destructors.
+	httpdram::Held heldBuf(httpdram::gAccount, httpdram::kReqBuf);
+	httpdram::Held heldRaw(httpdram::gAccount, httpdram::kReqRaw);
+	httpdram::Held heldReq(httpdram::gAccount, httpdram::kReqParsed);
+#endif
 	// The recv buffer is off the stack (a 4 KB local would fill the 4096-byte
 	// kHttpConnStackBytes): it is the connection slot's, allocated once in the
 	// constructor, in PSRAM where the board has it (#410/#328). PSRAM is fine for it:
@@ -736,6 +758,11 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 	{
 		std::memset(buf, 0, kReadBufBytes);
 	}
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+	// A slot buffer in PSRAM holds no internal DRAM and counts 0, like every block
+	// outside internal RAM; a heap fallback, or a slot that spilled into internal RAM, counts.
+	heldBuf.set(httpdram::internalRam(buf) ? static_cast<uint32_t>(kReadBufBytes) : 0u);
+#endif
 
 	// Read initial data. A follow-up loop below handles POST bodies that span
 	// multiple TCP segments (see Content-Length body-read completion below).
@@ -755,6 +782,9 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 	// If the headers indicate a Content-Length larger than what arrived in the
 	// first segment, keep reading until we have it all.
 	std::string raw(buf, static_cast<size_t>(bytesRead));
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+	heldRaw.set(httpdram::heapBytes(raw));
+#endif
 
 	// --- OTA upload interception (firmware streaming) -------------------------
 	// A firmware image is >1.5 MB, so it must NOT flow through the 16 KB-capped
@@ -912,6 +942,9 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 					}
 					if (n <= 0) break;
 					raw.append(buf, static_cast<size_t>(n));
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+					heldRaw.set(httpdram::heapBytes(raw));   // append may have regrown it
+#endif
 					bodyHave += static_cast<size_t>(n);
 				}
 			}
@@ -925,6 +958,10 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 	// the real admin out too, and Cisco SPA model-keyed provisioning never ran
 	// its ARP lookup.
 	req.clientIp = peerIp;
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+	heldReq.set(httpdram::heapBytesOf(req.method, req.path, req.body, req.origin, req.host,
+	                                  req.cookie, req.csrf, req.userAgent, req.clientIp));
+#endif
 	if (routeOut) routeLabel(req.method, req.path, routeOut, kRouteLabelBytes);   // #405
 	// Out-param for the two telephony-config routes below, whose slot index is
 	// a URL path segment rather than a form param (see parseTelephonyConfigSlotPath).
@@ -1729,6 +1766,26 @@ void HttpServer::sendResponseWithHeader(int sock, int statusCode, std::string_vi
 	// (CodeQL flagged a `head += body` shape here as "cleartext transmission"
 	// of emailConfigJson() on PR #394 -- a false positive: its secrets leave
 	// only as hasPassword/hasGsaKey booleans, #207.)
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+	// #410/#328 bench accounting: a body the route built on the heap is live until
+	// the send is done. A body inside a leased buffer (/api/status, /metrics, the
+	// registrar roster) is a standing allocation from boot, not builder heap.
+	httpdram::Held heldBody(httpdram::gAccount, httpdram::kRespBody);
+	{
+		const auto at = reinterpret_cast<std::uintptr_t>(body.data());
+		bool leased = false;
+		for (const char* b : _statusBuf)
+		{
+			const auto lo = reinterpret_cast<std::uintptr_t>(b);
+			leased = leased || (b != nullptr && at >= lo && at < lo + kStatusBufBytes);
+		}
+		if (!leased && httpdram::internalRam(body.data()))   // not a flash literal, not PSRAM
+		{
+			heldBody.set(static_cast<uint32_t>(body.size()));
+			httpdram::gAccount.noteBody(static_cast<uint32_t>(body.size()));
+		}
+	}
+#endif
 	HeadNumbers nums;
 	SendPiece v[kHeadPieces + 1];
 	size_t n = headPieces(v, nums, statusCode, statusText, contentType, body.size(), extraHeader);
@@ -2657,6 +2714,9 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	    .s(",\"psramFallbacks\":").n(psram::internalFallbacks().load(std::memory_order_relaxed))
 	    .s(",\"dynamicTaskCreates\":").n(psram::dynamicTaskCreates().load(std::memory_order_relaxed))   // #479
 	    .s("}");
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+	httpdram::gAccount.writeJson(json);   // #410/#328, bench only: docs/BENCH_PROBE.md
+#endif
 
 	json.s("}");
 
