@@ -45,12 +45,18 @@ but not the tenant's own numbers, so a far end equal to the route DN or to a DID
 before the first packet, and any phantom verdict says it holds only if the far end cannot route back.
 
 Probe scenarios (x349_unread_makecall, x379_never_opened, x518_403_clean_giveup,
-x279_degraded_bye, x888_ws_upsert) drive the bench probe image (docs/BENCH_PROBE.md, #384 H1):
-they need --expect-version with a -probe stamp, read /api/bench/fault's counters
-before and after, arm only their pre-registered faults (never for an emergency far
-end, never while the probe reports an emergency), and always disarm every fault and
-release the ballast in a finally block. The counters must show nothing armed at the
+x279_degraded_bye, x888_ws_upsert, x370_pressure_rebuild) drive the bench probe image
+(docs/BENCH_PROBE.md, #384 H1): they need --expect-version with a -probe stamp, read
+/api/bench/fault's counters before and after, arm only their pre-registered faults (never for
+an emergency far end, never while the probe reports an emergency), and always disarm every
+fault and release the ballast in a finally block. The counters must show nothing armed at the
 end, and every pre-registered fault must show fired >= 1, or the run is INVALID.
+
+x370_pressure_rebuild (#370) holds a DRAM ballast at the probe's 8192 B floor across one ring, so
+the rx task's rebuild of the GET handle after a transport failure (and the TLS handshake after it)
+runs under pressure. No fault forces that path: only the ballast can, and only by chance, so the
+witness is the board's own log (see x370_witness). The board's HTTP may not answer while the
+ballast is held, so the run makes no HTTP request between the hold and the release.
 
 h947_http_load (#947, for #410) measures the board's HTTP server, not a SIP path: idle, dashboard and
 dashboard-call runs (tests/load/http_load.py holds the traffic, the percentiles and the summary), each
@@ -197,6 +203,12 @@ LOG_COUNTERS = {
                         r"status=-?\d+\)|open failed \([^)]*\)), attempt (\d+)/\1(?!\d)",
     "get_transport_giveup": r"GET stream: \d+ consecutive transport failures",
     "get_rebuild_giveup": r"GET stream: could not rebuild client after transport failure",
+    # #370: runRxLoop() lost the transport (TelephonyAnchorClient.cpp:3871, :3882). recreateGetClient() runs next
+    # (:3895) unless this is the third in a row (:3890 gives up first). Group 1 = the attempt, 2 = the budget.
+    "get_transport_fail": r"GET stream (?:transport failure \(no HTTP response, status=-?\d+\)|open failed \([^)]*\)), "
+                          r"attempt (\d+)/(\d+)",
+    # An HTTP answer was parsed (:3820): the connection and its handshake worked. Groups: status, attempt, budget.
+    "get_answered": r"GET stream not ready \(HTTP (-?\d+)\), attempt (\d+)/(\d+)",
     "get_never_opened": r"GET \(Telephony->device\) stream never opened",
     # #902: a run of 403s on an ordinary outbound leg gave up early; group 1 = the 403 count,
     # group 2 = the leg, group 3 = the budget it did not spend.
@@ -500,6 +512,7 @@ GET_BACKOFF_CAP_MS = 500
 # 200 unread (docs/BENCH_PROBE.md), so the next open pays a full TLS handshake, measured
 # at 751-1311 ms on .244 (#379, #370's run; X1 logged 1072 ms).
 GET_RECONNECT_WORST_S = 1.311
+BALLAST_FLOOR = 8192                 # BenchProbeLogic.hpp kBallastMinTarget: the probe answers 400 below it
 MAKECALL_WORST_S = 1.5               # makeCall()'s POST round trip before the rx task starts
 GIVEUP_TO_BYE_S = 3.0                # the drop POST, 3CX's Remove event and the handset BYE
 HANGUP_MARGIN_S = 2.0                # the harness's own BYE must also finish inside the cap
@@ -532,6 +545,8 @@ def probe_problems(sc):
         problems.append("%s: hold_s leaves no room for the hangup inside the call cap" % n)
     if "call_fire_wait_s" in sc:
         problems += x888_timing_problems(sc)
+    if "ballast_bytes" in sc:
+        problems += x370_config_problems(sc)
     return problems
 
 
@@ -976,11 +991,13 @@ class BenchProbe:
     def __init__(self, http, tries=3, pause_s=0.2):
         self.http, self.tries, self.pause_s = http, tries, pause_s
 
-    def _call(self, method, fields=None):
+    def _call(self, method, fields=None, retry_none=False):
         st, body = None, None
         for i in range(self.tries):
             st, body = self.http.request_json(method, BENCH_PATH, fields)
-            if st != 503 or i + 1 == self.tries:   # 503: "counters busy", another reader holds them
+            # 503: "counters busy", another reader holds them. None: no answer at all, which a board squeezed
+            # by the ballast gives; retried only for an idempotent request (release, disarm), never an arm.
+            if not (st == 503 or (retry_none and st is None)) or i + 1 == self.tries:
                 break
             time.sleep(self.pause_s)
         return st, body
@@ -1015,11 +1032,30 @@ class BenchProbe:
                                  % (name, "" if value is None else " with value %d" % int(value)))
         return body
 
+    def hold_ballast(self, target, deadman_s):
+        """POST ballast=<target>&deadman=<s>: hold DRAM until free internal heap is at most `target`. A 409
+        (an emergency is live, or a ballast is already held) is an INVALID Abort, as for an arm. `held` false
+        on a 200 means the board was already at or under the target (BenchProbe.cpp: no blocks taken)."""
+        body = self._counters(*self._call("POST", {"ballast": str(int(target)), "deadman": str(int(deadman_s))}),
+                              what="holding the ballast")
+        held = body.get("ballast")
+        if not isinstance(held, dict) or held.get("held") is not True:
+            raise run_soak.Abort("INVALID", "holding the ballast: the counters do not show it held (free internal "
+                                 "%s B; already at or under the %d B target?)" % (body.get("freeInternal"), target))
+        return body
+
+    def release_ballast(self):
+        """POST ballast=release, repeated while the board gives no answer. It is never a 409 (HttpServer.cpp
+        leaves the verdict Ok, and releasing nothing is a no-op), so a non-200 is the owner gate or no answer.
+        -> True if the board answered 200."""
+        return self._call("POST", {"ballast": "release"}, retry_none=True)[0] == 200
+
     def disarm_all(self):
-        """POST fault=disarm, POST ballast=release, then GET. -> (counters or None, [problems])."""
+        """POST ballast=release, POST fault=disarm, then GET. -> (counters or None, [problems]). The release
+        goes first: it is the one a squeezed board needs, and both are safe to repeat."""
         problems = []
-        for fields in ({"fault": "disarm"}, {"ballast": "release"}):
-            st, _ = self._call("POST", fields)
+        for fields in ({"ballast": "release"}, {"fault": "disarm"}):
+            st, _ = self._call("POST", fields, retry_none=True)
             if st != 200:
                 problems.append("POST %s answered %s" % (urllib.parse.urlencode(fields), st))
         try:
@@ -1305,6 +1341,22 @@ class AnchorRun:
         self.probe.arm(name, value)
         self.manifest["probe"].setdefault("armed", []).append({"fault": name, "value": value})
         self.say("armed %s%s" % (name, "" if value is None else "=%d" % value))
+
+    def hold_ballast(self):
+        """Hold the scenario's pre-registered ballast. Like arm(): never for an emergency or never-dial far end.
+        From here until the release the board's HTTP may not answer, so the caller makes no other request."""
+        target, deadman = self.sc.get("ballast_bytes"), self.sc.get("ballast_deadman_s")
+        if not target or not deadman:
+            raise run_soak.Abort("INVALID", "%s holds a ballast it did not pre-register" % self.sc["name"])
+        if any(is_never_dial(end) for end in self.far_ends):
+            raise run_soak.Abort("INVALID", "refusing to hold the ballast: the far end is an emergency or "
+                                 "never-dial number (rule 5)")
+        body = self.probe.hold_ballast(target, deadman)
+        held = body["ballast"]
+        self.manifest["probe"]["ballast"] = {"target": target, "deadman_s": deadman, "bytes": held.get("bytes"),
+                                             "blocks": held.get("blocks"), "free_internal": body.get("freeInternal")}
+        self.say("ballast held: %s B in %s blocks, free internal %s B (target %d), dead-man %d s"
+                 % (held.get("bytes"), held.get("blocks"), body.get("freeInternal"), target, deadman))
 
     def probe_finish(self):
         """Disarm every fault and release the ballast, then read the counters back. Runs in
@@ -2515,6 +2567,256 @@ scenario(name="x888_ws_upsert", issues=("#888",), probe=True, faults=("ws_upsert
          uas={"caller": "6101", "detector": PIN_UA}, calls=1, max_calls=1, call_cap_s=30, fire_wait_s=6.0,
          call_fire_wait_s=10.0, cancel_after_fire_s=0.5, settle_s=3.0, drop_wait_s=5.0,
          path_counter="bench_ws_upsert", ring_required=True, judge=x888_judge)(probe_run(x888_run))
+
+
+# -- x370_pressure_rebuild ----------------------------------------------------------
+# #370: runRxLoop() rebuilds the GET handle after a transport failure (recreateGetClient,
+# TelephonyAnchorClient.cpp:3755, called at :3895) and the next open pays a fresh TLS handshake. Under pressure
+# that is where the old CORRUPT HEAP lived. No probe fault forces it: get_status rewrites only a parsed answer,
+# and a parsed answer keeps the handle (:3815-3862), so only a real transport failure reaches :3886-3899, and
+# only the ballast can cause one. get_status=404 keeps the loop in its "not ready" retries instead (a 403 would
+# trip the #902 fail-fast); get_max_attempts keeps the loop, and so the ring, short.
+# The rebuild has no success line of its own (:3895-3899 log only a failure, :3897). Its witness is derived from
+# positive lines that do exist: the failure line before it (:3871, :3882), then the NEXT attempt's line.
+# Every non-final iteration logs exactly one attempt line (:3820, :3871, :3882) and the only way past
+# recreateGetClient() to the next iteration is for it to have returned true, so attempt k+1 after a failure at k
+# is a rebuild that worked. test_anchor_x370_pressure_rebuild.py pins those lines to the source.
+X370_NEVER_DIAL = X888_NEVER_DIAL         # 911, 933, 113, 1001, on top of is_never_dial()
+
+
+def x370_destination_problems(far):
+    """Why x370 may not dial `far`, or []. Never echoes the number."""
+    out = []
+    if (far or "").lstrip("+") in X370_NEVER_DIAL:
+        out.append("the far end is on the x370 never-dial list")
+    if is_never_dial(far):
+        out.append("the far end is an emergency or never-dial number (rule 5)")
+    return out
+
+
+def x370_config_problems(sc):
+    n = sc.get("name", "<unnamed>")
+    out = []
+    if sc.get("ballast_bytes", 0) < BALLAST_FLOOR:
+        out.append("%s: ballast_bytes %s is under the probe's %d B floor (it answers 400)"
+                   % (n, sc.get("ballast_bytes"), BALLAST_FLOOR))
+    window = sc.get("call_fire_wait_s", 0) + sc.get("cancel_after_fire_s", 0) + CANCEL_FINAL_S
+    dead = sc.get("ballast_deadman_s", 0)
+    if not 1 <= dead <= 600:
+        out.append("%s: ballast_deadman_s %s must be 1-600 (BenchProbeLogic.hpp kDeadmanMaxS)" % (n, dead))
+    elif dead < window:
+        out.append("%s: the dead-man releases the ballast at %g s, before the call can end (up to %.1f s)"
+                   % (n, dead, window))
+    if window > AGENT_INVITE_TIMEOUT_S:
+        out.append("%s: the CANCEL can be due as late as %.1f s, past the agent's %g s INVITE bound"
+                   % (n, window, AGENT_INVITE_TIMEOUT_S))
+    return out
+
+
+def x370_witness(entries, cancel_t=None):
+    """What the board's log shows of the GET handle's rebuild: [(t, line)] -> counts.
+    attempts: transport-failure lines. rebuilt: of those, the ones whose next attempt (k+1, same budget) was
+    logged, so recreateGetClient() returned true. answered: of those, the next attempt got a parsed HTTP answer
+    (the fresh handshake finished). failed: 'could not rebuild' lines before the CANCEL (after it the loop is
+    being torn down and logs the same line). giveups: the third failure in a row, which gives up unrebuilt.
+    ponytail: one stream per run; a #554 rx restart would start its attempt numbers over."""
+    fails, seen, answered = [], set(), set()
+    failed = giveups = 0
+    for t, line in entries:
+        m = _RX["get_transport_fail"].search(line)
+        if m:
+            fails.append((int(m.group(1)), int(m.group(2))))
+            seen.add(fails[-1])
+            continue
+        m = _RX["get_answered"].search(line)
+        if m:
+            seen.add((int(m.group(2)), int(m.group(3))))
+            answered.add((int(m.group(2)), int(m.group(3))))
+        elif _RX["get_transport_giveup"].search(line):
+            giveups += 1
+        elif _RX["get_rebuild_giveup"].search(line) and (cancel_t is None or t < cancel_t):
+            failed += 1
+    nxt = [(k + 1, n) for k, n in fails if (k + 1, n) in seen]
+    return {"attempts": len(fails), "rebuilt": len(nxt), "answered": sum(1 for a in nxt if a in answered),
+            "failed": failed, "giveups": giveups}
+
+
+def x370_path(w):
+    """-> (outcome, why). outcome is None when the rebuild path is not shown to have run (INVALID, never PASS)."""
+    if w["answered"]:
+        return "rebuilt, the fresh handshake was answered", ""
+    if w["rebuilt"]:
+        return "rebuilt, the open after it failed again", ""
+    if w["failed"]:
+        return "rebuild failed, the board gave up cleanly", ""
+    if w["attempts"]:
+        return None, ("%d transport failure line(s), but no next attempt after one and no 'could not rebuild' "
+                      "line: the rebuild is not shown to have run (a lost syslog line, or the CANCEL came first)"
+                      % w["attempts"])
+    return None, ("0 'transport failure' or 'open failed' lines: the ballast did not make the GET open fail, so "
+                  "recreateGetClient() never ran")
+
+
+def x370_alive_problems(baseline, after):
+    """FAIL reasons from the first /api/status after the release (None: it never answered)."""
+    if not after:
+        return ["the board did not answer /api/status after the ballast was released: hung or rebooting"]
+    out = []
+    up0, up1 = baseline.get("uptime"), after.get("uptime")
+    if isinstance(up0, (int, float)) and isinstance(up1, (int, float)) and up1 < up0:
+        out.append("uptime went %s -> %s: the board rebooted" % (up0, up1))
+    rr0, rr1 = baseline.get("resetReason"), after.get("resetReason")
+    if rr1 is not None and rr0 is not None and rr1 != rr0:
+        out.append("resetReason changed %s -> %s: the board rebooted" % (rr0, rr1))
+    return out
+
+
+def x370_recover(run, sc):
+    """The public /api/status until it answers (the ballast is back) or recover_wait_s passes. -> dict or None."""
+    deadline = time.monotonic() + sc["recover_wait_s"]
+    while True:
+        st = run.http.status()
+        if st and isinstance(st.get("uptime"), (int, float)):
+            return st
+        if time.monotonic() >= deadline or run.stop.wait(0.5):
+            return None
+
+
+def x370_release(run):
+    """The first act once the call returns, and again in the finally: the board answers HTTP only when the
+    ballast is back, and the dead-man (a timer on the board) is the backstop if this cannot get through.
+    Never raises: probe_finish runs after the body and reports what is left."""
+    try:
+        ok = run.probe.release_ballast()
+        run.say("ballast released" if ok else "ballast release got no 200: the dead-man releases it by itself, "
+                "probe_finish tries again")
+    except Exception as e:  # noqa: BLE001 -- a login that failed under pressure must not hide the call's own error
+        run.say("ballast release raised %r: the dead-man releases it by itself, probe_finish tries again" % (e,))
+
+
+def x370_cancel_when(run, delay_s):
+    """CANCEL delay_s after the board logs its first GET transport failure: the rebuild and the open after it
+    are on the log by then, and the CANCEL ends the ring at once (one short ring). Reads only the syslog:
+    no HTTP request while the ballast is held."""
+    def when(since):
+        if run.phantoms():
+            return time.monotonic()
+        hit = matches(run.syslog.entries(since), "get_transport_fail")
+        return hit[0][0] + delay_s if hit else None
+    return when
+
+
+def x370_run(run, sc):
+    caller = run.agents["caller"]
+    bad = sorted({p for end in run.far_ends for p in x370_destination_problems(end)})
+    if bad:
+        raise run_soak.Abort("INVALID", "refusing before any arm, ballast or call: " + "; ".join(bad))
+    run.say("1 call %s -> far end with get_status=%d, get_max_attempts=%d and a %d B DRAM ballast (dead-man %d s) "
+            "held across it: CANCEL %g s after the first GET transport failure, or at %g s; the ballast is released "
+            "the moment the call returns and no HTTP request is made before"
+            % (caller.ext, sc["get_status"], sc["get_max_attempts"], sc["ballast_bytes"], sc["ballast_deadman_s"],
+               sc["cancel_after_fire_s"], sc["call_fire_wait_s"]))
+    run.checkpoint()
+    base = run.session_count()
+    rec = {"call": 1, "t_start": time.monotonic(), "final": None}
+    try:
+        run.arm("get_status", sc["get_status"])
+        run.arm("get_max_attempts", sc["get_max_attempts"])
+        run.hold_ballast()
+        run.calls.append(rec)                    # first: an abort keeps the record
+        rec["t_start"] = time.monotonic()
+        dlg = caller.invite(run.far_end, cancel_when=x370_cancel_when(run, sc["cancel_after_fire_s"]),
+                            cancel_when_timeout_s=sc["call_fire_wait_s"])
+        try:
+            rec.update(_call_id=dlg.call_id, final=dlg.final_status, cancel_status=dlg.cancel_status,
+                       _t_cancel=dlg.cancel_sent_at, cancel_when_expired=bool(dlg.cancel_when_expired),
+                       provisional=[s for _, s in dlg.responses if s < 200])
+        finally:
+            finish_call(caller, dlg, rec)
+    finally:
+        x370_release(run)
+    st = x370_recover(run, sc)
+    rec["alive"] = {k: (st or {}).get(k) for k in ("uptime", "resetReason", "version", "freeHeapInternal",
+                                                   "minFreeHeapInternal")}
+    rec["alive_problems"] = x370_alive_problems(run.baseline, st)
+    after_call(run, sc, caller, rec, base)
+    run.watch_call(time.monotonic() + sc["drop_wait_s"], stop_when=lambda: not undropped_legs(run.syslog.lines()))
+    run.say("call 1: final %s, CANCEL answered %s%s; the board %s" % (
+        rec["final"], rec.get("cancel_status"),
+        ", hung up by the harness (BYE %s)" % rec.get("hangup_bye") if "hangup_ms" in rec else "",
+        "answered after the release, uptime %s" % rec["alive"]["uptime"] if st else "did NOT answer after the release"))
+
+
+def x370_judge(run, sc, lines):
+    fails, invalid = common_problems(run, lines)
+    if not run.calls:
+        return fails, invalid, {}
+    c, caller = run.calls[0], run.agents["caller"]
+    ents = run.syslog.entries(c["t_start"]) if run.syslog else []
+    legs = started_legs(ents)
+    w = x370_witness(ents, c.get("_t_cancel"))
+    outcome, why = x370_path(w)
+    summary = {"outcome": outcome, "witness": w, "legs": len(legs),
+               "rebuild_success_line": "none on main (TelephonyAnchorClient.cpp:3895-3899 logs only the failure): "
+                                       "a success is derived from the next attempt's line",
+               "ballast": (run.manifest.get("probe") or {}).get("ballast")}
+    c["log"] = w
+    if len(legs) != 1:
+        failed = sum(len(matches(ents, k)) for k in ("makecall_failed", "post_open_failed", "makecall_status"))
+        invalid.append("%d anchored legs started during the call, not 1 (%d makeCall failure line(s)): the far end "
+                       "never rang; with the ballast held across makeCall's POST that can be the pressure itself"
+                       % (len(legs), failed))
+    elif outcome is None:
+        invalid.append(why)
+    if matches(ents, "orphaned_349"):
+        fails.append("makeCall logged a possible ORPHAN (#349/#328) under the ballast: a billable leg may be live "
+                     "on the 3CX route point; check the tenant and drop it by hand")
+        run.manifest["notes"].append("ORPHAN WARNING: check the 3CX route point for a live leg and drop it")
+    if "alive_problems" not in c:
+        invalid.append("the board's state after the release was not read: the run stopped before it")
+    fails += c.get("alive_problems") or []
+    b, a = run.probe_before, run.probe_after
+    if b and a:
+        early = ((a.get("ballast") or {}).get("released") or {}).get("deadman", 0) \
+            - ((b.get("ballast") or {}).get("released") or {}).get("deadman", 0)
+        if early > 0:
+            invalid.append("the dead-man released the ballast before the harness did: the hold ended early")
+    if c.get("final") == 487:
+        if c.get("cancel_status") != 200:
+            fails.append("the CANCEL was answered %s, not 200" % c.get("cancel_status"))
+    elif answered(c):                            # the far end picked up before the CANCEL: the harness BYE ends it
+        if c.get("hangup_bye") != 200:
+            fails.append("the harness's BYE got %s, not 200" % c.get("hangup_bye"))
+        fails += bye_problems(c, caller.ext, count=False)
+    fails += drop_problems(lines)
+    fails += rx_task_problems(lines)
+    phantom_pcap = sum(run.pcap_count("INVITE", ua, phantom=True) for ua in run.agents.values())
+    if phantom_pcap:
+        fails.append("/api/pcap shows %d INVITE(s) sent to a test UA that were not the register beep: a phantom "
+                     "inbound (second witness)" % phantom_pcap)
+    sf, si = session_problems(c, caller.ext)
+    run.say("x370: %s; transport failures %d, rebuilt %d, answered after the rebuild %d, 'could not rebuild' %d, "
+            "third-in-a-row give-ups %d" % (outcome or "NOT SHOWN", w["attempts"], w["rebuilt"], w["answered"],
+                                            w["failed"], w["giveups"]))
+    return fails + sf, invalid + si, summary
+
+
+X370 = dict(probe=True, faults=("get_status", "get_max_attempts"), get_status=404, get_max_attempts=8,
+            ballast_bytes=BALLAST_FLOOR, ballast_deadman_s=35, uas={"caller": "6101", "detector": PIN_UA},
+            calls=1, max_calls=1, call_cap_s=30, call_fire_wait_s=10.0, cancel_after_fire_s=2.0,
+            recover_wait_s=15.0, settle_s=3.0, drop_wait_s=5.0, no_status_logger=True)
+scenario(name="x370_pressure_rebuild", issues=("#370",), part_of="#370",
+         about="test UA 6101 -> the designated far end, one short ring, with a DRAM ballast at the probe's 8192 B "
+               "floor, get_status=404 and get_max_attempts=8: the rx task's rebuild of the GET handle after a "
+               "transport failure, and the TLS handshake after it, under pressure; CANCELled 2 s after the first "
+               "transport failure; the ballast is released the moment the call returns. No fault forces the "
+               "rebuild: a run whose log shows none is INVALID",
+         plan_lines=("x370      NO HTTP request to the board between the ballast hold and its release; the dead-man "
+                     "(%d s) is the backstop" % X370["ballast_deadman_s"],
+                     "x370      the ballast is held across makeCall's POST too: if its response is lost the #349 "
+                     "ORPHAN variant (a billable leg on 3CX) is possible, which the approval excludes "
+                     "(docs/BENCH_PROBE.md): desmo's OK for that is part of the RING-REQUIRED OK"),
+         path_counter="get_transport_fail", ring_required=True, judge=x370_judge, **X370)(probe_run(x370_run))
 
 
 # ---------------------------------------------------------------- h947_http_load (#947)

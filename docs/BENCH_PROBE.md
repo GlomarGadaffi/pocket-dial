@@ -157,6 +157,62 @@ blocks (4 KB, halving on fragmentation down to 64 B, at most 256 blocks) until
 - The counters report what was actually held and the free heap after: fragmentation
   can stop short of the target.
 - Ballast can starve unrelated tasks. That is the point, and why the dead-man exists.
+- `ballast=release` never answers `409`: `HttpServer.cpp` leaves the verdict `Ok` for it, and releasing with
+  nothing held is a no-op (`BenchProbe.cpp` `releaseLocked()`). The `409` is only for an arm (an emergency is
+  live, or one is already held).
+
+### `x370_pressure_rebuild` (#370)
+
+Part of #370, harness only. One ring with the ballast held at the 8192 floor, so the rx task's rebuild of the GET
+handle after a transport failure (`recreateGetClient()`, `TelephonyAnchorClient.cpp:3755`, called at `:3895`), and
+the TLS handshake after it, run under pressure. The scenario arms `get_status=404`, `get_max_attempts=8`, holds
+`ballast=8192&deadman=35`, places **one** call to the designated far end, CANCELs it 2 s after the first GET
+transport failure (or at 10 s if there is none), and releases the ballast the moment the call returns.
+
+- **No fault forces the rebuild.** `get_status` rewrites only a parsed HTTP answer, and a parsed answer keeps the
+  handle (`:3815-3862`); `overrideGetStatus()` leaves a transport failure (status <= 0) real. The rebuild runs only
+  after a real `GET stream transport failure` (`:3871`) or `GET stream open failed` (`:3882`) line, and only the
+  ballast can cause one, by chance. In a call that is not answered every GET answer is a 404 on a kept connection,
+  so the one handshake under pressure is the first open (`startRxIfNeeded()` in `makeCall()`, `:576`, before
+  `Successfully initiated call`). That is why the ballast is held **before the INVITE**. `get_status=404` and the
+  small `get_max_attempts` only keep the loop in its "not ready" retries for a short call; a 403 would trip the
+  #902 fail-fast and end it with a 503.
+- **The witness is derived; the rebuild has no success line.** `:3895-3899` log only a failure (`:3897`, "could not
+  rebuild client"). Every loop iteration that does not end it logs exactly one attempt line (`:3820`, `:3871`,
+  `:3882`) and cannot `continue` past one, and the only way from a failure at attempt k to the next iteration is
+  for `recreateGetClient()` to have returned true. So the scenario counts, from the syslog:
+
+  | Witness | Lines |
+  |---|---|
+  | transport failure (the path counter `get_transport_fail`; 0 is INVALID) | `GET stream transport failure (no HTTP response, status=-1), attempt k/N` or `GET stream open failed (...), attempt k/N` |
+  | rebuilt | such a line at k, then any attempt line at k+1 of the same N |
+  | fresh handshake answered | the k+1 line is `GET stream not ready (HTTP ...), attempt k+1/N`, a parsed answer |
+  | rebuild failed | `GET stream: could not rebuild client after transport failure` before the CANCEL (after it, the same line is the teardown) |
+  | third in a row | `GET stream: 3 consecutive transport failures`: gives up without a rebuild (`:3888-3894`) |
+
+  A failure with no next attempt and no "could not rebuild" line is not a witness (a lost UDP line, or the CANCEL
+  came first): INVALID. `test_anchor_x370_pressure_rebuild.py` pins every one of these lines, the `3`, and the
+  absence of a `continue` in the loop to the source, and fails if a success line is added so the witness can be
+  made direct. The line to add would sit in the `else` of `if (!recreateGetClient())` at `:3895`.
+- **Verdicts.** PASS: both faults fired, exactly one anchored leg, a rebuild witness (rebuilt, or failed cleanly),
+  the board answered `/api/status` after the release with a later uptime and the same reset reason, no panic line,
+  no coredump, no `ORPHANED` line, one drop. FAIL: any of the last five, a hang or reboot after the release, a
+  second rx task on the leg (#370's shape), a CANCEL not answered 200. INVALID: no transport failure (the
+  ballast did not bite), a failure with no next attempt, no leg (the far end never rang; with the ballast held
+  across `makeCall()`'s POST that can be the pressure itself), the ballast not taking (`held` false), a `409`, the
+  dead-man releasing it first.
+- **Pressure rules.** The board's HTTP may not answer while the ballast is held. The run makes no HTTP request
+  between the hold and the release (`CANCEL` timing reads the syslog), starts no status logger (a second poller
+  is load on the thing measured), releases first thing after the call and again in a `finally`
+  (`probe_finish()` releases before it disarms, repeating a release the board did not answer), and sets the
+  dead-man to 35 s, past the longest call, as the backstop.
+- **One ring.** The same far-end rules as every probe scenario, and its own never-dial list (911, 933, 113, 1001)
+  on top of `is_never_dial()`, checked before the first arm, the ballast and the INVITE. `calls` is 1, the call
+  cap 30 s.
+- **Needs an OK.** Holding the ballast across `makeCall()` puts its POST and the reconcile list read under
+  pressure: the #349 ORPHAN variant (a live billable leg on 3CX) is possible, which the approval excludes (see
+  `makecall_read_fail` above). An `ORPHANED` line is a FAIL with a note to check the route point. If the ballast
+  makes the POST fail instead, the run is INVALID (no leg); raise `ballast_bytes` to ease it.
 
 ## Rule 5: 911 and 933 come first
 
@@ -204,6 +260,12 @@ refusal, the `tick()` call) was syntax-checked with the release build's compile 
 `-DPOCKETDIAL_ANCHOR_BENCH_PROBE=1`, never linked into a probe image, and its stack use on the SIP task is
 unmeasured. The scenario has run only against the fake board in `tests/tools/test_anchor_scenarios.py`
 (`X888Test`), whose `ws_upsert` is a model of this section, not the firmware.
+
+`x370_pressure_rebuild` (#370) has run only against that fake board too (`X370Test`), whose GET loop logs the
+failure lines the knobs ask for. Not known until a board runs it: whether a ballast at 8192 makes the GET open
+fail at all (the mbedTLS buffers may be in PSRAM), whether `makeCall()`'s POST survives it, whether the board's
+HTTP answers the release, and whether 35 s is a long enough backstop. The rebuild witness is derived from the
+log, not read from a line of its own.
 
 ## HTTP DRAM accounting (`POCKETDIAL_HTTP_DRAM_ACCOUNT`)
 
