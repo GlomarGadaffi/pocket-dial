@@ -2776,7 +2776,7 @@ def build_parser():
     ap.add_argument("--probe-gap-ms", type=float, default=d["probe_gap_s"] * 1000, help="h947_http_load: pause "
                     "between probe polls")
     ap.add_argument("--burst-workers", type=int, default=d["burst_workers"],
-                    help="h947_http_load: concurrent clients in the burst (the board serves 3 per source)")
+                    help="h947_http_load: concurrent clients in the burst (the board serves 2 per source)")
     ap.add_argument("--burst-each", type=int, default=d["burst_each"], help="h947_http_load: requests per burst client")
     ap.add_argument("--call-mode", default=d["call_mode"],
                     help="h947_http_load: what dashboard-call's far end does: %s (default %s). ringing rings and is "

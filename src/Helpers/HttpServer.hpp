@@ -26,7 +26,7 @@
 #endif
 // #410: /api/status output buffers, allocated once at construction. 24 KB
 // covers a full small office (~15 KB, Globox's #410 inventory); with PSRAM,
-// one per connection slot (4 x 24 KB = 96 KB, all in PSRAM). Without PSRAM
+// one per connection slot (3 x 24 KB = 72 KB, all in PSRAM). Without PSRAM
 // they come from internal DRAM, so that profile gets 2 x 16 KB (32 KB): still
 // fits an office-sized body, and a third concurrent poller gets a counted 503.
 // Bigger bodies (32 ring groups of 32 members is ~96 KB) get a counted 500.
@@ -36,7 +36,7 @@
 #define PD_STATUS_BUF_COUNT_DEFAULT 2
 #else
 #define PD_STATUS_BUF_BYTES_DEFAULT 24576
-#define PD_STATUS_BUF_COUNT_DEFAULT 4
+#define PD_STATUS_BUF_COUNT_DEFAULT 3   // one per connection slot: kMaxConcurrentConnections
 #endif
 #ifndef POCKETDIAL_HTTP_STATUS_BUF_BYTES
 #define POCKETDIAL_HTTP_STATUS_BUF_BYTES PD_STATUS_BUF_BYTES_DEFAULT
@@ -92,15 +92,17 @@ public:
 	// interface down for the duration, which on a PBX means live call
 	// signalling and audio.
 	//
-	// 4 is chosen to stay safe at the CURRENT 8192-byte stack (~35 KB worst
-	// case) rather than only at the 4096 #366/#367 moves to, so this does not
-	// depend on which of the two lands first. It is also comfortably more than
-	// the dashboard uses: the SPA is one document plus its polled JSON.
-	static constexpr int kMaxConcurrentConnections = 4;
-	// Issue #529: those 4 slots were cheap to hold. The only read timeout was
+	// 3, down from 4 (#410, #328). A live connection holds a 4096 B stack, a TCB
+	// and a TCP send queue of up to 5760 B (a send copies into heap pbufs) in
+	// internal DRAM, and with four the .244 bench (the DRAM accounting image) read
+	// minFreeHeapInternal at 4.5 KB under the dashboard load. The 4th concurrent
+	// request now gets the 503 below. Tables sized from this (the per-source
+	// counts, the connection slots, the read buffers) follow it.
+	static constexpr int kMaxConcurrentConnections = 3;
+	// Issue #529: those slots were cheap to hold. The only read timeout was
 	// per recv() (5 s), and the buffered body loop runs BEFORE any auth check,
 	// so one unauthenticated host could trickle a body a byte every few seconds
-	// on all four and keep the admin plane at 503 for hours. Two bounds:
+	// on every slot and keep the admin plane at 503 for hours. Two bounds:
 	//  - one source address may hold at most kMaxConnectionsPerSource slots,
 	//    so at least one is always left for everyone else;
 	//  - everything read before dispatch (headers + buffered body) must arrive
@@ -125,7 +127,7 @@ public:
 	// is full, counted in psram::internalFallbacks()), so a live connection holds its
 	// task stack in internal DRAM and not a second 4 KB beside it. The stack stays
 	// internal: the handlers write NVS. A build without PSRAM (esp32_constrained)
-	// keeps a per-request heap buffer, as before: four reserved slots would hold 16 KB
+	// keeps a per-request heap buffer, as before: three reserved slots would hold 12 KB
 	// of internal DRAM from boot instead of only while a request is in flight.
 	static constexpr size_t kReadBufBytes = 4096;
 #if defined(ESP_PLATFORM) && !(defined(CONFIG_SPIRAM) && CONFIG_SPIRAM)
