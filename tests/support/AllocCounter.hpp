@@ -53,4 +53,27 @@ private:
 	std::size_t _start;
 };
 
+// Like AllocGuard, but only operator new calls for exactly `bytes` (#410: a
+// 4096-byte read buffer is told apart from every other allocation by its size).
+// One size is watched at a time, process-wide; the count is still per thread.
+void watchAllocSize(std::size_t bytes);   // 0 stops watching
+std::size_t threadWatchedAllocCount();
+
+class SizedAllocGuard
+{
+public:
+	explicit SizedAllocGuard(std::size_t bytes)
+	{
+		watchAllocSize(bytes);
+		_start = threadWatchedAllocCount();
+	}
+	~SizedAllocGuard() { watchAllocSize(0); }
+	SizedAllocGuard(const SizedAllocGuard&) = delete;
+	SizedAllocGuard& operator=(const SizedAllocGuard&) = delete;
+	std::size_t delta() const { return threadWatchedAllocCount() - _start; }
+
+private:
+	std::size_t _start = 0;
+};
+
 #endif

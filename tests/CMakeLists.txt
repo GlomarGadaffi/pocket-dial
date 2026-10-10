@@ -102,6 +102,9 @@ add_executable(sip_parser_tests
     # sendmsg() (byte-identical, short writes resumed, zero allocation).
     HttpSendPath_test.cpp
     HttpStatusAlloc_test.cpp
+    # Issues #410/#328: the per-connection read buffer is reserved per slot (PSRAM
+    # where there is some), not allocated per request.
+    HttpReadBuf_test.cpp
     # Issue #410 done-when 4: the per-route allocation gate.
     HttpRouteAlloc_test.cpp
     # Issue #412: every allocateVirtualPeer() caller must survive an exhausted

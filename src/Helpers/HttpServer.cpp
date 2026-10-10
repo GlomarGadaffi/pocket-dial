@@ -145,6 +145,27 @@ HttpServer::HttpServer(const std::string& ip, int port, RequestsHandler* handler
 	{
 		b = static_cast<char*>(psram::allocPreferPsram(kStatusBufBytes));
 	}
+
+	// #410/#328: and one recv buffer per connection slot, from PSRAM where the board
+	// has it. allocPreferPsram() spills into internal RAM only when PSRAM is full and
+	// counts that in psram::internalFallbacks() (memory.psramFallbacks on /api/status);
+	// a slot it could not serve at all stays null and handleClient() takes a heap buffer.
+	if (kReadBufReserved)
+	{
+		const uint32_t spilled0 = psram::internalFallbacks().load(std::memory_order_relaxed);
+		int missing = 0;
+		for (char*& b : _readBuf)
+		{
+			b = static_cast<char*>(psram::allocPreferPsram(kReadBufBytes));
+			if (b == nullptr) ++missing;
+		}
+		const uint32_t spilled = psram::internalFallbacks().load(std::memory_order_relaxed) - spilled0;
+		if (spilled != 0 || missing != 0)
+		{
+			std::cerr << "[HttpServer] read buffers: " << spilled << " of " << kMaxConcurrentConnections
+				<< " in internal RAM (PSRAM full), " << missing << " not allocated (per-request heap buffer) (#410)\n";
+		}
+	}
 }
 
 bool HttpServer::openListenSocket()
@@ -268,6 +289,10 @@ HttpServer::~HttpServer()
 	{
 		if (b != nullptr && stillRunning == 0) psram::freePreferPsram(b);
 	}
+	for (char* b : _readBuf)   // same reason: a still-running handler is reading into its slot's buffer
+	{
+		if (b != nullptr && stillRunning == 0) psram::freePreferPsram(b);
+	}
 }
 
 void HttpServer::start()
@@ -288,6 +313,11 @@ void HttpServer::setFailSocketTimeoutsForTest(bool failRecv, bool failSend)
 }
 static void (*s_dispatchMarkForTest)() = nullptr;   // #410 route gate
 void HttpServer::setDispatchMarkForTest(void (*mark)()) { s_dispatchMarkForTest = mark; }
+void HttpServer::dropReadBufForTest(int slot)
+{
+	psram::freePreferPsram(_readBuf[slot]);
+	_readBuf[slot] = nullptr;
+}
 #endif
 
 // Issue #529: SO_RCVTIMEO / SO_SNDTIMEO in milliseconds (at least 1, so 0 never
@@ -494,7 +524,7 @@ void HttpServer::acceptLoop()
 			std::thread([this, clientSock, connIdx]() {
 				// #405: which route this thread served, for the stack minimum.
 				char route[kRouteLabelBytes] = "unparsed";
-				handleClient(clientSock, route);
+				handleClient(clientSock, _readBuf[connIdx], route);
 				recordConnStackHwm(route);
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 				if (_afterCloseHookForTest) _afterCloseHookForTest();
@@ -645,7 +675,7 @@ void HttpServer::routeLabel(const std::string& method, const std::string& path,
 	out[n] = '\0';
 }
 
-void HttpServer::handleClient(int clientSock, char* routeOut)
+void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 {
 	// Issue #529: everything read before dispatch shares one deadline.
 	const auto readDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(_readDeadlineMs);
@@ -686,20 +716,33 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 		return;
 	}
 
-	// Heap-allocate the read buffer. On ESP32 each connection runs on a detached
-	// std::thread, i.e. an IDF pthread; sdkconfig.defaults sets
-	// CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192, so a 4 KB stack-local buffer
-	// would consume half the stack before any handler ran. Using std::vector keeps
-	// the data on the heap. (This comment previously claimed a ~3 KB stack, which
-	// has not matched sdkconfig for some time.)
-	std::vector<char> buf(4096, 0);
+	// The recv buffer is off the stack (a 4 KB local would fill the 4096-byte
+	// kHttpConnStackBytes): it is the connection slot's, allocated once in the
+	// constructor, in PSRAM where the board has it (#410/#328). PSRAM is fine for it:
+	// recv() copies out of lwIP's pbufs on this task (pbuf_copy_partial), nothing DMAs
+	// into it, and it is never a flash-write source (OTA/MoH uploads are handed `raw`,
+	// a copy). With no slot buffer (a build without PSRAM, or the constructor's
+	// allocation failed) the request takes one from the heap, as it always did, and
+	// counts a PSRAM fallback where PSRAM was expected.
+	std::vector<char> heapBuf;   // empty, no allocation, unless the fallback below is taken
+	char* buf = readBuf;
+	if (buf == nullptr)
+	{
+		heapBuf.resize(kReadBufBytes);   // zero-filled
+		buf = heapBuf.data();
+		if (kReadBufReserved) psram::internalFallbacks().fetch_add(1, std::memory_order_relaxed);
+	}
+	else
+	{
+		std::memset(buf, 0, kReadBufBytes);
+	}
 
 	// Read initial data. A follow-up loop below handles POST bodies that span
 	// multiple TCP segments (see Content-Length body-read completion below).
 #if defined _WIN32 || defined _WIN64
-	int bytesRead = recv(clientSock, buf.data(), static_cast<int>(buf.size()) - 1, 0);
+	int bytesRead = recv(clientSock, buf, static_cast<int>(kReadBufBytes) - 1, 0);
 #else
-	int bytesRead = static_cast<int>(recv(clientSock, buf.data(), buf.size() - 1, 0));
+	int bytesRead = static_cast<int>(recv(clientSock, buf, kReadBufBytes - 1, 0));
 #endif
 
 	if (bytesRead <= 0)
@@ -711,7 +754,7 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 	// #18: ensure the complete POST body is present before parsing.
 	// If the headers indicate a Content-Length larger than what arrived in the
 	// first segment, keep reading until we have it all.
-	std::string raw(buf.data(), static_cast<size_t>(bytesRead));
+	std::string raw(buf, static_cast<size_t>(bytesRead));
 
 	// --- OTA upload interception (firmware streaming) -------------------------
 	// A firmware image is >1.5 MB, so it must NOT flow through the 16 KB-capped
@@ -855,11 +898,11 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 						closeSocket(clientSock);
 						return;
 					}
-					buf.assign(buf.size(), 0);
+					std::memset(buf, 0, kReadBufBytes);
 #if defined _WIN32 || defined _WIN64
-					int n = recv(clientSock, buf.data(), static_cast<int>(buf.size()) - 1, 0);
+					int n = recv(clientSock, buf, static_cast<int>(kReadBufBytes) - 1, 0);
 #else
-					int n = static_cast<int>(recv(clientSock, buf.data(), buf.size() - 1, 0));
+					int n = static_cast<int>(recv(clientSock, buf, kReadBufBytes - 1, 0));
 #endif
 					if (n <= 0 && msLeft() <= 0)
 					{
@@ -868,7 +911,7 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 						return;
 					}
 					if (n <= 0) break;
-					raw.append(buf.data(), static_cast<size_t>(n));
+					raw.append(buf, static_cast<size_t>(n));
 					bodyHave += static_cast<size_t>(n);
 				}
 			}
