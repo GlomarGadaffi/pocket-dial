@@ -1,7 +1,16 @@
 #ifndef POCKETDIAL_URL_ENCODE_HPP
 #define POCKETDIAL_URL_ENCODE_HPP
 
+#include <cstddef>
 #include <string>
+#include <string_view>
+
+// The unreserved set (RFC 3986 section 2.3): what urlEncode() and urlEncodeInto() pass through.
+inline bool urlUnreserved(unsigned char c)
+{
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+	       c == '-' || c == '_' || c == '.' || c == '~';
+}
 
 // RFC 3986 percent-encoding for a single URL path/query component. The unreserved
 // set (A-Z a-z 0-9 - _ . ~) passes through unchanged; every other byte is emitted
@@ -17,12 +26,7 @@ inline std::string urlEncode(const std::string& in)
 	out.reserve(in.size());
 	for (unsigned char c : in)
 	{
-		const bool unreserved =
-			(c >= 'A' && c <= 'Z') ||
-			(c >= 'a' && c <= 'z') ||
-			(c >= '0' && c <= '9') ||
-			c == '-' || c == '_' || c == '.' || c == '~';
-		if (unreserved)
+		if (urlUnreserved(c))
 		{
 			out.push_back(static_cast<char>(c));
 		}
@@ -34,6 +38,30 @@ inline std::string urlEncode(const std::string& in)
 		}
 	}
 	return out;
+}
+
+// urlEncode() appended at dst[n], never past dst[cap), with no allocation (#951). n moves past what
+// was written. False when the encoding does not fit: dst is then partly written and the caller
+// throws it away; it is never used as a shorter value.
+inline bool urlEncodeInto(std::string_view in, char* dst, std::size_t cap, std::size_t& n)
+{
+	static const char kHex[] = "0123456789ABCDEF";
+	for (unsigned char c : in)
+	{
+		const std::size_t need = urlUnreserved(c) ? 1 : 3;
+		if (cap - n < need) return false;
+		if (need == 1)
+		{
+			dst[n++] = static_cast<char>(c);
+		}
+		else
+		{
+			dst[n++] = '%';
+			dst[n++] = kHex[c >> 4];
+			dst[n++] = kHex[c & 0x0F];
+		}
+	}
+	return true;
 }
 
 // Inverse of urlEncode: percent-decode a single URL component. '+' becomes a

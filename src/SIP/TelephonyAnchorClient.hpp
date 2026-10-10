@@ -5,6 +5,7 @@
 #include "RecentIdRing.hpp"   // Issue #554
 #include "ParkedTaskReap.hpp" // Issue #553: pd::ReapDecision
 #include "AnchorWedge.hpp"    // Issue #667: pd::anchorSlotLooksWedged
+#include "TelephonyAnchorLogic.hpp"   // #951: telephony::BearerHeader (the ESP block below includes it again)
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -82,9 +83,12 @@ private:
 
 	std::atomic<bool> _running{false};
 	std::atomic<bool> _connected{false};
-	std::string       _accessToken;
-	// #465: cached "Bearer " + _accessToken once per token fetch, avoiding per-request heap allocation; guarded by _mutex.
-	std::string       _bearerHeader;
+	// #465: cached "Bearer <token>" once per token fetch, avoiding per-request heap allocation; guarded by _mutex.
+	// #951: reserved once by init() for the longest token accepted, so the install assigns inside its
+	// capacity and _mutex never covers a reallocation; its storage is PSRAM where there is any. It is the
+	// only copy of the token (the raw one is gone). The readers copy it out as before: `std::string s =
+	// _bearerHeader;` converts through BearerHeader::operator std::string.
+	telephony::BearerHeader _bearerHeader;
 	// #100: count of outbound makeCall()s in flight whose own leg is NOT yet resolved (the window
 	// between the makecall POST and resolveOutboundLeg keying the slot). While > 0, the WS
 	// classifier treats an UNmatched upset as a probable far-leg of an in-flight outbound call
@@ -154,7 +158,9 @@ private:
 
 #if defined(ESP_PLATFORM) || defined(ESP32)
 	// #862: the token response is read into one of these three arenas, which live as long as the
-	// client, so the body read allocates no buffer (the rest of fetchToken is #951). One is for the
+	// client, so the body read allocates no buffer. #951 slice 1: fetchToken also builds its request,
+	// the lifetime decode's scratch and the WebSocket header in the claimed arena; what stays is
+	// esp_http_client_init and TLS. One is for the
 	// ordinary lane, one for a 911/933, one for the background refresh. Each is claimed with an
 	// atomic flag (never a mutex) and held across the socket read; a second fetch on the same lane is
 	// turned away. The 911/933 lane never waits for, and is never turned away by, an ordinary fetch.
@@ -411,8 +417,14 @@ private:
 	bool startRxIfNeeded(const std::string& participantId);
 
 	// onEvent/eventUser: optional esp_http_client event hook (performCtrl's connect witness, #884).
-	esp_http_client_handle_t makeAuthedClient(const std::string& url, esp_http_client_method_t method, int txBufSize, const std::string& token = "",
+	esp_http_client_handle_t makeAuthedClient(const char* url, esp_http_client_method_t method, int txBufSize, const std::string& token = "",
 	                                          http_event_handle_cb onEvent = nullptr, void* eventUser = nullptr);
+	// #951: fetchToken() passes the URL it built in the arena; every other caller keeps its std::string.
+	esp_http_client_handle_t makeAuthedClient(const std::string& url, esp_http_client_method_t method, int txBufSize, const std::string& token = "",
+	                                          http_event_handle_cb onEvent = nullptr, void* eventUser = nullptr)
+	{
+		return makeAuthedClient(url.c_str(), method, txBufSize, token, onEvent, eventUser);
+	}
 	bool performAuthedRequest(esp_http_client_handle_t client, int* statusCodeOut = nullptr);
 	// One-shot POST on the control handle (closes the connection after each success; creates or
 	// rebuilds the handle as needed, retries once after a failure). contentType may be
