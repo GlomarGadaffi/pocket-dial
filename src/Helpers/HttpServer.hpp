@@ -120,6 +120,19 @@ public:
 	static constexpr int kStatusBufCount = POCKETDIAL_HTTP_STATUS_BUF_COUNT;
 	static_assert(kStatusBufCount >= 1 && kStatusBufCount <= kMaxConcurrentConnections, "#410");
 	uint32_t statusRefusals() const { return _statusRefusals.load(std::memory_order_relaxed); }
+	// #410/#328: a connection's recv buffer. One per connection slot, allocated once in
+	// the constructor from PSRAM (psram::allocPreferPsram: internal RAM only when PSRAM
+	// is full, counted in psram::internalFallbacks()), so a live connection holds its
+	// task stack in internal DRAM and not a second 4 KB beside it. The stack stays
+	// internal: the handlers write NVS. A build without PSRAM (esp32_constrained)
+	// keeps a per-request heap buffer, as before: four reserved slots would hold 16 KB
+	// of internal DRAM from boot instead of only while a request is in flight.
+	static constexpr size_t kReadBufBytes = 4096;
+#if defined(ESP_PLATFORM) && !(defined(CONFIG_SPIRAM) && CONFIG_SPIRAM)
+	static constexpr bool kReadBufReserved = false;
+#else
+	static constexpr bool kReadBufReserved = true;
+#endif
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only (#529): a short deadline so a slow-client test runs in well
 	// under a second instead of kReadDeadlineMs.
@@ -211,7 +224,12 @@ public:
 	// CALLING THREAD, and call `mark` once the request is read and parsed, just
 	// before the route table. The gate counts route (dispatch + response)
 	// allocations from there; request reading is done-when 2's business.
-	void handleClientForTest(int sock) { handleClient(sock); }
+	void handleClientForTest(int sock) { handleClient(sock, _readBuf[0]); }
+	// #410/#328: slot `slot`'s recv buffer; dropReadBufForTest() frees it and leaves
+	// the slot null, so a test can drive the per-request heap fallback.
+	const char* readBufForTest(int slot) const { return _readBuf[slot]; }
+	void dropReadBufForTest(int slot);
+	uint32_t busyRefusalsForTest() const { return _busyRefusals.load(std::memory_order_relaxed); }
 	// #871: runs on each handler thread after its socket is closed and before
 	// its slot is freed, so a test can hold threads in that window. Set before start().
 	void setAfterCloseHookForTest(std::function<void()> f) { _afterCloseHookForTest = std::move(f); }
@@ -238,9 +256,10 @@ private:
 	                                             // accept() during teardown.
 
 	void acceptLoop();
-	// routeOut (optional, kRouteLabelBytes) receives the request's route label
-	// once it is parsed (#405).
-	void handleClient(int clientSock, char* routeOut = nullptr);
+	// readBuf: the connection slot's recv buffer (kReadBufBytes), or nullptr to take a
+	// per-request heap buffer instead. routeOut (optional, kRouteLabelBytes) receives
+	// the request's route label once it is parsed (#405).
+	void handleClient(int clientSock, char* readBuf, char* routeOut = nullptr);
 	// Issue #366: called on the connection thread once handleClient() has
 	// returned, from the thread body rather than inside handleClient itself --
 	// that function has many early returns and this way none of them can be
@@ -627,6 +646,9 @@ private:
 	std::atomic<bool> _statusBufBusy[kStatusBufCount]{};
 	std::atomic<uint32_t> _statusRefusals{0};
 	size_t _statusCap = kStatusBufBytes;
+	// #410/#328: slot i's recv buffer, owned by the handler thread that holds _conns[i]
+	// (claimConnSlot() to finishConnSlot()). Null: no reserved buffer (see kReadBufReserved).
+	char* _readBuf[kMaxConcurrentConnections]{};
 	long _readDeadlineMs = kReadDeadlineMs;
 
 	// Track server uptime
