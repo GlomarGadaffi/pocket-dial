@@ -406,6 +406,9 @@ add_executable(sip_parser_tests
     UrlEncode_test.cpp
     JsonEscape_test.cpp
     TelephonyAnchorLogic_test.cpp
+    # Issue #948: the 911/933 lane's status GET -- the failure contract on its body arena and the
+    # bounded claim (src/SIP/SosStatusGet.hpp), the code the anchor client's sos lane calls.
+    SosStatusGet_test.cpp
     MixBus_test.cpp
     # Issue #169: VAD energy-gating of mix participation (default off).
     VadGate_test.cpp

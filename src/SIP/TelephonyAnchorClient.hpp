@@ -20,6 +20,7 @@
 #include "freertos/semphr.h"  // #43: worker-pool done semaphore (+ existing _rxDoneSem)
 #include "PsramTask.hpp"      // #479: pd::StaticTaskSlot (the slot's tel_media_rx stack + TCB)
 #include "TelephonyAnchorLogic.hpp"   // #379: telephony::AnchorOwnLegs
+#include "SosStatusGet.hpp"           // #948: telephony::BodyArena, SosWitness
 #endif
 
 #include "PoolConfig.hpp"     // #100: POCKETDIAL_MAX_ANCHOR_CALLS (per-call slot count)
@@ -287,6 +288,30 @@ private:
 	// sequential ~100-150ms resumed ones instead. Guarded by _statusMutex; never touched under _mutex.
 	esp_http_client_handle_t      _statusClient = nullptr;
 	std::mutex                    _statusMutex;
+	// #941 (Rule 5): the 911/933 lane's own status-GET handle, built at start() by
+	// warmStatusConnection() so its TLS ticket starts warm (the #107 re-warm covers the POST slots
+	// only, so after a long idle the first 911 may pay a cold handshake). Only an emergency
+	// makeCall() uses it (httpGetBody sosLane), so a 911 never takes _statusMutex and never waits
+	// behind another task's status GET. No mutex is held across its I/O: _sosStatusBusy is a
+	// lock-free claim. #948: nothing on the 911 path waits for it. A GET that finds it held takes
+	// the fallback (an error, the call takes the conservative route); closeSosStatusClient() waits
+	// at most telephony::kSosClaimBoundUs, then leaves the handle to the GET that holds it. Never
+	// touched under _mutex.
+	esp_http_client_handle_t      _sosStatusClient = nullptr;
+	std::atomic<bool>             _sosStatusBusy{false};
+	// #948: the sos GET's body arena, reserved with the handle (start()'s warm GET is the first to
+	// need it) and freed with it, both under the claim. A body that does not fit is an error, never
+	// truncated. 16 participant objects at 768 B: telephony::sosBodyArenaBytes() gives the basis.
+	// ~BodyArena frees it without the claim, which is safe: this client is a member of
+	// RequestsHandler (RequestsHandler.hpp:2483), whose destructor stops the anchor first
+	// (RequestsHandler.cpp:765, _anchorClient->stop(), which drains through closeSosStatusClient())
+	// and which on the device never runs at all (RequestsHandler.hpp:2203, "the handler lives as
+	// long as the device"). A GET in flight at destruction would already be a use of a destroyed
+	// `this` (makeCall and httpGetBody read _mutex, _baseUrl and the callbacks), claim or no claim.
+	telephony::BodyArena          _sosBody;
+	telephony::SosWitness         _sosWitness;
+	telephony::SosBodyWitness     _sosBodyWitness;   // #948: the largest sos body this boot, for sizing the arena
+	static constexpr std::size_t  kSosBodyArenaBytes = telephony::sosBodyArenaBytes(POCKETDIAL_MAX_ANCHOR_CALLS);
 
 	// #100: the rx task handle, its done-sem, and the stopMediaStreams() single-entry gate are now
 	// per-CallSlot (rxTaskHandle / rxDoneSem / tearingDown in the struct above) — one rx pump per
@@ -403,11 +428,16 @@ private:
 	void closeCtrlClient();      // teardown under _ctrlMutex
 	void closePostClient();      // free the persistent warm _postClient (full teardown only), under _postMutex
 	void closeStatusClient();    // free the persistent warm _statusClient (full teardown only), under _statusMutex
+	void closeSosStatusClient(); // #941: free _sosStatusClient and its arena (full teardown only), under the _sosStatusBusy claim; #948: waits at most kSosClaimBoundUs
 	bool readJsonStringField(esp_http_client_handle_t client, const std::string& field, std::string& out);
 
 	// Live-state GET helpers (reconcile watchdog + drop-fallback + device resolve). Snapshot
 	// creds under _mutex then do blocking I/O lock-free.
-	bool httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut = nullptr);
+	// sosLane (#941): an emergency makeCall()'s GET; uses _sosStatusClient, never _statusMutex.
+	// warm (#948): start()'s warm GET on the sos handle. Not a 911: if it loses the claim it records no
+	// fallback witness line.
+	bool httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut = nullptr, bool sosLane = false,
+	                 bool warm = false);
 	// First participant id currently on our DN (single-leg assumption), or "" if none / on error.
 	std::string reconcileParticipantId();
 	// POST + capture the response body (for makecall result.id). Fresh client (not the persistent
@@ -440,7 +470,7 @@ private:
 	std::string getParticipantCaller(const std::string& legId);
 	// Device-specific makecall transport.
 	std::string pickDeviceId(const std::string& body);   // parse a /devices array → a device_id
-	bool resolveDevice();                                 // GET /devices → pickDeviceId → _deviceId
+	bool resolveDevice(bool sosLane = false);             // GET /devices → pickDeviceId → _deviceId (#941: sosLane = a 911/933 makeCall)
 	// Run on tel_maint (#658) when tick() sees a wedged _outboundActive (see .cpp).
 	static void reconcileTaskTrampoline(void* arg);
 	// #107: idle TLS re-warm — runs on tel_maint (#658) when tick() sees idle; reopens the
