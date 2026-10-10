@@ -139,6 +139,13 @@ namespace DeviceConfig
 	// ESP NVS write failure.
 	bool setWifiPassword(const std::string& password);
 
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Host tests only: the WiFi station mirror above is process-global and
+	// clearAll() leaves it alone, so a test that sets it leaks into every later
+	// test in the binary. Puts ssid/password back to "" and mode to 0.
+	void resetWifiForTest();
+#endif
+
 	// ---------------------------------------------------------------------
 	// Flash-time configuration seed
 	// ---------------------------------------------------------------------
