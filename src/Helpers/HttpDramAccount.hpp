@@ -14,7 +14,8 @@
 // allocated and released, so the operator can set the sum against that drop:
 //
 //   taskStack  the 4096 B stack of every live connection thread
-//   reqBuf     the 4096 B read buffer handleClient() allocates per request
+//   reqBuf     the 4096 B read buffer of handleClient(), while a request is in flight and
+//              only if it is in internal RAM (a PSRAM slot buffer, #410, counts 0)
 //   reqRaw     the std::string copy of the request (heap only; a small string is free)
 //   reqParsed  the parsed request's strings (the body is a second copy)
 //   respBody   a response body built on the heap, while it is being sent

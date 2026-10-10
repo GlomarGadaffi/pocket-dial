@@ -243,7 +243,7 @@ the moment the **total** last set a new high. Everything is bytes except `conns`
 | Consumer | What is counted, and where |
 |---|---|
 | `taskStack` | `HttpServer::kHttpConnStackBytes` (4096) for every connection thread from just before `std::thread` is created until its lambda ends (`acceptLoop()`). |
-| `reqBuf` | The `std::vector<char>(4096)` read buffer of `handleClient()`, while that request is in flight. |
+| `reqBuf` | The 4096 B read buffer of `handleClient()`, while that request is in flight, if it is in internal RAM. A connection slot's buffer in PSRAM (#410: the normal case on a PSRAM board) counts 0; a slot that spilled into internal RAM, or the per-request heap buffer a slot without one falls back to, counts 4096. |
 | `reqRaw` | The `std::string raw` copy of the request, by capacity, after each `append` (a small string lives inside the object and counts 0). |
 | `reqParsed` | The heap capacity of the parsed `HttpRequest` strings. `body` is a second copy of the request body. |
 | `respBody` | A response body built on the heap, from the moment `sendResponseWithHeader()` has it until the send is done. Not counted: a body inside a leased buffer (`/api/status`, `/metrics`, the registrar roster: allocated once at boot), a flash literal, or a block in PSRAM. |
@@ -271,7 +271,7 @@ instants:
 
 1. Reboot, wait for the phones to register, and let the board go idle. Read `/api/status` once
    and write down `freeHeapInternal` (`F0`), `minFreeHeapInternal` (`M0`) and `httpDramAccount`.
-   The request that reads it is itself in flight, so `reqBuf.now` is at least 4096 and `conns.now` at least 1.
+   The request that reads it is itself in flight, so `conns.now` is at least 1 (and `reqBuf.now` is 4096 only if its read buffer is in internal RAM, see the `reqBuf` row).
 2. Run the #961/#947 harness (idle, then dashboard), or `for i in $(seq 4); do curl ... & done`.
 3. Read `/api/status` again: `minFreeHeapInternal` (`M1`) and `httpDramAccount`.
 4. If `M1 < M0` the run set a new low-water mark, and `F0 - M1` is how far internal DRAM fell
@@ -281,10 +281,11 @@ instants:
    - `total.hwm` well short: the difference is in the list below, and `spawnFailures` says whether
      the floor was hit.
 5. Per consumer: `taskStack.hwm / 4096` is the peak connection threads, and each live connection
-   costs at least `4096 + 4096` (stack and read buffer) before any request text. With
-   `kMaxConcurrentConnections` at 4 that is 32768 B, more than the 31567 B low-water mark at the
-   first read in #947. That is arithmetic from the code, a candidate to confirm or reject with
-   the reading, not a finding.
+   costs at least `4096` (the stack), plus `4096` for a read buffer that is in internal RAM
+   (`reqBuf` row), before any request text. Before #410 moved the read buffer to PSRAM, with
+   `kMaxConcurrentConnections` at 4 that was `4096 + 4096` each, 32768 B, more than the 31567 B
+   low-water mark at the first read in #947. That is arithmetic from the code, a candidate to
+   confirm or reject with the reading, not a finding.
 
 ### What it cannot see
 
