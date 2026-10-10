@@ -519,7 +519,7 @@ TEST(SosStatusTeardown, TheNinetyOneOneGetTakesTheFallbackWithoutWaiting)
 	EXPECT_LT(best, 1'000) << "no pause is taken at all";
 }
 
-// ── The #349 window: a 911/933 whose list reads all fail is not refused ──────────
+// ── The #349 window: every list read failing is the usual 503, 911/933 included ──────
 
 // What a sos list read does around httpGetBody on the sos lane: the claim (waited for not at all),
 // then the arena read. The leg pick (cJSON) is replaced by "a non-empty body names leg 517".
@@ -558,93 +558,96 @@ struct SosListRead
 
 struct PlacedCall
 {
-	bool        success;   // makeCall() returns true: no 503
+	bool        success;   // makeCall() returns true; false is the 503 (NOT ROUTED for a 911)
 	std::string ownLeg;
 	int         reads;
-	int64_t     windowUs;
+	int64_t     windowUs;  // the simulated pauses between the reads
 };
 
 // makeCall()'s #349 path: the window, then the outcome. Time is simulated: a pause is the poll gap.
-PlacedCall placeUnreadCall(bool sosLane, SosListRead& list)
+template <class ReadFn>
+PlacedCall placeUnreadCall(ReadFn&& readOnce)
 {
 	int64_t t = 0;
 	const UnreadWindow w = readOwnLegWindow(
-		[&] { return list(); }, [&] { return t; }, [] { return true; }, [](int) {},
+		readOnce, [&] { return t; }, [] { return true; }, [](int) {},
 		[&] { t += int64_t{ kUnreadAdoptPollMs } * 1000; });
-	const UnreadOutcome o = unreadOutcome(!w.ownLeg.empty(), sosLane);
+	const UnreadOutcome o = unreadOutcome(!w.ownLeg.empty());
 	return PlacedCall{ o != UnreadOutcome::Fail, w.ownLeg, w.reads, t };
 }
 
-TEST(SosStatusUnread, ASosCallProceedsWhenTheListIsOverTheArena)
+// The window is main's: a read every kUnreadAdoptPollMs until since + poll reaches kUnreadAdoptWindowUs.
+// Reads that fail at once leave 10 reads and 9 pauses of 400 ms. This change adds no wait to it.
+constexpr int64_t kInstantFailureWindowUs = kUnreadAdoptWindowUs - int64_t{ kUnreadAdoptPollMs } * 1000;
+
+void expectTheUsual503(const PlacedCall& call, const char* how)
+{
+	EXPECT_FALSE(call.success) << how << ": makeCall returns false, so 503 (NOT ROUTED for a 911)";
+	EXPECT_TRUE(call.ownLeg.empty()) << "no own leg";
+	EXPECT_EQ(call.reads, 10) << "the window is unchanged";
+	EXPECT_EQ(call.windowUs, kInstantFailureWindowUs) << "no wait added to it";
+	std::fprintf(stderr, "[ #948 ] %s: 503 after %d reads, %lld ms of simulated pauses (the unchanged window)\n", how,
+	             call.reads, static_cast<long long>(call.windowUs / 1000));
+}
+
+TEST(SosStatusUnread, ASosCallIs503WhenTheListIsOverTheArena)
 {
 	SosListRead list;
 	ASSERT_TRUE(reserveReal(list.arena, 1024));
 	list.response.body = patternBody(1025);
-	const PlacedCall call = placeUnreadCall(/*sosLane=*/true, list);
-	EXPECT_GT(list.gets, 1) << "the window kept reading";
-	EXPECT_TRUE(call.success) << "no 503";
-	EXPECT_TRUE(call.ownLeg.empty());
-	EXPECT_LT(call.windowUs, kUnreadAdoptWindowUs);
+	const PlacedCall call = placeUnreadCall([&] { return list(); });
+	EXPECT_EQ(list.gets, call.reads) << "every read was a real GET, refused as over the arena";
+	expectTheUsual503(call, "list over the arena");
 }
 
-TEST(SosStatusUnread, ASosCallProceedsWhenTheListReadIsShort)
+TEST(SosStatusUnread, ASosCallIs503WhenTheListReadIsShort)
 {
 	SosListRead list;
 	ASSERT_TRUE(reserveReal(list.arena, 4096));
 	list.response.body  = patternBody(900);
 	list.response.endAt = 400;
-	const PlacedCall call = placeUnreadCall(true, list);
-	EXPECT_GT(list.gets, 1);
-	EXPECT_TRUE(call.success) << "no 503";
-	EXPECT_TRUE(call.ownLeg.empty());
+	const PlacedCall call = placeUnreadCall([&] { return list(); });
+	EXPECT_EQ(list.gets, call.reads);
+	expectTheUsual503(call, "short read");
 }
 
-TEST(SosStatusUnread, ASosCallProceedsWhenAnOverlapping911HoldsTheClaim)
+TEST(SosStatusUnread, ASosCallIs503WhenAnOverlapping911HoldsTheClaim)
 {
 	SosListRead list;
 	ASSERT_TRUE(reserveReal(list.arena, 4096));
 	list.response.body = patternBody(300);
 	list.claim.store(true);   // the other 911's GET is mid-flight for the whole window
-	const PlacedCall call = placeUnreadCall(true, list);
+	const PlacedCall call = placeUnreadCall([&] { return list(); });
 	EXPECT_EQ(list.gets, 0) << "no GET was issued on the held handle";
 	EXPECT_EQ(list.witness.count(SosFallback::Get), static_cast<uint32_t>(call.reads)) << "the fallback, every read";
 	EXPECT_EQ(list.pauses.load(), 0) << "the 911 never waits for the claim: no vTaskDelay on its path";
 	EXPECT_LE(list.slowestUs, 10'000) << "each read returns within the 10 ms bound";
-	EXPECT_TRUE(call.success) << "no 503";
-	EXPECT_TRUE(call.ownLeg.empty());
 	EXPECT_TRUE(list.claim.load()) << "the other holder's claim is untouched";
+	expectTheUsual503(call, "overlapping 911 holding the claim");
 }
 
-TEST(SosStatusUnread, AnythingButASosCallIsStillRefusedWhenEveryReadFails)
+TEST(SosStatusUnread, AnyOtherCallWhoseReadsAllFailIsRefusedTheSameWay)
+{
+	// Control: the refusal does not depend on how the reads failed or on the lane.
+	const PlacedCall call = placeUnreadCall([] { return std::string(); });
+	expectTheUsual503(call, "any read that shows no leg");
+}
+
+TEST(SosStatusUnread, AListedLegIsAdopted)
 {
 	SosListRead list;
-	ASSERT_TRUE(reserveReal(list.arena, 1024));
-	list.response.body = patternBody(1025);
-	const PlacedCall call = placeUnreadCall(/*sosLane=*/false, list);
-	EXPECT_FALSE(call.success) << "other callers keep today's behaviour";
-	EXPECT_TRUE(call.ownLeg.empty());
-}
-
-TEST(SosStatusUnread, AListedLegIsAdoptedOnEitherLane)
-{
-	for (const bool sos : { true, false })
-	{
-		SosListRead list;
-		ASSERT_TRUE(reserveReal(list.arena, 4096));
-		list.response.body = patternBody(300);
-		const PlacedCall call = placeUnreadCall(sos, list);
-		EXPECT_TRUE(call.success) << "sos " << sos;
-		EXPECT_EQ(call.ownLeg, "517");
-		EXPECT_EQ(call.reads, 1);
-	}
+	ASSERT_TRUE(reserveReal(list.arena, 4096));
+	list.response.body = patternBody(300);
+	const PlacedCall call = placeUnreadCall([&] { return list(); });
+	EXPECT_TRUE(call.success);
+	EXPECT_EQ(call.ownLeg, "517");
+	EXPECT_EQ(call.reads, 1);
 }
 
 TEST(SosStatusUnread, TheOutcomeTable)
 {
-	EXPECT_EQ(unreadOutcome(true, true), UnreadOutcome::Adopt);
-	EXPECT_EQ(unreadOutcome(true, false), UnreadOutcome::Adopt);
-	EXPECT_EQ(unreadOutcome(false, true), UnreadOutcome::Proceed) << "a 911/933 goes on with no own leg";
-	EXPECT_EQ(unreadOutcome(false, false), UnreadOutcome::Fail);
+	EXPECT_EQ(unreadOutcome(true), UnreadOutcome::Adopt);
+	EXPECT_EQ(unreadOutcome(false), UnreadOutcome::Fail) << "the 503 stands for a 911/933 as for any call";
 }
 
 // ── Witness ──────────────────────────────────────────────────────────────────

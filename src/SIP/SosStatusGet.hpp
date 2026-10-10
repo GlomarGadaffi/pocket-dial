@@ -19,7 +19,9 @@
 //   socket I/O. Nothing on the 911 path waits for it: the GET takes the fallback at once, and
 //   teardown waits at most kSosClaimBoundUs.
 //
-//   A 911/933 whose list reads all fail (#349 window) proceeds with no own leg; see unreadOutcome.
+//   A failed status GET is no list: if every read in the #349 window fails, the call is refused
+//   (503) as before #948 (see unreadOutcome). The contract adds ways for a read to fail (a list
+//   over the arena, a short read, an overlapping 911); each ends the same way.
 
 #include <atomic>
 #include <climits>
@@ -295,17 +297,16 @@ UnreadWindow readOwnLegWindow(ReadFn&& readOnce, NowFn&& nowUs, KeepFn&& keepGoi
 	return w;
 }
 
-// What makeCall() does when that window ends. Adopt: a leg was listed. Otherwise a 911/933 (the
-// operator's #948 ruling) proceeds with no own leg, as the normal path does when it cannot
-// resolve one: reconcile does the teardown and the call is not refused with a 503. Any other call
-// is still refused. A read that failed (a list over the arena, a short read, the claim held by an
-// overlapping 911) is a read that showed no leg.
-enum class UnreadOutcome : uint8_t { Adopt, Proceed, Fail };
+// What makeCall() does when that window ends. Adopt: a leg was listed. Fail: none was, and the call
+// is refused (503, NOT ROUTED), for a 911/933 as for any call, exactly as before #948. A read that
+// failed (a list over the arena, a short read, the claim held by an overlapping 911) is a read that
+// showed no leg. The operator ruled on #948 to keep the 503 here; adopting an unkeyed leg on the 911
+// lane instead is #977, which needs a decision before any code.
+enum class UnreadOutcome : uint8_t { Adopt, Fail };
 
-inline UnreadOutcome unreadOutcome(bool legFound, bool sosLane)
+inline UnreadOutcome unreadOutcome(bool legFound)
 {
-	if (legFound) return UnreadOutcome::Adopt;
-	return sosLane ? UnreadOutcome::Proceed : UnreadOutcome::Fail;
+	return legFound ? UnreadOutcome::Adopt : UnreadOutcome::Fail;
 }
 
 }  // namespace telephony

@@ -91,16 +91,18 @@ class AnchorSosStatusBoundedTest(unittest.TestCase):
             self.assertIn(needle, handler)
         self.assertIn("catch (const std::bad_alloc&)", code_only(self.sos_hpp), "the hand-back assign has its own catch")
 
-    def test_a_911_whose_list_reads_all_fail_proceeds_with_no_own_leg(self):
+    def test_a_911_whose_list_reads_all_fail_is_refused_like_any_call(self):
+        # The operator kept the 503 on #948 (adopting an unkeyed leg on the 911 lane is #977).
         make = code_only(body_of(self.src, "bool TelephonyAnchorClient::makeCall("))
         self.assertIn("telephony::readOwnLegWindow(", make)
         self.assertNotIn("unreadMakecallStep(", make, "the window loop lives in the host-tested helper")
-        self.assertIn("telephony::unreadOutcome(!ownLeg.empty(), sosLane)", make)
-        m = re.search(r"else if \(outcome == telephony::UnreadOutcome::Proceed\)\s*\{(.*?)\n\t\t\}", make, re.S)
-        self.assertIsNotNone(m, "the sos lane's own branch")
-        self.assertIn("success = true;", m.group(1))
-        self.assertNotIn("return false", m.group(1))
-        self.assertIn("ORPHANED on 3CX (#349/#328)", make, "other callers keep the refusal")
+        self.assertIn("telephony::unreadOutcome(!ownLeg.empty())", make, "no lane argument: one outcome for every call")
+        self.assertNotIn("Proceed", make, "no branch lets a call go on with no own leg")
+        self.assertNotIn("Proceed", code_only(self.sos_hpp))
+        m = re.search(r"if \(outcome == telephony::UnreadOutcome::Adopt\)\s*\{.*?\n\t\t\}\n\t\telse\n\t\t\{(.*?)\n\t\t\}\n", make, re.S)
+        self.assertIsNotNone(m, "the Adopt branch and the refusal that follows it")
+        self.assertIn("ORPHANED on 3CX (#349/#328)", m.group(1), "the refusal")
+        self.assertNotIn("success = true", m.group(1), "the refusal does not set success")
 
     def test_teardown_is_bounded_at_ten_ms_with_a_fallback(self):
         close = code_only(body_of(self.src, "void TelephonyAnchorClient::closeSosStatusClient("))

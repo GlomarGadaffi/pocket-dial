@@ -541,9 +541,11 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		ownLeg = window.ownLeg;
 		const int reads = window.reads;
 
-		// #948 (operator ruling): a 911/933 whose list reads all failed is not refused, however they
-		// failed (a list over the sos arena, a short read, the claim held by an overlapping 911).
-		const telephony::UnreadOutcome outcome = telephony::unreadOutcome(!ownLeg.empty(), sosLane);
+		// #948: the window and its outcome are host-tested (SosStatusGet.hpp). Every read failing is
+		// the same refusal for a 911/933 as for any call, however the reads failed (a list over the sos
+		// arena, a short read, the claim held by an overlapping 911): the operator ruled to keep the
+		// 503 here. Adopting an unkeyed leg on the 911 lane instead is #977.
+		const telephony::UnreadOutcome outcome = telephony::unreadOutcome(!ownLeg.empty());
 		if (outcome == telephony::UnreadOutcome::Adopt)
 		{
 			// More than one candidate on that read: the pick may be an unrelated inbound leg.
@@ -552,19 +554,6 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 				status, ownLeg.c_str(), counts.candidates, reads);
 			ownLegSource = telephony::OwnLegSource::AdoptedAfterUnreadResponse;
 			adopted = true;
-			success = true;
-		}
-		else if (outcome == telephony::UnreadOutcome::Proceed)
-		{
-			// Same as the normal path when it cannot resolve the leg (below: "teardown will rely on
-			// reconcile"): ownLeg stays empty, no slot is keyed, the 911 goes on. Loud, because 3CX may
-			// hold a leg we cannot see; reconcile tears it down. The phantom-inbound hazard above
-			// applies to that leg as it does on the normal path.
-			ESP_LOGE(TAG, "makeCall: 911/933 request reached 3CX but no response and no reconcilable "
-				"leg after %d attempts (last list status=%d: %d listed, %d direct_control, %d slot-claimed, "
-				"%d an earlier call's; direct_control false %d, absent %d, not a bool %d) — "
-				"proceeding without an own leg, reconcile tears down (#948)", reads, listStatus, counts.listed,
-				counts.controllable, counts.claimed, counts.oursAlready, counts.dcFalse, counts.dcAbsent, counts.dcNotBool);
 			success = true;
 		}
 		else
@@ -1299,7 +1288,7 @@ try
 	if (!sosLane) statusLock.lock();
 	// #948 (Rule 5): the 911 lane never waits for its claim. Held by another GET or by teardown:
 	// no status read, an error, and makeCall() takes the conservative route (it never assumes its
-	// own leg answered); a 911/933 goes on with no own leg and is not refused.
+	// own leg answered). On the #349 unread-response path every read failing is the usual 503.
 	telephony::SosStatusClaim sosClaim(sosLane ? &_sosStatusBusy : nullptr, telephony::kSosGetClaimBoundUs, kSosTickUs, sosNowUs, sosPause);
 	if (!sosClaim.held())
 	{
