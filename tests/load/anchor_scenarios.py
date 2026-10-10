@@ -54,11 +54,12 @@ end, and every pre-registered fault must show fired >= 1, or the run is INVALID.
 
 x952_token_age_held (#952, #945) is the one scenario that holds an answered call for minutes: it arms
 token_age once the call's streams are up, holds past the old 5-minute token margin, hangs up, and reports
-the token witnesses main emits (TOKEN_WITNESSES) with the hold reached. It reports; it does not judge the
+the token witnesses (TOKEN_WITNESSES) with the hold reached. It reports; it does not judge the
 refresh. Because it exceeds the ~30 s per call the recorded approvals allow, it runs only under an
-approval in LONG_HOLD_APPROVALS (empty until desmo's OK is recorded by a reviewed PR). --hold-s, --runs,
---run-cap and --arm-at apply to it alone. The #862 witnesses (token_maint_*_862, token_sos_*_862) are not
-emitted on main and are not counted here.
+approval in LONG_HOLD_APPROVALS (desmo's recorded 330 s OK, a comment on PR #958). --hold-s, --runs and
+--arm-at apply to it alone; --run-cap is its cap on held calls and h947's cap on runs. The #862 witnesses
+(token_maint_refresh_862, token_maint_skip_862, token_sos_live_fetch_862, token_sos_401_fetch_862) are
+counted here too. Main does not emit them, so on a main image they read 0; they come from the #945 image.
 
 h947_http_load (#947, for #410) measures the board's HTTP server, not a SIP path: idle, dashboard and
 dashboard-call runs (tests/load/http_load.py holds the traffic, the percentiles and the summary), each
@@ -130,8 +131,11 @@ APPROVALS = (
 )
 EXTRA_APPROVALS = ()          # a later recorded approval is added here by a reviewed PR
 # The recorded approvals above allow ~30 s a call. A held scenario (x952) keeps one call up for minutes,
-# so it needs its own recorded OK, and an old approval never covers it. Empty until desmo records one.
-LONG_HOLD_APPROVALS = ()
+# so it needs its own recorded OK, and an old approval never covers it.
+LONG_HOLD_APPROVALS = (
+    # desmo, 330 s held calls for x952 (#952, #945), relayed by the operator as a comment on PR #958.
+    "https://github.com/GlomarGadaffi/pocket-dial/pull/958#issuecomment-6094652997",
+)
 RIG_HOSTS = ("192.168.12.195", "192.168.12.244")
 TEST_UAS = ("6101", "6102", "6103", "6104")
 PIN_UA = "6104"
@@ -205,7 +209,7 @@ LOG_COUNTERS = {
     "bench_emergency": r"BENCHFAULT (?:every fault disarmed: emergency call|ballast released \(emergency\))",
     # #952/#945: the token witnesses main emits (TelephonyAnchorClient.cpp ensureToken(), fetchToken(),
     # requestRestartIfTokenStale(); BenchProbe.cpp fire()). Three carry a U+2014 dash on the board; \S+
-    # takes it, and a plain "--" too. The #862 witnesses (token_maint_*_862 and the like) are not on main.
+    # takes it, and a plain "--" too.
     "bench_token_age": r"BENCHFAULT token_age fired",
     "token_refresh_near_expiry": r"Access token near expiry \S+ refreshing",
     "token_refresh_deferred_live": r"Token near expiry but media streams active \S+ deferring refresh",
@@ -214,6 +218,13 @@ LOG_COUNTERS = {
                           r"|HTTP connection failed to open: )",
     "ws_restart_stale_token": r"WS disconnected/errored with an expiring token \S+ requesting anchor "
                               r"restart to refresh it",
+    # The #862 token witnesses (TelephonyAnchorLogic.hpp, PD_WITNESS_W = ESP_LOGW; #945, origin/fix/862-hot-path-allocs).
+    # Main does not emit them, so they read 0 on a main image; they count on the #945 image. The two sos lines
+    # fire only on a 911/933 POST path, which no scenario dials. token_maint_skip_862 is sampled.
+    "token_maint_refresh_862": r"token_maint_refresh_862:",
+    "token_maint_skip_862": r"token_maint_skip_862:",
+    "token_sos_live_fetch_862": r"token_sos_live_fetch_862:",
+    "token_sos_401_fetch_862": r"token_sos_401_fetch_862:",
     # makeCall() (#349): the unread response reconciled to our own leg, or not.
     "adopted_349": r"but 3CX has our leg (\S+) .*adopting the call instead of failing it \(#349\)",
     "orphaned_349": r"a call may be ORPHANED on 3CX \(#349/#328\)",
@@ -285,7 +296,9 @@ LOG_COUNTERS = {
 _RX = {k: re.compile(v) for k, v in LOG_COUNTERS.items()}
 # What x952 reports, in the order it prints it.
 TOKEN_WITNESSES = ("bench_token_age", "token_refresh_near_expiry", "token_refresh_deferred_live",
-                   "token_retrieved", "token_fetch_failed", "ws_restart_stale_token")
+                   "token_retrieved", "token_fetch_failed", "ws_restart_stale_token",
+                   "token_maint_refresh_862", "token_maint_skip_862", "token_sos_live_fetch_862",
+                   "token_sos_401_fetch_862")
 _ATTEMPT = re.compile(r"GET stream (?:not ready \(HTTP -?\d+\)|transport failure \(no HTTP response, "
                       r"status=-?\d+\)|open failed \([^)]*\)), attempt (\d+)/(\d+)")
 # RequestsHandler::endCall logs the session key, which is the stored header line, so a real board writes
@@ -2532,8 +2545,9 @@ def x952_judge(run, sc, lines):
 scenario(name="x952_token_age_held", issues=("#952", "#945"), probe=True, faults=("token_age",), held=True,
          about="test UA 6101 (sending RTP) -> the designated far end, answered (voicemail counts) and held "
                "330 s by default, past the old 5-minute token margin: token_age is armed once the call's "
-               "streams are open, and the token witnesses main emits are counted from then on. A report, not "
-               "a verdict on the refresh. Needs a recorded approval of a held call (LONG_HOLD_APPROVALS)",
+               "streams are open, and the token witnesses (the #862 ones read 0 on main) are counted from "
+               "then on. A report, not a verdict on the refresh. Needs a recorded approval of a held call "
+               "(LONG_HOLD_APPROVALS)",
          uas={"caller": "6101", "detector": PIN_UA},
          # The agent's default INVITE timeout (16 s) CANCELs a far end that rings 4-6 times before its
          # voicemail picks up: 3CX answers the caller only when the far leg connects.

@@ -655,6 +655,15 @@ class WitnessSampleTest(unittest.TestCase):
         "token_fetch_failed": "E (51400) TelephonyAnchor: Token request returned HTTP 401",
         "ws_restart_stale_token": "W (51500) TelephonyAnchor: WS disconnected/errored with an expiring token "
                                   "— requesting anchor restart to refresh it",
+        # #862 (#945 image, TelephonyAnchorLogic.hpp PD_WITNESS_W): main does not emit these
+        "token_maint_refresh_862": "W (51600) anchor: token_maint_refresh_862: the background refresh fetches a "
+                                   "new token, the one it replaces is 3512 s old (#862)",
+        "token_maint_skip_862": "W (51700) anchor: token_maint_skip_862: the background token refresh is skipped: "
+                                "a call is up (#862)",
+        "token_sos_live_fetch_862": "W (51800) e911: token_sos_live_fetch_862: 911/933 call 2 fetches a token while "
+                                    "911/933 call 1 has live streams; (#862)",
+        "token_sos_401_fetch_862": "W (51900) e911: token_sos_401_fetch_862: a 911/933 POST was answered 401, "
+                                   "fetching one token on its own arena (#862)",
     }
 
     def test_each_witness_regex_matches_the_line_the_firmware_formats(self):
@@ -2955,12 +2964,16 @@ X952_FAST = {"hold_s": 1.0, "margin_s": 0.4, "arm_wait_s": 2.0, "post_open_wait_
              "gap_s": 0.2}
 DEFER = "TelephonyAnchor: Token near expiry but media streams active — deferring refresh"
 RETRIEVED = "TelephonyAnchor: Retrieved access token (len=900, lifetime=3600s)"
+MAINT_REFRESH = ("anchor: token_maint_refresh_862: the background refresh fetches a new token, the one it "
+                 "replaces is 3500 s old (#862)")
+MAINT_SKIP = "anchor: token_maint_skip_862: the background token refresh is skipped: a call is up (#862)"
 WS_RESTART = ("TelephonyAnchor: WS disconnected/errored with an expiring token — requesting anchor restart to "
               "refresh it")
 
 
 def allow_held(test, approvals=None):
-    """A held call needs a recorded approval of its own, and none is recorded yet: the test supplies one."""
+    """A held call needs a recorded approval of its own: the test supplies one, so it does not depend on the
+    recorded LONG_HOLD_APPROVALS (X952RecordedApprovalTest pins those)."""
     p = mock.patch.object(an, "LONG_HOLD_APPROVALS", (an.APPROVALS[0],) if approvals is None else approvals)
     p.start()
     test.addCleanup(p.stop)
@@ -3088,6 +3101,35 @@ class X952RefusalTest(unittest.TestCase):
             self.assertIn(needle, out)
 
 
+class X952RecordedApprovalTest(unittest.TestCase):
+    """desmo's recorded 330 s OK (a comment on PR #958) is the one LONG_HOLD_APPROVALS entry."""
+    URL = "https://github.com/GlomarGadaffi/pocket-dial/pull/958#issuecomment-6094652997"
+
+    def test_the_recorded_approval_is_in_the_list_and_accepted_for_the_held_scenario(self):
+        self.assertEqual(an.LONG_HOLD_APPROVALS, (self.URL,))
+        self.assertEqual(an.approval_problems(self.URL, an.SCENARIOS[X952]), [])
+
+    def test_it_covers_no_other_scenario(self):
+        for name in ("x349_unread_makecall", "x4_cancel_ringing"):
+            self.assertIn("not a recorded approval", " ".join(an.approval_problems(self.URL, an.SCENARIOS[name])))
+
+    def test_an_unrecorded_or_911_style_url_is_refused_for_the_held_scenario(self):
+        base = "https://github.com/GlomarGadaffi/pocket-dial/"
+        for url in (base + "pull/958#issuecomment-1", base + "issues/911#issuecomment-6094652997",
+                    base + "issues/933", self.URL + "0", self.URL.replace("pull/958", "pull/959"), "911"):
+            with self.subTest(url=url):
+                self.assertIn("not a recorded approval of a held call",
+                              " ".join(an.approval_problems(url, an.SCENARIOS[X952])))
+        for old in an.APPROVALS:                        # the ~30 s approvals never cover a held call
+            self.assertTrue(an.approval_problems(old, an.SCENARIOS[X952]))
+
+    def test_main_takes_the_recorded_approval_unpatched_and_refuses_an_old_one(self):
+        for url, want in ((self.URL, 0), (an.APPROVALS[0], an.REFUSED)):
+            rc, out = run_main(cli("--dry-run", "--expect-version", PROBE_VERSION, scenario=X952, approval=url),
+                               base_env(), http=NoNetwork())
+            self.assertEqual(rc, want, out)
+
+
 class X952WitnessTest(unittest.TestCase):
     LOG = ["W (1) BenchProbe: BENCHFAULT token_age fired",
            "W (2) " + DEFER,
@@ -3096,7 +3138,11 @@ class X952WitnessTest(unittest.TestCase):
            "E (5) TelephonyAnchor: Token request returned HTTP 401",
            "I (6) TelephonyAnchor: Successfully dropped participant 41"]
     ZERO = {"bench_token_age": 0, "token_refresh_near_expiry": 0, "token_refresh_deferred_live": 0,
-            "token_retrieved": 0, "token_fetch_failed": 0, "ws_restart_stale_token": 0}
+            "token_retrieved": 0, "token_fetch_failed": 0, "ws_restart_stale_token": 0,
+            "token_maint_refresh_862": 0, "token_maint_skip_862": 0, "token_sos_live_fetch_862": 0,
+            "token_sos_401_fetch_862": 0}
+    NEW_862 = ("token_maint_refresh_862", "token_maint_skip_862", "token_sos_live_fetch_862",
+               "token_sos_401_fetch_862")
 
     def test_each_token_witness_counts_its_own_line_and_no_other(self):
         for name, line in sorted(WitnessSampleTest.SAMPLES.items()):
@@ -3105,7 +3151,8 @@ class X952WitnessTest(unittest.TestCase):
             with self.subTest(counter=name):
                 self.assertEqual(an.token_counts([line]), dict(self.ZERO, **{name: 1}))
         for near_miss in ("Access token near expiry — deferring", "Token near expiry — deferring refresh",
-                          "BENCHFAULT token_age armed (value 0)", "Retrieved access token", "token_maint_skip_862"):
+                          "BENCHFAULT token_age armed (value 0)", "Retrieved access token", "token_maint_skip_862",
+                          "token_maint_skip: x", "token_sos_401_fetch_86: x", "maint_refresh_862: x"):
             self.assertEqual(an.token_counts([near_miss]), self.ZERO, near_miss)
 
     def test_the_counts_for_a_fixed_log_excerpt(self):
@@ -3130,14 +3177,31 @@ class X952WitnessTest(unittest.TestCase):
         self.assertEqual(an.held_summary_text(summary), [
             "x952 token_age held: planned hold 330 s (old margin 300 s), token_age armed mid-call, 2 run(s)",
             "  run 1: held 331.2 s after the token was aged: bench_token_age=1 token_refresh_near_expiry=0 "
-            "token_refresh_deferred_live=2 token_retrieved=1 token_fetch_failed=1 ws_restart_stale_token=0",
+            "token_refresh_deferred_live=2 token_retrieved=1 token_fetch_failed=1 ws_restart_stale_token=0 "
+            "token_maint_refresh_862=0 token_maint_skip_862=0 token_sos_live_fetch_862=0 token_sos_401_fetch_862=0",
             "  run 2: held 120.0 s after the token was aged, ended early: bench_token_age=1 "
             "token_refresh_near_expiry=0 token_refresh_deferred_live=1 token_retrieved=0 token_fetch_failed=0 "
-            "ws_restart_stale_token=0",
+            "ws_restart_stale_token=0 token_maint_refresh_862=0 token_maint_skip_862=0 "
+            "token_sos_live_fetch_862=0 token_sos_401_fetch_862=0",
             "  total: bench_token_age=2 token_refresh_near_expiry=0 token_refresh_deferred_live=3 token_retrieved=1 "
-            "token_fetch_failed=1 ws_restart_stale_token=0"])
+            "token_fetch_failed=1 ws_restart_stale_token=0 token_maint_refresh_862=0 token_maint_skip_862=0 "
+            "token_sos_live_fetch_862=0 token_sos_401_fetch_862=0"])
         bare = an.held_summary_text(an.held_summary([{"call": 1}], sc))
         self.assertEqual(bare[1], "  run 1: held n/a after the token was aged: no counts")
+
+    def test_the_862_witnesses_end_the_list_and_each_is_counted_in_the_summary(self):
+        self.assertEqual(an.TOKEN_WITNESSES[-4:], self.NEW_862)
+        self.assertEqual(len(an.TOKEN_WITNESSES), 10)
+        sc = an.SCENARIOS[X952]
+        sample = WitnessSampleTest.SAMPLES
+        calls = [{"call": 1, "hold_s": 331.0, "ended_early": False, "aged_ms": 4000,
+                  "log": an.token_counts([sample[n] for n in self.NEW_862])},
+                 {"call": 2, "hold_s": 331.0, "ended_early": False, "aged_ms": 4000,
+                  "log": an.token_counts([sample["token_maint_skip_862"]] * 2)}]
+        self.assertEqual(calls[0]["log"], dict(self.ZERO, **{n: 1 for n in self.NEW_862}))
+        self.assertEqual(an.held_summary(calls, sc)["witnesses"],
+                         dict(self.ZERO, token_maint_refresh_862=1, token_maint_skip_862=3,
+                              token_sos_live_fetch_862=1, token_sos_401_fetch_862=1))
 
 
 class X952Test(ProbeRunCase):
@@ -3174,13 +3238,15 @@ class X952Test(ProbeRunCase):
         self.assert_clean_probe(out)
 
     def test_the_counts_start_when_the_token_is_aged_not_at_the_dial(self):
-        self.board.knobs["origination_lines"] = [RETRIEVED]
-        self.board.knobs["token_lines"] = [DEFER, DEFER, WS_RESTART]
+        self.board.knobs["origination_lines"] = [RETRIEVED, MAINT_SKIP]
+        self.board.knobs["token_lines"] = [DEFER, DEFER, WS_RESTART, MAINT_REFRESH]
         rc, out = self.go()
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.manifest["summary"]["witnesses"],
                          dict(X952WitnessTest.ZERO, bench_token_age=1, token_refresh_deferred_live=2,
-                              ws_restart_stale_token=1))
+                              ws_restart_stale_token=1, token_maint_refresh_862=1))
+        self.assertEqual(self.manifest["log_counters"]["token_maint_skip_862"], 1,
+                         "the whole-run counter sees the line from before the token was aged")
         self.assertEqual(self.manifest["log_counters"]["token_retrieved"], 1, "the whole-run counter still sees it")
 
     def test_before_call_arms_before_the_invite(self):
