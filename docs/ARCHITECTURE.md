@@ -155,7 +155,7 @@ Tasks the table above does not cover (name, stack, priority, core), from the `xT
 | `cdr_persist`, `cdr_archive`, `vm_archive` | 6144 / 1 / Core 0 | CDR NVS persist, SD CDR archive, voicemail archive writers |
 | `log_drain` | 3072 / 1 / Core 0 | Log queue drain + syslog tee, headless builds only |
 | `dns_task` / `decay_task` | 4096 / 5 / Core 0; 3072 / 3 / Core 0 | Captive-portal DNS; captive-portal decay (display build) |
-| `http_conn` (pthread) | **4096** / – / unpinned | One per HTTP connection, at most 4 at once (§4) |
+| `http_conn` (pthread) | **4096** / – / unpinned | One per HTTP connection, at most 3 at once (§4) |
 | `tel_*`, `trunk_dns`, `smtp_worker`, `restart_task`, `ota_reboot`, `heap_probe` | various / unpinned | One-shot or background workers created with no core affinity |
 
 > [!IMPORTANT]
@@ -239,7 +239,7 @@ To prevent slow-client TCP connections from stalling the main HTTP accept thread
 ### Accept Loop Implementation
 1. The main HTTP accept loop runs on its own `std::thread` (`_acceptThread`, spawned at `HttpServer.cpp:199`, loop `acceptLoop` at `:202`) and uses `select()` on the listening socket with a `250ms` timeout to periodically yield execution and verify if the server is still running.
 2. Upon activity, `accept()` is called to retrieve the client socket.
-3. **At most 4 connections are served at once** (`kMaxConcurrentConnections`, `HttpServer.hpp:64`); a fifth gets `503` and is closed (`HttpServer.cpp:308-331`).
+3. **At most 3 connections are served at once** (`kMaxConcurrentConnections`, `HttpServer.hpp:64`); a fourth gets `503` and is closed (`HttpServer.cpp:308-331`).
 4. Otherwise the server dispatches client processing to a detached `std::thread` (the spawn is wrapped in `try`/`catch`), instantly freeing the accept thread to monitor subsequent connections. Connection threads are named `http_conn` and get a **4096-byte** stack via `esp_pthread_set_cfg` (`kHttpConnStackBytes`, `HttpServer.cpp:224-231`), not the 8192-byte pthread default.
 
 ### The Admission Gate (`requireAdmin`)
@@ -279,8 +279,8 @@ There is deliberately no HSTS. This is plain HTTP on a LAN appliance, and pinnin
 make the device permanently unreachable over `http://`.
 
 ### Worker Protection & Robustness (Issue #23)
-* Slowloris protection (#529): everything read before a request is dispatched (headers plus the buffered body) must arrive within 10 s of the accept (`HttpServer::kReadDeadlineMs`); each `recv()` waits at most 5 s and never past that deadline, and a request not in by then is dropped and counted (`httpReadDeadlineDrops`). One source address may hold at most 3 of the 4 connection slots (`kMaxConnectionsPerSource`); a fourth is refused `503` and counted (`httpPerSourceRefusals`). Authenticated OTA/MoH uploads leave this path after the auth check and keep their own budgets.
-* Heap stack safety: Rather than allocating a raw stack-local character buffer, the worker uses a heap-allocated `std::vector<char>` read buffer. Connection threads run on a 4096-byte stack (§ Accept Loop above; the 8192-byte `CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT` in `sdkconfig.defaults` applies to other pthreads), so a 4 KB stack-local buffer would consume the whole thread's stack before any handler ran.
+* Slowloris protection (#529): everything read before a request is dispatched (headers plus the buffered body) must arrive within 10 s of the accept (`HttpServer::kReadDeadlineMs`); each `recv()` waits at most 5 s and never past that deadline, and a request not in by then is dropped and counted (`httpReadDeadlineDrops`). One source address may hold at most 2 of the 3 connection slots (`kMaxConnectionsPerSource`); a third is refused `503` and counted (`httpPerSourceRefusals`). Authenticated OTA/MoH uploads leave this path after the auth check and keep their own budgets.
+* Heap stack safety: Rather than allocating a raw stack-local character buffer, the worker reads into a 4 KB buffer that is not on its stack. Connection threads run on a 4096-byte stack (§ Accept Loop above; the 8192-byte `CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT` in `sdkconfig.defaults` applies to other pthreads), so a 4 KB stack-local buffer would consume the whole thread's stack before any handler ran. The buffer is the connection slot's (#410, #328): `HttpServer::kReadBufBytes`, one per slot, allocated once in the constructor from PSRAM (internal RAM only if PSRAM is full, counted in `memory.psramFallbacks`). The stack itself stays in internal RAM, because the handlers write NVS. A build without PSRAM (`esp32_constrained`) keeps a per-request heap buffer instead of holding three slots' worth of internal RAM from boot.
 * Buffer overflow cap: The worker parses the `Content-Length` header and enforces a maximum payload limit of **16 KB** (16,384 bytes). If a client attempts to upload a larger body (e.g., in a malicious POST flood to `/api/wifi/connect`), the worker immediately responds with `413 Payload Too Large` and aborts the connection, securing the target's RAM.
 
 ## 5. Security & Network Protections

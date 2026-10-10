@@ -837,8 +837,9 @@ void RequestsHandler::initHandlers()
 
 namespace
 {
-	// Issue #172: the one route that honours Require: 100rel is the 777 echo, and only for an
-	// initial INVITE (no To tag). Only the header gate keys on this; onInvite's 777 branch keys on
+	// Issue #172: the 777 echo is the route that always honours Require: 100rel, and only for an
+	// initial INVITE (no To tag); with the default-off forward100rel flag on, forwardHonours100rel() adds a
+	// plain extension call. Only the header gate keys on this; onInvite's 777 branch keys on
 	// destNumber == "777", the same To user.
 	bool isEchoTestInvite(const SipMessage& m)
 	{
@@ -988,9 +989,12 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// 100rel. Only the 777 echo sends its 180 reliably, so only its INVITE is told 100rel is
 		// honoured; any other message is judged at its Require line as before #172. Emergency traffic
 		// is never the echo (a PSAP callback to 777 is answered by that branch), so it takes the
-		// yield below as it always has.
+		// yield below as it always has. Step 3: with the default-off flag on, a plain extension call
+		// is told the same. forwardHonours100rel() returns false first thing with the flag off, so
+		// then the gate is the one main has.
 		const bool echoInvite = isEchoTestInvite(*request) && !isEmergencyTraffic(*request);
-		const auto hv = request->checkHeaders(unsupportedTag, echoInvite);
+		const bool reliableRoute = echoInvite || forwardHonours100rel(*request);
+		const auto hv = request->checkHeaders(unsupportedTag, reliableRoute);
 		if (hv != SipMessage::HeaderVerdict::Ok)
 		{
 			if (isEmergencyTraffic(*request))
@@ -1640,7 +1644,8 @@ namespace
 	// UNAVAILABLE/OK/FINAL_FAILURE/REQUEST_TERMINATED) are RESPONSE keys, not
 	// methods, and have no business in Allow.
 	//
-	// Deliberately absent: PRACK (onPrack covers only the 777 echo, #172; 100rel is not claimed
+	// Deliberately absent: PRACK (onPrack covers only the 777 echo and, with the default-off
+	// forward100rel flag on, a relayed call whose caller required 100rel, #172; 100rel is not claimed
 	// either), NOTIFY (BlfSubscriptions SENDS them; nothing accepts one) and
 	// PUBLISH. A phone that saw those here would wait on replies we never send.
 	constexpr const char* kAllowedMethods =
@@ -1664,8 +1669,9 @@ namespace
 	// or omitting Session-Expires when refresher=uas or unsupported (#724); and
 	// in-dialog bodiless UPDATE refreshes are handled locally or relayed (#439, #782).
 	//
-	// NOT "100rel": it is honoured only in a Require on the 777 echo INVITE (#172), not as a general
-	// capability a phone could rely on. NOT "norefersub", "path", "gruu" or "outbound" — none of
+	// NOT "100rel": it is honoured only in a Require, on the 777 echo INVITE and, with the default-off
+	// forward100rel flag on, on a plain extension call (#172), not as a general capability a phone could
+	// rely on. NOT "norefersub", "path", "gruu" or "outbound" — none of
 	// them have any implementation in this codebase.
 	constexpr const char* kSupportedOptionTags = "replaces, timer";
 
@@ -2827,6 +2833,20 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// Issue #172 step 3, RFC 3262 §3: the caller required 100rel and this plain call is one the PBX takes
+	// over (forwardHonours100rel: flag on, never emergency traffic). The leg to the callee loses the
+	// tag, and its offer too, or the callee could send a reliable 180 the PBX cannot PRACK (§3: a UAS
+	// must not unless Supported or Require names 100rel). `data` is edited, not only the relay below,
+	// because it is kept as the session's INVITE and every CANCEL, 487 ACK and CFB/CFNA redirect copies it
+	// (§4: no request but INVITE carries a Require of 100rel). The edit is not session state: a refused
+	// draw below drops `data` with it, and the retransmit arrives as a fresh INVITE.
+	const bool takeOver100rel = forwardHonours100rel(*data);
+	if (takeOver100rel)
+	{
+		data->removeOptionTag("Require", {}, "100rel");
+		data->removeOptionTag("Supported", "k", "100rel");
+	}
+
 	// Issue #715: draw the relay BEFORE publishing the session. Published first, a
 	// pool refusal left an Invited session with no ring timer (no CFNA/voicemail on
 	// the callee) and no relay on the wire, and the caller's INVITE retransmit is
@@ -2839,6 +2859,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 
 	_sessions.emplace(data->getCallID(), newSession);
 	newSession->setEmergency(isEmergencyCallback(called.value()->getNumber()));   // #659
+	if (takeOver100rel) newSession->openForwardedReliable(siphdr::cseqNumber(data->getCSeq()));   // #172 step 3
 
 	// Retain the original INVITE on every direct-call session — not only when
 	// the callee has a conditional forward (busy/no-answer) configured.
@@ -4722,11 +4743,6 @@ namespace
 		const size_t end = to.find_first_of("@;>");
 		return end == std::string_view::npos ? std::string() : std::string(to.substr(0, end));
 	}
-	constexpr std::string_view kAnchorThenTrunkRefused =
-		"the 3CX anchor could not place the call; the trunk refused it";
-	constexpr std::string_view kAnchorNoTrunk =
-		"the 3CX anchor could not place the call; no trunk is configured";
-	constexpr std::string_view kTrunkRefused = "the trunk refused it";
 }
 
 // ── Emergency call routing (Issue #166) ──────────────────────────────────────
@@ -4756,10 +4772,9 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// The loopback simulator answers whatever it is handed, so giving it 911
 	// "connects" the caller to nothing: they wait on a line no one will pick
 	// up instead of reaching for another phone. That is worse than any
-	// refusal. Order: a real anchor first (it is what has always carried 911,
-	// and when it is down it returns having sent nothing, so a fallback is
-	// still possible); then the generic SIP trunk, whose refusals answer the
-	// INVITE themselves and so must come last; then the 503 below.
+	// refusal. The real anchor is the only route: when it is down it returns
+	// having sent nothing, and the 503 below answers. No SIP trunk fallback
+	// (desmo, 2026-10-08).
 	const EmergencyRoute route = emergencyRouteLocked();
 	// #604: flag the session the route just made, so tick()'s RTP-inactivity
 	// reap never hangs up a 911 (the dialed number alone misses a dial-plan
@@ -4785,8 +4800,8 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		// takes its shared_ptr by value, and `data` is still needed below.
 		// #878 Phase A: only a refusal that sent nothing (the anchor not
 		// connected, or a capacity refusal before dispatch) sets the flag, and
-		// only then may the trunk below take the call. Any other false return is
-		// the anchor's own answer: never a second route (review S-B3).
+		// only then does the 503 below answer. Any other false return is the
+		// anchor's own answer: never a second route (review S-B3).
 		bool refusedBeforeDispatch = false;
 		const bool owned = originateAnchorCall(data, caller, bare, /*respondIfDisconnected=*/false,
 			&placed, &codecRejected, &refusedBeforeDispatch);
@@ -4809,36 +4824,9 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		}
 	}
 
-	// A codec-rejected offer is not retried on the trunk: the trunk RELAYS the
-	// handset's audio rather than transcoding it, so an offer the anchor cannot
-	// carry is no better there, and the 503 below says exactly why.
-	//
-	if (!codecRejected && _sipTrunk.config().valid())
-	{
-		// #538 review M1: the anchor's gate only runs when the anchor is real AND
-		// up, so the trunk needs its own. onTrunkAnswered answers the handset with
-		// buildMediaSdp's PCMU-only SDP, so a PCMA- or G.722-only 911 would
-		// otherwise CONNECT with dead audio while the front desk is told ROUTED TO
-		// TRUNK. Checked here, inside the trunk branch, so a board with no route
-		// at all still says "no emergency route configured" below.
-		if (data->hasSdp() &&
-			!data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false))
-		{
-			codecRejected = true;   // the 503 below says why
-		}
-		else
-		{
-			// Always owns the INVITE: every refusal on this path answers it, and
-			// logs which one it was ("trunk: <why> for <ext> -> 911").
-			(void)placeSipTrunkCall(data, caller, bare, &placed);
-			markEmergency();   // #604
-			const std::string_view note = route == EmergencyRoute::Anchor
-				? (placed ? kAnchorNotPlaced : kAnchorThenTrunkRefused)
-				: (placed ? std::string_view() : kTrunkRefused);
-			notifyEmergency(emergency, from, dialed, /*routed=*/placed, note);
-			return;
-		}
-	}
+	// No trunk fallback: a 911/933 never goes out over a real SIP trunk (desmo,
+	// 2026-10-08). The anchor is the only route; when it takes nothing the 503
+	// below says so.
 
 	// ── No route. 503, and specifically not 404 ──────────────────────────────
 	//
@@ -4871,15 +4859,12 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// actually went wrong -- a codec-rejected offer is not a trunk outage, and
 	// telling the caller's UA the wrong reason is the same honesty failure the
 	// 503-vs-404 rationale above was written to avoid.
-	const char* warningDetail = codecRejected
+	const std::string warningDetail = codecRejected
 		? "no G.711 codec offered"
 		: (route == EmergencyRoute::None
 			? "no emergency route configured"   // Issue #521: loopback only
-			: "no outbound trunk connected");
-	// Only the anchor route reaches here with neither a codec nor a missing
-	// route to blame: its anchor took nothing and no trunk is configured.
-	const std::string_view notRouted = (!codecRejected && route == EmergencyRoute::Anchor)
-		? kAnchorNoTrunk : std::string_view(warningDetail);
+			: "the 3CX anchor could not place the call");
+	const std::string_view notRouted = warningDetail;
 	auto response = getMessageFromPool(*data);
 	if (!response)
 	{
@@ -4965,6 +4950,44 @@ bool RequestsHandler::isEmergencyTraffic(const SipMessage& m)
 		return false;
 	}
 	return isPsapCallbackTo(m) || dialRuleMakesEmergency(std::string(m.getToNumber()));
+}
+
+bool RequestsHandler::forwardHonours100rel(const SipMessage& m)
+{
+	// Flag first: off, nothing below runs and the header gate is the one main has.
+	if (!_cfg.forward100rel() || m.getType() != SipMessageTypes::INVITE ||
+		std::string_view(m.getTo()).find("tag=") != std::string_view::npos || !m.requiresReliableProvisional())
+	{
+		return false;
+	}
+	// Rule 5: a PSAP callback is emergency traffic on any To and DOES reach onInvite's forward path (the
+	// 911/933 returns above it take only the dialed numbers), keeping its Require: 100rel as it always did.
+	if (isEmergencyTraffic(m)) return false;
+#if POCKETDIAL_TRUNK_INBOUND
+	if (isTrunkSbcSource(m.getSource())) return false;   // a carrier's call, or a phone behind its gateway
+#endif
+	// onInvite's #497 rule: the caller is registered, from the address it sent this from.
+	const auto caller = findClient(m.getFromNumber());
+	if (!caller.has_value() || caller.value()->getAddress().sin_addr.s_addr != m.getSource().sin_addr.s_addr)
+	{
+		return false;
+	}
+	// The callee is a registered phone that no earlier branch of onInvite claims: not a reserved or special
+	// extension, a configured page zone, a park orbit, a pickup code, a ring group or a dial rule (the list
+	// dialRuleMakesEmergency() uses), and with no call forward to redirect it.
+	const std::string dest(m.getToNumber());
+	if (!findClient(dest).has_value() || pbx::isReservedExtension(dest) ||
+		(pbx::isPageZoneExt(dest) && _cfg.findPageZone(dest)) || _park.orbitIndex(dest) >= 0 ||
+		pbx::isGroupPickupCode(dest) || !pbx::directedPickupTarget(dest).empty() || _cfg.findRingGroup(dest) ||
+		(!_cfg.dialPlan().empty() && _forker.matchDialRule(dest)))
+	{
+		return false;
+	}
+	for (const char* trigger : {"always", "busy", "noanswer"})
+	{
+		if (!_cfg.getForwardTarget(dest, trigger).empty()) return false;
+	}
+	return true;
 }
 
 bool RequestsHandler::isTrunkAnswerToOurEmergencyInvite(const SipMessage& m)
@@ -5436,6 +5459,12 @@ void RequestsHandler::asyncDropCall(const std::string& participantId)
 	}
 }
 
+void RequestsHandler::releaseFarLeg(Session& s, bool dropLeg)
+{
+	if (dropLeg) asyncDropCall(s.getAnchorParticipantId());
+	s.setAnchorLegReleased();
+}
+
 // Issue #379: the anchor's rx task spent its whole GET retry budget (3CX refused the
 // stream for ~2 min) with no teardown under way. Nothing else drops this leg, and with
 // its session gone nothing ever would: a live, billed 3CX leg with no local party. Drop
@@ -5454,7 +5483,7 @@ void RequestsHandler::anchorMediaNeverOpenedLocked(const std::string& participan
 			queueLog("[Telephony] no rx audio on 911 leg " + participantId + ", kept", true);
 			return;
 		}
-		s->setAnchorLegReleased();
+		releaseFarLeg(*s, /*dropLeg=*/false);   // the drop below goes out even when no session holds the leg
 		break;
 	}
 	if (MediaBridge* b = bridgeForParticipant(participantId)) b->stopBridge();
@@ -5472,7 +5501,7 @@ void RequestsHandler::anchorDroppedLocked(const std::string& participantId)
 	{
 		if (!session->isAnchor()) continue;
 		if (session->getAnchorParticipantId() != participantId) continue;
-		session->setAnchorLegReleased();   // 3CX already dropped it (#379)
+		releaseFarLeg(*session, /*dropLeg=*/false);   // 3CX already dropped it (#379)
 
 		if (MediaBridge* b = bridgeForParticipant(participantId)) b->stopBridge();
 		const std::string activeIp = _localIp;
@@ -6233,8 +6262,7 @@ void RequestsHandler::onInboundAnchorOk(const std::shared_ptr<SipMessage>& ok, c
 		auto bye = buildServerBye(handset->getNumber(), handset->getAddress(), callId, fromHeader,
 		                          std::string(ok->getTo()));
 		if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
-		asyncDropCall(session->getAnchorParticipantId());
-		session->setAnchorLegReleased();   // #379: endCall() must not drop it again
+		releaseFarLeg(*session);
 		endCall(callId, session->getSrc() ? session->getSrc()->getNumber() : "", handset->getNumber(),
 		        "inbound bridge failed");
 		return;
@@ -6317,13 +6345,20 @@ void RequestsHandler::onSessionProgress(std::shared_ptr<SipMessage> data)
 
 // Issue #172, RFC 3262 §3 and §7.2. The PBX is the UAS of a PRACK only on the 777 echo test's own dialog
 // (Session::isEchoDialog, set by onInvite's 777 branch): a matching RAck gets 200 and every other PRACK
-// there gets 481, whether or not the 180 was reliable. A PRACK on any other session is a relayed dialog's,
-// not ours to answer, and stays silent as it always was; a 481 there would make its sender end an early
-// dialog (RFC 3261 §12.2.1.2). That includes a call whose dest *11 or *69 repointed at a virtual 777 peer
-// (a 911 included) and a PSAP callback to 777, so this is keyed on the session's state, not on dest.
+// there gets 481, whether or not the 180 was reliable. The same holds, with the default-off flag on, on a
+// relayed call whose caller required 100rel (Session::isForwardedReliable, answerForwardedPrack). A PRACK
+// on any other session is a relayed dialog's, not ours to answer, and stays silent as it always was; a 481
+// there would make its sender end an early dialog (RFC 3261 §12.2.1.2). That includes a call whose dest *11
+// or *69 repointed at a virtual 777 peer (a 911 included) and a PSAP callback to 777, so this is keyed on the
+// session's state, not on dest.
 void RequestsHandler::onPrack(std::shared_ptr<SipMessage> data)
 {
 	auto session = getSession(data->getCallID());
+	if (session.has_value() && session.value()->isForwardedReliable())
+	{
+		answerForwardedPrack(data, session.value());   // #172 step 3
+		return;
+	}
 	if (!session.has_value() || !session.value()->isEchoDialog()) return;
 	if (!isDialogSourceAuthorized(session.value(), data->getSource())) return;
 	uint32_t rseq = 0;
@@ -6338,6 +6373,32 @@ void RequestsHandler::onPrack(std::shared_ptr<SipMessage> data)
 	response->removeHeaders("RAck");
 	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	if (matches) session.value()->acknowledgeReliableProvisional();
+	_outbox.emplace_back(data->getSource(), std::move(response));
+}
+
+// Issue #172 step 3, RFC 3262 §3 and §7.2: on a relayed call whose caller required 100rel the PBX sent the
+// reliable 180 itself (onRinging), so it is the PRACK's UAS and answers it here; the PRACK is not relayed,
+// the callee never offered 100rel. The echo test's onPrack above is the same answer for the PBX's own dialog.
+// Only the caller PRACKs. isDialogSourceAuthorized() cannot say so: it lets any address through while dest is
+// unset, which is the whole time the callee rings, so the caller's address is checked here and anything
+// else is dropped unanswered and consumes nothing.
+void RequestsHandler::answerForwardedPrack(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<Session>& session)
+{
+	const auto caller = session->getSrc();
+	if (!caller || data->getSource().sin_addr.s_addr != caller->getAddress().sin_addr.s_addr) return;
+	uint32_t rseq = 0;
+	uint32_t cseq = 0;
+	std::string_view method;
+	const bool matches = parseRAck(siphdr::stripHeaderNameView(data->getHeaderLine("RAck")), rseq, cseq, method) &&
+		method == SipMessageTypes::INVITE && session->matchesForwardedProvisional(rseq, cseq);
+	auto response = getMessageFromPool(*data);
+	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+	response->setHeader(matches ? SipMessageTypes::OK : SipMessageTypes::NO_TRANSACTION);
+	response->clearBody();
+	response->removeHeaders("RAck");
+	response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+	if (matches) session->acknowledgeForwardedProvisional();
 	_outbox.emplace_back(data->getSource(), std::move(response));
 }
 
@@ -6400,6 +6461,28 @@ void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
 	if (session.has_value() && session.value()->isBlindXferLeg())
 	{
 		return;
+	}
+	// Issue #172 step 3, RFC 3262 §3: the caller required 100rel and the PBX took it over, so this 180 goes
+	// to it reliably. The callee never offered 100rel (onInvite stripped it), so the reliability is the
+	// PBX's own: its RSeq, and its Contact, so the PRACK comes here and onPrack answers it. Not
+	// before the answer: a provisional after the final is not sent (§3), and not while the previous one
+	// is unacknowledged (§3: no second reliable provisional until the first is). The body goes: a
+	// 180 with a session description would have to hold the 200 for the PRACK (§3), so there is
+	// no early media on such a call. Nothing is retransmitted (no 64*T1 timer): a lost 180 is lost ringback,
+	// and the 200 does not wait for it. The PBX sees this 180 only if the callee answers it, not
+	// the caller directly (RFC 3261 §18.2.2); a callee that answers the caller leaves it an unreliable 180.
+	if (session.has_value() && session.value()->isForwardedReliable())
+	{
+		if (session.value()->getState() != Session::State::Invited) return;
+		const uint32_t rseq = session.value()->nextForwardedRSeq();
+		if (rseq == 0) return;
+		char rseqText[11];
+		const auto conv = std::to_chars(rseqText, rseqText + sizeof(rseqText), rseq);
+		data->clearBody();
+		data->removeHeaders("Require");
+		data->addHeader("Require", "100rel");
+		data->setHeaderOnce("RSeq", std::string_view(rseqText, static_cast<size_t>(conv.ptr - rseqText)));
+		presentContact(*data, data->getToNumber());
 	}
 	endHandle(data->getFromNumber(), data);
 }
@@ -6501,8 +6584,7 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 			s->removePendingTarget(std::string(data->getToNumber()));
 			if (s->getPendingTargets().empty())
 			{
-				asyncDropCall(s->getAnchorParticipantId());
-				s->setAnchorLegReleased();   // #379: endCall() must not drop it again
+				releaseFarLeg(*s);
 				endCall(std::string(data->getCallID()), s->getAnchorParticipantId(), "",
 					"inbound all busy/declined");
 			}
@@ -6654,8 +6736,7 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 			s->removePendingTarget(std::string(data->getToNumber()));
 			if (s->getPendingTargets().empty())
 			{
-				asyncDropCall(s->getAnchorParticipantId());
-				s->setAnchorLegReleased();   // #379: endCall() must not drop it again
+				releaseFarLeg(*s);
 				endCall(std::string(data->getCallID()), s->getAnchorParticipantId(), "",
 					"inbound all unavailable");
 			}
@@ -8887,7 +8968,7 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 		// BEFORE calling endCall(); the stopped bridge makes droppedViaBridge
 		// false above, so without this gate every one of them dropped the same
 		// leg twice. A path that drops the leg itself must also call
-		// setAnchorLegReleased(); one that forgets double-drops, and logs it
+		// releaseFarLeg(); one that forgets double-drops, and logs it
 		// with the line below, rather than orphaning a billable leg in silence.
 		if (!droppedViaBridge && !endingAnchorLegReleased && _anchorClient && endingWasAnchor)
 		{
@@ -9202,6 +9283,20 @@ std::string RequestsHandler::buildContact(std::string_view number) const
 {
 	std::string activeIp = _localIp;
 	return "Contact: <sip:" + std::string(number) + "@" + activeIp + ":" + std::to_string(_serverPort) + ";transport=UDP>";
+}
+
+void RequestsHandler::presentContact(SipMessage& msg, std::string_view number) const
+{
+	char uri[128];
+	const int n = std::snprintf(uri, sizeof(uri), "<sip:%.*s@%s:%d;transport=UDP>",
+		static_cast<int>(number.size()), number.data(), _localIp.c_str(), _serverPort);
+	if (n <= 0 || static_cast<size_t>(n) >= sizeof(uri))
+	{
+		msg.setContact(buildContact(number));
+		return;
+	}
+	msg.removeHeaders("m");   // a compact Contact would otherwise stay beside the new one
+	msg.setHeaderOnce("Contact", std::string_view(uri, static_cast<size_t>(n)));
 }
 
 // ── Dashboard query API ──────────────────────────────────────────────────────
@@ -10019,6 +10114,20 @@ std::string RequestsHandler::setSbcMode(bool enabled, size_t route)
 	return err;
 }
 
+// ── RFC 3262 100rel on a forwarded call (Issue #172, step 3) ──────────────────
+
+bool RequestsHandler::getForward100rel()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _cfg.forward100rel();
+}
+
+void RequestsHandler::setForward100rel(bool on)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	_cfg.setForward100rel(on);
+}
+
 // ── DID -> extension inbound routing (new) ────────────────────────────────────
 // Same direct-_mutex rationale as the Telephony-API slots immediately above.
 
@@ -10521,8 +10630,7 @@ void RequestsHandler::tick()
 					auto cancel = buildInboundCancelTo(session, target);
 					if (cancel) _outbox.emplace_back(target->getAddress(), std::move(cancel));
 				}
-				asyncDropCall(session->getAnchorParticipantId());
-				session->setAnchorLegReleased();   // #379: endCall() must not drop it again
+				releaseFarLeg(*session);
 				queueLog("[Telephony] Inbound: no answer from " +
 				         std::to_string(session->getPendingTargets().size()) + " extension(s) — cancelled");
 				endCall(callID, session->getAnchorParticipantId(), "", "inbound no answer");
@@ -10548,8 +10656,7 @@ void RequestsHandler::tick()
 					}
 				}
 				if (b) b->stopBridge();
-				if (!part.empty()) asyncDropCall(part);
-				session->setAnchorLegReleased();   // #379: endCall() must not drop it again
+				releaseFarLeg(*session, !part.empty());
 				const bool stillRinging = (session->getState() == Session::State::Invited);
 				if (stillRinging && session->getInviteMessage())
 				{
@@ -10801,8 +10908,7 @@ void RequestsHandler::tick()
 				}
 			}
 			if (b) b->stopBridge();
-			if (!part.empty()) asyncDropCall(part);
-			session->setAnchorLegReleased();   // #379: endCall() must not drop it again
+			releaseFarLeg(*session, !part.empty());
 			queueLog("[Telephony] anchor call torn down: audio write repeatedly failed — dropped leg " + part);
 
 			// Issue #279: this branch dropped the ANCHOR side (asyncDropCall) and
@@ -12821,8 +12927,6 @@ void RequestsHandler::setTrunkConfig(const SipTrunk::Config& cfg)
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
-	// Issue #546: and whatever proved the OLD trunk proves nothing about this one.
-	_trunkVerified = false;
 }
 
 SipTrunk::Config RequestsHandler::getTrunkConfig()
@@ -12883,8 +12987,6 @@ void RequestsHandler::applyStoredTrunkConfig()
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
-	// Issue #546: and whatever proved the OLD trunk proves nothing about this one.
-	_trunkVerified = false;
 
 	// Checked, not discarded. The HTTP route caps the password well below
 	// kMaxSecret, but this path reads raw NVS, which an older or different
@@ -12908,7 +13010,7 @@ void RequestsHandler::applyStoredTrunkConfig()
 	{
 		queueLog("WARN: EMERGENCY CALLING IS NOT CONFIGURED -- 911/933 calls will be "
 		         "refused (503). Only the loopback test provider is present; configure "
-		         "a SIP trunk (/setup/trunk) or a telephony provider.", true);
+		         "a telephony provider (the 3CX anchor). A SIP trunk never carries 911.", true);
 	}
 }
 
@@ -12920,10 +13022,8 @@ RequestsHandler::EmergencyRoute RequestsHandler::emergencyRoute()
 
 RequestsHandler::EmergencyRoute RequestsHandler::emergencyRouteLocked() const
 {
-	if (_anchorPlacesRealCalls) return EmergencyRoute::Anchor;
-	if (_sipTrunk.config().valid())
-		return _trunkVerified ? EmergencyRoute::Trunk : EmergencyRoute::TrunkUnverified;
-	return EmergencyRoute::None;
+	// Only the 3CX anchor carries 911/933. A SIP trunk never does (desmo, 2026-10-08).
+	return _anchorPlacesRealCalls ? EmergencyRoute::Anchor : EmergencyRoute::None;
 }
 
 const char* RequestsHandler::emergencyRouteName(EmergencyRoute r)
@@ -12931,8 +13031,6 @@ const char* RequestsHandler::emergencyRouteName(EmergencyRoute r)
 	switch (r)
 	{
 	case EmergencyRoute::Anchor: return "anchor";
-	case EmergencyRoute::Trunk:  return "trunk";
-	case EmergencyRoute::TrunkUnverified: return "trunk-unverified";
 	case EmergencyRoute::None:   return "none";
 	}
 	return "none";
@@ -13420,6 +13518,25 @@ bool RequestsHandler::placeSipTrunkCall(const std::shared_ptr<SipMessage>& data,
 	// the call to the carrier, and only that one sets it.
 	if (placedOut) *placedOut = false;
 
+	// Backstop (#930, #873): a 911/933 never goes over a real trunk, whoever
+	// called. routeTrunkCall() classifies first and hands it to the anchor; this
+	// holds for a caller that does not, as originateAnchorCall() holds for the
+	// anchor. Before any state: nothing to unwind. Same 503 as routeEmergencyCall().
+	if (pbx::classifyEmergencyDial(destination).isEmergency || isEmergencyTraffic(*data))
+	{
+		if (auto msg = getMessageFromPool(*data))   // pool exhausted: drop, peer retransmits (#101A)
+		{
+			msg->setHeader("SIP/2.0 503 Emergency Call Not Routable");
+			msg->clearBody();
+			msg->addHeader("Warning", "399 " + _localIp +
+				" \"Emergency call could not be routed: a 911/933 never goes over a trunk\"");
+			msg->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+			_outbox.emplace_back(data->getSource(), std::move(msg));
+		}
+		queueLog("trunk: a 911/933 never goes over a trunk", true);
+		return true;
+	}
+
 	const std::string callID(data->getCallID());
 
 	auto refuse = [&](const char* statusLine, const char* why) {
@@ -13636,10 +13753,6 @@ void RequestsHandler::onTrunkRinging(const SipTrunk::TrunkEvent& ev, bool earlyM
 void RequestsHandler::onTrunkAnswered(const SipTrunk::TrunkEvent& ev,
 	const std::shared_ptr<SipMessage>& ok)
 {
-	// Issue #546: a carrier 2xx to our INVITE is the proof "configured" lacks.
-	// Recorded before anything below can bail out: the route works whether or
-	// not this particular handset leg is still there to connect.
-	_trunkVerified = true;
 	const std::string handsetCallID(ev.handsetCallID);
 	auto sit = _sessions.find(handsetCallID);
 	if (sit == _sessions.end() || !sit->second) return;

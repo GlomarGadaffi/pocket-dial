@@ -906,7 +906,8 @@ namespace
 	// RFC 4028 is honoured passively (pjsua sends Require: timer on every
 	// INVITE). "replaces": RFC 3891, see kSupportedOptionTags in
 	// RequestsHandler.cpp. 100rel is known only when checkHeaders() is told the INVITE
-	// is the 777 echo's (#172). Everything else -- path, gruu, outbound, sec-agree -- is a 420.
+	// is one the PBX sends reliable provisionals for: the 777 echo's, or a plain extension call
+	// with the default-off flag on (#172). Everything else -- path, gruu, outbound, sec-agree -- is a 420.
 	// A Content-Type value naming SDP. Media type only: parameters after ';' do
 	// not change what we parse.
 	bool isSdpMediaType(std::string_view contentTypeValue)
@@ -934,7 +935,7 @@ namespace
 	}
 }
 
-SipMessage::HeaderVerdict SipMessage::checkHeaders(std::string_view& unsupported, bool echoTestInvite) const
+SipMessage::HeaderVerdict SipMessage::checkHeaders(std::string_view& unsupported, bool reliableRoute) const
 {
 	using namespace SipLimits;
 	unsupported = {};
@@ -995,7 +996,7 @@ SipMessage::HeaderVerdict SipMessage::checkHeaders(std::string_view& unsupported
 		}
 		else if (checkRequire && (iequal(name, "require") || iequal(name, "proxy-require")))
 		{
-			const bool honours100rel = echoTestInvite && method == SipMessageTypes::INVITE && iequal(name, "require");   // #172
+			const bool honours100rel = reliableRoute && method == SipMessageTypes::INVITE && iequal(name, "require");   // #172
 			if (anyOptionTag(value, [&](std::string_view tag) {
 					if (isKnownOptionTag(tag) || (honours100rel && iequalLower(tag, "100rel"))) return false;
 					unsupported = tag;
@@ -1026,6 +1027,66 @@ bool SipMessage::requiresReliableProvisional() const
 		}
 	}
 	return false;
+}
+
+void SipMessage::removeOptionTag(std::string_view name, std::string_view compact, std::string_view tag)
+{
+	for (size_t i = 0; i < _headerLines.size();)
+	{
+		std::string& line = _headerLines[i];
+		const std::string_view lineName = headerNameOf(line);
+		if (!iequal(lineName, name) && (compact.empty() || !iequal(lineName, compact)))
+		{
+			++i;
+			continue;
+		}
+		// Each pass takes out the first `tag` in the value, with the comma that joins it to a
+		// neighbour, until the line has none.
+		bool cut = false;
+		for (;;)
+		{
+			const std::string_view value = headerValueOf(line);
+			const size_t valueAt = static_cast<size_t>(value.data() - line.data());
+			size_t from = 0;
+			size_t prevComma = std::string_view::npos;
+			size_t hitAt = std::string_view::npos, hitEnd = 0, hitComma = std::string_view::npos;
+			while (from <= value.size())
+			{
+				const size_t comma = value.find(',', from);
+				const size_t end = comma == std::string_view::npos ? value.size() : comma;
+				if (iequalLower(trimWs(value.substr(from, end - from)), tag))
+				{
+					hitAt = from;
+					hitEnd = end;
+					hitComma = comma;
+					break;
+				}
+				if (comma == std::string_view::npos) break;
+				prevComma = comma;
+				from = comma + 1;
+			}
+			if (hitAt == std::string_view::npos) break;
+			size_t cutFrom = hitAt;
+			size_t cutTo = hitEnd;
+			if (hitComma != std::string_view::npos)
+			{
+				cutTo = hitComma + 1;
+				while (cutTo < value.size() && (value[cutTo] == ' ' || value[cutTo] == '\t')) ++cutTo;
+			}
+			else if (prevComma != std::string_view::npos)
+			{
+				cutFrom = prevComma;
+			}
+			line.erase(valueAt + cutFrom, cutTo - cutFrom);
+			cut = true;
+		}
+		if (cut && trimWs(headerValueOf(line)).empty())
+		{
+			_headerLines.erase(_headerLines.begin() + static_cast<long>(i));
+			continue;
+		}
+		++i;
+	}
 }
 
 bool SipMessage::hasSdpContentType() const

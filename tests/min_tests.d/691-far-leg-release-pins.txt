@@ -1,0 +1,2 @@
+# FarLegReleasePin tests: InboundAnchorReinvite_test.cpp 5, AnchorRouting_test.cpp 2, TelCtlPool_test.cpp 1 (#691 step 0, no behaviour change)
+8

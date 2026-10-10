@@ -368,3 +368,105 @@ TEST(InboundAnchorBye, AByeFromAStrangerOnARingingInboundCallDoesNotEndIt)
 {
 	expectRingingInboundCallSurvivesABye("192.168.40.99");
 }
+
+// #691 step 0: how an inbound anchored call's far leg is released. Every teardown path below
+// drops the carrier leg and marks the session released, so endCall()'s no-bridge fallback does
+// not drop it a second time (#379). The mark is not readable afterwards (endCall() recycles the
+// Session), so a missing mark shows as a second drop. Pins of today's behaviour: they pass on the
+// sources from before releaseFarLeg() too.
+namespace
+{
+	struct RingingInbound
+	{
+		Sent sent;
+		RequestsHandler handler{kPbxIp, 5060,
+			[this](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); }};
+		LoopbackAnchorClient* loop = nullptr;
+		std::string callIdLine;
+		std::string fork;
+		std::shared_ptr<Session> session;
+		unsigned dropsBefore = 0;
+
+		void ring(const char* participantId)
+		{
+			handler.handle(makeRegister("106", kHandsetIp));
+			callIdLine = handler.routeInboundAnchorCallForTest("106", participantId, "5551234567");
+			ASSERT_FALSE(callIdLine.empty()) << "precondition: an inbound anchored session exists";
+			handler.tick();   // the fork INVITE waits in _asyncOutbox
+			fork = findSentTo(sent, addrFor(kHandsetIp), "INVITE sip:106@");
+			ASSERT_FALSE(fork.empty()) << "precondition: the call is forked to the handset";
+			auto s = handler.getSession(callIdLine);
+			ASSERT_TRUE(s.has_value());
+			session = s.value();
+			loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+			ASSERT_NE(loop, nullptr) << "host suite is expected to boot the Loopback anchor";
+			dropsBefore = loop->dropCallCount();
+		}
+
+		void handsetReplies(const std::string& statusLine, const std::string& headers = {})
+		{
+			handler.handle(RequestsHandler::getMessageFromPool(
+				statusLine + "\r\n" + headerLine(fork, "Via:") + "\r\n" + headerLine(fork, "From:") + "\r\n"
+				"To: <sip:106@" + std::string(kPbxIp) + ">;tag=hs106\r\n" + callIdLine + "\r\n"
+				"CSeq: 1 INVITE\r\n" + headers + "Content-Length: 0\r\n\r\n", addrFor(kHandsetIp)));
+		}
+
+		void expectReleasedOnce()
+		{
+			EXPECT_FALSE(handler.getSession(callIdLine).has_value()) << "the call ended";
+			EXPECT_EQ(loop->dropCallCount(), dropsBefore + 1)
+				<< "the carrier leg is dropped exactly once, not again by endCall()";
+		}
+
+		void expireRingTimerAndTick()
+		{
+			session->armRingTimer(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+			handler.forceNextTickForTest();
+			handler.tick();
+		}
+	};
+}
+
+TEST(FarLegReleasePin, AnInboundCallTheHandsetAnswersWithNoSdpDropsTheLegOnce)
+{
+	RingingInbound r;
+	ASSERT_NO_FATAL_FAILURE(r.ring("part-691"));
+	r.handsetReplies("SIP/2.0 200 OK", "Contact: <sip:106@" + std::string(kHandsetIp) + ":5060>\r\n");
+	r.expectReleasedOnce();
+}
+
+TEST(FarLegReleasePin, AnInboundCallEveryRingingHandsetRefusesBusyDropsTheLegOnce)
+{
+	RingingInbound r;
+	ASSERT_NO_FATAL_FAILURE(r.ring("part-691"));
+	r.handsetReplies("SIP/2.0 486 Busy Here");
+	r.expectReleasedOnce();
+}
+
+TEST(FarLegReleasePin, AnInboundCallEveryRingingHandsetRefusesUnavailableDropsTheLegOnce)
+{
+	RingingInbound r;
+	ASSERT_NO_FATAL_FAILURE(r.ring("part-691"));
+	r.handsetReplies("SIP/2.0 480 Temporarily Unavailable");
+	r.expectReleasedOnce();
+}
+
+TEST(FarLegReleasePin, AnInboundCallNobodyAnswersDropsTheLegOnce)
+{
+	RingingInbound r;
+	ASSERT_NO_FATAL_FAILURE(r.ring("part-691"));
+	r.expireRingTimerAndTick();
+	r.expectReleasedOnce();
+}
+
+// The four inbound paths drop whatever id the session holds, an empty one included; the two
+// outbound paths skip an empty id. On the Loopback anchor an empty-id drop still counts as an
+// attempt, so this is observable. It records today's behaviour; it does not endorse it.
+TEST(FarLegReleasePin, AnInboundCallWithNoParticipantIdIsStillHandedToDropCall)
+{
+	RingingInbound r;
+	ASSERT_NO_FATAL_FAILURE(r.ring(""));
+	ASSERT_TRUE(r.session->getAnchorParticipantId().empty());
+	r.expireRingTimerAndTick();
+	r.expectReleasedOnce();
+}

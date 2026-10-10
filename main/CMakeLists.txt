@@ -395,6 +395,21 @@ if(POCKETDIAL_ANCHOR_BENCH_PROBE)
     message(WARNING "SipServer: ANCHOR BENCH PROBE image -- bench only, faults and DRAM ballast on /api/bench/fault (#384)")
 endif()
 
+# Issues #410 / #328: BENCH-ONLY accounting of the internal DRAM the HTTP path holds
+# (docs/BENCH_PROBE.md): "httpDramAccount" on /api/status. Any transport. Never ship it;
+# a release image has no such field. Without this plumbing `idf.py -D` would only set a
+# cache variable and the build would silently carry the default 0.
+if(POCKETDIAL_HTTP_DRAM_ACCOUNT)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_HTTP_DRAM_ACCOUNT=1)
+    # lwIP's pool counters (httpDramAccount.memp): HttpServer.cpp must see the same
+    # MEMP_STATS as lwIP itself, which the top-level CMakeLists.txt sets under the same
+    # conditions -- only with CONFIG_LWIP_STATS (sdkconfig.defaults.accounting).
+    if(CONFIG_LWIP_STATS)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE MEMP_STATS=1)
+    endif()
+    message(WARNING "SipServer: HTTP DRAM ACCOUNTING image -- bench only, httpDramAccount on /api/status (#410, #328)")
+endif()
+
 if(DEFINED POCKETDIAL_PCAP_RING_SIZE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
         POCKETDIAL_PCAP_RING_SIZE=${POCKETDIAL_PCAP_RING_SIZE})

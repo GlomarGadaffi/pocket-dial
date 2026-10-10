@@ -45,7 +45,7 @@ but not the tenant's own numbers, so a far end equal to the route DN or to a DID
 before the first packet, and any phantom verdict says it holds only if the far end cannot route back.
 
 Probe scenarios (x349_unread_makecall, x379_never_opened, x518_403_clean_giveup,
-x279_degraded_bye) drive the bench probe image (docs/BENCH_PROBE.md, #384 H1):
+x279_degraded_bye, x888_ws_upsert) drive the bench probe image (docs/BENCH_PROBE.md, #384 H1):
 they need --expect-version with a -probe stamp, read /api/bench/fault's counters
 before and after, arm only their pre-registered faults (never for an emergency far
 end, never while the probe reports an emergency), and always disarm every fault and
@@ -59,6 +59,17 @@ refresh. Because it exceeds the ~30 s per call the recorded approvals allow, it 
 approval in LONG_HOLD_APPROVALS (empty until desmo's OK is recorded by a reviewed PR). --hold-s, --runs,
 --run-cap and --arm-at apply to it alone. The #862 witnesses (token_maint_*_862, token_sos_*_862) are not
 emitted on main and are not counted here.
+
+h947_http_load (#947, for #410) measures the board's HTTP server, not a SIP path: idle, dashboard and
+dashboard-call runs (tests/load/http_load.py holds the traffic, the percentiles and the summary), each
+repeated --repeats times (default 3), at most --run-cap runs in all (default 9; one past it is refused before
+anything is sent, and the run loop stops at it). Only dashboard-call rings the far end: once a run, held
+hold_s (24 s) inside the 30 s call cap, with every refusal above. --call-mode says what the far end does:
+ringing (the default) rings and is not answered, so the window runs for hold_s and the harness CANCELs as it
+closes (no dialog, so no BYE), a valid call only if a 180 Ringing was seen (http_load.ringing_call); answered
+expects an answer and hangs up with a BYE after the hold. A far end that answers in ringing mode is held and
+BYEd as in answered mode. It starts no status_logger.sh (a second poller is load on the thing measured) and
+reads the board from its own /api/status requests.
 
 Syslog carries esp_log lines only. RequestsHandler's queueLog() lines (e.g. "anchor
 call torn down: ...", "no rx audio, dropping leg") go to stdout and never reach it
@@ -103,6 +114,7 @@ REPO = os.path.normpath(os.path.join(HERE, "..", ".."))
 for _p in (HERE, os.path.join(REPO, "tools", "soak")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+import http_load  # noqa: E402
 import load_profile as lp  # noqa: E402
 import rig_policy  # noqa: E402
 import run_soak  # noqa: E402
@@ -189,6 +201,7 @@ LOG_COUNTERS = {
     # The bench probe (BenchProbe.cpp): one line per firing, and the rule-5 stops.
     "bench_fired": r"BENCHFAULT (\S+) fired",
     "bench_makecall_read_fail": r"BENCHFAULT makecall_read_fail fired",
+    "bench_ws_upsert": r"BENCHFAULT ws_upsert fired",
     "bench_emergency": r"BENCHFAULT (?:every fault disarmed: emergency call|ballast released \(emergency\))",
     # #952/#945: the token witnesses main emits (TelephonyAnchorClient.cpp ensureToken(), fetchToken(),
     # requestRestartIfTokenStale(); BenchProbe.cpp fire()). Three carry a U+2014 dash on the board; \S+
@@ -244,7 +257,18 @@ LOG_COUNTERS = {
     "beep_uri_856": r"beep: register beep Request-URI: (registered Contact|bare \(no Contact stored\))",
     # #888: an upsert ignored while a makeCall was pending (group 1 = pending makeCalls, 2 = the oldest's age in ms).
     "upset_ignored_pending_888": r"Upset ignored while (\d+) makeCall\(s\) pending \(oldest (-?\d+) ms old\): "
-                                 r"3CX does not repeat a Connected one \(#888\)",
+                                 r"nin=\d+ active=\d+ part=\S+: 3CX does not repeat a Connected one \(#888\)",
+    # #888: an unmatched upsert mapped to an in-flight outbound leg (nin >= 1): groups = nin, pending, active, part, own, sighting.
+    "upset_absorbed_inflight_888": r"Upset absorbed while an outbound is in flight: nin=(\d+) pending=(\d+) active=(\d+) "
+                                 r"part=(\S+) own=(\S+) seen=(\d+) \(#888\)",
+    # #888: an unmatched upsert dropped as an own leg with no outbound slot (classification, or the worker re-check).
+    "upset_dropped_own_leg_888": r"Upset dropped as own leg (?:with no outbound slot|at the worker re-check): nin=(\d+) "
+                                 r"pending=(\d+) active=(\d+) part=(\S+) seen=(\d+) \(#888\)",
+    # #888: an unmatched upsert whose work item was not queued (queue full or no allocation): the upsert is lost.
+    "upset_dropped_unqueued_888": r"Upset dropped, work item not queued: nin=(\d+) pending=(\d+) active=(\d+) "
+                                 r"part=(\S+) seen=(\d+) \(#888\)",
+    # #888: the 256-line per-boot cap on the three witnesses above was hit; logged once per boot, then no more of them.
+    "witness_cap_888": r"witness cap reached: no further #888 witness lines this boot",
     # #906: the degraded-audio sweep kept a connected 911/933 up instead of hanging it up.
     "e911_degraded_kept_906": r"e911: audio to the anchor keeps failing on a connected 911/933: kept up, not hung up \(#906\)",
     # #884: one line per successful control request (drop/answer): group 1 = the attempt, 2 = reused (no connect),
@@ -455,7 +479,8 @@ def load_far_ends(env, stat_fn=os.stat, posix=None):
 
 _FAR_FLAG = re.compile(r"^--?(?:far[-_]?end|far|target|dial|number|callee|to)(?:=|$)", re.I)
 _NUMERIC_FLAGS = ("--port", "--http-port", "--syslog-port", "--pin-check-s", "--owner-ext",
-                  "--hold-s", "--runs", "--run-cap")
+                  "--hold-s", "--runs", "--run-cap", "--repeats", "--window-s", "--probe-polls",
+                  "--probe-gap-ms", "--burst-workers", "--burst-each")
 
 
 def argv_problems(argv, redactor):
@@ -501,7 +526,8 @@ def host_problems(host):
 
 
 # ---------------------------------------------------------------- the bench probe's numbers
-PROBE_FAULTS = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age")
+PROBE_FAULTS = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age",
+                "ws_upsert")
 BENCH_PATH = "/api/bench/fault"
 PROBE_IMAGE = "anchor-bench-probe"
 GET_MAX_ATTEMPTS = 240               # BenchProbeLogic.hpp kGetMaxAttempts; get_max_attempts only shrinks it
@@ -543,6 +569,8 @@ def probe_problems(sc):
                             "case), past the %.0f s the call cap leaves" % (n, m, get_giveup_worst_s(m), cap))
     if sc.get("hold_s", 0) > sc.get("call_cap_s", 0) - HANGUP_MARGIN_S:
         problems.append("%s: hold_s leaves no room for the hangup inside the call cap" % n)
+    if "call_fire_wait_s" in sc:
+        problems += x888_timing_problems(sc)
     return problems
 
 
@@ -641,10 +669,10 @@ def scenario_problems(sc):
         problems.append("%s: the phantom detector must be %s, the S1 pin's target" % (n, PIN_UA))
     if len(set(uas.values())) != len(uas):
         problems.append("%s: one UA in two roles" % n)
-    cap = min(MAX_CALLS, sc.get("max_calls", MAX_CALLS))
-    if not 1 <= sc.get("calls", 0) <= cap:
-        problems.append("%s: calls must be 1-%d (%s)" % (
-            n, cap, "the #384 approval" if cap == MAX_CALLS
+    cap, lo = min(MAX_CALLS, sc.get("max_calls", MAX_CALLS)), sc.get("min_calls", 1)
+    if not lo <= sc.get("calls", 0) <= cap:
+        problems.append("%s: calls must be %d-%d (%s)" % (
+            n, lo, cap, "the #384 approval" if cap == MAX_CALLS
             else "this scenario's own cap; the #384 approval allows %d" % MAX_CALLS))
     if sc.get("held"):
         problems += held_problems(sc)
@@ -654,6 +682,9 @@ def scenario_problems(sc):
         problems.append("%s: needs a run and a judge" % n)
     if sc.get("probe"):
         problems += probe_problems(sc)
+    elif sc.get("hold_s", 0) > sc.get("call_cap_s", 0) - HANGUP_MARGIN_S:
+        problems.append("%s: hold_s leaves no room for the hangup inside the call cap" % n)
+    problems += sc.get("config_problems") or []
     if "ref_timeout_s" in sc:
         problems += ref_timing_problems(sc)
     if "leg_wait_s" in sc:
@@ -1110,7 +1141,7 @@ class AnchorRun:
                          "ring_required": RING_REQUIRED if sc.get("ring_required") else None,
                          "path_counter": {"name": sc["path_counter"],
                                           "regex": LOG_COUNTERS[sc["path_counter"]]},
-                         "params": {k: v for k, v in sc.items() if k not in ("run", "judge")},
+                         "params": {k: v for k, v in sc.items() if k not in ("run", "judge", "from_args")},
                          "notes": []}
 
     # -- output / helpers ----------------------------------------------------
@@ -1391,6 +1422,8 @@ class AnchorRun:
         return out
 
     def watch_board(self):
+        if self.watch is None:           # no_status_logger: nothing writes status.jsonl to watch
+            return
         if self.logger is not None and self.logger.poll() is not None:
             raise run_soak.Abort("INVALID", "the status logger exited during the run")
         ev = self.watch.poll(time.time(), self.logger_started)
@@ -1457,10 +1490,11 @@ class AnchorRun:
         self.setup_syslog()
         if self.sc.get("probe"):
             self.probe_preflight()
-        self.logger = self.start_logger([LOGGER, self.http.base[len("http://"):], self.p("status.jsonl")],
-                                        self.p("logger.log"))
-        self.logger_started = time.time()
-        self.watch = run_soak.Watch(self.p("status.jsonl"))
+        if not self.sc.get("no_status_logger"):
+            self.logger = self.start_logger([LOGGER, self.http.base[len("http://"):], self.p("status.jsonl")],
+                                            self.p("logger.log"))
+            self.logger_started = time.time()
+            self.watch = run_soak.Watch(self.p("status.jsonl"))
         for role, ext in sorted(self.sc["uas"].items()):
             opts = dict((self.sc.get("agent_opts") or {}).get(role) or {})
             if opts.pop("rtp", False):
@@ -2510,6 +2544,426 @@ scenario(name="x952_token_age_held", issues=("#952", "#945"), probe=True, faults
          judge=x952_judge)(probe_run(x952_run))
 
 
+# -- x888_ws_upsert -----------------------------------------------------------------
+# The three #888 witness branches of TelephonyAnchorClient::handleWsEvent, one synthetic upsert each.
+# The probe's ws_upsert fault (docs/BENCH_PROBE.md) feeds that function a frame shaped like 3CX's, with a
+# participant id of its own, pdb-u<case>-<n>; the scenario counts the witness line each one makes.
+# (case, branch, the exact text the firmware logs): test_anchor_x888_ws_upsert.py greps the source for it.
+X888_BRANCHES = ((1, "unqueued", "Upset dropped, work item not queued"),
+                 (2, "absorbed", "Upset absorbed while an outbound is in flight"),
+                 (3, "own-leg", "Upset dropped as own leg with no outbound slot"))
+X888_ID_PREFIX = "pdb-u"                          # BenchProbeLogic.hpp kWsProbeIdPrefix
+X888_NEVER_DIAL = ("911", "933", "113", "1001")   # this scenario's own list, on top of is_never_dial()
+
+
+def x888_destination_problems(far):
+    """Why x888 may not dial `far`, or []: its own never-dial list, then any emergency or never-dial
+    number in any form. Never echoes the number."""
+    out = []
+    if (far or "").lstrip("+") in X888_NEVER_DIAL:
+        out.append("the far end is on the x888 never-dial list")
+    if is_never_dial(far):
+        out.append("the far end is an emergency or never-dial number (rule 5)")
+    return out
+
+
+def x888_timing_problems(sc):
+    n = sc.get("name", "<unnamed>")
+    worst = sc["call_fire_wait_s"] + sc["cancel_after_fire_s"] + 2 * AGENT_TXN_TIMEOUT_S
+    if worst > sc.get("call_cap_s", 0):
+        return ["%s: the call can take up to %.1f s (wait for the fire %g + the CANCEL delay %g + a CANCEL and a "
+                "BYE transaction of %g s each), past the %d s call cap"
+                % (n, worst, sc["call_fire_wait_s"], sc["cancel_after_fire_s"], AGENT_TXN_TIMEOUT_S,
+                   sc.get("call_cap_s", 0))]
+    return []
+
+
+def x888_counts(lines, case):
+    """{branch: lines} for the synthetic upsert of `case`: the branch's witness text and that case's part id
+    (so a real participant's line is not this run's). The three texts are not substrings of one another, so
+    a line counts for one branch only."""
+    part = "part=%s%d-" % (X888_ID_PREFIX, case)
+    return {name: sum(1 for ln in lines if text in ln and part in ln) for _, name, text in X888_BRANCHES}
+
+
+def x888_verdict(case, counts, fired):
+    """-> (verdict, why). PASS: the probe fired and the case's own branch logged exactly one line for its
+    upsert, no other branch one. No line is INVALID, never PASS (the branch was not shown to run); a second
+    line, or a line in another branch for the same upsert, is a FAIL."""
+    _, name, text = X888_BRANCHES[case - 1]
+    own = counts[name]
+    others = [k for k, n in counts.items() if k != name and n]
+    if not fired:
+        return "INVALID", "ws_upsert did not fire for case %d: its precondition never held" % case
+    if own == 0:
+        return "INVALID", "0 lines of '%s' for case %d: the branch was not shown to run" % (text, case)
+    if own > 1:
+        return "FAIL", "%d lines of '%s' for one upsert" % (own, text)
+    if others:
+        return "FAIL", "the upsert also logged %s" % ", ".join(others)
+    return "PASS", ""
+
+
+def x888_case_line(case, verdict, counts):
+    _, name, text = X888_BRANCHES[case - 1]
+    n = counts[name]
+    others = ", ".join("%s=%d" % (k, c) for k, c in counts.items() if k != name and c)
+    return "case %d %s: %s (%d line%s: %s%s)" % (case, name, verdict, n, "" if n == 1 else "s", text,
+                                                 "; other branches: " + others if others else "")
+
+
+def x888_summary(results):
+    """results: [(case, verdict, counts)]. One line: each branch's own count, the tally, the overall verdict."""
+    tally = collections.Counter(v for _, v, _ in results)
+    overall = "FAIL" if tally["FAIL"] else "INVALID" if tally["INVALID"] else "PASS"
+    own = ["%s=%d" % (X888_BRANCHES[c - 1][1], k[X888_BRANCHES[c - 1][1]]) for c, _, k in results]
+    return "x888 summary: %s: %d PASS, %d FAIL, %d INVALID -> %s" % (
+        " ".join(own), tally["PASS"], tally["FAIL"], tally["INVALID"], overall)
+
+
+def x888_fired(run):
+    """The probe's own ws_upsert count, over HTTP (the syslog is UDP and may lose the line)."""
+    return run.probe.counters()["faults"]["ws_upsert"]["fired"]
+
+
+def x888_idle_case(run, sc, case):
+    """Cases 1 and 3 need no call: arm, and wait for the board's next tick to inject."""
+    run.checkpoint()
+    before = x888_fired(run)
+    run.arm("ws_upsert", case)
+    fired = run.watch_call(time.monotonic() + sc["fire_wait_s"], stop_when=lambda: x888_fired(run) > before,
+                           step=0.25)
+    run.x888[case] = fired
+    run.say("case %d: ws_upsert %s" % (case, "fired" if fired else
+                                      "did NOT fire within %g s (its precondition did not hold)" % sc["fire_wait_s"]))
+    run.watch_call(time.monotonic() + sc["settle_s"])          # the witness line follows the fire
+
+
+def x888_cancel_when(run, delay_s):
+    """CANCEL delay_s after the board logs ws_upsert fired for this INVITE: the injected upsert is handled
+    while the far leg rings, and the CANCEL ends the ring at once after it (one short ring)."""
+    def when(since):
+        if run.phantoms():
+            return time.monotonic()
+        fired = matches(run.syslog.entries(since), "bench_ws_upsert")
+        return fired[0][0] + delay_s if fired else None
+    return when
+
+
+def x888_call_case(run, sc, caller, base):
+    """Case 2: armed before the INVITE, the fault waits for an unanswered outbound leg (the board's tick
+    sees it once the makecall response has named the leg). The call is then CANCELled while it rings."""
+    run.checkpoint()
+    before = x888_fired(run)
+    run.arm("ws_upsert", 2)
+    rec = {"call": 1, "t_start": time.monotonic(), "final": None}
+    run.calls.append(rec)                    # first: an abort keeps the record
+    dlg = caller.invite(run.far_end, cancel_when=x888_cancel_when(run, sc["cancel_after_fire_s"]),
+                        cancel_when_timeout_s=sc["call_fire_wait_s"])
+    try:
+        rec.update(_call_id=dlg.call_id, final=dlg.final_status, cancel_status=dlg.cancel_status,
+                   cancel_when_expired=bool(dlg.cancel_when_expired),
+                   provisional=[s for _, s in dlg.responses if s < 200])
+    finally:
+        finish_call(caller, dlg, rec)
+    run.x888[2] = x888_fired(run) > before
+    after_call(run, sc, caller, rec, base)
+    run.watch_call(time.monotonic() + sc["drop_wait_s"], stop_when=lambda: not undropped_legs(run.syslog.lines()))
+    run.say("case 2: ws_upsert %s; call 1: final %s, CANCEL answered %s%s"
+            % ("fired" if run.x888[2] else "did NOT fire", rec["final"], rec.get("cancel_status"),
+               ", hung up by the harness (BYE %s)" % rec.get("hangup_bye") if "hangup_ms" in rec else ""))
+
+
+def x888_run(run, sc):
+    caller = run.agents["caller"]
+    bad = sorted({p for end in run.far_ends for p in x888_destination_problems(end)})
+    if bad:
+        raise run_soak.Abort("INVALID", "refusing before any call: " + "; ".join(bad))
+    run.x888 = {}
+    run.say("3 synthetic upserts through handleWsEvent: case 1 an unknown participant, no call (not queued); "
+            "case 2 an unknown participant while 1 call %s -> far end rings (absorbed), CANCELled %g s after "
+            "the fire; case 3 our own leg, no call. The branch's witness line counts each one"
+            % (caller.ext, sc["cancel_after_fire_s"]))
+    run.checkpoint()
+    base = run.session_count()
+    x888_idle_case(run, sc, 1)
+    x888_call_case(run, sc, caller, base)
+    x888_idle_case(run, sc, 3)
+
+
+def x888_judge(run, sc, lines):
+    fails, invalid = common_problems(run, lines)
+    if not run.calls:
+        return fails, invalid, {}
+    fired = getattr(run, "x888", {})
+    results = []
+    for case, name, _ in X888_BRANCHES:
+        counts = x888_counts(lines, case)
+        verdict, why = x888_verdict(case, counts, fired.get(case))
+        results.append((case, verdict, counts))
+        if verdict != "PASS":
+            (fails if verdict == "FAIL" else invalid).append("case %d %s: %s" % (case, name, why))
+        run.say(x888_case_line(case, verdict, counts))
+    summary_line = x888_summary(results)
+    run.say(summary_line)
+    summary = {"summary": summary_line, "cases": {X888_BRANCHES[c - 1][1]: v for c, v, _ in results},
+               "lines": {X888_BRANCHES[c - 1][1]: k[X888_BRANCHES[c - 1][1]] for c, _, k in results}}
+    n = ((run.manifest.get("probe") or {}).get("fired") or {}).get("ws_upsert")
+    if n is not None and n != len(X888_BRANCHES):
+        invalid.append("ws_upsert fired %d times, not %d: a stray arm or a lost one" % (n, len(X888_BRANCHES)))
+    # a synthetic participant announced as an inbound call would ring the DID row's phones: never, not even once
+    synthetic = sorted(leg for leg in per_leg(lines, "inbound_call") if leg.startswith(X888_ID_PREFIX))
+    if synthetic:
+        fails.append("'Inbound call on DN' was logged for %d synthetic participant(s) (%s): a probe upsert was "
+                     "announced as an inbound call" % (len(synthetic), ", ".join(synthetic)))
+    c, caller = run.calls[0], run.agents["caller"]
+    if c.get("final") == 487:
+        if c.get("cancel_status") != 200:
+            fails.append("the CANCEL was answered %s, not 200" % c.get("cancel_status"))
+    elif answered(c):                        # the far end picked up before the CANCEL: the harness BYE ends it
+        if c.get("hangup_bye") != 200:
+            fails.append("the harness's BYE got %s, not 200" % c.get("hangup_bye"))
+        fails += bye_problems(c, caller.ext, count=False)
+    else:
+        invalid.append("the call did not ring (final %s): case 2 had no unanswered outbound leg to land on"
+                       % c.get("final"))
+    fails += drop_problems(lines)
+    phantom_pcap = sum(run.pcap_count("INVITE", ua, phantom=True) for ua in run.agents.values())
+    if phantom_pcap:
+        fails.append("/api/pcap shows %d INVITE(s) sent to a test UA that were not the register beep: a phantom "
+                     "inbound (second witness)" % phantom_pcap)
+    sf, si = session_problems(c, caller.ext)
+    return fails + sf, invalid + si, summary
+
+
+scenario(name="x888_ws_upsert", issues=("#888",), probe=True, faults=("ws_upsert",),
+         about="the three #888 witness branches on the real device: one synthetic upsert each through "
+               "handleWsEvent (an unknown participant with no call: not queued; the same while test UA 6101's "
+               "call to the designated far end rings: absorbed; our own leg: dropped), one short ring, CANCELled; "
+               "a branch with no witness line is INVALID",
+         uas={"caller": "6101", "detector": PIN_UA}, calls=1, max_calls=1, call_cap_s=30, fire_wait_s=6.0,
+         call_fire_wait_s=10.0, cancel_after_fire_s=0.5, settle_s=3.0, drop_wait_s=5.0,
+         path_counter="bench_ws_upsert", ring_required=True, judge=x888_judge)(probe_run(x888_run))
+
+
+# ---------------------------------------------------------------- h947_http_load (#947)
+def h947_from_args(sc, args):
+    """Size the scenario from the CLI: modes x repeats make the plan, the plan's call runs make `calls`."""
+    cfg = dict(http_load.DEFAULTS, modes=tuple(m for m in args.http_modes.split(",") if m),
+               repeats=args.repeats,
+               run_cap=http_load.DEFAULTS["run_cap"] if args.run_cap is None else args.run_cap, window_s=args.window_s,
+               probe_polls=args.probe_polls, probe_gap_s=args.probe_gap_ms / 1000.0,
+               burst_workers=args.burst_workers, burst_each=args.burst_each, call_mode=args.call_mode)
+    runs = http_load.plan(cfg) if 1 <= cfg["repeats"] <= http_load.RUN_CAP_MAX else []
+    rings = sum(1 for mode, _ in runs if mode == http_load.CALL_MODE)
+    problems = http_load.config_problems(cfg)
+    # an out-of-range value is never printed back (a number pasted into the wrong flag may be a far end)
+    lines = [] if problems else [
+        "plan      %d run(s), cap %d: %s" % (len(runs), cfg["run_cap"], ", ".join(
+            "%s x%d" % (m, cfg["repeats"]) for m in http_load.MODES if m in cfg["modes"])),
+        "traffic   window %g s a run; probe %d x GET /api/status; burst %d x %d; %d ring(s), one held %g s each, "
+        "call mode %s" % (cfg["window_s"], cfg["probe_polls"], cfg["burst_workers"], cfg["burst_each"], rings,
+                          sc["hold_s"], cfg["call_mode"])]
+    return dict(sc, cfg=cfg, calls=rings, ring_required=rings > 0, plan_lines=lines, config_problems=problems,
+                extra_s=0 if problems else (len(runs) - rings) * (cfg["window_s"] + sc["gap_s"] + 30))
+
+
+def h947_ring_gate(run):
+    """The last check before the one INVITE (arm() does the same for a fault): the far end is not an
+    emergency, owner or PBX number. Never echoes the number."""
+    bad = [p for end in run.far_ends for p in far_end_problems(end, set(OWNER_EXTS))]
+    if bad:
+        raise run_soak.Abort("INVALID", "refusing to ring: " + "; ".join(bad))
+
+
+def h947_halt_on_stop(run, load):
+    """A signal (run.stop) ends the window at once, not at its end."""
+    if run.stopped():
+        load.halt.set()
+
+
+def h947_checkpoint(run, tries=3):
+    """run.checkpoint(), tried again after an INVALID: the board answers a request past its per-source cap with
+    503, which checkpoint() cannot tell from a lapsed pin. A pin that really lapsed fails every try."""
+    for i in range(tries):
+        try:
+            return run.checkpoint()
+        except run_soak.Abort as e:
+            if e.verdict != "INVALID" or i == tries - 1 or run.stop.wait(0.3):
+                raise
+
+
+def h947_watch(run, load):
+    """The window's per-tick checks, on the run's thread: a signal, a phantom inbound, the S1 pin."""
+    nxt = [time.monotonic() + run.a.pin_check_s]
+
+    def watch():
+        if run.stopped():
+            return h947_halt_on_stop(run, load)
+        if run.phantoms():
+            raise run_soak.Abort("FAIL", "a phantom inbound reached a test UA during the call: the run stops")
+        if time.monotonic() >= nxt[0] and not load.bursting.is_set():   # the burst holds every slot
+            t0 = time.monotonic()
+            h947_checkpoint(run)                  # the S1 pin; its requests are load too
+            load.safety(t0, time.monotonic())
+            nxt[0] = time.monotonic() + run.a.pin_check_s
+    return watch
+
+
+def h947_ringing(run, sc, load, caller, cfg):
+    """Ringing mode: the far end rings and is not answered. invite() blocks until a final response, so it runs
+    on a thread while this one runs the window for hold_s from the INVITE. The CANCEL (RFC 3261 s9.1: no
+    dialog yet, so no BYE) is due at INVITE + hold_s, the window's planned end, NOT when window() returns: its
+    teardown joins pollers that can sit in a 5 s request on a slow board, and the ring must not outlast the
+    hold. It goes at once if the window is cut short (an abort), and the INVITE ends 487 (s9.2). The agent's own
+    INVITE bound (16 s) would end the wait before hold_s, so this call gets hold_s plus the hangup margin,
+    inside the call cap. A 200 that arrives is the answered case: the window still runs to hold_s and
+    finish_call BYEs. -> (dlg, rec)"""
+    hold = sc["hold_s"]
+    rec = {"call": 1, "t_start": time.monotonic(), "final": None, "call_mode": "ringing"}
+    run.calls.append(rec)
+    rec["call"] = len(run.calls)
+    closed, box = threading.Event(), []
+
+    def cancel_due(since):                        # None until due: the agent sleeps to any time it is given
+        return time.monotonic() if closed.is_set() or time.monotonic() >= since + hold else None
+
+    def invite():
+        try:
+            box.append(caller.invite(run.far_end, cancel_when=cancel_due, cancel_when_timeout_s=hold + 1.0,
+                                     invite_timeout=hold + HANGUP_MARGIN_S))
+        except Exception as e:  # noqa: BLE001 -- raised again on the run's thread once it has been joined
+            box.append(e)
+    worker = threading.Thread(target=invite, name="h947-invite", daemon=True)
+    worker.start()
+    try:
+        load.window(cfg, rec["t_start"] + hold, h947_watch(run, load))
+    finally:
+        window_end = time.monotonic()
+        closed.set()                              # the CANCEL goes now, whatever stopped the window
+        worker.join(hold + HANGUP_MARGIN_S + caller.timeout + 2.0)
+    if worker.is_alive():
+        raise run_soak.Abort("INVALID", "the INVITE transaction did not end within %g s of the window: its "
+                                        "CANCEL state is unknown" % (hold + HANGUP_MARGIN_S + caller.timeout + 2.0))
+    dlg = box[0]
+    if isinstance(dlg, Exception):
+        raise dlg
+    t0, ring_at = dlg.invite_sent_at, next((t for t, s in dlg.responses if s == 180), None)
+    rec.update(_call_id=dlg.call_id, final=dlg.final_status, provisional=[s for _, s in dlg.responses if s < 200],
+               ring_ms=ms_since(t0, ring_at), window_ms=ms_since(t0, window_end),
+               cancel_ms=ms_since(t0, dlg.cancel_sent_at), cancel_status=dlg.cancel_status,
+               ended_early=dlg.ended.is_set())
+    finish_call(caller, dlg, rec)
+    return dlg, rec
+
+
+def h947_call(run, sc, load, caller, cfg):
+    """One call to the far end with the window inside it, in the mode cfg says (h947_ringing for ringing). The
+    caller never holds or re-INVITEs (a SIP hold would start music on hold and change what is measured).
+    Answered: the window runs from the answer to hold_s after the INVITE, then the harness BYEs."""
+    h947_ring_gate(run)
+    base = run.session_count()
+    ringing = cfg["call_mode"] == "ringing"
+    if ringing:
+        dlg, rec = h947_ringing(run, sc, load, caller, cfg)
+    else:
+        dlg, rec = start_call(run, sc, caller)
+        rec["call_mode"] = "answered"
+        rec["call"] = len(run.calls)
+        try:
+            if dlg.ok:
+                load.window(cfg, rec["t_start"] + sc["hold_s"], h947_watch(run, load))
+                rec["ended_early"] = dlg.ended.is_set()
+        finally:
+            finish_call(caller, dlg, rec)
+    k = rec["call"]
+    run.pull_pcap("call-%02d" % k)
+    rec["pcap_byes"] = run.pcap_count("BYE", caller, rec.get("_call_id"))
+    rec["sessions"] = run.sessions_settle(base, caller.ext, sc["settle_s"])
+    extra = {"call": k, "call_mode": rec["call_mode"], "answered": answered(rec)}
+    if ringing:
+        extra.update({key: rec[key] for key in ("final", "ring_ms", "window_ms", "cancel_ms", "cancel_status")},
+                     hold_s=sc["hold_s"])
+    if ringing and not extra["answered"]:
+        run.say("call %d: %s" % (k, http_load.call_text(extra)))
+    else:
+        run.say("call %d: final %s, %s" % (k, rec["final"], "ended by the far side early" if rec.get("ended_early")
+                                           else "hung up after %s ms (BYE %s)" % (rec.get("hangup_ms"),
+                                                                                  rec.get("hangup_bye"))))
+    return extra
+
+
+def h947_run(run, sc):
+    cfg, caller = sc["cfg"], run.agents["caller"]
+    if not run.http.cookie:
+        raise run_soak.Abort("INVALID", "no admin session: the dashboard's polls need one")
+    sink = run.load_sink = http_load.Sink(run.p("http-load.jsonl"))
+    get = http_load.getter(run.a.host, run.a.http_port)
+    budget = http_load.RunBudget(cfg["run_cap"])
+    for line in sc["plan_lines"]:
+        run.say(line)
+    try:
+        for n, (mode, rep) in enumerate(http_load.plan(cfg), 1):
+            if run.stopped():
+                break
+            try:
+                budget.take()
+            except http_load.CapExceeded as e:
+                raise run_soak.Abort("INVALID", str(e))
+            run.checkpoint()
+            load = http_load.RunLoad(get, sink, n, mode, run.http.cookie)
+            run.say("run %d: %s, repeat %d" % (n, mode, rep))
+            if mode == http_load.CALL_MODE:
+                extra = h947_call(run, sc, load, caller, cfg)
+            else:
+                load.window(cfg, time.monotonic() + cfg["window_s"], lambda: h947_halt_on_stop(run, load))
+                extra = {}
+            sink.add(load.meta(rep, **extra))
+            run.idle(sc["gap_s"])
+    finally:
+        sink.close()
+
+
+def h947_judge(run, sc, lines):
+    sink = getattr(run, "load_sink", None)
+    recs = http_load.read_log(sink.lines) if sink else []
+    fails = ["a panic line reached the syslog"] if count_lines(lines)["panic"] else []
+    more_fails, invalid = http_load.judge_log(recs)
+    fails += more_fails
+    for c in run.calls:
+        if not answered(c) and c.get("call_mode") != "ringing":
+            invalid.append("call %s: the far end did not answer (final %s): no call was up for that run"
+                           % (c.get("call"), c.get("final")))
+            continue
+        if not answered(c):
+            pass                       # ringing mode: judge_log read the call's verdict from the run record
+        elif c.get("ended_early"):
+            invalid.append("call %s ended from the far side before its window closed" % c.get("call"))
+        elif c.get("hangup_bye") != 200:
+            fails.append("call %s: the harness's BYE got %s, not 200" % (c.get("call"), c.get("hangup_bye")))
+        sf, si = session_problems(c, run.agents["caller"].ext)
+        fails += sf
+        invalid += si
+    if run.calls:
+        fails += drop_problems(lines)
+    text = http_load.render(recs)
+    for line in text.splitlines():
+        run.say(line)
+    with open(run.p("http-summary.txt"), "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+    return fails, invalid, {"runs": [http_load.run_stats(d) for d in http_load.per_run(recs)]}
+
+
+scenario(name="h947_http_load", issues=("#947", "#410"), part_of="#947",
+         about="the HTTP server under load, before #410 picks a connection design: idle, dashboard and "
+               "dashboard-call runs (6101 -> the designated far end, held, in the last; --call-mode ringing "
+               "is the default), peak concurrency, "
+               "p50/p99 of GET /api/status, the http_conn stack and internal-DRAM watermarks",
+         uas={"caller": "6101", "detector": PIN_UA}, calls=3, max_calls=10, min_calls=0, call_cap_s=30,
+         hold_s=24.0, gap_s=5.0, settle_s=5.0, path_counter="initiated", ring_required=True,
+         no_status_logger=True, from_args=h947_from_args, judge=h947_judge)(h947_run)
+
+
 # ---------------------------------------------------------------- CLI
 class _Parser(argparse.ArgumentParser):
     def error(self, message):
@@ -2541,13 +2995,32 @@ def build_parser():
                          "must exceed the old %d s margin)" % (HELD_HOLD_S, OLD_TOKEN_MARGIN_S))
     ap.add_argument("--runs", type=int, default=None, help="x952 only: held calls to place (default 1)")
     ap.add_argument("--run-cap", type=int, default=None,
-                    help="x952 only: the most held calls this run may place (default 1; at most %d); "
-                         "--runs above it is refused" % HELD_MAX_RUNS)
+                    help="x952: the most held calls this run may place (default 1; at most %d); --runs above it "
+                         "is refused. h947_http_load: most runs in all (default %d); modes x repeats past it is "
+                         "refused before anything is sent, and the run loop stops at it. Only dashboard-call "
+                         "rings, once a run" % (HELD_MAX_RUNS, http_load.DEFAULTS["run_cap"]))
     ap.add_argument("--arm-at", choices=("mid-call", "before-call"), default=None,
                     help="x952 only: when token_age is armed (default mid-call: once the call's streams are "
                          "open; before-call only shows makeCall() refreshing the aged token)")
     ap.add_argument("--out", default="anchor-evidence")
     ap.add_argument("--dry-run", action="store_true", help="print the plan; contact nothing")
+    d = http_load.DEFAULTS
+    ap.add_argument("--http-modes", default=",".join(d["modes"]),
+                    help="h947_http_load: comma list of %s (default all, lightest first)" % ", ".join(http_load.MODES))
+    ap.add_argument("--repeats", type=int, default=d["repeats"], help="h947_http_load: runs per mode")
+    ap.add_argument("--window-s", type=float, default=d["window_s"], help="h947_http_load: seconds per idle/"
+                    "dashboard run (a call run lasts hold_s, inside the 30 s call cap)")
+    ap.add_argument("--probe-polls", type=int, default=d["probe_polls"],
+                    help="h947_http_load: sequential GET /api/status per run (the #410 .244 recipe: 200)")
+    ap.add_argument("--probe-gap-ms", type=float, default=d["probe_gap_s"] * 1000, help="h947_http_load: pause "
+                    "between probe polls")
+    ap.add_argument("--burst-workers", type=int, default=d["burst_workers"],
+                    help="h947_http_load: concurrent clients in the burst (the board serves 2 per source)")
+    ap.add_argument("--burst-each", type=int, default=d["burst_each"], help="h947_http_load: requests per burst client")
+    ap.add_argument("--call-mode", default=d["call_mode"],
+                    help="h947_http_load: what dashboard-call's far end does: %s (default %s). ringing rings and is "
+                         "not answered: the window runs for the hold, then a CANCEL; answered answers, then a BYE"
+                         % (" or ".join(http_load.CALL_MODES), d["call_mode"]))
     return ap
 
 
@@ -2556,7 +3029,7 @@ RUN_DEFAULTS = {"register_expires": 120, "register_refresh_s": 60.0, "beep_wait_
 
 
 def needed_s(sc):
-    return 300 + sc["calls"] * (sc["call_cap_s"] + sc.get("gap_s", 0)) + RUN_DEFAULTS["tail_s"]
+    return 300 + sc["calls"] * (sc["call_cap_s"] + sc.get("gap_s", 0)) + RUN_DEFAULTS["tail_s"] + sc.get("extra_s", 0)
 
 
 def main(argv=None, env=None, http=None, agent_factory=None, start_logger=None, out=print,
@@ -2596,13 +3069,19 @@ def main(argv=None, env=None, http=None, agent_factory=None, start_logger=None, 
         return REFUSED
     for k, v in dict(RUN_DEFAULTS, **(run_defaults or {})).items():
         setattr(args, k, v)
-    sc = dict(SCENARIOS[args.scenario], **(overrides or {}))
+    sc = SCENARIOS[args.scenario]
+    if sc.get("from_args"):                  # h947: the plan, and so the calls, follow the command line
+        sc = sc["from_args"](sc, args)
+    sc = dict(sc, **(overrides or {}))
     if args.hold_s is not None and not math.isfinite(args.hold_s):
         problems.append("--hold-s must be a finite number of seconds")
         args.hold_s = None
     # --runs is the calls requested, --run-cap the most this run may place: scenario_problems refuses
-    # calls above max_calls, so a second run is refused when the cap is 1.
-    held_args = {"hold_s": args.hold_s, "calls": args.runs, "max_calls": args.run_cap, "arm_at": args.arm_at}
+    # calls above max_calls, so a second run is refused when the cap is 1. h947 reads --run-cap in
+    # from_args (its own plan cap), so here it is x952's only.
+    held_args = {"hold_s": args.hold_s, "calls": args.runs, "arm_at": args.arm_at}
+    if not sc.get("from_args"):
+        held_args["max_calls"] = args.run_cap
     given = {k: v for k, v in held_args.items() if v is not None}
     if given and not sc.get("held"):
         problems.append("--hold-s, --runs, --run-cap and --arm-at apply only to a held scenario")
@@ -2629,7 +3108,8 @@ def main(argv=None, env=None, http=None, agent_factory=None, start_logger=None, 
     args.local_ip = args.local_ip or sip_agent.local_ip_for(args.host, args.port)
 
     emit("sip_stress.py --scenario %s%s" % (sc["name"], "  (DRY RUN: nothing is contacted)" if args.dry_run else ""))
-    emit("  issues    %s (Part of #384): %s" % (" ".join(sc.get("issues", ())), sc.get("about")))
+    emit("  issues    %s (Part of %s): %s" % (" ".join(sc.get("issues", ())), sc.get("part_of", "#384"),
+                                              sc.get("about")))
     emit("  board     %s  SIP :%d  HTTP :%d" % (args.host, args.port, args.http_port))
     emit("  test UAs  %s; the S1 pin is <route DN> -> %s" % (
         ", ".join("%s %s" % kv for kv in sorted(sc["uas"].items())), PIN_UA))
@@ -2643,6 +3123,8 @@ def main(argv=None, env=None, http=None, agent_factory=None, start_logger=None, 
         emit("  held      %g s after token_age is armed %s (the old margin is %g s); %d run(s), run cap %d"
              % (sc["hold_s"], "once the call's streams are open" if sc["arm_at"] == "mid-call"
                 else "before the INVITE", sc["margin_s"], sc["calls"], sc["max_calls"]))
+    for line in sc.get("plan_lines", ()):
+        emit("  " + line)
     emit("  approval  %s" % (args.approval_url or "<none>"))
     emit("  CHECK-OUT %s until %s" % (args.checkout_url or "<none>", args.checkout_expiry or "<none>"))
     if sc.get("probe"):

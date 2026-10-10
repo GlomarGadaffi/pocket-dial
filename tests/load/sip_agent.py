@@ -27,6 +27,8 @@ keeps the behaviour above:
     None while that is unknown. The wait is always bounded: at T s, or if fn raises, the
     CANCEL goes at once and the dialog says so (cancel_when_expired), so a phone is never
     left ringing. Used to time a CANCEL from a syslog line instead of from the INVITE;
+  * invite(..., invite_timeout=T) bounds this call's INVITE transaction at T s instead of the agent's
+    invite_timeout (16 s), for a call that must ring longer before its CANCEL;
   * Dialog.hold() / resume(): a re-INVITE offering sendonly / sendrecv (s14.1);
   * contact_params: URI parameters on the Contact (e.g. ";line=pd6101");
   * strict_dialogs: a BYE must match Call-ID AND both tags (s12.2.2), else 481;
@@ -467,13 +469,13 @@ class Agent:
                 "a=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-15\r\na=ptime:20\r\na=%s\r\n"
                 % (self.ext, sess, sess, self.lip, self.lip, dlg.rtp_port, direction))
 
-    def _transaction(self, text, key, invite, txn=None):
+    def _transaction(self, text, key, invite, txn=None, timeout=None):
         """Send a request, retransmit per RFC 3261 s17.1, return the final response or None."""
         txn = txn or _Txn()
         with self._lock:
             self._waiters[key] = txn
         self._send(text)
-        deadline = time.monotonic() + (self.invite_timeout if invite else self.timeout)
+        deadline = time.monotonic() + (timeout or (self.invite_timeout if invite else self.timeout))
         interval = T1
         try:
             while True:
@@ -519,7 +521,8 @@ class Agent:
             self.registered = False
         return status
 
-    def invite(self, target_user, cancel_after_ms=None, cancel_when=None, cancel_when_timeout_s=None):
+    def invite(self, target_user, cancel_after_ms=None, cancel_when=None, cancel_when_timeout_s=None,
+               invite_timeout=None):
         """INVITE sip:<target_user>@<pbx>. Returns the Dialog; dialog.ok says
         whether it was answered (2xx, then ACKed). A non-2xx final is ACKed by
         the transaction (s17.1.1.3); no final at all is CANCELled if it rang.
@@ -534,7 +537,10 @@ class Agent:
         cancel_when_timeout_s (required with it) bounds the wait: at that many seconds
         after the INVITE, or at once if fn raises, the CANCEL goes and
         dialog.cancel_when_expired is set (cancel_when_error says what fn raised).
-        The two ways of timing a CANCEL exclude each other."""
+        The two ways of timing a CANCEL exclude each other.
+
+        invite_timeout: this call's INVITE transaction bound in s (default: the agent's), so that a CANCEL
+        due after the agent's own bound can still read its 487."""
         if cancel_when is not None:
             if cancel_after_ms is not None:
                 raise ValueError("cancel_after_ms and cancel_when are two ways to time the CANCEL: use one")
@@ -563,7 +569,8 @@ class Agent:
                                          args=(dlg, ruri, branch, txn, None, cancel_when,
                                                dlg.invite_sent_at + cancel_when_timeout_s))
             canceller.start()
-        final = self._transaction(text, (dlg.call_id, dlg.local_cseq, "INVITE"), invite=True, txn=txn)
+        final = self._transaction(text, (dlg.call_id, dlg.local_cseq, "INVITE"), invite=True, txn=txn,
+                                  timeout=invite_timeout)
         if canceller is not None:
             canceller.join(self.timeout + 1.0)
         if final is None:
