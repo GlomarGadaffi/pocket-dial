@@ -61,7 +61,7 @@ def lock_scopes(body):
 
 # What takes the heap, or the time, or both. A lock must not hold any of it.
 SLOW = re.compile(r"esp_http_client_\w+\s*\(|esp_websocket_client_\w+\s*\(|makeAuthedClient\s*\(|"
-                  r"readJsonStringField\s*\(|acceptLifetime\s*\(|tokenLifetimeUs\s*\(|haveCachedToken\s*\(|vTaskDelay|claimWaiting\s*\(|"
+                  r"readJsonStringField\s*\(|readTokenLifetime\s*\(|noteLifetimeFields\s*\(|haveCachedToken\s*\(|vTaskDelay|claimWaiting\s*\(|"
                   r"std::string\b(?!_view)|std::vector|urlEncode\s*\(|to_string|\bnew\b|make_unique|make_shared")
 # Own-code heap in fetchToken: no string, no vector, no encode-to-string, no allocation at all.
 HEAP = re.compile(r"std::string\b(?!_view)|std::vector|urlEncode\s*\(|std::to_string|\bnew\b|make_unique|make_shared|"
@@ -100,28 +100,33 @@ class FetchTokenWiringTest(unittest.TestCase):
                 start = self.fetch.index(scope)
                 self.assertFalse(start <= at < start + len(scope), call + " is inside a _mutex scope")
 
-    def test_the_lifetime_is_resolved_before_the_lock_and_the_cache_is_asked_only_outside_it(self):
-        accept = self.fetch.index("acceptLifetime(lease, tokenStr, [this] { return haveCachedToken(); }, lifetimeUs)")
-        gate = self.fetch.index("installed = _tokenGate.installIfNewer(issuedUs);")
-        lock = self.fetch.rindex("std::lock_guard<std::mutex> lock(_mutex);", 0, gate)
-        self.assertLess(accept, lock, "the decode is CPU work and takes its scratch from the arena, outside the lock")
-        self.assertLess(self.fetch.index("acceptToken(tokenStr)"), accept)
+    def test_the_lifetime_is_read_and_logged_before_the_lock_from_the_claims_only(self):
+        flat = " ".join(self.fetch.split())   # the calls wrap
+        read = flat.index("telephony::readTokenLifetime( std::string_view(lease.data(), lease.size()), tokenStr, "
+                          "lease.spare(), lease.spareBytes());")
+        note = flat.index("_tokenLanes.noteLifetimeFields(life);")
+        gate = flat.index("installed = _tokenGate.installIfNewer(issuedUs);")
+        lock = flat.rindex("std::lock_guard<std::mutex> lock(_mutex);", 0, gate)
+        self.assertLess(read, note, "the witness logs what was read")
+        self.assertLess(note, lock, "the decode and the witness are CPU work in the arena's unused tail, outside the lock")
+        self.assertIn("const int64_t lifetimeUs = life.lifetimeUs;", flat)
+        self.assertNotIn("expiresInS", flat, "expires_in is logged by the witness and is never the lifetime")
         for scope in lock_scopes(self.fetch):
-            self.assertNotIn("haveCachedToken", scope, "haveCachedToken() takes _mutex itself")
-        helper = " ".join(body_of(self.cpp, "static bool acceptLifetime(").split())   # one line: the call wraps
-        self.assertIn("lease.spare(), lease.spareBytes()", helper, "the scratch is the arena's unused tail")
-        self.assertIn("std::string_view(lease.data(), lease.size())", helper, "expires_in is read from the whole response")
-        self.assertIn("return lifetimeUs != 0;", helper, "a lifetime of 0 is the refusal: the token is not installed")
-        self.assertEqual(self.fetch.count("acceptLifetime("), 1)
+            self.assertNotIn("readTokenLifetime", scope)
+            self.assertNotIn("noteLifetimeFields", scope)
 
-    def test_a_token_whose_lifetime_is_refused_is_not_installed_and_the_cached_one_stays(self):
-        # acceptLifetime() false short-circuits the whole install block: success stays false, so the
-        # end of fetchToken leaves token_fetch_failed_951 and returns false, and _bearerHeader and
-        # the stamp are untouched because the gate is inside the block.
-        cond = self.fetch[self.fetch.index("int64_t lifetimeUs = 0;"):self.fetch.index("installed = _tokenGate.installIfNewer")]
-        self.assertRegex(cond, r"(?s)readJsonStringField\(.*?&&\s*acceptToken\(tokenStr\)\s*&&\s*acceptLifetime\(")
-        self.assertEqual(self.fetch.count("success = true;"), 1)
-        self.assertGreater(self.fetch.index("success = true;"), self.fetch.index("installed = _tokenGate.installIfNewer"))
+    def test_the_token_is_installed_whatever_is_cached_and_whatever_its_lifetime(self):
+        # Telephony drops the old token when it grants the new one: no branch may keep the old (dead) one.
+        flat = " ".join(self.fetch.split())
+        self.assertNotIn("haveCachedToken", flat, "fetchToken never asks whether a token is cached")
+        self.assertRegex(flat, r"if \(readJsonStringField\([^)]*\) && acceptToken\(tokenStr\)\) \{",
+                         "the install block is guarded by the read and by checkToken, and by nothing else")
+        gate = flat.index("installed = _tokenGate.installIfNewer(issuedUs);")
+        self.assertEqual(flat.count("success = true;"), 1)
+        self.assertGreater(flat.index("success = true;"), gate)
+        between = flat[flat.index("acceptToken(tokenStr)"):gate]
+        self.assertNotIn("return false", between, "nothing between the check and the gate refuses the token")
+        self.assertNotRegex(between, r"if \(life|lifetimeUs ==|lifetimeUs <=")
 
     def test_a_token_that_does_not_fit_is_refused_before_the_gate_advances(self):
         accept = self.fetch.index("acceptToken(tokenStr)")

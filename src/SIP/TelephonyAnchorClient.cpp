@@ -995,23 +995,6 @@ static bool acceptToken(std::string_view token)
 	return check == telephony::TokenCheck::Ok;
 }
 
-// #951: the lifetime to install `token` with (telephony::tokenLifetimeUs), or false: none can be read
-// and a token is cached, so this one is not installed and the cached one stays. The decode borrows the
-// arena's unused tail and expires_in is read from the whole response. haveCachedToken takes _mutex, so
-// it is called only when no lifetime can be read, and never under a lock of the caller's.
-template <class HaveCachedToken>
-static bool acceptLifetime(telephony::TokenLanes::Lease& lease, std::string_view token,
-                           HaveCachedToken&& haveCachedToken, int64_t& lifetimeUs)
-{
-	lifetimeUs = telephony::tokenLifetimeUs(std::string_view(lease.data(), lease.size()), token, lease.spare(),
-	                                        lease.spareBytes(), haveCachedToken);
-	if (lifetimeUs == 0)
-	{
-		ESP_LOGE(TAG, "Token response rejected: its lifetime cannot be read (payload too big, no expires_in), keeping the token we have");
-	}
-	return lifetimeUs != 0;
-}
-
 bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForArena, std::uint32_t sosCallId)
 {
 	// #862: claim the lane's token arena before any I/O. A fetch on this lane already holds it,
@@ -1116,12 +1099,15 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 			if (status == 200)
 			{
 				std::string_view tokenStr;   // views the arena, which `lease` holds until this returns
-				int64_t lifetimeUs = 0;
-				if (readJsonStringField(client, lease, "access_token", tokenStr, deadlineUs) && acceptToken(tokenStr) &&
-				    acceptLifetime(lease, tokenStr, [this] { return haveCachedToken(); }, lifetimeUs))
+				if (readJsonStringField(client, lease, "access_token", tokenStr, deadlineUs) && acceptToken(tokenStr))
 				{
-					// The lifetime was read before the lock (acceptLifetime, #951).
+					// The lifetime is exp - iat from the JWT's claims, read before the lock into the arena's unused
+					// tail: CPU only, no heap. The response's expires_in is only logged (#951).
 					const int tokenLen = static_cast<int>(tokenStr.size());
+					const telephony::TokenLifetime life = telephony::readTokenLifetime(
+					    std::string_view(lease.data(), lease.size()), tokenStr, lease.spare(), lease.spareBytes());
+					_tokenLanes.noteLifetimeFields(life);
+					const int64_t lifetimeUs = life.lifetimeUs;
 					// _mutex guards _bearerHeader, reserved at init() for the longest token acceptToken() lets
 					// through, so the install is the gate, one assign inside that capacity and the atomics:
 					// no I/O and no allocation. _tokenObtainedUs/_tokenLifetimeUs are std::atomic (#344) and

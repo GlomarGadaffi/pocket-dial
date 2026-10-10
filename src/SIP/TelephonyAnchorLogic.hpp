@@ -42,17 +42,18 @@ namespace telephony
 // expires_in (Telephony reports 60s there, which would cause a refresh storm).
 inline constexpr int64_t kTokenFallbackLifetimeUs = 50LL * 60 * 1000000;
 
-// #951: the lifetime of a token whose payload is too big to read exp and iat from, whose response
-// carries no readable expires_in, and when there is no cached token to keep: 5 minutes. It errs
-// short on purpose. The 50 minute constant above errs long (a token that really lives 10 minutes
-// would be called valid for 50, and expire under a call), and is left as it is for a payload that
-// cannot be parsed at all (#975). A token this short is never due for the background refresh
-// (maintTokenDue: a lifetime within the 10 minute margin is not), so it is renewed ahead of an
-// ordinary call, or by the one fetch a 911/933 makes after its POST is answered 401.
+// #951: the lifetime of a token whose payload is too big for the scratch and whose claims are not in
+// the start of it: 5 minutes. It errs short on purpose. The 50 minute constant above errs long (a
+// token that really lives 10 minutes would be called valid for 50, and expire under a call), and is
+// left as it is for a payload that cannot be parsed at all (#975). A token this short is never due
+// for the background refresh (maintTokenDue: a lifetime within the 10 minute margin is not), so it
+// is renewed ahead of an ordinary call, or by the one fetch a 911/933 makes after its POST is
+// answered 401. The token is installed whatever is cached: Telephony drops the old token the moment
+// it grants a new one, so keeping the old one would keep a dead token.
 inline constexpr int64_t kTokenShortFallbackLifetimeUs = 5LL * 60 * 1000000;
 
 // What decodeJwtLifetimeUs() returns when the payload's decoded bytes do not fit the scratch it was
-// lent: it did not look, and tokenLifetimeUs() decides what to do. Not a lifetime (they are positive).
+// lent: it did not look, and readTokenLifetime() decides what to do. Not a lifetime (they are positive).
 inline constexpr int64_t kLifetimeNoScratch = -1;
 
 // ── base64url decode (no padding required) ───────────────────────────────────
@@ -152,8 +153,10 @@ inline bool scanJsonNumber(std::string_view json, std::string_view key, int64_t&
 // The payload is decoded into scratch[0..scratchBytes), lent by the caller: fetchToken() lends the
 // arena's unused tail, so this allocates nothing (#951; it was three allocations: the payload, the
 // decoded bytes and the JSON text). A payload whose decoded bytes do not fit returns
-// kLifetimeNoScratch, not a lifetime: tokenLifetimeUs() decides from there.
-inline int64_t decodeJwtLifetimeUs(std::string_view jwt, char* scratch, std::size_t scratchBytes)
+// kLifetimeNoScratch, not a lifetime: readTokenLifetime() decides from there. *spanSecondsOut, if
+// given, is set to exp - iat when the claims were read and the span is sane, and left alone otherwise.
+inline int64_t decodeJwtLifetimeUs(std::string_view jwt, char* scratch, std::size_t scratchBytes,
+                                   int64_t* spanSecondsOut = nullptr)
 {
 	const size_t firstDot = jwt.find('.');
 	if (firstDot == std::string_view::npos) return kTokenFallbackLifetimeUs;
@@ -180,45 +183,40 @@ inline int64_t decodeJwtLifetimeUs(std::string_view jwt, char* scratch, std::siz
 	int64_t span = exp - iat; // seconds
 	if (span > 0 && span < 86400) // sanity: positive, under a day
 	{
+		if (spanSecondsOut) *spanSecondsOut = span;
 		return span * 1000000;
 	}
 	return kTokenFallbackLifetimeUs;
 }
 
 // ── The lifetime a fetched token is installed with (#951) ───────────────────────────────────
-// 0 means: do not install this token. Otherwise microseconds.
-//  * The payload fits the scratch: decodeJwtLifetimeUs(), exactly as before. expires_in is NOT
-//    consulted: Telephony reports expires_in:60 for a token that lives about an hour, so taking
-//    the shorter of the two here would turn every token into a one minute one. A payload it cannot
+// The claims decide it: exp - iat of the token's payload. The response's expires_in is read and
+// logged (token_lifetime_fields_951, the bench check) but never used: the code comments say
+// Telephony reports expires_in:60 for a token that lives about an hour (operator ruling on #951).
+//  * The payload fits the scratch: decodeJwtLifetimeUs(), exactly as before. A payload it cannot
 //    parse (no dots, bad base64, no exp or iat, a span out of range) still takes
 //    kTokenFallbackLifetimeUs; that is unchanged here and tracked in #975.
-//  * The payload does not fit: the shortest of what can still be read, never the 50 minute constant.
-//    The response's expires_in (body is the whole response), and exp - iat from the start of the
-//    payload, which is decoded as far as the scratch goes and cut back to its last ',' so a number
-//    the cut went through is never read. Either alone is used; both give the shorter.
-//  * Neither readable: with a token already cached the new one is refused (0) and the cached one
-//    stays; with none cached it is installed with kTokenShortFallbackLifetimeUs, so a 911/933 is
-//    never left without a token for want of a lifetime. haveCachedToken is only called here.
-// Witness lines: one when the payload did not fit, one more for the refusal or the short fallback.
-// None names a number or a credential.
-template <class HaveCachedToken>
-inline int64_t tokenLifetimeUs(std::string_view body, std::string_view jwt, char* scratch, std::size_t scratchBytes,
-                               HaveCachedToken&& haveCachedToken)
+//  * The payload does not fit: exp - iat from the start of the payload, decoded as far as the
+//    scratch goes and cut back to its last ',' so a number the cut went through is never read; if
+//    the claims are not in that start, kTokenShortFallbackLifetimeUs (5 minutes, errs short).
+// The token is always installed. Nothing here refuses it, whatever is cached.
+struct TokenLifetime
 {
-	const int64_t fromPayload = decodeJwtLifetimeUs(jwt, scratch, scratchBytes);
-	if (fromPayload != kLifetimeNoScratch) return fromPayload;
+	std::int64_t lifetimeUs;   // what the token is installed with; always positive
+	std::int64_t expiresInS;   // the response's expires_in in seconds; -1: not read. Logged, never used
+	std::int64_t spanS;        // exp - iat in seconds; -1: not read
+};
+
+inline TokenLifetime readTokenLifetime(std::string_view body, std::string_view jwt, char* scratch, std::size_t scratchBytes)
+{
+	TokenLifetime t{0, -1, -1};
+	int64_t expiresIn = 0;
+	if (scanJsonNumber(body, "expires_in", expiresIn)) t.expiresInS = expiresIn;
+	t.lifetimeUs = decodeJwtLifetimeUs(jwt, scratch, scratchBytes, &t.spanS);
+	if (t.lifetimeUs != kLifetimeNoScratch) return t;
 
 	PD_WITNESS_W("anchor", "token_lifetime_scratch_951: the token's payload does not fit the arena's unused bytes, so "
-	                       "its lifetime comes from expires_in and the start of the payload (#951)");
-	int64_t shortestUs = 0;   // 0: nothing read yet
-	auto take = [&shortestUs](int64_t seconds) {
-		if (seconds <= 0 || seconds >= 86400) return;   // the span rule decodeJwtLifetimeUs() applies
-		const int64_t us = seconds * 1000000;
-		if (shortestUs == 0 || us < shortestUs) shortestUs = us;
-	};
-	int64_t expiresIn = 0;
-	if (scanJsonNumber(body, "expires_in", expiresIn)) take(expiresIn);
-
+	                       "its claims are read from the start of it (#951)");
 	// decodeJwtLifetimeUs() only answers kLifetimeNoScratch for a payload with both dots around it
 	const size_t firstDot = jwt.find('.');
 	const size_t secondDot = jwt.find('.', firstDot + 1);
@@ -232,20 +230,18 @@ inline int64_t tokenLifetimeUs(std::string_view body, std::string_view jwt, char
 		{
 			head = head.substr(0, comma + 1);
 			int64_t exp = 0, iat = 0;
-			if (scanJsonNumber(head, "exp", exp) && scanJsonNumber(head, "iat", iat)) take(exp - iat);
+			if (scanJsonNumber(head, "exp", exp) && scanJsonNumber(head, "iat", iat) && exp - iat > 0 && exp - iat < 86400)
+			{
+				t.spanS = exp - iat;   // the span rule decodeJwtLifetimeUs() applies
+				t.lifetimeUs = t.spanS * 1000000;
+				return t;
+			}
 		}
 	}
-	if (shortestUs != 0) return shortestUs;
-
-	if (haveCachedToken())
-	{
-		PD_WITNESS_W("anchor", "token_lifetime_unread_951: the token's lifetime cannot be read (payload too big, no expires_in); "
-		                       "it is not installed and the cached token stays (#951)");
-		return 0;
-	}
-	PD_WITNESS_W("e911", "token_lifetime_short_951: the token's lifetime cannot be read (payload too big, no expires_in) and "
-	                     "no token is cached: installed with the short fallback, so a 911/933 still has a token (#951)");
-	return kTokenShortFallbackLifetimeUs;
+	PD_WITNESS_W("anchor", "token_lifetime_short_951: the token's claims are not in the start of its payload: installed "
+	                       "with the short fallback (#951)");
+	t.lifetimeUs = kTokenShortFallbackLifetimeUs;
+	return t;
 }
 
 // ── WS entity-path tokenizer ─────────────────────────────────────────────────
@@ -1038,6 +1034,11 @@ inline const char* laneName(TokenLane lane)
 // the first of a boot and then every this-many-th, so a run of them cannot flood the log.
 inline constexpr std::uint32_t kWitnessSampleEvery = 16;
 
+// token_lifetime_fields_951 is logged for the first this-many fetches of a boot and then no more. Not
+// sampled like the lines above: the bench wants the first few fetches whole (expires_in against exp -
+// iat, for #951), and a boot that fetches a token every few minutes must not fill the log with them.
+inline constexpr std::uint32_t kLifetimeFieldsWitnessCap = 8;
+
 // ── The background refresh keeps a token ten minutes from its expiry (#862, #945) ───────────
 // tick() wakes a job on tel_maint when the token is due (maintRefreshWakeDue, atomics only); the job
 // decides again with every input read at that moment (maintRefreshDecision) and only then fetches,
@@ -1237,6 +1238,20 @@ public:
 		             maintRefreshReasonName(why));
 	}
 
+	// One line per fetch for the first kLifetimeFieldsWitnessCap fetches of a boot (#951): what the
+	// response's expires_in said, what the claims said (exp - iat), and the lifetime the token was
+	// installed with, in seconds, -1 where nothing was read. Durations only: never the token, never
+	// the payload, never the credentials. It is how the bench finds out what expires_in really is.
+	void noteLifetimeFields(const TokenLifetime& t)
+	{
+		if (_lifetimeFieldLines.load(std::memory_order_relaxed) >= kLifetimeFieldsWitnessCap) return;
+		if (_lifetimeFieldLines.fetch_add(1, std::memory_order_relaxed) >= kLifetimeFieldsWitnessCap) return;
+		PD_WITNESS_W("anchor",
+		             "token_lifetime_fields_951: expires_in=%lld exp_minus_iat=%lld lifetime_used=%lld (seconds; -1: not read) (#951)",
+		             static_cast<long long>(t.expiresInS), static_cast<long long>(t.spanS),
+		             static_cast<long long>(t.lifetimeUs / 1000000));
+	}
+
 	// A fetch that was started and did not end in a token it could use: the request did not fit, the
 	// client was not made, the connect, the write or the status failed, the body did not read or the
 	// token was refused (checkToken). One line each, never sampled: a fetch is a TLS handshake, so
@@ -1268,6 +1283,7 @@ private:
 	std::atomic<int>           _emergenciesPending{0};
 	std::atomic<std::uint32_t> _sosCalls{0};
 	std::atomic<std::uint32_t> _maintSkips{0};
+	std::atomic<std::uint32_t> _lifetimeFieldLines{0};
 };
 
 // ── The cache keeps the token whose request was issued last (#862, ruling 2 on #945) ───────

@@ -5,7 +5,7 @@
 // its own buffers is done by host-compiled pieces, and these tests run those pieces in fetchToken's
 // order with the lane's real arena, under the binary-wide counting operator new:
 //   telephony::buildTokenRequest (URL + form body, built in the arena), BodyArena::collect (the
-//   response), jsonStringField, checkToken, tokenLifetimeUs (scratch = the arena's unused tail),
+//   response), jsonStringField, checkToken, readTokenLifetime (scratch = the arena's unused tail),
 //   TokenInstallGate, BearerHeader (a string reserved once, as init() does) and
 //   wsAuthHeaderInPlace (the WebSocket header, rebuilt in the arena).
 // What the ESP arm itself may contain (no std::string, no vector, _mutex held for the copy and the
@@ -198,15 +198,11 @@ namespace
 			return Outcome::Failed;
 		}
 
-		const std::int64_t lifetimeUs = telephony::tokenLifetimeUs(std::string_view(lease.data(), lease.size()), tokenStr,
-		                                                           lease.spare(), lease.spareBytes(),
-		                                                           [&] { return !cache.bearer.empty(); });   // acceptLifetime()
-		if (lifetimeUs == 0)
-		{
-			lanes.noteFetchFailed(lane);
-			return Outcome::Failed;
-		}
-		bool installed = false;
+		const telephony::TokenLifetime life = telephony::readTokenLifetime(
+		    std::string_view(lease.data(), lease.size()), tokenStr, lease.spare(), lease.spareBytes());
+		lanes.noteLifetimeFields(life);
+		const std::int64_t lifetimeUs = life.lifetimeUs;
+				bool installed = false;
 		{   // _mutex
 			installed = cache.gate.installIfNewer(issuedUs);
 			if (installed)
@@ -521,11 +517,12 @@ TEST(FetchTokenOwnCode, TheLifetimeDecodeNeedsOnlyThreeQuartersOfThePayloadAndTa
 	EXPECT_EQ(pdwitness::count("token_lifetime_scratch_951"), 0u) << "the decode itself says nothing; tokenLifetimeUs() does";
 }
 
-// ── the lifetime of a token whose payload does not fit the scratch (#951) ─────────────────────
-// The operator's rule: the shorter of expires_in and exp - iat when both can be read, either alone,
-// neither: refused when a token is cached (it stays), installed with five minutes when none is.
+// ── the lifetime of a token (#951) ───────────────────────────────────────────────────────────────
+// The operator's rule: exp - iat of the payload (read from the start of it when it does not fit the
+// scratch), else five minutes; the token is always installed, whatever is cached; expires_in is
+// logged and never used.
 
-TEST(FetchTokenLifetime, EndToEndTheShorterOfExpiresInAndTheClaimsWinsWithNoHeap)
+TEST(FetchTokenLifetime, EndToEndTheClaimsAreTheLifetimeAndExpiresInIsNotUsedWithNoHeap)
 {
 	telephony::TokenLanes lanes;
 	Cache                 cache;
@@ -544,32 +541,13 @@ TEST(FetchTokenLifetime, EndToEndTheShorterOfExpiresInAndTheClaimsWinsWithNoHeap
 	}
 	EXPECT_EQ(out, Outcome::Installed);
 	EXPECT_EQ(heap, 0u);
-	EXPECT_EQ(cache.lifetimeUs, 60LL * 1000000) << "expires_in 60 is shorter than the claims' 3600";
+	EXPECT_EQ(cache.lifetimeUs, 3600LL * 1000000) << "exp - iat, not the response's expires_in 60";
 	EXPECT_EQ(pdwitness::count("token_lifetime_scratch_951"), 1u);
+	EXPECT_EQ(pdwitness::count("token_lifetime_fields_951"), 1u) << "one line per fetch";
 	EXPECT_EQ(std::string(cache.bearer), "Bearer " + token) << "the token itself is whole";
 }
 
-TEST(FetchTokenLifetime, PayloadTooBigWithExpiresInAloneInstallsWithIt)
-{
-	telephony::TokenLanes lanes;
-	Cache                 cache;
-	const Config          cfg;
-	Capture               first;
-	ASSERT_EQ(fetchOwnCode(lanes, TokenLane::Ordinary, cfg, cache, kT0 + 1, tokenResponse(makeToken(100)), first),
-	          Outcome::Installed);   // a token is cached: expires_in alone is enough all the same
-	const std::string token = makeBigToken(2400, true);
-	ASSERT_LT(token.size(), telephony::kMaxTokenBytes);
-	const std::string response = responseWith(token, "\"expires_in\":600,");
-	Capture           cap;
-	pdwitness::clear();
-	EXPECT_EQ(fetchOwnCode(lanes, TokenLane::Emergency, cfg, cache, kT0 + 2, response, cap), Outcome::Installed);
-	EXPECT_EQ(cache.lifetimeUs, 600LL * 1000000);
-	EXPECT_EQ(std::string(cache.bearer), "Bearer " + token);
-	EXPECT_EQ(pdwitness::count("token_lifetime_unread_951"), 0u);
-	EXPECT_EQ(pdwitness::count("token_lifetime_short_951"), 0u);
-}
-
-TEST(FetchTokenLifetime, PayloadTooBigWithTheClaimsAloneInstallsWithExpMinusIat)
+TEST(FetchTokenLifetime, PayloadTooBigWithTheClaimsAtItsStartInstallsWithExpMinusIat)
 {
 	telephony::TokenLanes lanes;
 	Cache                 cache;
@@ -581,68 +559,14 @@ TEST(FetchTokenLifetime, PayloadTooBigWithTheClaimsAloneInstallsWithExpMinusIat)
 	EXPECT_EQ(cache.lifetimeUs, 3600LL * 1000000);
 }
 
-TEST(FetchTokenLifetime, PayloadTooBigWithBothTakesTheShorterAndNeverAsksForTheCache)
-{
-	const std::string token = makeBigToken(2400, false);   // claims say 3600 s
-	char              scratch[256];
-	ASSERT_GT(token.size() / 2, sizeof scratch);
-	int asked = 0;
-	auto cached = [&asked] { ++asked; return true; };
-	EXPECT_EQ(telephony::tokenLifetimeUs("{\"expires_in\":600}", token, scratch, sizeof scratch, cached), 600LL * 1000000)
-	    << "expires_in is the shorter";
-	EXPECT_EQ(telephony::tokenLifetimeUs("{\"expires_in\":7200}", token, scratch, sizeof scratch, cached), 3600LL * 1000000)
-	    << "the claims are the shorter";
-	EXPECT_EQ(telephony::tokenLifetimeUs("{\"expires_in\":3600}", token, scratch, sizeof scratch, cached), 3600LL * 1000000);
-	EXPECT_EQ(asked, 0) << "the cache is only asked about when nothing can be read";
-	// an expires_in that is not a sane lifetime is not a reading: the claims stand alone
-	for (const char* body : {"{\"expires_in\":0}", "{\"expires_in\":-5}", "{\"expires_in\":86400}", "{\"expires_in\":\"60\"}",
-	                         "{\"expires_in\":60.5}"})
-	{
-		EXPECT_EQ(telephony::tokenLifetimeUs(body, token, scratch, sizeof scratch, cached), 3600LL * 1000000) << body;
-	}
-}
-
-TEST(FetchTokenLifetime, PayloadTooBigWithNeitherAndACachedTokenIsRefusedAndTheCachedOneAndTheStampStay)
-{
-	telephony::TokenLanes lanes;
-	Cache                 cache;
-	const Config          cfg;
-	Capture               first;
-	ASSERT_EQ(fetchOwnCode(lanes, TokenLane::Ordinary, cfg, cache, kT0 + 1000, tokenResponse(makeToken(100)), first),
-	          Outcome::Installed);
-	const std::string  cachedBearer = cache.bearer;
-	const std::int64_t cachedObtained = cache.obtainedUs, cachedLifetime = cache.lifetimeUs;
-
-	const std::string token = makeBigToken(2400, true);   // nothing readable in its start
-	const std::string response = responseWith(token, "");   // and no expires_in
-	Capture           cap;
-	pdwitness::clear();
-	std::size_t heap = 0;
-	Outcome     out = Outcome::Installed;
-	{
-		AllocGuard g;
-		out = fetchOwnCode(lanes, TokenLane::Emergency, cfg, cache, kT0 + 2000, response, cap);
-		heap = g.delta();
-	}
-	EXPECT_EQ(out, Outcome::Failed);
-	EXPECT_EQ(heap, 0u);
-	EXPECT_EQ(std::string(cache.bearer), cachedBearer) << "Rule 5: the token already cached stays";
-	EXPECT_EQ(cache.obtainedUs, cachedObtained);
-	EXPECT_EQ(cache.lifetimeUs, cachedLifetime);
-	EXPECT_FALSE(cap.wsSet);
-	EXPECT_EQ(pdwitness::count("token_lifetime_unread_951"), 1u);
-	EXPECT_EQ(pdwitness::count("token_fetch_failed_951"), 1u);
-	EXPECT_TRUE(cache.gate.installIfNewer(kT0 + 1500)) << "the refused response did not advance the install stamp";
-}
-
-TEST(FetchTokenLifetime, PayloadTooBigWithNeitherAndNoCachedTokenInstallsWithTheFiveMinuteFallback)
+TEST(FetchTokenLifetime, PayloadTooBigWithUnreadableClaimsInstallsWithTheFiveMinuteFallbackWhateverExpiresInSays)
 {
 	telephony::TokenLanes lanes;
 	Cache                 cache;
 	const Config          cfg;
 	ASSERT_TRUE(cache.bearer.empty());
-	const std::string token = makeBigToken(2400, true);
-	const std::string response = responseWith(token, "");
+	const std::string token = makeBigToken(2400, true);   // the pad comes first: no claims in the start of the payload
+	const std::string response = responseWith(token, "\"expires_in\":600,");
 	Capture           cap;
 	pdwitness::clear();
 	std::size_t heap = 0;
@@ -654,12 +578,43 @@ TEST(FetchTokenLifetime, PayloadTooBigWithNeitherAndNoCachedTokenInstallsWithThe
 	}
 	EXPECT_EQ(out, Outcome::Installed) << "a 911/933 with no token is never refused for want of a lifetime";
 	EXPECT_EQ(heap, 0u);
-	EXPECT_EQ(cache.lifetimeUs, telephony::kTokenShortFallbackLifetimeUs);
+	EXPECT_EQ(cache.lifetimeUs, telephony::kTokenShortFallbackLifetimeUs) << "not the 600 s expires_in says";
 	EXPECT_EQ(telephony::kTokenShortFallbackLifetimeUs, 5LL * 60 * 1000000);
 	EXPECT_LT(telephony::kTokenShortFallbackLifetimeUs, telephony::kTokenFallbackLifetimeUs) << "it errs short";
 	EXPECT_EQ(std::string(cache.bearer), "Bearer " + token);
 	EXPECT_EQ(pdwitness::count("token_lifetime_short_951"), 1u);
-	EXPECT_EQ(pdwitness::count("token_lifetime_unread_951"), 0u);
+}
+
+TEST(FetchTokenLifetime, PayloadTooBigWithUnreadableClaimsInstallsTheFreshTokenWithTheFiveMinuteFallbackEvenWhenATokenIsCached)
+{
+	telephony::TokenLanes lanes;
+	Cache                 cache;
+	const Config          cfg;
+	Capture               first;
+	ASSERT_EQ(fetchOwnCode(lanes, TokenLane::Ordinary, cfg, cache, kT0 + 1000, tokenResponse(makeToken(100)), first),
+	          Outcome::Installed);
+	const std::string cachedBearer = cache.bearer;
+
+	const std::string token = makeBigToken(2400, true);   // nothing readable in its start
+	const std::string response = responseWith(token, "");   // and no expires_in
+	Capture           cap;
+	pdwitness::clear();
+	std::size_t heap = 0;
+	Outcome     out = Outcome::Failed;
+	{
+		AllocGuard g;
+		out = fetchOwnCode(lanes, TokenLane::Emergency, cfg, cache, kT0 + 2000, response, cap);
+		heap = g.delta();
+	}
+	EXPECT_EQ(out, Outcome::Installed) << "Telephony dropped the cached token when it granted this one: it is never kept over it";
+	EXPECT_EQ(heap, 0u);
+	EXPECT_NE(std::string(cache.bearer), cachedBearer);
+	EXPECT_EQ(std::string(cache.bearer), "Bearer " + token);
+	EXPECT_EQ(cache.lifetimeUs, telephony::kTokenShortFallbackLifetimeUs);
+	EXPECT_TRUE(cap.wsSet) << "and the WebSocket gets the new header";
+	EXPECT_EQ(pdwitness::count("token_fetch_failed_951"), 0u);
+	EXPECT_FALSE(cache.gate.installIfNewer(kT0 + 2000)) << "the newer install moved the stamp to its own issue time";
+	EXPECT_TRUE(cache.gate.installIfNewer(kT0 + 2001));
 }
 
 TEST(FetchTokenLifetime, ANumberTheScratchCutsThroughIsNeverReadAsIfItWereWhole)
@@ -669,31 +624,88 @@ TEST(FetchTokenLifetime, ANumberTheScratchCutsThroughIsNeverReadAsIfItWereWhole)
 	const std::string token = b64url("{\"alg\":\"none\"}") + "." + b64url(json) + ".sig";
 	const std::size_t cut = json.find("\"exp\":370") + std::strlen("\"exp\":370");
 	std::string       scratch(cut, '\0');
-	auto none = [] { return false; };
-	EXPECT_EQ(telephony::tokenLifetimeUs("{}", token, &scratch[0], cut, none), telephony::kTokenShortFallbackLifetimeUs)
-	    << "nothing readable: not 270 s";
-	EXPECT_EQ(telephony::tokenLifetimeUs("{\"expires_in\":900}", token, &scratch[0], cut, none), 900LL * 1000000);
+	const telephony::TokenLifetime cutRead = telephony::readTokenLifetime("{}", token, &scratch[0], cut);
+	EXPECT_EQ(cutRead.lifetimeUs, telephony::kTokenShortFallbackLifetimeUs) << "nothing readable: not 270 s";
+	EXPECT_EQ(cutRead.spanS, -1);
+	const telephony::TokenLifetime withExpiresIn = telephony::readTokenLifetime("{\"expires_in\":900}", token, &scratch[0], cut);
+	EXPECT_EQ(withExpiresIn.lifetimeUs, telephony::kTokenShortFallbackLifetimeUs) << "expires_in is not a lifetime";
+	EXPECT_EQ(withExpiresIn.expiresInS, 900) << "but it is read, for the witness";
 	// a scratch that holds both claims and the comma after them reads them
 	std::string wider(json.find("\"pad\""), '\0');
-	EXPECT_EQ(telephony::tokenLifetimeUs("{}", token, &wider[0], wider.size(), none), 3600LL * 1000000);
+	const telephony::TokenLifetime wide = telephony::readTokenLifetime("{}", token, &wider[0], wider.size());
+	EXPECT_EQ(wide.lifetimeUs, 3600LL * 1000000);
+	EXPECT_EQ(wide.spanS, 3600);
 }
 
 TEST(FetchTokenLifetime, ANormalSizePayloadIsReadAsBeforeIgnoresExpiresInAndAnUnparseableOneKeepsTheOldFallback)
 {
 	std::vector<char> scratch(4096);
-	int asked = 0;
-	auto cached = [&asked] { ++asked; return true; };
-	EXPECT_EQ(telephony::tokenLifetimeUs("{\"expires_in\":60}", makeToken(100), scratch.data(), scratch.size(), cached),
-	          3600LL * 1000000)
+	const telephony::TokenLifetime fits =
+	    telephony::readTokenLifetime("{\"expires_in\":60}", makeToken(100), scratch.data(), scratch.size());
+	EXPECT_EQ(fits.lifetimeUs, 3600LL * 1000000)
 	    << "Telephony reports expires_in:60 for a token that lives an hour: a payload that fits is not min()'d with it";
+	EXPECT_EQ(fits.spanS, 3600);
+	EXPECT_EQ(fits.expiresInS, 60);
 	// exp and iat missing from a payload that fits: the unchanged #945 fallback, tracked in #975
 	const std::string noClaims = b64url("{\"alg\":\"none\"}") + "." + b64url("{\"iss\":\"x\"}") + ".sig";
-	EXPECT_EQ(telephony::tokenLifetimeUs("{\"expires_in\":600}", noClaims, scratch.data(), scratch.size(), cached),
-	          telephony::kTokenFallbackLifetimeUs);
-	EXPECT_EQ(telephony::tokenLifetimeUs("{\"expires_in\":600}", "not-a-jwt", scratch.data(), scratch.size(), cached),
+	const telephony::TokenLifetime unparsed =
+	    telephony::readTokenLifetime("{\"expires_in\":600}", noClaims, scratch.data(), scratch.size());
+	EXPECT_EQ(unparsed.lifetimeUs, telephony::kTokenFallbackLifetimeUs);
+	EXPECT_EQ(unparsed.spanS, -1);
+	EXPECT_EQ(unparsed.expiresInS, 600);
+	EXPECT_EQ(telephony::readTokenLifetime("{}", "not-a-jwt", scratch.data(), scratch.size()).lifetimeUs,
 	          telephony::kTokenFallbackLifetimeUs);
 	EXPECT_EQ(telephony::kTokenFallbackLifetimeUs, 50LL * 60 * 1000000);
-	EXPECT_EQ(asked, 0);
+}
+
+// token_lifetime_fields_951: the bench's check of what expires_in really is (#951)
+
+TEST(FetchTokenLifetime, TheLifetimeFieldsWitnessLogsExpiresInTheSpanAndTheLifetimeUsedAsNumbersAndNothingElse)
+{
+	telephony::TokenLanes lanes;
+	std::vector<char>     scratch(4096);
+	const std::string     token = makeToken(100);
+	pdwitness::clear();
+	lanes.noteLifetimeFields(telephony::readTokenLifetime("{\"expires_in\":60}", token, scratch.data(), scratch.size()));
+	lanes.noteLifetimeFields(telephony::readTokenLifetime("{}", "not-a-jwt", scratch.data(), scratch.size()));
+	const std::string bigNeither = makeBigToken(2400, true);
+	char              small[256];
+	lanes.noteLifetimeFields(telephony::readTokenLifetime("{\"expires_in\":900}", bigNeither, small, sizeof small));
+	const auto lines = pdwitness::lines();
+	std::vector<std::string> fields;
+	for (const std::string& l : lines)
+		if (l.find("token_lifetime_fields_951") != std::string::npos) fields.push_back(l);
+	ASSERT_EQ(fields.size(), 3u);
+	EXPECT_EQ(fields[0], "anchor: token_lifetime_fields_951: expires_in=60 exp_minus_iat=3600 lifetime_used=3600 "
+	                     "(seconds; -1: not read) (#951)");
+	EXPECT_EQ(fields[1], "anchor: token_lifetime_fields_951: expires_in=-1 exp_minus_iat=-1 lifetime_used=3000 "
+	                     "(seconds; -1: not read) (#951)")
+	    << "nothing read: -1 twice, and the unparseable-JWT fallback (#975) as the lifetime";
+	EXPECT_EQ(fields[2], "anchor: token_lifetime_fields_951: expires_in=900 exp_minus_iat=-1 lifetime_used=300 "
+	                     "(seconds; -1: not read) (#951)")
+	    << "expires_in read and logged, not used";
+	for (const std::string& l : fields)
+	{
+		EXPECT_EQ(l.find(token.substr(0, 24)), std::string::npos) << "no token in it";
+		EXPECT_EQ(l.find(bigNeither.substr(0, 24)), std::string::npos);
+		EXPECT_EQ(l.find("Bearer"), std::string::npos);
+		EXPECT_EQ(l.find(kSecret), std::string::npos);
+	}
+}
+
+TEST(FetchTokenLifetime, TheLifetimeFieldsWitnessIsCappedAtEightPerBootAndLogsTheFirstEight)
+{
+	EXPECT_EQ(telephony::kLifetimeFieldsWitnessCap, 8u);
+	telephony::TokenLanes lanes;
+	pdwitness::clear();
+	for (int i = 0; i < 30; ++i)
+		lanes.noteLifetimeFields(telephony::TokenLifetime{(i + 1) * 1000000LL, i, i + 100});
+	EXPECT_EQ(pdwitness::count("token_lifetime_fields_951"), 8u);
+	EXPECT_EQ(pdwitness::count("expires_in=7 exp_minus_iat=107 lifetime_used=8 "), 1u) << "the eighth is the last";
+	EXPECT_EQ(pdwitness::count("expires_in=8 "), 0u) << "the ninth is not logged";
+	telephony::TokenLanes another;   // a boot is a client: a second one has its own eight
+	another.noteLifetimeFields(telephony::TokenLifetime{1000000, 0, 0});
+	EXPECT_EQ(pdwitness::count("token_lifetime_fields_951"), 9u);
 }
 
 // ── a short lifetime and the background refresh ─────────────────────────────────────────────────

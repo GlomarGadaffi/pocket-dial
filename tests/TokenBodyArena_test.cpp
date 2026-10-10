@@ -802,11 +802,11 @@ TEST(TokenLanes, TheThreeArenasAreTheWholeCost)
 	// "Three arenas of 4,096 B usable each" (ordinary, 911/933, background refresh): kTokenBodyBytes of
 	// body plus the byte that shows an overflow, and the flag and length beside it. Three of them is
 	// what the client carries, reserved with it, and a host's pointer-sized padding is the most the
-	// bound allows beyond the buffers. The four 32-bit counters beside them are the 16 bytes.
+	// bound allows beyond the buffers. The five 32-bit counters beside them (the fifth is #951's witness cap) and their padding are the 24 bytes.
 	EXPECT_GE(sizeof(Arena), kN + 1);
 	EXPECT_LE(sizeof(Arena), kN + 1 + 3 * sizeof(void*));
 	EXPECT_GE(sizeof(Lanes), 3 * sizeof(Arena));
-	EXPECT_LE(sizeof(Lanes), 3 * sizeof(Arena) + 16) << "three arenas and nothing that grows";
+	EXPECT_LE(sizeof(Lanes), 3 * sizeof(Arena) + 24) << "three arenas and nothing that grows";
 }
 
 // ── a 911/933 with a token POSTs at once; no token is the only reason to fetch first ─────
