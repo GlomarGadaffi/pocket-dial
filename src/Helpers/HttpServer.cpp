@@ -98,6 +98,103 @@
 #include "esp_pthread.h"
 #endif
 
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+// #410/#328, bench only (docs/BENCH_PROBE.md): the probes behind httpDramAccount's
+// "heap", "connCreate", "tasks", "tcp" and "memp" members. Device-side readers
+// here, the arithmetic and the JSON in HttpDramAccount.hpp (host-tested). On the
+// host they are no-ops and "memp" is null.
+#if defined(ESP_PLATFORM)
+#include "lwip/tcp.h"
+#include "lwip/stats.h"
+#include "lwip/priv/tcp_priv.h"      // tcp_active_pcbs
+#include "lwip/priv/tcpip_priv.h"    // tcpip_api_call(): run on the lwIP thread, with its lists stable
+#include "lwip/priv/memp_priv.h"     // memp_pools[]: element sizes
+
+[[maybe_unused]] static uint32_t pdDramInternalFree()
+{
+	return static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
+
+[[maybe_unused]] static void pdDramSampleHeap()
+{
+	httpdram::gProbes.sampleHeap(pdDramInternalFree(),
+		static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+		static_cast<uint32_t>(uxTaskGetNumberOfTasks()));
+}
+
+// Called right after the connection thread was created: the internal bytes it cost.
+[[maybe_unused]] static void pdDramConnCreated(uint32_t freeBefore)
+{
+	httpdram::gProbes.connCreated(freeBefore, pdDramInternalFree());
+}
+
+namespace
+{
+	struct PdDramTcpWalk
+	{
+		tcpip_api_call_data call{};   // first: the callback gets &call back
+		uint16_t httpPort = 0;
+		httpdram::TcpSnapshot snap{};
+	};
+
+	err_t pdDramTcpWalk(tcpip_api_call_data* c)
+	{
+		PdDramTcpWalk* w = reinterpret_cast<PdDramTcpWalk*>(c);
+		for (const tcp_pcb* p = tcp_active_pcbs; p != nullptr; p = p->next)
+			httpdram::addPcb(w->snap, p->local_port == w->httpPort, TCP_SND_BUF, tcp_sndbuf(p), tcp_sndqueuelen(p));
+		return ERR_OK;
+	}
+}
+
+// What every TCP send queue holds right now (written, not yet acknowledged), read on
+// the lwIP thread. Needs no lwIP statistics.
+[[maybe_unused]] static void pdDramSampleTcp(uint16_t httpPort)
+{
+	PdDramTcpWalk w{};
+	w.httpPort = httpPort;
+	if (tcpip_api_call(pdDramTcpWalk, &w.call) == ERR_OK) httpdram::gProbes.sampleTcp(w.snap);
+}
+
+// ,"memp":[...] -- lwIP's own pool counters; null unless the image was built with
+// LWIP_STATS and MEMP_STATS (sdkconfig.defaults.accounting and main/CMakeLists.txt).
+template <class Out> [[maybe_unused]] static void pdDramWriteMemp(Out& json)
+{
+#if LWIP_STATS && MEMP_STATS
+	json.s(",\"memp\":[");
+	bool first = true;
+	for (int i = 0; i < MEMP_MAX; ++i)
+	{
+		const struct stats_mem* m = lwip_stats.memp[i];
+		if (m == nullptr || (m->max == 0 && m->err == 0)) continue;   // a pool never drawn from
+		if (!first) json.s(",");
+		first = false;
+#if LWIP_STATS_DISPLAY
+		const char* name = m->name;
+#else
+		const char* name = "pool";
+#endif
+		httpdram::writeMempRow(json, httpdram::MempRow{ name, static_cast<uint32_t>(m->used),
+			static_cast<uint32_t>(m->max), static_cast<uint32_t>(m->err), static_cast<uint32_t>(memp_pools[i]->size) });
+	}
+	json.s("]");
+#else
+	json.s(",\"memp\":null");
+#endif
+}
+#else   // host: nothing to read
+[[maybe_unused]] static uint32_t pdDramInternalFree() { return 0; }
+[[maybe_unused]] static void pdDramSampleHeap() {}
+[[maybe_unused]] static void pdDramConnCreated(uint32_t) {}
+[[maybe_unused]] static void pdDramSampleTcp(uint16_t) {}
+template <class Out> [[maybe_unused]] static void pdDramWriteMemp(Out& json) { json.s(",\"memp\":null"); }
+#endif
+[[maybe_unused]] static void pdDramSampleProbes(uint16_t httpPort)
+{
+	pdDramSampleHeap();
+	pdDramSampleTcp(httpPort);
+}
+#endif   // POCKETDIAL_HTTP_DRAM_ACCOUNT
+
 // Forward declarations for the file-local form/URL helpers (defined lower down).
 // sendApiDnd() and sendApiKill() use getFormParam() but are defined earlier in
 // this TU — this declaration is what lets them, so no reordering is needed.
@@ -427,9 +524,19 @@ void HttpServer::acceptLoop()
 
 		timeval tv{};
 		tv.tv_sec = 0;
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+		// Bench only: sample the lwIP send queues and the heap on this thread, 50 times a
+		// second, while the connections run. They are NOT read on the http_conn threads: a
+		// route can be down to ~470 B of their 4096 B stack (#405) and the lwIP call needs more.
+		tv.tv_usec = 20000;
+#else
 		tv.tv_usec = 250000; // 250ms timeout
+#endif
 
 		int activity = select(_listenSock + 1, &readfds, nullptr, nullptr, &tv);
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+		pdDramSampleProbes(static_cast<uint16_t>(_port));
+#endif
 		if (activity < 0)
 		{
 			if (!_running) break;
@@ -525,6 +632,7 @@ void HttpServer::acceptLoop()
 		_activeConnections.fetch_add(1, std::memory_order_acq_rel);
 #if POCKETDIAL_HTTP_DRAM_ACCOUNT
 		httpdram::gAccount.opened(kHttpConnStackBytes);   // the stack exists from pthread_create on
+		const uint32_t dramFreeBeforeThread = pdDramInternalFree();
 #endif
 
 		try
@@ -537,6 +645,9 @@ void HttpServer::acceptLoop()
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 				if (_afterCloseHookForTest) _afterCloseHookForTest();
 #endif
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+				pdDramSampleHeap();   // the heap as this connection ends, its stack not yet reaped
+#endif
 				finishConnSlot(connIdx);
 #if POCKETDIAL_HTTP_DRAM_ACCOUNT
 				// Before the decrement below: once it lands the server may be destroyed.
@@ -546,6 +657,10 @@ void HttpServer::acceptLoop()
 #endif
 				_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			}).detach();
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+			pdDramConnCreated(dramFreeBeforeThread);   // what the thread cost beyond kHttpConnStackBytes
+			pdDramSampleHeap();
+#endif
 		}
 		catch (const std::exception& e)
 		{
@@ -2729,7 +2844,15 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	    .s(",\"dynamicTaskCreates\":").n(psram::dynamicTaskCreates().load(std::memory_order_relaxed))   // #479
 	    .s("}");
 #if POCKETDIAL_HTTP_DRAM_ACCOUNT
-	httpdram::gAccount.writeJson(json);   // #410/#328, bench only: docs/BENCH_PROBE.md
+	// #410/#328, bench only: docs/BENCH_PROBE.md. The probes' members go inside the
+	// httpDramAccount object, so the top-level key list is still main's plus that one.
+	// The heap is read here, beside the other heap figures of this route; the lwIP
+	// queues were read by the accept thread (acceptLoop()), at most 20 ms ago.
+	pdDramSampleHeap();
+	httpdram::gAccount.writeJson(json, [](auto& o) {
+		httpdram::gProbes.writeJson(o);
+		pdDramWriteMemp(o);
+	});
 #endif
 
 	json.s("}");
