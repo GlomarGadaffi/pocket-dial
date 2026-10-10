@@ -1,2 +1,2 @@
-# HttpReadBuf_test.cpp: 5 tests (#410/#328, the read buffer reserved per slot in PSRAM)
-5
+# HttpReadBuf_test.cpp: 6 tests (#410/#328, the read buffer reserved per slot in PSRAM; the no-heap 503)
+6

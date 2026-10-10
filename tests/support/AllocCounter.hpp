@@ -76,4 +76,18 @@ private:
 	std::size_t _start = 0;
 };
 
+// Makes the next `times` operator new calls of exactly `bytes` on the calling
+// thread throw std::bad_alloc (the nothrow forms then return nullptr: libstdc++
+// builds them on the throwing one). `times` 0 disarms.
+void failAllocOfSize(std::size_t bytes, int times);
+
+class FailAllocGuard
+{
+public:
+	explicit FailAllocGuard(std::size_t bytes, int times = 1) { failAllocOfSize(bytes, times); }
+	~FailAllocGuard() { failAllocOfSize(0, 0); }
+	FailAllocGuard(const FailAllocGuard&) = delete;
+	FailAllocGuard& operator=(const FailAllocGuard&) = delete;
+};
+
 #endif

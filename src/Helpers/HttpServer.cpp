@@ -59,6 +59,8 @@
 #include <cstdio>        // snprintf: sendStaticHtml's allocation-free head (#410)
 #include <cstdlib>
 #include <mutex>
+#include <memory>        // unique_ptr<char[]>: the per-request read buffer fallback (#410)
+#include <new>           // std::nothrow
 #include <cstring>
 #include <charconv>   // std::to_chars: /api/status numbers, no heap (#410)
 #include <string_view>
@@ -745,13 +747,25 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 	// into it, and it is never a flash-write source (OTA/MoH uploads are handed `raw`,
 	// a copy). With no slot buffer (a build without PSRAM, or the constructor's
 	// allocation failed) the request takes one from the heap, as it always did, and
-	// counts a PSRAM fallback where PSRAM was expected.
-	std::vector<char> heapBuf;   // empty, no allocation, unless the fallback below is taken
+	// counts a PSRAM fallback where PSRAM was expected. If the heap has none either
+	// the request is refused with a 503, counted like the accept loop's refusals;
+	// nothing here may throw on this detached thread.
+	std::unique_ptr<char[]> heapBuf;   // owns the fallback buffer, if one is taken
 	char* buf = readBuf;
 	if (buf == nullptr)
 	{
-		heapBuf.resize(kReadBufBytes);   // zero-filled
-		buf = heapBuf.data();
+		heapBuf.reset(new (std::nothrow) char[kReadBufBytes]());   // zero-filled
+		buf = heapBuf.get();
+		if (buf == nullptr)
+		{
+			const uint32_t n = _busyRefusals.fetch_add(1, std::memory_order_relaxed) + 1;
+			if ((n & (n - 1)) == 0)
+				std::cerr << "[HttpServer] 503 busy: no read buffer (" << n << " refused so far)\n";
+			sendResponse(clientSock, 503, "Service Unavailable", "application/json",
+			             "{\"error\":\"busy\",\"message\":\"no read buffer\"}");
+			closeSocket(clientSock);
+			return;
+		}
 		if (kReadBufReserved) psram::internalFallbacks().fetch_add(1, std::memory_order_relaxed);
 	}
 	else

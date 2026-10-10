@@ -229,6 +229,7 @@ public:
 	// the slot null, so a test can drive the per-request heap fallback.
 	const char* readBufForTest(int slot) const { return _readBuf[slot]; }
 	void dropReadBufForTest(int slot);
+	uint32_t busyRefusalsForTest() const { return _busyRefusals.load(std::memory_order_relaxed); }
 	// #871: runs on each handler thread after its socket is closed and before
 	// its slot is freed, so a test can hold threads in that window. Set before start().
 	void setAfterCloseHookForTest(std::function<void()> f) { _afterCloseHookForTest = std::move(f); }

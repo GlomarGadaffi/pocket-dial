@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <thread>
 
@@ -48,11 +49,29 @@ namespace
 			char buf[1024];
 			for (ssize_t n; (n = ::recv(sv[1], buf, sizeof(buf), 0)) > 0;) got.append(buf, static_cast<size_t>(n));
 		});
-		server.handleClientForTest(sv[0]);   // closes sv[0] itself
+		std::exception_ptr thrown;   // a throwing handler must not leave `reader` joinable (terminate)
+		try
+		{
+			server.handleClientForTest(sv[0]);   // closes sv[0] itself
+		}
+		catch (...)
+		{
+			thrown = std::current_exception();
+			::close(sv[0]);
+		}
 		reader.join();
 		::close(sv[1]);
+		if (thrown) std::rethrow_exception(thrown);
 		return got;
 	}
+
+	// psram::internalFallbacks() is process-wide and reads 0 on the host for the
+	// other tests: put it back.
+	struct RestoreFallbackCounter
+	{
+		uint32_t v = psram::internalFallbacks().load();
+		~RestoreFallbackCounter() { psram::internalFallbacks().store(v); }
+	};
 }
 
 TEST(HttpReadBuf, OneBufferPerConnectionSlotIsAllocatedAtConstruction)
@@ -129,11 +148,7 @@ TEST(HttpReadBuf, AConnectionFromTheAcceptLoopReadsIntoOneSlotBuffer)
 
 TEST(HttpReadBuf, ASlotWithNoBufferTakesAHeapBufferAndCountsAPsramFallback)
 {
-	struct RestoreCounter   // process-wide: other tests read it as 0 on the host
-	{
-		uint32_t v = psram::internalFallbacks().load();
-		~RestoreCounter() { psram::internalFallbacks().store(v); }
-	} restoreCounter;
+	RestoreFallbackCounter restore;
 	HttpServer server("127.0.0.1", 0, nullptr);
 	server.dropReadBufForTest(0);                 // what a failed allocation at boot leaves
 	ASSERT_NE(server.readBufForTest(1), nullptr);   // the other slots are untouched
@@ -144,6 +159,33 @@ TEST(HttpReadBuf, ASlotWithNoBufferTakesAHeapBufferAndCountsAPsramFallback)
 	const std::string resp = serveOne(server, kNotFound);
 	EXPECT_EQ(resp.rfind("HTTP/1.1 404", 0), 0u) << resp.substr(0, 200);
 	EXPECT_EQ(g.delta(), 1u) << "the fallback is one 4096-byte heap buffer for the request";
+	EXPECT_EQ(psram::internalFallbacks().load() - fallbacks, 1u);
+}
+
+TEST(HttpReadBuf, ASlotWithNoBufferAndNoHeapAnswers503WithoutThrowingAndTheServerCarriesOn)
+{
+	// handleClient() runs on a detached thread: a bad_alloc out of the fallback
+	// buffer would reach std::terminate and reboot the board. The same path serves a
+	// build without PSRAM, where every request takes the heap buffer.
+	RestoreFallbackCounter restore;
+	HttpServer server("127.0.0.1", 0, nullptr);
+	server.dropReadBufForTest(0);
+	serveOne(server, kNotFound);                  // warm-up
+	const uint32_t fallbacks = psram::internalFallbacks().load();
+	const uint32_t refusals = server.busyRefusalsForTest();
+
+	std::string refused;
+	{
+		FailAllocGuard noHeap(kBufBytes);         // the heap has no 4096 bytes for this request
+		EXPECT_NO_THROW(refused = serveOne(server, kNotFound));
+	}
+	EXPECT_EQ(refused.rfind("HTTP/1.1 503", 0), 0u) << refused.substr(0, 200);
+	EXPECT_NE(refused.find("\"error\":\"busy\""), std::string::npos) << refused;
+	EXPECT_EQ(server.busyRefusalsForTest() - refusals, 1u) << "counted with the accept loop's 503s";
+	EXPECT_EQ(psram::internalFallbacks().load(), fallbacks) << "a refusal held no buffer, so it is no fallback";
+
+	const std::string next = serveOne(server, kNotFound);   // the server is still up
+	EXPECT_EQ(next.rfind("HTTP/1.1 404", 0), 0u) << next.substr(0, 200);
 	EXPECT_EQ(psram::internalFallbacks().load() - fallbacks, 1u);
 }
 

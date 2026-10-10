@@ -24,6 +24,9 @@ namespace
 	std::atomic<std::size_t> g_watchedSize{0};
 	thread_local std::size_t t_watchedAllocs = 0;
 
+	thread_local std::size_t t_failSize = 0;
+	thread_local int t_failLeft = 0;
+
 	void count(std::size_t bytes)
 	{
 		g_allocs.fetch_add(1, std::memory_order_relaxed);
@@ -101,11 +104,21 @@ std::size_t heapLiveBytes() { return g_liveBytes.load(std::memory_order_relaxed)
 bool heapLiveTracked() { return kLiveTracked; }
 void watchAllocSize(std::size_t bytes) { g_watchedSize.store(bytes, std::memory_order_relaxed); }
 std::size_t threadWatchedAllocCount() { return t_watchedAllocs; }
+void failAllocOfSize(std::size_t bytes, int times)
+{
+	t_failSize = bytes;
+	t_failLeft = times;
+}
 
 // The nothrow forms are not replaced: the standard library implements them by
 // calling these, so they are counted through here.
 void* operator new(std::size_t n)
 {
+	if (t_failLeft > 0 && n == t_failSize)
+	{
+		--t_failLeft;
+		throw std::bad_alloc();
+	}
 	count(n);
 	if (void* p = std::malloc(n ? n : 1))
 	{
