@@ -9,20 +9,26 @@
 //   a failed allocation, a failed or short read, or a body that does not fit the arena is an
 //   error, never partial data. Truncating into a fixed buffer is rejected: a truncated
 //   participant list can silently mis-decide the 911's own leg. The caller then takes the
-//   conservative route (it never assumes its own leg answered) and the call is not refused.
-//   Not covered, and the one documented exemption from #427 for this GET: the cJSON parse the
-//   callers run on the body and the std::string the body is handed back in.
+//   conservative route: it never assumes its own leg answered. The std::string the body is
+//   handed back in allocates under a std::bad_alloc catch, so that too is an error and not a
+//   terminate (exceptions are on, sdkconfig.defaults). The documented exemption from #427 for
+//   this GET is what the callers do with the body: the cJSON parse (a NULL return is "no
+//   list", the same conservative route) and their own std::string work.
 //
 //   Bounded claim. The handle is owned through a lock-free claim, never a mutex held across
-//   socket I/O. Nothing on the 911 path spins on it: the GET takes the fallback at once, and
+//   socket I/O. Nothing on the 911 path waits for it: the GET takes the fallback at once, and
 //   teardown waits at most kSosClaimBoundUs.
+//
+//   A 911/933 whose list reads all fail (#349 window) proceeds with no own leg; see unreadOutcome.
 
 #include <atomic>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <new>
 #include <string>
 
+#include "TelephonyAnchorLogic.hpp"
 #include "Witness.hpp"
 
 namespace telephony
@@ -97,6 +103,7 @@ enum class BodyRead : uint8_t
 	ReadError,   // the transport failed
 	Short,       // the body ended before the response said it was complete
 	TooBig,      // more body than the arena holds
+	AllocFailed, // the std::string the body is handed back in could not allocate
 };
 
 inline const char* bodyReadName(BodyRead r)
@@ -108,6 +115,7 @@ inline const char* bodyReadName(BodyRead r)
 		case BodyRead::ReadError: return "read error";
 		case BodyRead::Short:     return "short read";
 		case BodyRead::TooBig:    return "body over the arena";
+		case BodyRead::AllocFailed: return "allocation failed";
 	}
 	return "?";
 }
@@ -120,8 +128,12 @@ inline const char* bodyReadName(BodyRead r)
 // Ok: out holds the whole body. Anything else: out is empty, whatever was read before the
 // failure is never shown. Each call starts at zero, so a retry cannot glue its bytes onto an
 // earlier attempt's.
-template <class ReadFn, class CompleteFn>
-BodyRead readSosBody(const BodyArena& arena, ReadFn&& read, CompleteFn&& complete, std::string& out)
+//
+// Out is a std::string; it is a template parameter only so a test can hand in one whose assign
+// throws std::bad_alloc, which a real heap cannot be made to do on demand. The hand-back is the
+// one allocation here: a throw is caught, out is left empty, the result is AllocFailed.
+template <class ReadFn, class CompleteFn, class Out>
+BodyRead readSosBody(const BodyArena& arena, ReadFn&& read, CompleteFn&& complete, Out& out)
 {
 	out.clear();
 	char* const buf = arena.data();
@@ -146,7 +158,15 @@ BodyRead readSosBody(const BodyArena& arena, ReadFn&& read, CompleteFn&& complet
 		len += static_cast<std::size_t>(n);
 	}
 	if (!complete()) return BodyRead::Short;
-	out.assign(buf, len);
+	try
+	{
+		out.assign(buf, len);
+	}
+	catch (const std::bad_alloc&)
+	{
+		out.clear();
+		return BodyRead::AllocFailed;
+	}
 	return BodyRead::Ok;
 }
 
@@ -155,6 +175,10 @@ BodyRead readSosBody(const BodyArena& arena, ReadFn&& read, CompleteFn&& complet
 // 10 ms is the ruling's ceiling for closeSosStatusClient(). A pause is taken only while a whole
 // tick still fits, so 8 ms leaves one tick of overshoot and the scheduler's slack under it.
 inline constexpr int64_t kSosClaimBoundUs = 8'000;
+
+// What a 911/933 status GET waits for a claim another 911's GET holds: nothing. Rule 5: a 911 is
+// never delayed. It takes the fallback (no status read, proceed with no own leg) at once.
+inline constexpr int64_t kSosGetClaimBoundUs = 0;
 
 // Take the flag, pausing between tries while another whole step still fits in boundUs.
 // False: held by someone else. nowUs() is a microsecond clock; pause() sleeps one step.
@@ -240,6 +264,48 @@ bool closeWithinBound(std::atomic<bool>& flag, int64_t stepUs, NowFn&& nowUs, Pa
 	}
 	freeAll();
 	return true;
+}
+
+// ── The #349 window ──────────────────────────────────────────────────────────
+
+// makeCall(): the makecall POST reached 3CX and no response was read. The participant list is
+// read every kUnreadAdoptPollMs until it shows our leg or the window closes (unreadMakecallStep).
+// readOnce() is one resolveOutboundLeg() read: the leg id, or "" when the read failed or the list
+// shows none. keepGoing() is false once the anchor is stopping. onReread(reads) logs.
+struct UnreadWindow
+{
+	std::string ownLeg;
+	int         reads = 0;
+};
+
+template <class ReadFn, class NowFn, class KeepFn, class RereadFn, class PauseFn>
+UnreadWindow readOwnLegWindow(ReadFn&& readOnce, NowFn&& nowUs, KeepFn&& keepGoing, RereadFn&& onReread, PauseFn&& pause)
+{
+	UnreadWindow w;
+	const int64_t startUs = nowUs();
+	for (;;)
+	{
+		w.ownLeg = readOnce();
+		++w.reads;
+		if (unreadMakecallStep(!w.ownLeg.empty(), nowUs() - startUs) != UnreadMakecallStep::ReadAgain || !keepGoing())
+			break;
+		onReread(w.reads);
+		pause();
+	}
+	return w;
+}
+
+// What makeCall() does when that window ends. Adopt: a leg was listed. Otherwise a 911/933 (the
+// operator's #948 ruling) proceeds with no own leg, as the normal path does when it cannot
+// resolve one: reconcile does the teardown and the call is not refused with a 503. Any other call
+// is still refused. A read that failed (a list over the arena, a short read, the claim held by an
+// overlapping 911) is a read that showed no leg.
+enum class UnreadOutcome : uint8_t { Adopt, Proceed, Fail };
+
+inline UnreadOutcome unreadOutcome(bool legFound, bool sosLane)
+{
+	if (legFound) return UnreadOutcome::Adopt;
+	return sosLane ? UnreadOutcome::Proceed : UnreadOutcome::Fail;
 }
 
 }  // namespace telephony

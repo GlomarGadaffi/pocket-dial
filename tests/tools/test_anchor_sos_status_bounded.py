@@ -48,6 +48,7 @@ class AnchorSosStatusBoundedTest(unittest.TestCase):
         self.assertTrue(ok_at < self.sos_read.index("*statusOut") < log_at)
         self.assertRegex(self.sos_read, r"rd == telephony::BodyRead::TooBig[^;]*\)\s*break;",
                          "an oversize body is not retried: the same body would not fit again")
+        self.assertIn("rd == telephony::BodyRead::AllocFailed", self.sos_read, "nor is a failed hand-back allocation")
         self.assertNotIn("bodyOut.assign", self.sos_read, "the helper assigns bodyOut, on Ok only")
         # the other failures rebuild the handle and retry once, as before
         self.assertRegex(self.sos_read, r"esp_http_client_cleanup\(client\);\s*client = nullptr;\s*continue;")
@@ -70,11 +71,36 @@ class AnchorSosStatusBoundedTest(unittest.TestCase):
     def test_the_911_get_never_waits_for_the_claim(self):
         self.assertRegex(
             self.get_body,
-            r"SosStatusClaim sosClaim\(sosLane \? &_sosStatusBusy : nullptr, /\*boundUs=\*/0,[^;]*\);\s*"
+            r"SosStatusClaim sosClaim\(sosLane \? &_sosStatusBusy : nullptr, telephony::kSosGetClaimBoundUs,[^;]*\);\s*"
             r"if \(!sosClaim\.held\(\)\)\s*\{\s*_sosWitness\.note\(telephony::SosFallback::Get\);\s*return false;")
         self.assertNotIn("flag->exchange(true", code_only(self.src), "no claim spin is left in the anchor client")
         self.assertNotIn("struct SosStatusClaim", self.src)
         self.assertNotIn("vTaskDelay(1)", self.get_body)
+        self.assertRegex(code_only(self.sos_hpp), r"kSosGetClaimBoundUs\s*=\s*0;", "a 911 waits for nothing")
+
+    def test_a_bad_alloc_anywhere_in_the_911_get_is_an_error_not_a_terminate(self):
+        sig = "bool TelephonyAnchorClient::httpGetBody("
+        start = self.src.rindex(sig)
+        body = body_of(self.src, sig)
+        body_at = self.src.index(body, start)
+        self.assertRegex(self.src[start + len(sig):body_at], r"\)\s*try\s*$", "a function-try-block")
+        tail = self.src[body_at + len(body):]
+        handler = code_only(tail[:tail.index("\n}\n")])
+        self.assertRegex(handler, r"^\s*catch \(const std::bad_alloc&\)\s*\{")
+        for needle in ("if (!sosLane) throw;", "bodyOut.clear();", "if (statusOut) *statusOut = -1;", "return false;"):
+            self.assertIn(needle, handler)
+        self.assertIn("catch (const std::bad_alloc&)", code_only(self.sos_hpp), "the hand-back assign has its own catch")
+
+    def test_a_911_whose_list_reads_all_fail_proceeds_with_no_own_leg(self):
+        make = code_only(body_of(self.src, "bool TelephonyAnchorClient::makeCall("))
+        self.assertIn("telephony::readOwnLegWindow(", make)
+        self.assertNotIn("unreadMakecallStep(", make, "the window loop lives in the host-tested helper")
+        self.assertIn("telephony::unreadOutcome(!ownLeg.empty(), sosLane)", make)
+        m = re.search(r"else if \(outcome == telephony::UnreadOutcome::Proceed\)\s*\{(.*?)\n\t\t\}", make, re.S)
+        self.assertIsNotNone(m, "the sos lane's own branch")
+        self.assertIn("success = true;", m.group(1))
+        self.assertNotIn("return false", m.group(1))
+        self.assertIn("ORPHANED on 3CX (#349/#328)", make, "other callers keep the refusal")
 
     def test_teardown_is_bounded_at_ten_ms_with_a_fallback(self):
         close = code_only(body_of(self.src, "void TelephonyAnchorClient::closeSosStatusClient("))

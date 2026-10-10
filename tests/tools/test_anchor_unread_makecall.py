@@ -23,8 +23,12 @@ class AnchorUnreadMakecallTest(unittest.TestCase):
         self.unread = self.make[start:end]
 
     def test_the_list_is_read_until_the_pure_decision_stops(self):
-        self.assertIn("telephony::unreadMakecallStep(", self.unread,
-                      "the unread branch must ask unreadMakecallStep(), not stop on the first list answer")
+        # #948: the window loop moved into telephony::readOwnLegWindow (SosStatusGet.hpp, host-tested
+        # by SosStatusGet_test.cpp), which is where unreadMakecallStep() is asked.
+        self.assertIn("telephony::readOwnLegWindow(", self.unread,
+                      "the unread branch must run the window, not stop on the first list answer")
+        self.assertIn("unreadMakecallStep(", body_of(read("SosStatusGet.hpp"), "UnreadWindow readOwnLegWindow("),
+                      "the window asks unreadMakecallStep()")
         self.assertNotIn("kReconcileAttempts", self.unread, "a fixed attempt count does not bound the window")
         self.assertIn("telephony::kUnreadAdoptPollMs", self.unread)
 

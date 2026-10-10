@@ -525,25 +525,26 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		// another slot claimed). A read that shows no leg is read again until the
 		// window closes (telephony::unreadMakecallStep): on .244 3CX had placed the
 		// call and one such read was taken as "no call".
-		const int64_t readsStartUs = esp_timer_get_time();
-		int reads = 0;
 		int listStatus = 0;
 		telephony::ListLegCounts counts;
-		for (;;)
-		{
-			ownLeg = resolveOutboundLeg(std::string(), destination, &listStatus, &ownLegSource, &counts, /*skipOurs=*/true);
-			++reads;
-			const telephony::UnreadMakecallStep step =
-				telephony::unreadMakecallStep(!ownLeg.empty(), esp_timer_get_time() - readsStartUs);
-			if (step != telephony::UnreadMakecallStep::ReadAgain || !_running.load(std::memory_order_acquire)) break;
-			ESP_LOGW(TAG, "makeCall: no leg listed yet (list status=%d, read %d: %d listed, %d direct_control, "
-				"%d slot-claimed, %d an earlier call's; direct_control false %d, absent %d, not a bool %d) "
-				"— reading again (#349)", listStatus, reads, counts.listed, counts.controllable, counts.claimed,
-				counts.oursAlready, counts.dcFalse, counts.dcAbsent, counts.dcNotBool);
-			vTaskDelay(pdMS_TO_TICKS(telephony::kUnreadAdoptPollMs));
-		}
+		const telephony::UnreadWindow window = telephony::readOwnLegWindow(
+			[&] { return resolveOutboundLeg(std::string(), destination, &listStatus, &ownLegSource, &counts, /*skipOurs=*/true); },
+			[] { return esp_timer_get_time(); },
+			[this] { return _running.load(std::memory_order_acquire); },
+			[&](int readNo) {
+				ESP_LOGW(TAG, "makeCall: no leg listed yet (list status=%d, read %d: %d listed, %d direct_control, "
+					"%d slot-claimed, %d an earlier call's; direct_control false %d, absent %d, not a bool %d) "
+					"— reading again (#349)", listStatus, readNo, counts.listed, counts.controllable, counts.claimed,
+					counts.oursAlready, counts.dcFalse, counts.dcAbsent, counts.dcNotBool);
+			},
+			[] { vTaskDelay(pdMS_TO_TICKS(telephony::kUnreadAdoptPollMs)); });
+		ownLeg = window.ownLeg;
+		const int reads = window.reads;
 
-		if (!ownLeg.empty())
+		// #948 (operator ruling): a 911/933 whose list reads all failed is not refused, however they
+		// failed (a list over the sos arena, a short read, the claim held by an overlapping 911).
+		const telephony::UnreadOutcome outcome = telephony::unreadOutcome(!ownLeg.empty(), sosLane);
+		if (outcome == telephony::UnreadOutcome::Adopt)
 		{
 			// More than one candidate on that read: the pick may be an unrelated inbound leg.
 			ESP_LOGW(TAG, "makeCall: no response read (status=%d) but 3CX has our leg %s — "
@@ -551,6 +552,19 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 				status, ownLeg.c_str(), counts.candidates, reads);
 			ownLegSource = telephony::OwnLegSource::AdoptedAfterUnreadResponse;
 			adopted = true;
+			success = true;
+		}
+		else if (outcome == telephony::UnreadOutcome::Proceed)
+		{
+			// Same as the normal path when it cannot resolve the leg (below: "teardown will rely on
+			// reconcile"): ownLeg stays empty, no slot is keyed, the 911 goes on. Loud, because 3CX may
+			// hold a leg we cannot see; reconcile tears it down. The phantom-inbound hazard above
+			// applies to that leg as it does on the normal path.
+			ESP_LOGE(TAG, "makeCall: 911/933 request reached 3CX but no response and no reconcilable "
+				"leg after %d attempts (last list status=%d: %d listed, %d direct_control, %d slot-claimed, "
+				"%d an earlier call's; direct_control false %d, absent %d, not a bool %d) — "
+				"proceeding without an own leg, reconcile tears down (#948)", reads, listStatus, counts.listed,
+				counts.controllable, counts.claimed, counts.oursAlready, counts.dcFalse, counts.dcAbsent, counts.dcNotBool);
 			success = true;
 		}
 		else
@@ -1266,6 +1280,7 @@ void sosPause() { vTaskDelay(1); }
 // #941 (Rule 5): sosLane (an emergency makeCall's GET) drives _sosStatusClient instead and never
 // touches _statusMutex, so a 911/933 cannot wait behind another task's status GET.
 bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut, bool sosLane)
+try
 {
 	if (statusOut) *statusOut = -1;
 	bodyOut.clear();
@@ -1284,8 +1299,8 @@ bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bod
 	if (!sosLane) statusLock.lock();
 	// #948 (Rule 5): the 911 lane never waits for its claim. Held by another GET or by teardown:
 	// no status read, an error, and makeCall() takes the conservative route (it never assumes its
-	// own leg answered); the call itself is not refused.
-	telephony::SosStatusClaim sosClaim(sosLane ? &_sosStatusBusy : nullptr, /*boundUs=*/0, kSosTickUs, sosNowUs, sosPause);
+	// own leg answered); a 911/933 goes on with no own leg and is not refused.
+	telephony::SosStatusClaim sosClaim(sosLane ? &_sosStatusBusy : nullptr, telephony::kSosGetClaimBoundUs, kSosTickUs, sosNowUs, sosPause);
 	if (!sosClaim.held())
 	{
 		_sosWitness.note(telephony::SosFallback::Get);
@@ -1352,7 +1367,8 @@ bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bod
 				ESP_LOGE(TAG, "httpGetBody: sos status GET %s (status=%d), no status read (#948)",
 				         telephony::bodyReadName(rd), status);
 				// Not transient: the same body would not fit again, and a missing arena stays missing.
-				if (rd == telephony::BodyRead::TooBig || rd == telephony::BodyRead::NoArena) break;
+				if (rd == telephony::BodyRead::TooBig || rd == telephony::BodyRead::NoArena ||
+				    rd == telephony::BodyRead::AllocFailed) break;
 				esp_http_client_cleanup(client);
 				client = nullptr;
 				continue;
@@ -1394,6 +1410,18 @@ bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bod
 	}
 
 	return ok;
+}
+catch (const std::bad_alloc&)
+{
+	// #948: an exhausted heap in a 911 status GET is an error, not a terminate (exceptions are on).
+	// The claim and the locks were released as the frame unwound, and no connection is left open: the
+	// hand-back inside readSosBody has its own catch, so the close after it ran. The ordinary lane
+	// is unchanged: it still propagates.
+	if (!sosLane) throw;
+	bodyOut.clear();
+	if (statusOut) *statusOut = -1;
+	ESP_LOGE(TAG, "httpGetBody: sos status GET out of memory, no status read (#948)");
+	return false;
 }
 
 // POST with a body and return the response body (and HTTP status). Mirrors httpGetBody but for the

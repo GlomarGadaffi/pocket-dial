@@ -60,11 +60,28 @@ std::string patternBody(std::size_t n)
 	return s;
 }
 
-BodyRead readAll(const BodyArena& arena, ScriptedRead& src, std::string& out)
+template <class Out>
+BodyRead readAll(const BodyArena& arena, ScriptedRead& src, Out& out)
 {
 	return readSosBody(
 		arena, [&](char* p, int n) { return src.read(p, n); }, [&] { return src.complete(); }, out);
 }
+
+// A string whose assign throws std::bad_alloc: a real heap cannot be made to fail on demand.
+struct ThrowingString
+{
+	std::string value = "stale";
+	bool        throwOnAssign = true;
+	int         assigns = 0;
+
+	void clear() { value.clear(); }
+	void assign(const char* p, std::size_t n)
+	{
+		++assigns;
+		if (throwOnAssign) throw std::bad_alloc();
+		value.assign(p, n);
+	}
+};
 
 bool reserveReal(BodyArena& a, std::size_t cap)
 {
@@ -224,6 +241,55 @@ TEST(SosStatusBody, AFullListOfTheLargestParticipantsFitsTheArena)
 	EXPECT_EQ(out, list);
 }
 
+TEST(SosStatusBody, AFailedHandBackAllocationIsAnErrorNotAnEscapingException)
+{
+	// An exhausted heap during a 911 status GET must come back as an error. Uncaught, the
+	// std::bad_alloc from the hand-back string is std::terminate on the 911's task.
+	BodyArena arena;
+	ASSERT_TRUE(reserveReal(arena, 4096));
+	ScriptedRead src;
+	src.body = patternBody(300);
+
+	ThrowingString out;
+	BodyRead r = BodyRead::Ok;
+	EXPECT_NO_THROW(r = readAll(arena, src, out));
+	EXPECT_EQ(r, BodyRead::AllocFailed);
+	EXPECT_EQ(out.assigns, 1);
+	EXPECT_TRUE(out.value.empty()) << "no body, partial or otherwise";
+
+	// the arena is intact: the next attempt, with memory back, reads the whole body
+	out.throwOnAssign = false;
+	ScriptedRead again;
+	again.body = patternBody(300);
+	EXPECT_EQ(readAll(arena, again, out), BodyRead::Ok);
+	EXPECT_EQ(out.value, again.body);
+}
+
+TEST(SosStatusBody, TheOtherErrorsNeverReachTheHandBackAllocation)
+{
+	BodyArena arena;
+	ASSERT_TRUE(reserveReal(arena, 1024));
+	ThrowingString out;
+
+	ScriptedRead big;
+	big.body = patternBody(1025);
+	EXPECT_EQ(readAll(arena, big, out), BodyRead::TooBig);
+	ScriptedRead fails;
+	fails.body   = patternBody(900);
+	fails.failAt = 512;
+	EXPECT_EQ(readAll(arena, fails, out), BodyRead::ReadError);
+	ScriptedRead shortRead;
+	shortRead.body  = patternBody(900);
+	shortRead.endAt = 400;
+	EXPECT_EQ(readAll(arena, shortRead, out), BodyRead::Short);
+	BodyArena none;
+	ScriptedRead any;
+	EXPECT_EQ(readAll(none, any, out), BodyRead::NoArena);
+
+	EXPECT_EQ(out.assigns, 0);
+	EXPECT_TRUE(out.value.empty());
+}
+
 TEST(SosStatusBody, TheArenaIsReservedOnceAndFreedOnce)
 {
 	g_allocs = g_frees = 0;
@@ -354,6 +420,19 @@ TEST(SosStatusClaim, AHeldClaimGivesUpWithinTheBoundOnAFakeClock)
 	EXPECT_LE(kSosClaimBoundUs, 10'000) << "the ruling's ceiling";
 }
 
+TEST(SosStatusClaim, ATickLongerThanTheBoundNeverPausesAndDoesNotSpin)
+{
+	// At CONFIG_FREERTOS_HZ=100 one tick is 10 ms, more than the 8 ms bound: the claim is tried
+	// once and given up, not spun on. (The build is 1000 Hz: sdkconfig.defaults.)
+	std::atomic<bool> flag{true};
+	FakeClock c(flag);
+	c.stepUs = 10'000;
+	const bool won = claimWithin(flag, kSosClaimBoundUs, c.stepUs, [&] { return c.now(); }, [&] { c.pause(); });
+	EXPECT_FALSE(c.runaway) << "a busy-wait";
+	EXPECT_FALSE(won);
+	EXPECT_EQ(c.pauses, 0);
+}
+
 TEST(SosStatusClaim, AHolderThatLetsGoInsideTheBoundIsFollowed)
 {
 	std::atomic<bool> flag{true};
@@ -419,21 +498,153 @@ TEST(SosStatusTeardown, FreesOnceWhenTheClaimIsFree)
 
 TEST(SosStatusTeardown, TheNinetyOneOneGetTakesTheFallbackWithoutWaiting)
 {
+	// The operator: a 911 is never delayed (<= 10 ms), no wait of any length on the 911 path.
 	int64_t best = INT64_MAX;
 	for (int run = 0; run < 5; ++run)
 	{
 		std::atomic<bool> flag{true};
+		std::atomic<int> pauses{0};
 		const Timed t = runGuarded(flag, [&] {
 			const int64_t t0 = steadyUs();
-			SosStatusClaim claim(&flag, 0, 1000, steadyUs, pauseOneMs);
+			SosStatusClaim claim(&flag, kSosGetClaimBoundUs, 1000, steadyUs, [&] { ++pauses; pauseOneMs(); });
 			return Timed{ claim.held(), steadyUs() - t0 };
 		});
 		EXPECT_FALSE(t.freed) << "held() must be false: the GET falls back";
+		EXPECT_EQ(pauses.load(), 0) << "the 911 path never waits for the claim";
 		EXPECT_TRUE(flag.load());
+		EXPECT_LE(t.us, 10'000);
 		best = std::min(best, t.us);
 	}
 	std::fprintf(stderr, "[ #948 ] 911 GET with the claim held: best %lld us over 5 runs\n", static_cast<long long>(best));
 	EXPECT_LT(best, 1'000) << "no pause is taken at all";
+}
+
+// ── The #349 window: a 911/933 whose list reads all fail is not refused ──────────
+
+// What a sos list read does around httpGetBody on the sos lane: the claim (waited for not at all),
+// then the arena read. The leg pick (cJSON) is replaced by "a non-empty body names leg 517".
+struct SosListRead
+{
+	std::atomic<bool> claim{false};
+	BodyArena         arena;
+	ScriptedRead      response;   // each read gets a fresh copy: a new response
+	SosWitness        witness;
+	std::atomic<int>  pauses{0};
+	int64_t           slowestUs = 0;
+	int               gets = 0;
+
+	std::string operator()()
+	{
+		const int64_t t0 = steadyUs();
+		std::string leg;
+		{
+			SosStatusClaim c(&claim, kSosGetClaimBoundUs, 1000, steadyUs, [&] { ++pauses; pauseOneMs(); });
+			if (!c.held())
+			{
+				witness.note(SosFallback::Get);
+			}
+			else
+			{
+				++gets;
+				ScriptedRead r = response;
+				std::string body;
+				if (readAll(arena, r, body) == BodyRead::Ok && !body.empty()) leg = "517";
+			}
+		}
+		slowestUs = std::max(slowestUs, steadyUs() - t0);
+		return leg;
+	}
+};
+
+struct PlacedCall
+{
+	bool        success;   // makeCall() returns true: no 503
+	std::string ownLeg;
+	int         reads;
+	int64_t     windowUs;
+};
+
+// makeCall()'s #349 path: the window, then the outcome. Time is simulated: a pause is the poll gap.
+PlacedCall placeUnreadCall(bool sosLane, SosListRead& list)
+{
+	int64_t t = 0;
+	const UnreadWindow w = readOwnLegWindow(
+		[&] { return list(); }, [&] { return t; }, [] { return true; }, [](int) {},
+		[&] { t += int64_t{ kUnreadAdoptPollMs } * 1000; });
+	const UnreadOutcome o = unreadOutcome(!w.ownLeg.empty(), sosLane);
+	return PlacedCall{ o != UnreadOutcome::Fail, w.ownLeg, w.reads, t };
+}
+
+TEST(SosStatusUnread, ASosCallProceedsWhenTheListIsOverTheArena)
+{
+	SosListRead list;
+	ASSERT_TRUE(reserveReal(list.arena, 1024));
+	list.response.body = patternBody(1025);
+	const PlacedCall call = placeUnreadCall(/*sosLane=*/true, list);
+	EXPECT_GT(list.gets, 1) << "the window kept reading";
+	EXPECT_TRUE(call.success) << "no 503";
+	EXPECT_TRUE(call.ownLeg.empty());
+	EXPECT_LT(call.windowUs, kUnreadAdoptWindowUs);
+}
+
+TEST(SosStatusUnread, ASosCallProceedsWhenTheListReadIsShort)
+{
+	SosListRead list;
+	ASSERT_TRUE(reserveReal(list.arena, 4096));
+	list.response.body  = patternBody(900);
+	list.response.endAt = 400;
+	const PlacedCall call = placeUnreadCall(true, list);
+	EXPECT_GT(list.gets, 1);
+	EXPECT_TRUE(call.success) << "no 503";
+	EXPECT_TRUE(call.ownLeg.empty());
+}
+
+TEST(SosStatusUnread, ASosCallProceedsWhenAnOverlapping911HoldsTheClaim)
+{
+	SosListRead list;
+	ASSERT_TRUE(reserveReal(list.arena, 4096));
+	list.response.body = patternBody(300);
+	list.claim.store(true);   // the other 911's GET is mid-flight for the whole window
+	const PlacedCall call = placeUnreadCall(true, list);
+	EXPECT_EQ(list.gets, 0) << "no GET was issued on the held handle";
+	EXPECT_EQ(list.witness.count(SosFallback::Get), static_cast<uint32_t>(call.reads)) << "the fallback, every read";
+	EXPECT_EQ(list.pauses.load(), 0) << "the 911 never waits for the claim: no vTaskDelay on its path";
+	EXPECT_LE(list.slowestUs, 10'000) << "each read returns within the 10 ms bound";
+	EXPECT_TRUE(call.success) << "no 503";
+	EXPECT_TRUE(call.ownLeg.empty());
+	EXPECT_TRUE(list.claim.load()) << "the other holder's claim is untouched";
+}
+
+TEST(SosStatusUnread, AnythingButASosCallIsStillRefusedWhenEveryReadFails)
+{
+	SosListRead list;
+	ASSERT_TRUE(reserveReal(list.arena, 1024));
+	list.response.body = patternBody(1025);
+	const PlacedCall call = placeUnreadCall(/*sosLane=*/false, list);
+	EXPECT_FALSE(call.success) << "other callers keep today's behaviour";
+	EXPECT_TRUE(call.ownLeg.empty());
+}
+
+TEST(SosStatusUnread, AListedLegIsAdoptedOnEitherLane)
+{
+	for (const bool sos : { true, false })
+	{
+		SosListRead list;
+		ASSERT_TRUE(reserveReal(list.arena, 4096));
+		list.response.body = patternBody(300);
+		const PlacedCall call = placeUnreadCall(sos, list);
+		EXPECT_TRUE(call.success) << "sos " << sos;
+		EXPECT_EQ(call.ownLeg, "517");
+		EXPECT_EQ(call.reads, 1);
+	}
+}
+
+TEST(SosStatusUnread, TheOutcomeTable)
+{
+	EXPECT_EQ(unreadOutcome(true, true), UnreadOutcome::Adopt);
+	EXPECT_EQ(unreadOutcome(true, false), UnreadOutcome::Adopt);
+	EXPECT_EQ(unreadOutcome(false, true), UnreadOutcome::Proceed) << "a 911/933 goes on with no own leg";
+	EXPECT_EQ(unreadOutcome(false, false), UnreadOutcome::Fail);
 }
 
 // ── Witness ──────────────────────────────────────────────────────────────────
