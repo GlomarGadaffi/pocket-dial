@@ -11,6 +11,8 @@ sys.path.insert(0, os.path.join(HERE, "..", "load"))
 import anchor_scenarios as an  # noqa: E402
 
 SRC = os.path.join(HERE, "..", "..", "src", "SIP", "TelephonyAnchorClient.cpp")
+BENCH = os.path.join(HERE, "..", "..", "src", "SIP", "BenchProbe.cpp")
+BENCH_LOGIC = os.path.join(HERE, "..", "..", "src", "SIP", "BenchProbeLogic.hpp")
 
 # Comments and string literals are blanked (length and newlines kept) before any brace is counted.
 _TOKEN = re.compile(r'//[^\n]*|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'')
@@ -64,6 +66,51 @@ class EspWitnessWiringTest(unittest.TestCase):
             if "#888" in self.src[m.start():end]:
                 out.append(m.start())
         return out
+
+    def test_952_token_witnesses_are_the_lines_main_emits(self):
+        # The format strings as written in ensureToken(), fetchToken() and requestRestartIfTokenStale()
+        # (U+2014 is the dash in three of them), each beside the line the board's syslog then carries.
+        emitted = {
+            "token_refresh_deferred_live": (
+                'ESP_LOGW(TAG, "Token near expiry but media streams active — deferring refresh");',
+                "W (1) TelephonyAnchor: Token near expiry but media streams active — deferring refresh"),
+            "token_refresh_near_expiry": (
+                'ESP_LOGI(TAG, "Access token near expiry — refreshing");',
+                "I (2) TelephonyAnchor: Access token near expiry — refreshing"),
+            "token_retrieved": (
+                'ESP_LOGI(TAG, "Retrieved access token (len=%d, lifetime=%llds)",',
+                "I (3) TelephonyAnchor: Retrieved access token (len=1043, lifetime=3600s)"),
+            "ws_restart_stale_token": (
+                'ESP_LOGW(TAG, "WS disconnected/errored with an expiring token — requesting anchor restart '
+                'to refresh it");',
+                "W (4) TelephonyAnchor: WS disconnected/errored with an expiring token — requesting anchor "
+                "restart to refresh it"),
+        }
+        for name, (source_line, board_line) in emitted.items():
+            with self.subTest(counter=name):
+                self.assertIn(source_line, self.src)
+                self.assertEqual(an.count_lines([board_line])[name], 1)
+        failed = (
+            ('ESP_LOGE(TAG, "Token request returned HTTP %d", status);',
+             "E (5) TelephonyAnchor: Token request returned HTTP 401"),
+            ('ESP_LOGE(TAG, "Token failed to write body: %d", writeBytes);',
+             "E (6) TelephonyAnchor: Token failed to write body: -1"),
+            ('ESP_LOGE(TAG, "Token HTTP connection failed to open: %s", esp_err_to_name(err));',
+             "E (7) TelephonyAnchor: Token HTTP connection failed to open: ESP_ERR_HTTP_CONNECT"))
+        for source_line, board_line in failed:
+            with self.subTest(line=board_line):
+                self.assertIn(source_line, self.src)
+                self.assertEqual(an.count_lines([board_line])["token_fetch_failed"], 1)
+
+    def test_952_bench_fire_line_is_the_one_bench_token_age_counts(self):
+        with open(BENCH, encoding="utf-8") as f:
+            bench = f.read()
+        with open(BENCH_LOGIC, encoding="utf-8") as f:
+            logic = f.read()
+        self.assertIn('ESP_LOGW(TAG, "BENCHFAULT %.*s fired", static_cast<int>(n.size()), n.data());', bench)
+        self.assertIn('"token_age"', logic, "the fault name that fills the %.*s")
+        self.assertEqual(an.count_lines(["W (8) BenchProbe: BENCHFAULT token_age fired"])["bench_token_age"], 1)
+        self.assertEqual(an.count_lines(["W (9) BenchProbe: BENCHFAULT get_status fired"])["bench_token_age"], 0)
 
     def test_888_upset_ignored_while_pending_is_logged_with_the_pending_age(self):
         self.assertIn('"Upset ignored while %d makeCall(s) pending (oldest %lld ms old): "', self.src)
