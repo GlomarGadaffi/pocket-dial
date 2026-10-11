@@ -51,11 +51,16 @@
 // comment on the HA1-export/no-import asymmetry this implies.
 #include "SipSecretStore.hpp"
 #include "PoolConfig.hpp"    // POCKETDIAL_PARK_TIMEOUT_SEC (informational export field)
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+#include "HttpDramAccount.hpp"   // #410/#328: bench-only per-consumer DRAM counters
+#endif
 #include "JsonReader.hpp"    // strict, dependency-free JSON reader for /api/config/import
 #include <cctype>
 #include <cstdio>        // snprintf: sendStaticHtml's allocation-free head (#410)
 #include <cstdlib>
 #include <mutex>
+#include <memory>        // unique_ptr<char[]>: the per-request read buffer fallback (#410)
+#include <new>           // std::nothrow
 #include <cstring>
 #include <charconv>   // std::to_chars: /api/status numbers, no heap (#410)
 #include <string_view>
@@ -92,6 +97,103 @@
 // independently of CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT.
 #include "esp_pthread.h"
 #endif
+
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+// #410/#328, bench only (docs/BENCH_PROBE.md): the probes behind httpDramAccount's
+// "heap", "connCreate", "tasks", "tcp" and "memp" members. Device-side readers
+// here, the arithmetic and the JSON in HttpDramAccount.hpp (host-tested). On the
+// host they are no-ops and "memp" is null.
+#if defined(ESP_PLATFORM)
+#include "lwip/tcp.h"
+#include "lwip/stats.h"
+#include "lwip/priv/tcp_priv.h"      // tcp_active_pcbs
+#include "lwip/priv/tcpip_priv.h"    // tcpip_api_call(): run on the lwIP thread, with its lists stable
+#include "lwip/priv/memp_priv.h"     // memp_pools[]: element sizes
+
+[[maybe_unused]] static uint32_t pdDramInternalFree()
+{
+	return static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
+
+[[maybe_unused]] static void pdDramSampleHeap()
+{
+	httpdram::gProbes.sampleHeap(pdDramInternalFree(),
+		static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+		static_cast<uint32_t>(uxTaskGetNumberOfTasks()));
+}
+
+// Called right after the connection thread was created: the internal bytes it cost.
+[[maybe_unused]] static void pdDramConnCreated(uint32_t freeBefore)
+{
+	httpdram::gProbes.connCreated(freeBefore, pdDramInternalFree());
+}
+
+namespace
+{
+	struct PdDramTcpWalk
+	{
+		tcpip_api_call_data call{};   // first: the callback gets &call back
+		uint16_t httpPort = 0;
+		httpdram::TcpSnapshot snap{};
+	};
+
+	err_t pdDramTcpWalk(tcpip_api_call_data* c)
+	{
+		PdDramTcpWalk* w = reinterpret_cast<PdDramTcpWalk*>(c);
+		for (const tcp_pcb* p = tcp_active_pcbs; p != nullptr; p = p->next)
+			httpdram::addPcb(w->snap, p->local_port == w->httpPort, TCP_SND_BUF, tcp_sndbuf(p), tcp_sndqueuelen(p));
+		return ERR_OK;
+	}
+}
+
+// What every TCP send queue holds right now (written, not yet acknowledged), read on
+// the lwIP thread. Needs no lwIP statistics.
+[[maybe_unused]] static void pdDramSampleTcp(uint16_t httpPort)
+{
+	PdDramTcpWalk w{};
+	w.httpPort = httpPort;
+	if (tcpip_api_call(pdDramTcpWalk, &w.call) == ERR_OK) httpdram::gProbes.sampleTcp(w.snap);
+}
+
+// ,"memp":[...] -- lwIP's own pool counters; null unless the image was built with
+// LWIP_STATS and MEMP_STATS (sdkconfig.defaults.accounting and main/CMakeLists.txt).
+template <class Out> [[maybe_unused]] static void pdDramWriteMemp(Out& json)
+{
+#if LWIP_STATS && MEMP_STATS
+	json.s(",\"memp\":[");
+	bool first = true;
+	for (int i = 0; i < MEMP_MAX; ++i)
+	{
+		const struct stats_mem* m = lwip_stats.memp[i];
+		if (m == nullptr || (m->max == 0 && m->err == 0)) continue;   // a pool never drawn from
+		if (!first) json.s(",");
+		first = false;
+#if LWIP_STATS_DISPLAY
+		const char* name = m->name;
+#else
+		const char* name = "pool";
+#endif
+		httpdram::writeMempRow(json, httpdram::MempRow{ name, static_cast<uint32_t>(m->used),
+			static_cast<uint32_t>(m->max), static_cast<uint32_t>(m->err), static_cast<uint32_t>(memp_pools[i]->size) });
+	}
+	json.s("]");
+#else
+	json.s(",\"memp\":null");
+#endif
+}
+#else   // host: nothing to read
+[[maybe_unused]] static uint32_t pdDramInternalFree() { return 0; }
+[[maybe_unused]] static void pdDramSampleHeap() {}
+[[maybe_unused]] static void pdDramConnCreated(uint32_t) {}
+[[maybe_unused]] static void pdDramSampleTcp(uint16_t) {}
+template <class Out> [[maybe_unused]] static void pdDramWriteMemp(Out& json) { json.s(",\"memp\":null"); }
+#endif
+[[maybe_unused]] static void pdDramSampleProbes(uint16_t httpPort)
+{
+	pdDramSampleHeap();
+	pdDramSampleTcp(httpPort);
+}
+#endif   // POCKETDIAL_HTTP_DRAM_ACCOUNT
 
 // Forward declarations for the file-local form/URL helpers (defined lower down).
 // sendApiDnd() and sendApiKill() use getFormParam() but are defined earlier in
@@ -144,6 +246,27 @@ HttpServer::HttpServer(const std::string& ip, int port, RequestsHandler* handler
 	for (char*& b : _statusBuf)
 	{
 		b = static_cast<char*>(psram::allocPreferPsram(kStatusBufBytes));
+	}
+
+	// #410/#328: and one recv buffer per connection slot, from PSRAM where the board
+	// has it. allocPreferPsram() spills into internal RAM only when PSRAM is full and
+	// counts that in psram::internalFallbacks() (memory.psramFallbacks on /api/status);
+	// a slot it could not serve at all stays null and handleClient() takes a heap buffer.
+	if (kReadBufReserved)
+	{
+		const uint32_t spilled0 = psram::internalFallbacks().load(std::memory_order_relaxed);
+		int missing = 0;
+		for (char*& b : _readBuf)
+		{
+			b = static_cast<char*>(psram::allocPreferPsram(kReadBufBytes));
+			if (b == nullptr) ++missing;
+		}
+		const uint32_t spilled = psram::internalFallbacks().load(std::memory_order_relaxed) - spilled0;
+		if (spilled != 0 || missing != 0)
+		{
+			std::cerr << "[HttpServer] read buffers: " << spilled << " of " << kMaxConcurrentConnections
+				<< " in internal RAM (PSRAM full), " << missing << " not allocated (per-request heap buffer) (#410)\n";
+		}
 	}
 }
 
@@ -268,6 +391,10 @@ HttpServer::~HttpServer()
 	{
 		if (b != nullptr && stillRunning == 0) psram::freePreferPsram(b);
 	}
+	for (char* b : _readBuf)   // same reason: a still-running handler is reading into its slot's buffer
+	{
+		if (b != nullptr && stillRunning == 0) psram::freePreferPsram(b);
+	}
 }
 
 void HttpServer::start()
@@ -288,6 +415,11 @@ void HttpServer::setFailSocketTimeoutsForTest(bool failRecv, bool failSend)
 }
 static void (*s_dispatchMarkForTest)() = nullptr;   // #410 route gate
 void HttpServer::setDispatchMarkForTest(void (*mark)()) { s_dispatchMarkForTest = mark; }
+void HttpServer::dropReadBufForTest(int slot)
+{
+	psram::freePreferPsram(_readBuf[slot]);
+	_readBuf[slot] = nullptr;
+}
 #endif
 
 // Issue #529: SO_RCVTIMEO / SO_SNDTIMEO in milliseconds (at least 1, so 0 never
@@ -392,9 +524,19 @@ void HttpServer::acceptLoop()
 
 		timeval tv{};
 		tv.tv_sec = 0;
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+		// Bench only: sample the lwIP send queues and the heap on this thread, 50 times a
+		// second, while the connections run. They are NOT read on the http_conn threads: a
+		// route can be down to ~470 B of their 4096 B stack (#405) and the lwIP call needs more.
+		tv.tv_usec = 20000;
+#else
 		tv.tv_usec = 250000; // 250ms timeout
+#endif
 
 		int activity = select(_listenSock + 1, &readfds, nullptr, nullptr, &tv);
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+		pdDramSampleProbes(static_cast<uint16_t>(_port));
+#endif
 		if (activity < 0)
 		{
 			if (!_running) break;
@@ -488,25 +630,45 @@ void HttpServer::acceptLoop()
 		// on every exit path, and the catch below releases it if no thread was
 		// ever created.
 		_activeConnections.fetch_add(1, std::memory_order_acq_rel);
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+		httpdram::gAccount.opened(kHttpConnStackBytes);   // the stack exists from pthread_create on
+		const uint32_t dramFreeBeforeThread = pdDramInternalFree();
+#endif
 
 		try
 		{
 			std::thread([this, clientSock, connIdx]() {
 				// #405: which route this thread served, for the stack minimum.
 				char route[kRouteLabelBytes] = "unparsed";
-				handleClient(clientSock, route);
+				handleClient(clientSock, _readBuf[connIdx], route);
 				recordConnStackHwm(route);
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 				if (_afterCloseHookForTest) _afterCloseHookForTest();
 #endif
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+				pdDramSampleHeap();   // the heap as this connection ends, its stack not yet reaped
+#endif
 				finishConnSlot(connIdx);
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+				// Before the decrement below: once it lands the server may be destroyed.
+				// The stack itself is only freed when the idle task reaps this task, a
+				// little after this line (docs/BENCH_PROBE.md).
+				httpdram::gAccount.closed(kHttpConnStackBytes);
+#endif
 				_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			}).detach();
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+			pdDramConnCreated(dramFreeBeforeThread);   // what the thread cost beyond kHttpConnStackBytes
+			pdDramSampleHeap();
+#endif
 		}
 		catch (const std::exception& e)
 		{
 			// No thread was created, so nothing will ever decrement for this one.
 			finishConnSlot(connIdx);
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+			httpdram::gAccount.spawnFailed(kHttpConnStackBytes);
+#endif
 			_activeConnections.fetch_sub(1, std::memory_order_acq_rel);
 			std::cerr << "[HttpServer] connection thread spawn failed: " << e.what()
 				<< " — dropping connection\n";
@@ -645,7 +807,7 @@ void HttpServer::routeLabel(const std::string& method, const std::string& path,
 	out[n] = '\0';
 }
 
-void HttpServer::handleClient(int clientSock, char* routeOut)
+void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 {
 	// Issue #529: everything read before dispatch shares one deadline.
 	const auto readDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(_readDeadlineMs);
@@ -686,20 +848,57 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 		return;
 	}
 
-	// Heap-allocate the read buffer. On ESP32 each connection runs on a detached
-	// std::thread, i.e. an IDF pthread; sdkconfig.defaults sets
-	// CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192, so a 4 KB stack-local buffer
-	// would consume half the stack before any handler ran. Using std::vector keeps
-	// the data on the heap. (This comment previously claimed a ~3 KB stack, which
-	// has not matched sdkconfig for some time.)
-	std::vector<char> buf(4096, 0);
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+	// #410/#328 bench accounting: what this request holds on the heap, released on
+	// every return below by the holders' destructors.
+	httpdram::Held heldBuf(httpdram::gAccount, httpdram::kReqBuf);
+	httpdram::Held heldRaw(httpdram::gAccount, httpdram::kReqRaw);
+	httpdram::Held heldReq(httpdram::gAccount, httpdram::kReqParsed);
+#endif
+	// The recv buffer is off the stack (a 4 KB local would fill the 4096-byte
+	// kHttpConnStackBytes): it is the connection slot's, allocated once in the
+	// constructor, in PSRAM where the board has it (#410/#328). PSRAM is fine for it:
+	// recv() copies out of lwIP's pbufs on this task (pbuf_copy_partial), nothing DMAs
+	// into it, and it is never a flash-write source (OTA/MoH uploads are handed `raw`,
+	// a copy). With no slot buffer (a build without PSRAM, or the constructor's
+	// allocation failed) the request takes one from the heap, as it always did, and
+	// counts a PSRAM fallback where PSRAM was expected. If the heap has none either
+	// the request is refused with a 503, counted like the accept loop's refusals;
+	// nothing here may throw on this detached thread.
+	std::unique_ptr<char[]> heapBuf;   // owns the fallback buffer, if one is taken
+	char* buf = readBuf;
+	if (buf == nullptr)
+	{
+		heapBuf.reset(new (std::nothrow) char[kReadBufBytes]());   // zero-filled
+		buf = heapBuf.get();
+		if (buf == nullptr)
+		{
+			const uint32_t n = _busyRefusals.fetch_add(1, std::memory_order_relaxed) + 1;
+			if ((n & (n - 1)) == 0)
+				std::cerr << "[HttpServer] 503 busy: no read buffer (" << n << " refused so far)\n";
+			sendResponse(clientSock, 503, "Service Unavailable", "application/json",
+			             "{\"error\":\"busy\",\"message\":\"no read buffer\"}");
+			closeSocket(clientSock);
+			return;
+		}
+		if (kReadBufReserved) psram::internalFallbacks().fetch_add(1, std::memory_order_relaxed);
+	}
+	else
+	{
+		std::memset(buf, 0, kReadBufBytes);
+	}
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+	// A slot buffer in PSRAM holds no internal DRAM and counts 0, like every block
+	// outside internal RAM; a heap fallback, or a slot that spilled into internal RAM, counts.
+	heldBuf.set(httpdram::internalRam(buf) ? static_cast<uint32_t>(kReadBufBytes) : 0u);
+#endif
 
 	// Read initial data. A follow-up loop below handles POST bodies that span
 	// multiple TCP segments (see Content-Length body-read completion below).
 #if defined _WIN32 || defined _WIN64
-	int bytesRead = recv(clientSock, buf.data(), static_cast<int>(buf.size()) - 1, 0);
+	int bytesRead = recv(clientSock, buf, static_cast<int>(kReadBufBytes) - 1, 0);
 #else
-	int bytesRead = static_cast<int>(recv(clientSock, buf.data(), buf.size() - 1, 0));
+	int bytesRead = static_cast<int>(recv(clientSock, buf, kReadBufBytes - 1, 0));
 #endif
 
 	if (bytesRead <= 0)
@@ -711,7 +910,10 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 	// #18: ensure the complete POST body is present before parsing.
 	// If the headers indicate a Content-Length larger than what arrived in the
 	// first segment, keep reading until we have it all.
-	std::string raw(buf.data(), static_cast<size_t>(bytesRead));
+	std::string raw(buf, static_cast<size_t>(bytesRead));
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+	heldRaw.set(httpdram::heapBytes(raw));
+#endif
 
 	// --- OTA upload interception (firmware streaming) -------------------------
 	// A firmware image is >1.5 MB, so it must NOT flow through the 16 KB-capped
@@ -855,11 +1057,11 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 						closeSocket(clientSock);
 						return;
 					}
-					buf.assign(buf.size(), 0);
+					std::memset(buf, 0, kReadBufBytes);
 #if defined _WIN32 || defined _WIN64
-					int n = recv(clientSock, buf.data(), static_cast<int>(buf.size()) - 1, 0);
+					int n = recv(clientSock, buf, static_cast<int>(kReadBufBytes) - 1, 0);
 #else
-					int n = static_cast<int>(recv(clientSock, buf.data(), buf.size() - 1, 0));
+					int n = static_cast<int>(recv(clientSock, buf, kReadBufBytes - 1, 0));
 #endif
 					if (n <= 0 && msLeft() <= 0)
 					{
@@ -868,7 +1070,10 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 						return;
 					}
 					if (n <= 0) break;
-					raw.append(buf.data(), static_cast<size_t>(n));
+					raw.append(buf, static_cast<size_t>(n));
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+					heldRaw.set(httpdram::heapBytes(raw));   // append may have regrown it
+#endif
 					bodyHave += static_cast<size_t>(n);
 				}
 			}
@@ -882,6 +1087,10 @@ void HttpServer::handleClient(int clientSock, char* routeOut)
 	// the real admin out too, and Cisco SPA model-keyed provisioning never ran
 	// its ARP lookup.
 	req.clientIp = peerIp;
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+	heldReq.set(httpdram::heapBytesOf(req.method, req.path, req.body, req.origin, req.host,
+	                                  req.cookie, req.csrf, req.userAgent, req.clientIp));
+#endif
 	if (routeOut) routeLabel(req.method, req.path, routeOut, kRouteLabelBytes);   // #405
 	// Out-param for the two telephony-config routes below, whose slot index is
 	// a URL path segment rather than a form param (see parseTelephonyConfigSlotPath).
@@ -1686,6 +1895,26 @@ void HttpServer::sendResponseWithHeader(int sock, int statusCode, std::string_vi
 	// (CodeQL flagged a `head += body` shape here as "cleartext transmission"
 	// of emailConfigJson() on PR #394 -- a false positive: its secrets leave
 	// only as hasPassword/hasGsaKey booleans, #207.)
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+	// #410/#328 bench accounting: a body the route built on the heap is live until
+	// the send is done. A body inside a leased buffer (/api/status, /metrics, the
+	// registrar roster) is a standing allocation from boot, not builder heap.
+	httpdram::Held heldBody(httpdram::gAccount, httpdram::kRespBody);
+	{
+		const auto at = reinterpret_cast<std::uintptr_t>(body.data());
+		bool leased = false;
+		for (const char* b : _statusBuf)
+		{
+			const auto lo = reinterpret_cast<std::uintptr_t>(b);
+			leased = leased || (b != nullptr && at >= lo && at < lo + kStatusBufBytes);
+		}
+		if (!leased && httpdram::internalRam(body.data()))   // not a flash literal, not PSRAM
+		{
+			heldBody.set(static_cast<uint32_t>(body.size()));
+			httpdram::gAccount.noteBody(static_cast<uint32_t>(body.size()));
+		}
+	}
+#endif
 	HeadNumbers nums;
 	SendPiece v[kHeadPieces + 1];
 	size_t n = headPieces(v, nums, statusCode, statusText, contentType, body.size(), extraHeader);
@@ -2192,7 +2421,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 #else
 	json.s("\"wifiCapable\":false,");
 #endif
-	// Issue #521: where a 911 dial would go -- "anchor", "trunk" or "none".
+	// Issue #521: where a 911 dial would go -- "anchor" or "none".
 	// "none" means the board refuses it with 503 (only the loopback simulator
 	// is configured), and the dashboard keeps a warning banner up for as long
 	// as it says so. Ungated like the rest of this block: whether this phone
@@ -2614,6 +2843,17 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	    .s(",\"psramFallbacks\":").n(psram::internalFallbacks().load(std::memory_order_relaxed))
 	    .s(",\"dynamicTaskCreates\":").n(psram::dynamicTaskCreates().load(std::memory_order_relaxed))   // #479
 	    .s("}");
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+	// #410/#328, bench only: docs/BENCH_PROBE.md. The probes' members go inside the
+	// httpDramAccount object, so the top-level key list is still main's plus that one.
+	// The heap is read here, beside the other heap figures of this route; the lwIP
+	// queues were read by the accept thread (acceptLoop()), at most 20 ms ago.
+	pdDramSampleHeap();
+	httpdram::gAccount.writeJson(json, [](auto& o) {
+		httpdram::gProbes.writeJson(o);
+		pdDramWriteMemp(o);
+	});
+#endif
 
 	json.s("}");
 

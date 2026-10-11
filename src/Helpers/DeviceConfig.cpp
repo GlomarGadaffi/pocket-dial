@@ -711,6 +711,14 @@ namespace DeviceConfig
 		return true;
 #endif
 	}
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	void resetWifiForTest()
+	{
+		std::lock_guard<std::mutex> lock(wifiMirrorMutex());
+		wifiMirror() = WifiStationMirror{};
+	}
+#endif
 }
 
 namespace DeviceConfig

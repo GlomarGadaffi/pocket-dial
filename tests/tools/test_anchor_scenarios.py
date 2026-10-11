@@ -585,9 +585,12 @@ class RefusalTest(unittest.TestCase):
                         call_cap_s=10, judge=lambda *a: ([], [], {}))(lambda run, sc: None)
         self.assertNotIn("x_none", an.SCENARIOS)
         # x379_cancel_before_leg joined the registry with this change (the CANCEL-before-the-leg race)
-        self.assertEqual(sorted(an.SCENARIOS), ["x279_degraded_bye", "x349_unread_makecall",
-                                                "x379_cancel_before_leg", "x379_never_opened",
-                                                "x4_cancel_ringing", "x518_403_clean_giveup"])
+        # h947_http_load joined the registry with #947 (the HTTP-under-load measurement; tests/tools/test_http_load.py)
+        # x370_pressure_rebuild joined the registry with #370 (the GET handle's rebuild under a DRAM ballast)
+        self.assertEqual(sorted(an.SCENARIOS), ["h947_http_load", "x279_degraded_bye", "x349_unread_makecall",
+                                                "x370_pressure_rebuild", "x379_cancel_before_leg",
+                                                "x379_never_opened", "x4_cancel_ringing", "x518_403_clean_giveup",
+                                                "x888_ws_upsert", "x952_token_age_held"])
 
     def test_dry_run_prints_the_plan_and_the_ring_required_banner(self):
         rc, out = run_main(cli("--dry-run"), base_env(), http=NoNetwork())
@@ -632,11 +635,38 @@ class WitnessSampleTest(unittest.TestCase):
         "stray_final_890": "W (40301) trunk: final 486 after the call was answered ignored (#890)",
         "beep_uri_856": "I (30100) beep: register beep Request-URI: bare (no Contact stored)",
         "upset_ignored_pending_888": "W (50300) TelephonyAnchor: Upset ignored while 1 makeCall(s) pending (oldest "
-                                     "1840 ms old): 3CX does not repeat a Connected one (#888)",
+                                     "1840 ms old): nin=0 active=0 part=517: 3CX does not repeat a Connected one (#888)",
+        "upset_absorbed_inflight_888": "W (50310) TelephonyAnchor: Upset absorbed while an outbound is in flight: nin=1 "
+                                     "pending=0 active=1 part=518 own=517 seen=16 (#888)",
+        "upset_dropped_own_leg_888": "W (50320) TelephonyAnchor: Upset dropped as own leg with no outbound slot: nin=0 "
+                                     "pending=0 active=0 part=519 seen=1 (#888)",
+        "upset_dropped_unqueued_888": "W (50330) TelephonyAnchor: Upset dropped, work item not queued: nin=0 pending=0 "
+                                     "active=0 part=520 seen=1 (#888)",
+        "witness_cap_888": "W (50340) TelephonyAnchor: witness cap reached: no further #888 witness lines this boot",
         "e911_degraded_kept_906": "W (61100) e911: audio to the anchor keeps failing on a connected 911/933: kept up, "
                                   "not hung up (#906)",
         "cdr_callee_dialed_901": "I (99001) pbx: CDR callee is the dialed number (anchor audio write failure) (#901)",
         "ctrl_request_884": "I (52010) TelephonyAnchor: ctrl request: attempt 0 resumed in 131 ms (#884)",
+        "token_lifetime_fields_951": "W (52100) anchor: token_lifetime_fields_951: expires_in=60 exp_minus_iat=3600 "
+                                     "lifetime_used=3600 (seconds; -1: not read) (#951)",
+        # #952/#945: main's token witnesses, as TelephonyAnchorClient.cpp and BenchProbe.cpp format them
+        "bench_token_age": "W (51000) BenchProbe: BENCHFAULT token_age fired",
+        "token_refresh_near_expiry": "I (51100) TelephonyAnchor: Access token near expiry — refreshing",
+        "token_refresh_deferred_live": "W (51200) TelephonyAnchor: Token near expiry but media streams active "
+                                       "— deferring refresh",
+        "token_retrieved": "I (51300) TelephonyAnchor: Retrieved access token (len=1043, lifetime=3600s)",
+        "token_fetch_failed": "E (51400) TelephonyAnchor: Token request returned HTTP 401",
+        "ws_restart_stale_token": "W (51500) TelephonyAnchor: WS disconnected/errored with an expiring token "
+                                  "— requesting anchor restart to refresh it",
+        # #862 (#945 image, TelephonyAnchorLogic.hpp PD_WITNESS_W): main does not emit these
+        "token_maint_refresh_862": "W (51600) anchor: token_maint_refresh_862: the background refresh fetches a "
+                                   "new token, the one it replaces is 3512 s old (#862)",
+        "token_maint_skip_862": "W (51700) anchor: token_maint_skip_862: the background token refresh is skipped: "
+                                "a call is up (#862)",
+        "token_sos_live_fetch_862": "W (51800) e911: token_sos_live_fetch_862: 911/933 call 2 fetches a token while "
+                                    "911/933 call 1 has live streams; (#862)",
+        "token_sos_401_fetch_862": "W (51900) e911: token_sos_401_fetch_862: a 911/933 POST was answered 401, "
+                                   "fetching one token on its own arena (#862)",
     }
 
     def test_each_witness_regex_matches_the_line_the_firmware_formats(self):
@@ -1855,7 +1885,8 @@ class X379RefusalTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------- the probe scenarios (#384 H1)
-PROBE_SCENARIOS = ("x349_unread_makecall", "x379_never_opened", "x518_403_clean_giveup", "x279_degraded_bye")
+PROBE_SCENARIOS = ("x349_unread_makecall", "x379_never_opened", "x518_403_clean_giveup", "x279_degraded_bye",
+                   "x888_ws_upsert", "x370_pressure_rebuild")
 PROBE_VERSION = "v1.5.0-fake-probe"
 EM_DASH = "—"
 
@@ -1866,12 +1897,15 @@ class FakeProbeBoard(FakeBoard):
     from what it really sent, a media port that counts RTP, and one anchor call flow per
     mode, each logging the esp_log lines the real board would. Knobs change one thing."""
 
-    NAMES = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age")
+    NAMES = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age", "ws_upsert")
 
     def __init__(self, mode):
         super().__init__()
         self.mode = mode
         self.knobs = {}
+        self.ws_n = 0                     # ws_upsert: the n of the synthetic id, like the board's own counter
+        self.ws_fired_at = []             # (case, monotonic time) of each synthetic upsert
+        self._ws_stop = threading.Event()
         self.faults = {n: {"armed": False, "value": 0, "fired": 0, "emergencySkips": 0} for n in self.NAMES}
         self.ballast = {"held": False, "bytes": 0, "blocks": 0, "target": 0, "deadmanS": 0,
                         "released": {"api": 0, "deadman": 0, "emergency": 0}, "refusedEmergency": 0}
@@ -1888,10 +1922,42 @@ class FakeProbeBoard(FakeBoard):
         self.media.settimeout(0.1)
         self.media_port = self.media.getsockname()[1]
         threading.Thread(target=self._media_loop, daemon=True).start()
+        if mode == "x888":
+            threading.Thread(target=self._ws_loop, daemon=True).start()
 
     def stop(self):
+        self._ws_stop.set()
         super().stop()
         self.media.close()
+
+    # #888 ws_upsert: the SIP task's 1 Hz tick on the board, 20 Hz here. A case waits armed until it
+    # can happen (1 and 3 with no call, 2 with an unanswered outbound leg in flight), as on the board.
+    def _ws_loop(self):
+        while not self._ws_stop.wait(0.05):
+            with self.lock:
+                f = self.faults["ws_upsert"]
+                if not f["armed"] or self.knobs.get("ws_never"):
+                    continue
+                case = f["value"]
+                live = [c for c in self.calls.values() if c.get("leg_up") and not c.get("done")]
+                if bool(live) != (case == 2) or self.fire("ws_upsert") is None:
+                    continue
+                self.ws_n += 1
+                self.ws_fired_at.append((case, time.monotonic()))
+                self._ws_witness(case, "pdb-u%d-%d" % (case, self.ws_n), live[0]["leg"] if live else "")
+
+    WS_LINES = {1: "Upset dropped, work item not queued: nin=0 pending=0 active=0 part=%s seen=1 (#888)",
+                2: "Upset absorbed while an outbound is in flight: nin=1 pending=0 active=1 part=%s own=%s seen=1 (#888)",
+                3: "Upset dropped as own leg with no outbound slot: nin=0 pending=0 active=0 part=%s seen=1 (#888)"}
+
+    def _ws_witness(self, case, part, leg):
+        k = self.knobs
+        shown = k.get("ws_wrong_branch", {}).get(case, case)       # a case that takes another branch
+        n = 0 if case in k.get("ws_no_line", ()) else 2 if case in k.get("ws_double_line", ()) else 1
+        for _ in range(n):
+            self.log("TelephonyAnchor: " + self.WS_LINES[shown] % ((part, leg) if shown == 2 else (part,)))
+        if k.get("ws_inbound_synth"):
+            self.log("TelephonyAnchor: Inbound call on DN %s: participant %s caller ''" % (self.route_dn, part))
 
     def _media_loop(self):
         while True:
@@ -1953,7 +2019,8 @@ class FakeProbeBoard(FakeBoard):
             ok = fault in self.faults and (
                 (fault == "get_status" and value.isdigit() and 400 <= int(value) <= 599) or
                 (fault == "get_max_attempts" and value.isdigit() and 1 <= int(value) <= 240) or
-                (fault not in ("get_status", "get_max_attempts") and not value))
+                (fault == "ws_upsert" and value in ("1", "2", "3")) or
+                (fault not in ("get_status", "get_max_attempts", "ws_upsert") and not value))
             if not ok:
                 return (400, {"error": "bad request"})
             if self.emergency_live or self.knobs.get("emergency_on_arm"):
@@ -1965,9 +2032,29 @@ class FakeProbeBoard(FakeBoard):
                 self.on_arm(fault)
             return (200, self.counters())
         if not fault and ballast == "release":
+            if self.knobs.get("release_503", 0) > 0:      # "counters busy": the release has to be repeated
+                self.knobs["release_503"] -= 1
+                return (503, {"error": "counters busy"})
             if self.ballast["held"]:
                 self.ballast["held"] = False
                 self.ballast["released"]["api"] += 1
+                self.log("BenchProbe: BENCHFAULT ballast released (api): 90000 bytes")
+            return (200, self.counters())
+        if not fault and ballast.isdigit():
+            # BenchProbe.cpp armBallast(): a floor of 8192, 409 while an emergency is live or one is held, and a
+            # 200 with nothing held when the board is already at or under the target
+            deadman = form.get("deadman", "")
+            if int(ballast) < 8192 or (deadman and not (deadman.isdigit() and 1 <= int(deadman) <= 600)):
+                return (400, {"error": "bad request"})
+            if self.emergency_live or self.knobs.get("emergency_on_arm"):
+                return (409, {"error": "emergency call in progress"})
+            if self.ballast["held"] or self.knobs.get("ballast_409"):
+                return (409, {"error": "ballast already held"})
+            if not self.knobs.get("ballast_noop"):
+                self.ballast.update(held=True, bytes=90000, blocks=30, target=int(ballast),
+                                    deadmanS=int(deadman or 120))
+                self.log("BenchProbe: BENCHFAULT ballast held: 90000 bytes in 30 blocks, free internal %s, "
+                         "dead-man %s s" % (ballast, deadman or 120))
             return (200, self.counters())
         return (400, {"error": "bad request"})
 
@@ -2016,6 +2103,8 @@ class FakeProbeBoard(FakeBoard):
         return "https://%s/callcontrol/%s/participants/%s/stream" % (TENANT, self.route_dn, leg)
 
     def _on_invite(self, req, addr):
+        if self.mode in ("x888", "x370"):                # the plain ringing anchor call: CANCEL -> 487, one drop
+            return FakeBoard._on_invite(self, req, addr)
         c = self.calls.get(req.call_id())
         if tag_of(req.get("to")):
             if c is None:
@@ -2033,6 +2122,42 @@ class FakeProbeBoard(FakeBoard):
         self.calls[req.call_id()] = c
         self._reply(req, addr, 100, "Trying")
         getattr(self, "_call_" + self.mode)(c)
+
+    # #370: the rx task's GET loop on a ringing leg, under the ballast. With nothing held the open survives; held,
+    # it fails x370_fails times in a row (the rebuild runs after each but the third), then the knobs say how it ends.
+    def _leg_up(self, c):
+        super()._leg_up(c)
+        if self.mode == "x370":
+            threading.Thread(target=self._pressure_loop, args=(c,), daemon=True).start()
+
+    def _pressure_loop(self, c):
+        time.sleep(0.05)
+        k = self.knobs
+        with self.lock:
+            status, budget = self.fire("get_status"), self.fire("get_max_attempts")
+            n, code = budget or 240, status or 404
+            fails = k.get("x370_fails", 1) if self.ballast["held"] else 0
+            how = ("open failed (ESP_ERR_HTTP_CONNECT)" if k.get("x370_open_failed")
+                   else "transport failure (no HTTP response, status=-1)")
+            for a in range(1, fails + 1):
+                self.log("TelephonyAnchor: GET stream %s, attempt %d/%d" % (how, a, n))
+            if fails >= 3:
+                self.log("TelephonyAnchor: GET stream: 3 consecutive transport failures %s giving up rather than "
+                         "reopening a dead connection %d more times" % (EM_DASH, n - 3))
+            elif fails and k.get("x370_rebuild_fail"):
+                self.log("TelephonyAnchor: GET stream: could not rebuild client after transport failure %s "
+                         "giving up" % EM_DASH)
+            elif not (fails and k.get("x370_no_followup")):
+                for b in range(fails + 1, min(n, fails + 3) + 1):
+                    self.log("TelephonyAnchor: GET stream not ready (HTTP %d), attempt %d/%d" % (code, b, n))
+            if k.get("x370_panic"):
+                self.log("E (1) boot: Guru Meditation Error: Core 1 panic'ed (LoadProhibited)")
+            if k.get("x370_orphan"):
+                self.log("TelephonyAnchor: makeCall: request reached 3CX but no response and no reconcilable leg "
+                         "after 3 attempts %s a call may be ORPHANED on 3CX (#349/#328)" % EM_DASH)
+            if k.get("x370_deadman_early"):                     # the dead-man fired before the harness released
+                self.ballast["held"] = False
+                self.ballast["released"]["deadman"] += 1
 
     def answer(self, c):
         self._reply(c["req"], c["addr"], 180, "Ringing", to_tag=c["tag"])
@@ -2213,6 +2338,52 @@ class FakeProbeBoard(FakeBoard):
                 self.bye_handset(c)
             c["state"] = "stuck" if k.get("stuck") else "ended"
 
+    # #952: a held, answered call; token_age fires on the next tick once it is armed. Knobs:
+    # origination_lines (logged before any stream), token_lines (logged right after the fire),
+    # far_hangs_up_s (the far side ends the call that long after the fire), refuse, no_post_open,
+    # post_open_delay_s (the POST stream opens that long after the answer).
+    def _call_x952(self, c):
+        k = self.knobs
+        for line in k.get("origination_lines", ()):
+            self.log(line)
+        if k.get("refuse"):                             # the makecall failed: no leg was ever created
+            return self.refuse(c, 503)
+        self.initiated(c)
+        self.answer(c)
+
+        def open_stream():
+            c["stream_open"] = True
+            self.log("TelephonyAnchor: POST (device->Telephony) audio stream OPEN: %s" % self.url(c["leg"]))
+        if k.get("post_open_delay_s"):
+            threading.Timer(k["post_open_delay_s"], open_stream).start()
+        elif not k.get("no_post_open"):
+            open_stream()
+        threading.Thread(target=self._age_watch, args=(c,), daemon=True).start()
+
+    def _age_watch(self, c):
+        while True:
+            time.sleep(0.02)
+            with self.lock:
+                if c["state"] != "up":
+                    return
+                if self.faults["token_age"]["armed"] and self.fire("token_age") is not None:
+                    for line in self.knobs.get("token_lines", ()):
+                        self.log(line)
+                    break
+        hang = self.knobs.get("far_hangs_up_s")
+        if hang is None:
+            return
+        time.sleep(hang)
+        with self.lock:
+            if c["state"] != "up":
+                return
+            self.log("MediaBridge: stopBridge call=%s part=%s" % (c["req"].call_id(), c["leg"]))
+            c["released"] = True
+            self.endcall(c, "anchor hangup")
+            self.drop(c)
+            self.bye_handset(c)
+            c["state"] = "ended"
+
 
 class ProbeRunCase(unittest.TestCase):
     MODE = "x349"
@@ -2226,12 +2397,13 @@ class ProbeRunCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def go(self, scenario=None, overrides=None, env=None, version=PROBE_VERSION, fast_cap=None, pin_check="0.05"):
+    def go(self, scenario=None, overrides=None, env=None, version=PROBE_VERSION, fast_cap=None, pin_check="0.05",
+           extra=()):
         def start_logger(argv, out_path):
             return FakeLogger(self.board, argv, out_path)
         argv = cli("--port", str(self.board.port), "--http-port", str(self.http_port), "--local-ip", "127.0.0.1",
                    "--syslog-port", "0", "--set-syslog", "--pin-check-s", pin_check, "--out", self.tmp.name,
-                   "--expect-version", version, scenario=scenario or self.SCENARIO)
+                   "--expect-version", version, *extra, scenario=scenario or self.SCENARIO)
         ov = dict(self.FAST, **(overrides or {}))
         with contextlib.ExitStack() as stack:
             if fast_cap is not None:     # a harness hangup at the cap, without a 30 s test
@@ -2319,7 +2491,7 @@ class ProbeRefusalTest(unittest.TestCase):
                              overrides={"uas": {"caller": "1001", "detector": "6104"}})
                 self.refused(cli(*ver, scenario=name), base_env(), "must be 6104",
                              overrides={"uas": {"caller": "6101", "detector": "6103"}})
-                self.refused(cli(*ver, scenario=name), base_env(), "calls must be 1-30", overrides={"calls": 31})
+                self.refused(cli(*ver, scenario=name), base_env(), "calls must be 1-", overrides={"calls": 31})
 
     def test_a_probe_scenario_needs_a_probe_stamp(self):
         for name in PROBE_SCENARIOS:
@@ -2675,6 +2847,281 @@ class X279Test(ProbeRunCase):
         self.assertIn("degraded_endcall is 0", out)
 
 
+class X888Test(ProbeRunCase):
+    """x888_ws_upsert against a fake board whose ws_upsert fires the way the probe does: one
+    synthetic upsert per arm, a witness line for the branch it reaches (#888)."""
+    MODE = "x888"
+    SCENARIO = "x888_ws_upsert"
+    FAST = {"fire_wait_s": 1.5, "call_fire_wait_s": 2.5, "cancel_after_fire_s": 0.2, "settle_s": 0.4,
+            "drop_wait_s": 1.0}
+
+    def test_pass_runs_the_three_cases_in_order_with_one_call(self):
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.manifest["verdict"], "PASS")
+        self.assertEqual([(p["fault"], p["value"]) for p in self.board.bench_posts
+                          if p.get("fault") not in (None, "disarm")],
+                         [("ws_upsert", "1"), ("ws_upsert", "2"), ("ws_upsert", "3")])
+        self.assertEqual(self.manifest["probe"]["fired"], {"ws_upsert": 3})
+        for line in ("case 1 unqueued: PASS (1 line: Upset dropped, work item not queued)",
+                     "case 2 absorbed: PASS (1 line: Upset absorbed while an outbound is in flight)",
+                     "case 3 own-leg: PASS (1 line: Upset dropped as own leg with no outbound slot)",
+                     "x888 summary: unqueued=1 absorbed=1 own-leg=1: 3 PASS, 0 FAIL, 0 INVALID -> PASS"):
+            self.assertEqual(sum(1 for ln in out.splitlines() if ln.endswith(line)), 1, line + "\n" + out)
+        self.assertEqual(len(self.calls), 1, "only case 2 places a call")
+        c = self.calls[0]
+        self.assertEqual((c["final"], c["cancel_status"], self.board.invite_users), (487, 200, [FAR]))
+        self.assertEqual(len(self.board.cancels), 1)
+        self.assertEqual(self.manifest["log_counters"]["dropped"], 1)
+        self.assertEqual(self.manifest["log_counters"]["bench_ws_upsert"], 3)
+        self.assertEqual(self.manifest["summary"]["cases"], {"unqueued": "PASS", "absorbed": "PASS", "own-leg": "PASS"})
+        self.assertNotIn("_call_id", c)
+        self.assert_clean_probe(out)
+
+    def test_the_case_2_call_is_cancelled_after_the_fire_not_before_it(self):
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        at = dict(self.board.ws_fired_at)
+        self.assertEqual(sorted(at), [1, 2, 3])
+        self.assertGreaterEqual(self.board.cancels[0] - at[2], self.FAST["cancel_after_fire_s"],
+                                "the CANCEL waits for the injected upsert to be handled")
+        self.assertGreater(at[3], self.board.cancels[0], "case 3 runs after the call is over")
+
+    def test_invalid_when_a_branch_never_logs_its_line(self):
+        self.board.knobs["ws_no_line"] = {2}
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("case 2 absorbed: INVALID (0 lines: Upset absorbed while an outbound is in flight)", out)
+        self.assertIn("case 1 unqueued: PASS", out)
+        self.assertIn("-> INVALID", out)
+        self.assert_clean_probe(out)
+
+    def test_invalid_when_the_fault_never_fires(self):
+        self.board.fire_enabled = False
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("the fault ws_upsert fired 0 times", out)
+        self.assertIn("case 1 unqueued: INVALID (0 lines", out)
+        self.assertIn("x888 summary: unqueued=0 absorbed=0 own-leg=0: 0 PASS, 0 FAIL, 3 INVALID -> INVALID", out)
+        self.assertEqual(self.calls[0]["final"], 487, "the call is still CANCELled at its wait, not left ringing")
+        self.assert_clean_probe(out)
+
+    def test_fail_on_a_second_witness_line_for_one_upsert(self):
+        self.board.knobs["ws_double_line"] = {1}
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("case 1 unqueued: FAIL (2 lines", out)
+
+    def test_a_case_that_took_another_branch_is_not_a_pass(self):
+        self.board.knobs["ws_wrong_branch"] = {2: 1}          # the in-flight upsert logged "not queued"
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("case 2 absorbed: INVALID (0 lines: Upset absorbed while an outbound is in flight; "
+                      "other branches: unqueued=1)", out)
+
+    def test_fail_when_a_synthetic_participant_is_announced_as_an_inbound_call(self):
+        self.board.knobs["ws_inbound_synth"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("announced as an inbound call", out)
+
+    def test_invalid_when_the_call_never_rings(self):
+        self.board.refuse_calls = {0}                         # 180, then a 503 before any leg exists
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("the call did not ring (final 503)", out)
+        self.assertIn("case 2 absorbed: INVALID (0 lines", out)
+
+    def test_a_409_at_arm_time_stops_before_the_first_upsert(self):
+        self.board.knobs["emergency_on_arm"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("arming ws_upsert: 409", out)
+        self.assertEqual(self.board.invite_users, [])
+        self.assertIn("emergency call touched the probe", out)
+        self.assert_clean_probe(out)
+
+    def test_an_unmet_precondition_waits_armed_and_is_disarmed_at_the_end(self):
+        self.board.knobs["ws_never"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(self.board.armed(), [])
+        self.assertIn("did NOT fire within", out)
+
+
+class X370Test(ProbeRunCase):
+    """x370_pressure_rebuild against a fake board whose GET loop fails its open while the ballast is held, the
+    way the log of a squeezed board reads (#370): the rebuild witness is the board's own lines."""
+    MODE = "x370"
+    SCENARIO = "x370_pressure_rebuild"
+    FAST = {"call_fire_wait_s": 3.0, "cancel_after_fire_s": 0.3, "recover_wait_s": 3.0, "settle_s": 0.4,
+            "drop_wait_s": 1.0}
+
+    def posts(self):
+        return self.board.bench_posts
+
+    def test_pass_a_rebuild_whose_fresh_handshake_was_answered_under_one_ring(self):
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.manifest["verdict"], "PASS")
+        self.assertEqual(self.manifest["summary"]["outcome"], "rebuilt, the fresh handshake was answered")
+        self.assertEqual(self.manifest["summary"]["witness"],
+                         {"attempts": 1, "rebuilt": 1, "answered": 1, "failed": 0, "giveups": 0})
+        self.assertEqual(self.manifest["probe"]["fired"], {"get_status": 1, "get_max_attempts": 1})
+        self.assertEqual(self.manifest["probe"]["ballast"]["target"], 8192)
+        self.assertEqual(self.manifest["probe"]["ballast"]["deadman_s"], 35)
+        self.assertEqual(len(self.calls), 1)
+        c = self.calls[0]
+        self.assertEqual((c["final"], c["cancel_status"], self.board.invite_users), (487, 200, [FAR]))
+        self.assertFalse(c["cancel_when_expired"], "the CANCEL followed the failure line, not the wait bound")
+        self.assertEqual(len(self.board.cancels), 1, "one ring")
+        self.assertEqual(c["alive_problems"], [])
+        self.assertNotIn("_call_id", c)
+        self.assertFalse(os.path.exists(os.path.join(self.res, "status.jsonl")), "no second poller on a squeezed board")
+        self.assert_clean_probe(out)
+
+    def test_the_arms_hold_and_release_go_in_order_and_the_release_precedes_the_disarm(self):
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        p = self.posts()
+        self.assertEqual(p[:3], [{"fault": "get_status", "value": "404"}, {"fault": "get_max_attempts", "value": "8"},
+                                 {"ballast": "8192", "deadman": "35"}])
+        self.assertLess(p.index({"ballast": "8192", "deadman": "35"}), p.index({"ballast": "release"}))
+        self.assertLess(p.index({"ballast": "release"}), p.index({"fault": "disarm"}))
+        self.assertEqual(self.board.ballast["released"]["api"], 1)
+
+    def test_pass_when_the_next_open_fails_again_and_the_third_in_a_row_gives_up(self):
+        self.board.knobs["x370_fails"] = 3
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.manifest["summary"]["outcome"], "rebuilt, the open after it failed again")
+        self.assertEqual(self.manifest["summary"]["witness"]["giveups"], 1)
+
+    def test_an_open_failed_line_is_a_transport_failure_too(self):
+        self.board.knobs["x370_open_failed"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.manifest["summary"]["witness"]["attempts"], 1)
+
+    def test_invalid_when_the_rebuild_returned_false_it_may_be_a_teardown(self):
+        self.board.knobs["x370_rebuild_fail"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("recreateGetClient() returned false", out)
+        self.assertIn("the log cannot tell which", out)
+        self.assertIsNone(self.manifest["summary"]["outcome"])
+        self.assertEqual(self.manifest["summary"]["witness"]["failed"], 1, "the count stays in the summary")
+        self.assertEqual(self.manifest["log_counters"]["get_rebuild_giveup"], 1)
+
+    def test_invalid_when_the_ballast_never_made_the_open_fail(self):
+        self.board.knobs["x370_fails"] = 0
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("0 'transport failure' or 'open failed' lines", out)
+        self.assertIn("get_transport_fail is 0", out)
+        self.assertTrue(self.calls[0]["cancel_when_expired"], "no failure line: the CANCEL went at the wait bound")
+        self.assertEqual(self.calls[0]["final"], 487, "and the far end is not left ringing")
+        self.assert_clean_probe(out)
+
+    def test_invalid_when_a_failure_has_no_next_attempt_and_no_giveup(self):
+        self.board.knobs["x370_no_followup"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("no next attempt after one and no 'could not rebuild' line", out)
+
+    def test_invalid_when_the_call_never_rings(self):
+        self.board.refuse_calls = {0}                          # 180, then a 503 before any leg exists
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("0 anchored legs started during the call, not 1", out)
+        self.assertEqual(self.board.ballast["released"]["api"], 1, "the ballast was held across it and released")
+        self.assert_clean_probe(out)
+
+    def test_invalid_when_the_ballast_did_not_take(self):
+        self.board.knobs["ballast_noop"] = True               # already at or under the target
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("do not show it held", out)
+        self.assertEqual(self.board.invite_users, [])
+        self.assert_clean_probe(out)
+
+    def test_a_409_on_the_hold_stops_before_the_call_and_the_finally_releases(self):
+        self.board.knobs["ballast_409"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("holding the ballast: 409", out)
+        self.assertEqual(self.board.invite_users, [])
+        self.assertIn({"ballast": "release"}, self.posts())
+        self.assert_clean_probe(out)
+
+    def test_a_409_on_a_fault_arm_stops_before_the_hold_and_the_call(self):
+        self.board.knobs["emergency_on_arm"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("arming get_status: 409", out)
+        self.assertNotIn("ballast held", out)
+        self.assertEqual(self.board.invite_users, [])
+        self.assertIn({"ballast": "release"}, self.posts(), "the scenario's own finally releases whatever it may hold")
+
+    def test_the_ballast_is_released_when_the_call_raises(self):
+        def boom(*a, **kw):
+            raise RuntimeError("the UA blew up mid-call")
+        with mock.patch.object(sip_agent.Agent, "invite", boom):
+            rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("harness exception", out)
+        self.assertEqual(self.board.ballast["released"]["api"], 1)
+        self.assertLess(self.posts().index({"ballast": "8192", "deadman": "35"}), self.posts().index({"ballast": "release"}))
+        self.assert_clean_probe(out)
+
+    def test_a_release_the_board_answers_busy_is_repeated(self):
+        self.board.knobs["release_503"] = 2
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertGreaterEqual(self.posts().count({"ballast": "release"}), 3, "two busy answers, then the 200")
+        self.assertEqual(self.board.ballast["released"]["api"], 1)
+
+    def test_fail_on_a_panic_line(self):
+        self.board.knobs["x370_panic"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("a panic line reached the syslog", out)
+
+    def test_fail_when_the_board_rebooted(self):
+        self.board.reboot_after_call = 0                       # its uptime goes back after the CANCEL
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("the board rebooted", out)
+
+    def test_fail_on_a_possible_orphan_under_the_ballast(self):
+        self.board.knobs["x370_orphan"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("possible ORPHAN", out)
+        self.assertTrue(any("ORPHAN WARNING" in n for n in self.manifest["notes"]))
+
+    def test_invalid_when_the_dead_man_released_the_ballast_first(self):
+        self.board.knobs["x370_deadman_early"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("the dead-man released the ballast before the harness did", out)
+
+    def test_no_http_request_reaches_the_board_while_the_ballast_is_held(self):
+        # between the hold and the release the harness sends SIP and reads its own syslog; the one request
+        # the board may get is the release itself
+        calls, orig = [], an.BoardHttp._req
+
+        def spy(http, method, path, fields=None, auth=False, csrf=False):
+            calls.append((method, path, dict(fields or {}), self.board.ballast["held"]))
+            return orig(http, method, path, fields, auth, csrf)
+        with mock.patch.object(an.BoardHttp, "_req", spy):
+            rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        during = [(m, p, f) for m, p, f, held in calls if held]
+        self.assertEqual(during, [("POST", an.BENCH_PATH, {"ballast": "release"})])
+        self.assertTrue(any(p == "/api/status" and not held for _, p, _, held in calls), "read after the release")
+
+
 class ProbeSafetyTest(ProbeRunCase):
     def test_a_release_image_is_invalid_before_any_sip(self):
         self.board.probe_image = False
@@ -2740,6 +3187,402 @@ class ProbeSafetyTest(ProbeRunCase):
         rc, out = self.go()
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.board.ballast["released"]["api"], 1)
+        self.assert_clean_probe(out)
+
+
+# ---------------------------------------------------------------- x952_token_age_held (#952, #945)
+X952 = "x952_token_age_held"
+X952_FAST = {"hold_s": 1.0, "margin_s": 0.4, "arm_wait_s": 2.0, "post_open_wait_s": 2.0, "settle_s": 0.6,
+             "gap_s": 0.2}
+DEFER = "TelephonyAnchor: Token near expiry but media streams active — deferring refresh"
+RETRIEVED = "TelephonyAnchor: Retrieved access token (len=900, lifetime=3600s)"
+MAINT_REFRESH = ("anchor: token_maint_refresh_862: the background refresh fetches a new token, the one it "
+                 "replaces is 3500 s old (#862)")
+MAINT_SKIP = "anchor: token_maint_skip_862: the background token refresh is skipped: a call is up (#862)"
+WS_RESTART = ("TelephonyAnchor: WS disconnected/errored with an expiring token — requesting anchor restart to "
+              "refresh it")
+
+
+def allow_held(test, approvals=None):
+    """A held call needs a recorded approval of its own: the test supplies one, so it does not depend on the
+    recorded LONG_HOLD_APPROVALS (X952RecordedApprovalTest pins those)."""
+    p = mock.patch.object(an, "LONG_HOLD_APPROVALS", (an.APPROVALS[0],) if approvals is None else approvals)
+    p.start()
+    test.addCleanup(p.stop)
+
+
+class X952RefusalTest(unittest.TestCase):
+    VER = ("--expect-version", PROBE_VERSION)
+
+    def setUp(self):
+        allow_held(self)
+
+    def go(self, *extra, **kw):
+        return cli(*self.VER, *extra, scenario=X952, **kw)
+
+    def refused(self, argv, env, *needles):
+        rc, out = run_main(argv, env, http=NoNetwork())
+        self.assertEqual(rc, an.REFUSED, out)
+        for n in needles:
+            self.assertIn(n, out)
+        self.assertNotIn(FAR, out)
+        self.assertNotIn(FAR[-10:], out)
+        return out
+
+    def accepted(self, *extra, **kw):
+        rc, out = run_main(self.go("--dry-run", *extra, **kw), base_env(), http=NoNetwork())
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn(FAR, out)
+        return out
+
+    def test_it_is_one_probe_scenario_that_arms_token_age_and_holds_a_call(self):
+        sc = an.SCENARIOS[X952]
+        self.assertEqual((sc["probe"], tuple(sc["faults"]), sc["held"], sc["path_counter"]),
+                         (True, ("token_age",), True, "bench_token_age"))
+        self.assertEqual((sc["calls"], sc["max_calls"], sc["arm_at"]), (1, 1, "mid-call"))
+        self.assertEqual(sc["agent_opts"]["caller"], {"rtp": True, "contact_params": ";line=pd6101",
+                                                      "invite_timeout": 45.0})
+        self.assertGreater(sc["agent_opts"]["caller"]["invite_timeout"], an.AGENT_INVITE_TIMEOUT_S,
+                           "the default 16 s would CANCEL a far end still ringing toward its voicemail")
+        self.assertEqual(an.OLD_TOKEN_MARGIN_S, 300)
+        self.assertGreater(sc["hold_s"], an.OLD_TOKEN_MARGIN_S)
+        self.assertEqual(an.scenario_problems(sc), [])
+        self.assertNotIn("x336_ws_reauth", an.SCENARIOS, "the ws_drop scenario stays unregistered")
+
+    def test_the_forbidden_destinations_are_refused_before_anything_is_sent(self):
+        owner = an.owner_set(None, None)
+        for num, why in (("911", "emergency or never-dial"), ("933", "emergency or never-dial"),
+                         ("113", "emergency or never-dial"), ("1001", "owner extension")):
+            with self.subTest(num=num):
+                self.assertTrue(an.far_end_problems(num, owner), num)
+                for far in (num, "+" + num):
+                    rc, out = run_main(self.go(), base_env(PD_ANCHOR_FAR_END=far), http=NoNetwork())
+                    self.assertEqual(rc, an.REFUSED, out)
+                    self.assertIn(why, out)
+                    self.assertIn("nothing was sent", out)
+        self.assertEqual(an.far_end_problems(FAR, owner), [], "a far end that is none of them is accepted")
+        self.accepted()
+
+    def test_a_second_run_is_refused_when_the_cap_is_one(self):
+        self.refused(self.go("--runs", "2"), base_env(), "calls must be 1-1")
+        self.refused(self.go("--runs", "2", "--run-cap", "1"), base_env(), "calls must be 1-1")
+        self.refused(self.go("--runs", "0"), base_env(), "calls must be 1-1")
+        self.refused(self.go("--runs", "4", "--run-cap", "3"), base_env(), "calls must be 1-3")
+        self.refused(self.go("--run-cap", "4"), base_env(), "the run cap (max_calls) must be 1-3")
+        self.refused(self.go("--run-cap", "0"), base_env(), "the run cap (max_calls) must be 1-3")
+        self.assertIn("1 run(s), run cap 1", self.accepted())
+        self.assertIn("2 run(s), run cap 2", self.accepted("--runs", "2", "--run-cap", "2"))
+
+    def test_the_hold_must_outlast_the_old_margin_and_stay_under_the_ceiling(self):
+        for bad in ("300", "299", "0", "-5", "901"):
+            self.refused(self.go("--hold-s", bad), base_env(), "hold_s must be longer than the old 300 s")
+        for bad in ("nan", "inf"):
+            self.refused(self.go("--hold-s", bad), base_env(), "--hold-s must be a finite number")
+        self.assertIn("each <= 331 s", self.accepted("--hold-s", "301"))
+        self.assertIn("each <= 930 s", self.accepted("--hold-s", "900"))
+        self.assertIn("held      330 s after token_age is armed once the call's streams are open (the old margin "
+                      "is 300 s)", self.accepted())
+
+    def test_the_new_flags_are_numeric_but_the_far_end_is_still_never_an_argument(self):
+        self.accepted("--hold-s", "330", "--runs", "1", "--run-cap", "1", "--arm-at", "before-call")
+        self.accepted("--hold-s=330", "--run-cap=1")
+        self.refused(self.go("330"), base_env(), "number-shaped")
+        self.refused(self.go("--hold-s", FAR), base_env(), "holds a secret")
+        self.refused(self.go("--hold-s=" + FAR), base_env(), "holds a secret")
+        self.refused(self.go("--arm-at", "tomorrow"), base_env(), "invalid choice")
+
+    def test_the_flags_apply_to_the_held_scenario_alone(self):
+        for flag in (("--hold-s", "60"), ("--runs", "1"), ("--run-cap", "1"), ("--arm-at", "mid-call")):
+            self.refused(cli(*flag, scenario="x349_unread_makecall"), base_env(), "apply only to a held scenario")
+
+    def test_a_held_call_needs_an_approval_recorded_for_it(self):
+        for approvals in ((), ("https://github.com/GlomarGadaffi/pocket-dial/issues/952#issuecomment-1",)):
+            with mock.patch.object(an, "LONG_HOLD_APPROVALS", approvals):
+                for url in an.APPROVALS:
+                    self.refused(self.go(approval=url), base_env(), "not a recorded approval of a held call")
+        held = "https://github.com/GlomarGadaffi/pocket-dial/issues/952#issuecomment-1"
+        with mock.patch.object(an, "LONG_HOLD_APPROVALS", (held,)):
+            self.accepted(approval=held)
+            # the held approval is not an approval of the 30-second scenarios, nor theirs of this one
+            self.refused(cli(approval=held), base_env(), "not a recorded approval")
+            self.refused(self.go(), base_env(), "not a recorded approval of a held call")
+
+    def test_the_30_second_ceiling_is_unchanged_for_every_other_scenario(self):
+        self.assertEqual(an.MAX_CALL_S, 30)
+        other = an.SCENARIOS["x349_unread_makecall"]
+        held = an.SCENARIOS[X952]
+        for sc in (dict(other, call_cap_s=360), dict(held, held=False)):
+            self.assertTrue(any("call_cap_s must be 1-30" in p for p in an.scenario_problems(sc)), sc["name"])
+        self.assertTrue(any("call_cap_s must be 1-930" in p
+                            for p in an.scenario_problems(dict(held, call_cap_s=931))))
+        self.assertTrue(any("hold_s must be longer" in p for p in an.scenario_problems(dict(held, hold_s=901))))
+
+    def test_it_inherits_the_probe_scenarios_preconditions(self):
+        self.refused(self.go(checkout=None), base_env(), "no CHECK-OUT")
+        self.refused(self.go(exp=expiry(60)), base_env(), "before this run would end")
+        self.refused(self.go(approval=None), base_env(), "no --approval-url")
+        self.refused(self.go("--far-end", FAR), base_env(), "never goes on an argv")
+        self.refused(self.go(), base_env(PD_ANCHOR_FAR_END=None), "no far end")
+        self.refused(self.go(), base_env(PD_BOARD_ADMIN_PIN=None), "PD_BOARD_ADMIN_PIN")
+        self.refused(self.go(host="192.168.12.110"), base_env(), "not an approved rig")
+        self.refused(self.go(), base_env(PD_ANCHOR_FAR_END="6104"), "this PBX owns")
+        self.refused(cli(scenario=X952), base_env(), "no --expect-version")
+        self.refused(cli("--expect-version", "v1.5.0", scenario=X952), base_env(), "not a -probe stamp")
+        out = self.accepted()
+        for needle in ("RING-REQUIRED", "PROBE IMAGE", "bench_token_age"):
+            self.assertIn(needle, out)
+
+
+class X952RecordedApprovalTest(unittest.TestCase):
+    """desmo's recorded 330 s OK (a comment on PR #958) is the one LONG_HOLD_APPROVALS entry."""
+    URL = "https://github.com/GlomarGadaffi/pocket-dial/pull/958#issuecomment-6094652997"
+
+    def test_the_recorded_approval_is_in_the_list_and_accepted_for_the_held_scenario(self):
+        self.assertEqual(an.LONG_HOLD_APPROVALS, (self.URL,))
+        self.assertEqual(an.approval_problems(self.URL, an.SCENARIOS[X952]), [])
+
+    def test_it_covers_no_other_scenario(self):
+        for name in ("x349_unread_makecall", "x4_cancel_ringing"):
+            self.assertIn("not a recorded approval", " ".join(an.approval_problems(self.URL, an.SCENARIOS[name])))
+
+    def test_an_unrecorded_or_911_style_url_is_refused_for_the_held_scenario(self):
+        base = "https://github.com/GlomarGadaffi/pocket-dial/"
+        for url in (base + "pull/958#issuecomment-1", base + "issues/911#issuecomment-6094652997",
+                    base + "issues/933", self.URL + "0", self.URL.replace("pull/958", "pull/959"), "911"):
+            with self.subTest(url=url):
+                self.assertIn("not a recorded approval of a held call",
+                              " ".join(an.approval_problems(url, an.SCENARIOS[X952])))
+        for old in an.APPROVALS:                        # the ~30 s approvals never cover a held call
+            self.assertTrue(an.approval_problems(old, an.SCENARIOS[X952]))
+
+    def test_main_takes_the_recorded_approval_unpatched_and_refuses_an_old_one(self):
+        for url, want in ((self.URL, 0), (an.APPROVALS[0], an.REFUSED)):
+            rc, out = run_main(cli("--dry-run", "--expect-version", PROBE_VERSION, scenario=X952, approval=url),
+                               base_env(), http=NoNetwork())
+            self.assertEqual(rc, want, out)
+
+
+class X952WitnessTest(unittest.TestCase):
+    LOG = ["W (1) BenchProbe: BENCHFAULT token_age fired",
+           "W (2) " + DEFER,
+           "W (3) " + DEFER,
+           "I (4) " + RETRIEVED,
+           "E (5) TelephonyAnchor: Token request returned HTTP 401",
+           "I (6) TelephonyAnchor: Successfully dropped participant 41"]
+    ZERO = {"bench_token_age": 0, "token_refresh_near_expiry": 0, "token_refresh_deferred_live": 0,
+            "token_retrieved": 0, "token_fetch_failed": 0, "ws_restart_stale_token": 0,
+            "token_maint_refresh_862": 0, "token_maint_skip_862": 0, "token_sos_live_fetch_862": 0,
+            "token_sos_401_fetch_862": 0}
+    NEW_862 = ("token_maint_refresh_862", "token_maint_skip_862", "token_sos_live_fetch_862",
+               "token_sos_401_fetch_862")
+
+    def test_each_token_witness_counts_its_own_line_and_no_other(self):
+        for name, line in sorted(WitnessSampleTest.SAMPLES.items()):
+            if name not in an.TOKEN_WITNESSES:
+                continue
+            with self.subTest(counter=name):
+                self.assertEqual(an.token_counts([line]), dict(self.ZERO, **{name: 1}))
+        for near_miss in ("Access token near expiry — deferring", "Token near expiry — deferring refresh",
+                          "BENCHFAULT token_age armed (value 0)", "Retrieved access token", "token_maint_skip_862",
+                          "token_maint_skip: x", "token_sos_401_fetch_86: x", "maint_refresh_862: x"):
+            self.assertEqual(an.token_counts([near_miss]), self.ZERO, near_miss)
+
+    def test_the_counts_for_a_fixed_log_excerpt(self):
+        self.assertEqual(an.token_counts(self.LOG), dict(self.ZERO, bench_token_age=1, token_refresh_deferred_live=2,
+                                                         token_retrieved=1, token_fetch_failed=1))
+        self.assertEqual(list(an.token_counts(self.LOG)), list(an.TOKEN_WITNESSES))
+        self.assertEqual(an.token_counts([]), self.ZERO)
+
+    def test_the_summary_as_json_and_as_text(self):
+        sc = an.SCENARIOS[X952]
+        calls = [{"call": 1, "hold_s": 331.2, "ended_early": False, "aged_ms": 4200,
+                  "log": an.token_counts(self.LOG)},
+                 {"call": 2, "hold_s": 120.0, "ended_early": True, "aged_ms": 3900,
+                  "log": an.token_counts(self.LOG[:2])}]
+        summary = an.held_summary(calls, sc)
+        self.assertEqual((summary["hold_s_planned"], summary["margin_s"], summary["arm_at"]), (330.0, 300, "mid-call"))
+        self.assertEqual(summary["witnesses"], dict(self.ZERO, bench_token_age=2, token_refresh_deferred_live=3,
+                                                    token_retrieved=1, token_fetch_failed=1))
+        self.assertEqual([(r["run"], r["hold_s"], r["ended_early"]) for r in summary["runs"]],
+                         [(1, 331.2, False), (2, 120.0, True)])
+        self.assertEqual(json.loads(json.dumps(summary)), summary)
+        self.assertEqual(an.held_summary_text(summary), [
+            "x952 token_age held: planned hold 330 s (old margin 300 s), token_age armed mid-call, 2 run(s)",
+            "  run 1: held 331.2 s after the token was aged: bench_token_age=1 token_refresh_near_expiry=0 "
+            "token_refresh_deferred_live=2 token_retrieved=1 token_fetch_failed=1 ws_restart_stale_token=0 "
+            "token_maint_refresh_862=0 token_maint_skip_862=0 token_sos_live_fetch_862=0 token_sos_401_fetch_862=0",
+            "  run 2: held 120.0 s after the token was aged, ended early: bench_token_age=1 "
+            "token_refresh_near_expiry=0 token_refresh_deferred_live=1 token_retrieved=0 token_fetch_failed=0 "
+            "ws_restart_stale_token=0 token_maint_refresh_862=0 token_maint_skip_862=0 "
+            "token_sos_live_fetch_862=0 token_sos_401_fetch_862=0",
+            "  total: bench_token_age=2 token_refresh_near_expiry=0 token_refresh_deferred_live=3 token_retrieved=1 "
+            "token_fetch_failed=1 ws_restart_stale_token=0 token_maint_refresh_862=0 token_maint_skip_862=0 "
+            "token_sos_live_fetch_862=0 token_sos_401_fetch_862=0"])
+        bare = an.held_summary_text(an.held_summary([{"call": 1}], sc))
+        self.assertEqual(bare[1], "  run 1: held n/a after the token was aged: no counts")
+
+    def test_the_862_witnesses_end_the_list_and_each_is_counted_in_the_summary(self):
+        self.assertEqual(an.TOKEN_WITNESSES[-4:], self.NEW_862)
+        self.assertEqual(len(an.TOKEN_WITNESSES), 10)
+        sc = an.SCENARIOS[X952]
+        sample = WitnessSampleTest.SAMPLES
+        calls = [{"call": 1, "hold_s": 331.0, "ended_early": False, "aged_ms": 4000,
+                  "log": an.token_counts([sample[n] for n in self.NEW_862])},
+                 {"call": 2, "hold_s": 331.0, "ended_early": False, "aged_ms": 4000,
+                  "log": an.token_counts([sample["token_maint_skip_862"]] * 2)}]
+        self.assertEqual(calls[0]["log"], dict(self.ZERO, **{n: 1 for n in self.NEW_862}))
+        self.assertEqual(an.held_summary(calls, sc)["witnesses"],
+                         dict(self.ZERO, token_maint_refresh_862=1, token_maint_skip_862=3,
+                              token_sos_live_fetch_862=1, token_sos_401_fetch_862=1))
+
+
+class X952Test(ProbeRunCase):
+    MODE = "x952"
+    SCENARIO = X952
+    FAST = X952_FAST
+
+    def setUp(self):
+        super().setUp()
+        allow_held(self)
+
+    def test_pass_arms_after_the_streams_open_holds_and_reports(self):
+        seen = []
+        self.board.knobs["post_open_delay_s"] = 0.3            # the answer comes first, the stream a moment later
+        self.board.on_arm = lambda fault: seen.append(any(c.get("stream_open") for c in self.board.calls.values()))
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((self.arms(), seen), (["token_age"], [True]), "armed once, after the POST stream opened")
+        self.assertEqual(self.manifest["probe"]["fired"], {"token_age": 1})
+        c = self.calls[0]
+        self.assertEqual((c["final"], c["hangup_bye"], c["arm_at"], c["ended_early"]), (200, 200, "mid-call", False))
+        self.assertGreaterEqual(c["hold_s"], 1.0)
+        self.assertGreaterEqual(c["post_open_ms"], 300)
+        self.assertGreaterEqual(c["aged_ms"], c["post_open_ms"])
+        self.assertGreater(self.board.rtp_rx, 0, "the handset sends audio, so the POST stream is really live")
+        s = self.manifest["summary"]
+        self.assertEqual(s["witnesses"], dict(X952WitnessTest.ZERO, bench_token_age=1))
+        self.assertEqual(s["runs"][0]["hold_s"], c["hold_s"])
+        self.assertIn("x952 token_age held: planned hold 1 s (old margin 0.4 s), token_age armed mid-call, 1 run(s)",
+                      out)
+        self.assertEqual(self.manifest["log_counters"]["dropped"], 1)
+        self.assertEqual(c["sessions"], {"baseline": 0, "after": 0, "test_ua_sessions": 0})
+        self.assertEqual(self.board.bindings, {})
+        self.assert_clean_probe(out)
+
+    def test_the_counts_start_when_the_token_is_aged_not_at_the_dial(self):
+        self.board.knobs["origination_lines"] = [RETRIEVED, MAINT_SKIP]
+        self.board.knobs["token_lines"] = [DEFER, DEFER, WS_RESTART, MAINT_REFRESH]
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.manifest["summary"]["witnesses"],
+                         dict(X952WitnessTest.ZERO, bench_token_age=1, token_refresh_deferred_live=2,
+                              ws_restart_stale_token=1, token_maint_refresh_862=1))
+        self.assertEqual(self.manifest["log_counters"]["token_maint_skip_862"], 1,
+                         "the whole-run counter sees the line from before the token was aged")
+        self.assertEqual(self.manifest["log_counters"]["token_retrieved"], 1, "the whole-run counter still sees it")
+
+    def test_before_call_arms_before_the_invite(self):
+        order = []
+
+        def on_arm(fault):                          # the anchor's next tick fires it, after the POST is answered
+            order.append(len(self.board.invite_users))
+
+            def tick():
+                with self.board.lock:
+                    self.board.fire(fault)
+            threading.Timer(0.1, tick).start()
+        self.board.on_arm = on_arm
+        rc, out = self.go(extra=("--arm-at", "before-call"))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(order, [0], "armed with no INVITE yet")
+        self.assertEqual(self.calls[0]["arm_at"], "before-call")
+        self.assertLess(self.calls[0]["aged_ms"], 0)
+        self.assertEqual(self.manifest["summary"]["witnesses"]["bench_token_age"], 1)
+
+    def test_two_runs_when_the_cap_allows_them(self):
+        self.board.knobs["token_lines"] = [DEFER]
+        rc, out = self.go(extra=("--runs", "2", "--run-cap", "2"))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.board.invite_users, [FAR, FAR])
+        self.assertEqual([c["call"] for c in self.calls], [1, 2])
+        self.assertEqual(self.manifest["probe"]["fired"], {"token_age": 2})
+        self.assertEqual(self.manifest["summary"]["witnesses"],
+                         dict(X952WitnessTest.ZERO, bench_token_age=2, token_refresh_deferred_live=2))
+        self.assertEqual([r["witnesses"]["token_refresh_deferred_live"] for r in self.manifest["summary"]["runs"]],
+                         [1, 1])
+        self.assertEqual(self.manifest["log_counters"]["dropped"], 2)
+        for n in ("call-01.pcap", "call-02.pcap"):
+            self.assertTrue(os.path.exists(os.path.join(self.res, "pcap", n)), n)
+        self.assert_clean_probe(out)
+
+    def test_invalid_when_the_far_side_hangs_up_inside_the_margin(self):
+        self.board.knobs["far_hangs_up_s"] = 0.02
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("not past the old 0.4 s margin", out)
+        self.assertIn("endCall reasons: anchor hangup", out)
+        c = self.calls[0]
+        self.assertTrue(c["ended_early"])
+        self.assertLess(c["hold_s"], 0.4)
+        self.assertEqual(c["pbx_byes"], 1)
+        self.assertNotIn("hangup_bye", c, "the PBX hung up; the harness sent no BYE")
+        self.assert_clean_probe(out)
+
+    def test_a_call_that_ends_past_the_margin_but_before_the_planned_hold_is_reported_not_invalid(self):
+        self.board.knobs["far_hangs_up_s"] = 0.7
+        rc, out = self.go(overrides={"hold_s": 3.0})
+        self.assertEqual(rc, 0, out)
+        run = self.manifest["summary"]["runs"][0]
+        self.assertTrue(run["ended_early"])
+        self.assertGreater(run["hold_s"], 0.4)
+        self.assertEqual(self.calls[0]["pbx_byes"], 1)
+        self.assertIn("ended early", out)
+
+    def test_invalid_without_ringing_on_when_token_age_never_fires(self):
+        self.board.fire_enabled = False
+        rc, out = self.go(overrides={"hold_s": 30.0, "arm_wait_s": 0.5})
+        self.assertEqual(rc, 3, out)
+        self.assertIn("no 'BENCHFAULT token_age fired' line came within 0.5 s", out)
+        self.assertIn("the fault token_age fired 0 times", out)
+        self.assertLess(self.calls[0]["duration_s"], 10.0, "nothing was aged, so the call was not held for 30 s")
+        self.assertEqual(self.calls[0]["hangup_bye"], 200)
+        self.assert_clean_probe(out)
+
+    def test_invalid_when_no_stream_opens_and_nothing_is_armed(self):
+        self.board.knobs["no_post_open"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("no POST stream OPEN line for the call's leg", out)
+        self.assertEqual(self.arms(), [])
+        self.assert_clean_probe(out)
+
+    def test_invalid_when_the_far_end_does_not_answer(self):
+        self.board.knobs["refuse"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("the far end did not answer (final 503)", out)
+        self.assertEqual(self.arms(), [])
+
+    def test_an_emergency_that_appears_after_the_preflight_stops_the_run_before_the_invite(self):
+        read = self.board.counters
+        reads = []
+
+        def counters():
+            reads.append(1)
+            if len(reads) > 1:                     # the preflight read was clear; the next one is not
+                self.board.emergency_live = True
+            return read()
+        self.board.counters = counters
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("refusing to dial: the probe reports an emergency call live", out)
+        self.assertEqual((self.board.invite_users, self.arms()), ([], []))
+
+    def test_fail_on_a_second_drop(self):
+        self.board.knobs["double_drop"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("dropped 2 times", out)
         self.assert_clean_probe(out)
 
 

@@ -1,0 +1,2 @@
+# Forward100rel_test.cpp: 35 tests (default-off flag, 100rel stripped from a forwarded leg, reliable 180 and local PRACK, every other route stays 420, Rule 5 emergency traffic, heap)
+35

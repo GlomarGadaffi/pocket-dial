@@ -84,6 +84,117 @@ TEST(BenchProbeLogic, ParametersAreRequiredExactlyWhereTheyMeanSomething)
 	EXPECT_EQ(bp::parseFaultRequest("ws_drop", "", r), Verdict::BadRequest);
 }
 
+TEST(BenchProbeLogic, WsUpsertTakesACaseOneToThreeAndNothingElse)
+{
+	// #888: ws_upsert injects one synthetic upsert; the value picks which witness branch it aims at.
+	Fault f = Fault::Count;
+	ASSERT_TRUE(bp::parseFault("ws_upsert", f));
+	EXPECT_EQ(f, Fault::WsUpsert);
+	EXPECT_EQ(bp::faultName(Fault::WsUpsert), "ws_upsert");
+	bp::FaultRequest r;
+	for (const char* c : {"1", "2", "3"})
+	{
+		EXPECT_EQ(bp::parseFaultRequest("ws_upsert", c, r), Verdict::Ok) << c;
+		EXPECT_EQ(r.fault, Fault::WsUpsert);
+		EXPECT_TRUE(r.hasValue);
+		EXPECT_EQ(r.value, c[0] - '0');
+	}
+	EXPECT_EQ(bp::kWsUpsertCases, 3);
+	for (const char* bad : {"", "0", "4", "-1", "1x", " 1", "01a"})
+		EXPECT_EQ(bp::parseFaultRequest("ws_upsert", bad, r), Verdict::BadRequest) << "'" << bad << "'";
+}
+
+TEST(BenchProbeLogic, WsUpsertWaitsForItsCaseAndNeverForcesIt)
+{
+	// wsUpsertReady(case, nin, active, pending): nin = unanswered in-flight outbound legs,
+	// active = outbound slots, pending = makeCalls mid-resolve.
+	// Case 1 (unknown participant) and 3 (our own leg) are "no call" cases: any outbound slot
+	// or pending makeCall makes them wait, so a synthetic upsert can never share a call's state.
+	for (int c : {1, 3})
+	{
+		EXPECT_TRUE(bp::wsUpsertReady(c, 0, 0, 0)) << c;
+		EXPECT_FALSE(bp::wsUpsertReady(c, 1, 1, 0)) << c;
+		EXPECT_FALSE(bp::wsUpsertReady(c, 0, 1, 0)) << "an answered call is still a call: " << c;
+		EXPECT_FALSE(bp::wsUpsertReady(c, 0, 0, 1)) << "a makeCall mid-resolve: " << c;
+	}
+	// Case 2 needs an unanswered outbound leg in flight (nin >= 1), the absorbed branch's own condition.
+	EXPECT_FALSE(bp::wsUpsertReady(2, 0, 0, 0));
+	EXPECT_FALSE(bp::wsUpsertReady(2, 0, 1, 0)) << "answered: nin is 0";
+	EXPECT_FALSE(bp::wsUpsertReady(2, 0, 0, 1)) << "pending only: that is the ignored branch, not this one";
+	EXPECT_TRUE(bp::wsUpsertReady(2, 1, 1, 0));
+	EXPECT_TRUE(bp::wsUpsertReady(2, 2, 2, 1));
+	for (int c : {0, 4, -1})
+		EXPECT_FALSE(bp::wsUpsertReady(c, 1, 1, 0)) << c;
+}
+
+TEST(BenchProbeLogic, WsUpsertFrameIsTheShapeHandleWsEventParses)
+{
+	char id[24];
+	ASSERT_GT(bp::formatWsUpsertId(id, sizeof(id), 2, 17), 0u);
+	EXPECT_STREQ(id, "pdb-u2-17");
+	EXPECT_TRUE(bp::isWsProbeId(id));
+	EXPECT_LT(std::strlen(id), sizeof(id)) << "the witness line prints part=%.24s";
+
+	char frame[192];
+	const size_t n = bp::formatWsUpsertFrame(frame, sizeof(frame), /*TEL_EV_UPSET=*/0, "rcv2", id);
+	ASSERT_GT(n, 0u);
+	const std::string s(frame, n);
+	EXPECT_EQ(s, "{\"event\":{\"event_type\":0,\"entity\":\"/callcontrol/rcv2/participants/pdb-u2-17\","
+	             "\"attached_data\":{}}}");
+	// The entity goes through the parser handleWsEvent() uses, to the same dn and participant id.
+	const size_t at = s.find("/callcontrol/");
+	const telephony::ParticipantEntity e = telephony::parseParticipantEntity(
+		s.substr(at, s.find('"', at) - at));
+	ASSERT_TRUE(e.valid);
+	EXPECT_EQ(e.dn, "rcv2");
+	EXPECT_EQ(e.participantId, "pdb-u2-17");
+
+	// Nothing that could break the JSON or the path goes in; a short buffer is refused, never cut.
+	for (const char* bad : {"", "a\"b", "a/b", "a\\b", "a b", "a\nb"})
+	{
+		EXPECT_EQ(bp::formatWsUpsertFrame(frame, sizeof(frame), 0, bad, id), 0u) << "dn '" << bad << "'";
+		EXPECT_EQ(bp::formatWsUpsertFrame(frame, sizeof(frame), 0, "rcv2", bad), 0u) << "id '" << bad << "'";
+	}
+	EXPECT_EQ(bp::formatWsUpsertFrame(frame, n, 0, "rcv2", id), 0u) << "one byte short for the NUL";
+	EXPECT_EQ(bp::formatWsUpsertFrame(frame, n + 1, 0, "rcv2", id), n);
+	char tiny[8];
+	EXPECT_EQ(bp::formatWsUpsertId(tiny, sizeof(tiny), 1, 1234567), 0u);
+	EXPECT_EQ(bp::formatWsUpsertId(id, sizeof(id), 4, 1), 0u) << "only cases 1-3 have an id";
+}
+
+TEST(BenchProbeLogic, ASyntheticParticipantIsNeverQueuedAsAnInboundCall)
+{
+	// handleWsEvent() maps an unknown participant with no outbound in flight to itself (controlLeg ==
+	// partId): the worker would announce it as an inbound call and ring the route DN's phones. A
+	// synthetic id is refused there, which is also how case 1 reaches the "not queued" branch.
+	EXPECT_TRUE(bp::wsProbeRefusesEnqueue("pdb-u1-1", "pdb-u1-1"));
+	EXPECT_TRUE(bp::wsProbeRefusesEnqueue("pdb-u2-2", "pdb-u2-2")) << "case 2 with the call gone before the classification";
+	// Case 2 as intended: mapped to the in-flight leg, so the worker checks that leg, not an inbound call.
+	EXPECT_FALSE(bp::wsProbeRefusesEnqueue("pdb-u2-2", "517"));
+	// Real 3CX participants are numbers; they are never touched.
+	EXPECT_FALSE(bp::wsProbeRefusesEnqueue("517", "517"));
+	EXPECT_FALSE(bp::wsProbeRefusesEnqueue("518", "517"));
+	EXPECT_FALSE(bp::wsProbeRefusesEnqueue("", ""));
+	EXPECT_FALSE(bp::isWsProbeId("pdb-"));
+	EXPECT_FALSE(bp::isWsProbeId("xpdb-u1-1"));
+}
+
+TEST(BenchProbeLogic, TheCountersBodyStillFitsTheHttpBufferWithEveryCounterAtItsWidest)
+{
+	// HttpServer::sendApiBenchFault renders into one static 1024-byte buffer. A new fault adds a
+	// block of counters; the widest every counter can get must still fit.
+	bp::Faults faults;
+	bp::BallastStatus b;
+	char buf[1024];
+	const size_t n = bp::renderStatus(buf, sizeof(buf), faults, b, false, 0);
+	ASSERT_GT(n, 0u);
+	// Counters in the body: 2 header, 2 per fault (fired, skips), 8 ballast, 1 free heap; each is
+	// 1 digit now and at most 10 as a uint32. Each fault's value is at most 3 digits (599) now.
+	const size_t counters = 2 + 2 * bp::kFaultCount + 8 + 1;
+	const size_t widest = n + counters * 9 + bp::kFaultCount * 2;
+	EXPECT_LE(widest, sizeof(buf)) << "the body is " << n << " bytes empty, " << widest << " at its widest";
+}
+
 TEST(BenchProbeLogic, AFaultFiresExactlyOncePerArm)
 {
 	bp::Faults faults;

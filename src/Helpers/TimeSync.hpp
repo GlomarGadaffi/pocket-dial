@@ -83,6 +83,24 @@ size_t formatRfc3339(time_t t, char* out, size_t cap);
 // frame still RFC 5424 conformant rather than carrying a fabricated 1970 stamp.
 std::string rfc3339Now();
 
+// Bytes a buffer needs for rfc3339NowInto(): 20 characters plus the NUL (formatRfc3339
+// needs cap >= 21). A synced stamp is 20 characters, which is over std::string's
+// 15-character small-string buffer, so rfc3339Now() heap-allocates on every synced
+// syslog line. This buffer is 21 bytes on the stack, smaller than the 24-byte
+// std::string object it replaces, so the log-drain task's stack is no worse off (#862).
+inline constexpr size_t kRfc3339Bytes = 21;
+
+// rfc3339Now() without the heap: writes the same text into `out` and returns its length.
+// Returns 0 only when `out` is null or `cap` is below 2 (the "-" fallback needs two bytes).
+// Syslog::send() calls this on every line.
+size_t rfc3339NowInto(char* out, size_t cap);
+
+// The pure core of rfc3339NowInto(): RFC 3339 for `now` when `synced`, kNilValue otherwise
+// (and also when a synced time will not fit in `cap`). Split out so the host suite can drive
+// the synced branch, which it never reaches by itself because isSynced() is always false
+// off-device.
+size_t formatNowOrNil(bool synced, time_t now, char* out, size_t cap);
+
 }  // namespace timesync
 
 #endif

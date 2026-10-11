@@ -1,10 +1,10 @@
 // HttpReadDeadline_test.cpp — issue #529: one LAN host must not be able to
 // hold every HTTP connection slot.
 //
-// The server serves at most HttpServer::kMaxConcurrentConnections (4) at once.
+// The server serves at most HttpServer::kMaxConcurrentConnections (3) at once.
 // Its only read timeout used to be per recv() (5 s), and the buffered body loop
 // runs before any auth check, so a client that sent a Content-Length and then a
-// byte every few seconds held its slot for as long as it liked. Four of those
+// byte every few seconds held its slot for as long as it liked. Three of those
 // and every dashboard, /api/status and login request got 503.
 //
 // Now: everything read before dispatch must arrive within one deadline, and one

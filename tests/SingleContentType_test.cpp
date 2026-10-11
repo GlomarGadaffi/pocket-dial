@@ -6,8 +6,6 @@
 // header lines and replace its body with the PBX's own SDP. When the INVITE's
 // Content-Type was not SDP they added a second line, so a 911 sent with
 // Content-Type: text/plain was answered with text/plain AND application/sdp.
-// The trunk's 183 and 200 to the handset (onTrunkRinging, onTrunkAnswered)
-// copy the INVITE the same way and kept its Content-Type line, whatever it was.
 //
 // Reachability. The header gate answers 415 to an INVITE whose body is not
 // labelled SDP, unless it yields for emergency traffic: a To of 911, a
@@ -262,23 +260,6 @@ namespace
 		return answerOrReport(r, "SIP/2.0 200");
 	}
 
-	// onTrunkRinging() and onTrunkAnswered(): a 911 over the trunk, the
-	// carrier's 183 with early media and then its 200.
-	std::pair<std::string, std::string> trunkAnswers(const std::string& typeLines)
-	{
-		Rig r(/*trunk=*/true);
-		r.send(invite("911", "ct845-trunk", typeLines), kCallerIp);
-		const std::string carrierInvite = r.first("INVITE sip:911@", kSbcIp);
-		if (carrierInvite.empty())
-		{
-			ADD_FAILURE() << "the 911 did not reach the carrier:\n" << r.dump();
-			return {};
-		}
-		r.send(carrierResponse(carrierInvite, "SIP/2.0 183 Session Progress"), kSbcIp);
-		r.send(carrierResponse(carrierInvite, "SIP/2.0 200 OK"), kSbcIp);
-		return {answerOrReport(r, "SIP/2.0 183"), answerOrReport(r, "SIP/2.0 200")};
-	}
-
 	// The PBX's own SDP, whole, under exactly the Content-Type line `typeLine`.
 	void expectOwnSdpUnder(const std::string& answer, const std::string& typeLine)
 	{
@@ -321,22 +302,6 @@ TEST(SingleContentType, AnEmergencyReinviteOnTheAnchorGetsOneSdpContentType)
 	expectOwnSdpUnder(ok, kSdpType);
 }
 
-// The sibling copies on the trunk route, where a 911 goes on a trunk board.
-TEST(SingleContentType, AnEmergencyCallOverTheTrunkGetsOneSdpContentTypeOnItsProgressAndAnswer)
-{
-	const auto [progress, ok] = trunkAnswers("Content-Type: text/plain\r\n");
-	ASSERT_FALSE(progress.empty());
-	ASSERT_FALSE(ok.empty());
-	{
-		SCOPED_TRACE("183");
-		expectOwnSdpUnder(progress, kSdpType);
-	}
-	{
-		SCOPED_TRACE("200");
-		expectOwnSdpUnder(ok, kSdpType);
-	}
-}
-
 // A request is not supposed to carry two (RFC 3261 §7.3.1), and the gate reads
 // the last one. A 555 call passes it with text/plain first and SDP last.
 TEST(SingleContentType, AnInviteWithTwoContentTypeLinesIsAnsweredWithOne)
@@ -366,11 +331,6 @@ TEST(SingleContentType, AnInviteAlreadyLabelledSdpKeepsItsOwnLineOnEveryPath)
 		answer = reinviteAnswer(lines);
 		ASSERT_FALSE(answer.empty());
 		expectOwnSdpUnder(answer, typeLine);
-		const auto [progress, ok] = trunkAnswers(lines);
-		ASSERT_FALSE(progress.empty());
-		ASSERT_FALSE(ok.empty());
-		expectOwnSdpUnder(progress, typeLine);
-		expectOwnSdpUnder(ok, typeLine);
 	}
 }
 
@@ -386,17 +346,6 @@ TEST(SingleContentType, AnInviteWithNoContentTypeGetsExactlyOneOnEveryPath)
 	answer = reinviteAnswer("");
 	ASSERT_FALSE(answer.empty());
 	expectOwnSdpUnder(answer, kSdpType);
-	const auto [progress, ok] = trunkAnswers("");
-	ASSERT_FALSE(progress.empty());
-	ASSERT_FALSE(ok.empty());
-	{
-		SCOPED_TRACE("trunk 183");
-		expectOwnSdpUnder(progress, kSdpType);
-	}
-	{
-		SCOPED_TRACE("trunk 200");
-		expectOwnSdpUnder(ok, kSdpType);
-	}
 }
 
 // ── Answers that carry another party's SDP, or the hold SDP ──────────────────

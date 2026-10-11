@@ -176,9 +176,16 @@ namespace
 		}
 
 		bool forkedTo600() const { return count("INVITE sip:600@", kCalleeIp) == 1; }
-		bool routedTo911() const
+		// Past the grammar and on the emergency route, which (no anchor, no trunk) refuses it.
+		bool reachedEmergencyRoute() const
 		{
-			return count("INVITE sip:911@" + std::string(kSbcIp), kSbcIp) == 1;
+			return count("SIP/2.0 503 Emergency Call Not Routable", kCallerIp) == 1;
+		}
+
+		// Past the grammar and placed by the anchor, which answers the INVITE synchronously.
+		bool answeredByAnchor() const
+		{
+			return count("SIP/2.0 200", kCallerIp) == 1;
 		}
 
 		std::string dump() const
@@ -238,7 +245,7 @@ namespace
 		  i.extra = "Contact: <sip:500@10.9.2.1>, <sip:500@10.9.2.2>, <sip:500@10.9.2.3>, <sip:500@10.9.2.4>\r\n";
 		  v.push_back({"5 Contact entries", "SIP/2.0 400", i}); }
 		{ Invite i; i.callId = "sg-v-100rel"; i.extra = "Require: 100rel\r\n";
-		  v.push_back({"Require: 100rel (no PRACK)", "SIP/2.0 420", i}); }
+		  v.push_back({"Require: 100rel to an ordinary extension (only the 777 echo honours it)", "SIP/2.0 420", i}); }
 		{ Invite i; i.callId = "sg-v-preq"; i.extra = "Proxy-Require: sec-agree\r\n";
 		  v.push_back({"Proxy-Require: sec-agree", "SIP/2.0 420", i}); }
 		{ Invite i; i.callId = "sg-v-text"; i.contentType = "text/plain"; i.body = "hello\r\n";
@@ -395,8 +402,9 @@ TEST(SipGrammar, TheBytesRefusedTo600AreRoutedTo911)
 			e.ruri = "sip:911@server";
 			e.to = "<sip:911@server>";
 			if (e.contentType == "text/plain") { e.contentType = "application/sdp"; e.body = kOffer; }
+			b.handler->setAnchorPlacesRealCallsForTest(true);
 			b.send(e);
-			EXPECT_TRUE(b.routedTo911())
+			EXPECT_TRUE(b.answeredByAnchor())
 				<< "an optional header must never cost a 911 call:\n" << b.dump();
 			EXPECT_EQ(b.count("SIP/2.0 4", kCallerIp), 0u) << b.dump();
 
@@ -429,7 +437,7 @@ TEST(SipGrammar, UrnServiceSosIsA911Call)
 		i.ruri = urn;
 		i.to = std::string("<") + urn + ">";
 		b.send(i);
-		EXPECT_TRUE(b.routedTo911()) << "urn:service:sos must reach the carrier as 911:\n" << b.dump();
+		EXPECT_TRUE(b.reachedEmergencyRoute()) << "urn:service:sos must reach the carrier as 911:\n" << b.dump();
 		EXPECT_EQ(b.count("SIP/2.0 400", kCallerIp), 0u) << b.dump();
 	}
 }
@@ -492,5 +500,6 @@ TEST(SipGrammar, AnEmergencyWithAnOversizeDialogLineIsNotRefusedForIt)
 	i.from = "\"" + std::string(220, 'x') + "\" <sip:500@server>";
 	b.send(i);
 	EXPECT_EQ(b.count("SIP/2.0 400", kCallerIp), 0u) << b.dump();
-	EXPECT_TRUE(b.routedTo911()) << b.dump();
+	EXPECT_TRUE(b.reachedEmergencyRoute()) << b.dump();
+	EXPECT_EQ(b.count("INVITE", kSbcIp), 0u) << b.dump();   // never to a carrier (#930)
 }

@@ -1,0 +1,2 @@
+# VadGate_test.cpp: 7 pure-gate + 7 MixBus wiring (incl. 1 default-off golden)
+14

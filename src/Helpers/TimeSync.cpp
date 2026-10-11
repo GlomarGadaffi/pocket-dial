@@ -123,12 +123,29 @@ size_t formatRfc3339(time_t t, char* out, size_t cap)
 	return (n > 0 && static_cast<size_t>(n) < cap) ? static_cast<size_t>(n) : 0;
 }
 
+size_t formatNowOrNil(bool synced, time_t now, char* out, size_t cap)
+{
+	if (synced)
+	{
+		const size_t n = formatRfc3339(now, out, cap);
+		if (n > 0) return n;
+	}
+	// kNilValue and its NUL. Also the fallback when a synced time will not format.
+	if (out == nullptr || cap < 2) return 0;
+	out[0] = kNilValue[0];
+	out[1] = '\0';
+	return 1;
+}
+
+size_t rfc3339NowInto(char* out, size_t cap)
+{
+	return formatNowOrNil(isSynced(), static_cast<time_t>(::time(nullptr)), out, cap);
+}
+
 std::string rfc3339Now()
 {
-	if (!isSynced()) return kNilValue;
-
-	char buf[32];
-	const size_t n = formatRfc3339(static_cast<time_t>(::time(nullptr)), buf, sizeof(buf));
+	char buf[kRfc3339Bytes];
+	const size_t n = rfc3339NowInto(buf, sizeof(buf));
 	return (n > 0) ? std::string(buf, n) : std::string(kNilValue);
 }
 
