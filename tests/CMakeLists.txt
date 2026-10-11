@@ -102,6 +102,8 @@ add_executable(sip_parser_tests
     # sendmsg() (byte-identical, short writes resumed, zero allocation).
     HttpSendPath_test.cpp
     HttpStatusAlloc_test.cpp
+    # Issue #986 slice 0: RequestsHandler::_mutex hold histogram, max hold + site, 20 ms witness.
+    TimedMutex_test.cpp
     # Issues #410/#328: the per-connection read buffer is reserved per slot (PSRAM
     # where there is some), not allocated per request.
     HttpReadBuf_test.cpp

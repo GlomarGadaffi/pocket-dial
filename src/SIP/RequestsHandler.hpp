@@ -70,6 +70,7 @@
 #include "VoicemailArchive.hpp"
 #include "VoicemailMenu.hpp"
 #include "PbxEnv.hpp"
+#include "TimedMutex.hpp"   // #986: _mutex measures its own holds
 #include "TransactionLayer.hpp"
 #include "Registrar.hpp"
 #include "PnpResponder.hpp"
@@ -233,6 +234,9 @@ public:
 	static constexpr size_t kArpRequestSources = 4;
 	static constexpr std::chrono::milliseconds kArpRequestWindow{1000};
 	uint32_t getLearnArpRequestsLimited() const { return _learnArpRequestsLimited.load(std::memory_order_relaxed); }
+	// #986: how long _mutex has been held since boot (max and p99 in us, holds over
+	// 20 ms, the call site of the longest). Takes no lock: the stats are atomics.
+	pd::MutexHold getMutexHold() const { return pd::TimedMutex::snapshot(); }
 	// Server BYEs sipb::bye() refused (#744): too long for sipb::kMaxByeBytes, or
 	// a field empty or carrying a control byte. The far leg got no BYE and stays
 	// up until it hangs up or the session sweep; a dialog's From and To are not
@@ -468,7 +472,7 @@ public:
 	// A reboot or factory reset checks this first. Takes _mutex, like emergencyRoute().
 	bool hasLiveEmergencyCall()
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		return emergencyCallLive();
 	}
 	// PbxEnv hook for the DTMF restart doors (#652). Caller holds _mutex.
@@ -495,7 +499,7 @@ public:
 	// reaches firmware (see the comment below).
 	void setAnchorPlacesRealCallsForTest(bool real)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_anchorPlacesRealCalls = real;
 	}
 	// Test-only (#713). The host build boots the loopback anchor, which is
@@ -508,7 +512,7 @@ public:
 	// real anchor's boot does.
 	void forceAsyncAnchorForTest(bool on)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_anchorBootType = on ? TelephonyProviderType::Telephony : TelephonyProviderType::Loopback;
 		if (on) startTelCtl();
 	}
@@ -516,7 +520,7 @@ public:
 	// queue were full.
 	void failNextAnchorWorkerSpawnForTest()
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_failNextAnchorWorkerSpawn = true;
 	}
 	// Test-only (#878 review S-B3): the next originateAnchorCall() on a
@@ -525,7 +529,7 @@ public:
 	// take. No fallback may follow it.
 	void answerThenFailNextAnchorCallForTest()
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_answerThenFailNextAnchorCall = true;
 	}
 	// Test-only (#657): each tel_ctl worker parks after taking a job, as one
@@ -553,7 +557,7 @@ public:
 	// Test-only (#659): move every 911/933 dial mark `d` into the past.
 	void ageEmergencyCallbacksForTest(std::chrono::steady_clock::duration d)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_emergencyCallbacks.ageForTest(d);
 	}
 	// Test-only (#726): move every armed client give-up timer (Timer B/F) into
@@ -562,7 +566,7 @@ public:
 	// which of the two ended a call.
 	void expireTransactionTimersForTest()
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_txLayer.expireClientTimeoutsForTest();
 	}
 #endif
@@ -614,11 +618,14 @@ public:
 	// #463: tick() runs at most once a second; this lets a test drive two passes
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
+	// #986: hold _mutex for `d`, as a slow NVS commit or PIN hash would. Host builds
+	// only. Defined in the .cpp so every call is one site however the caller is inlined.
+	void holdMutexForTest(std::chrono::milliseconds d);
 	// #589 review: age the in-flight splice transactions so a test can reach the 64*T1 sweep.
 	// #719: and the torn-down attended-transfer splices the PBX still remembers.
 	void ageSpliceTxnsForTest(std::chrono::steady_clock::duration d)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		for (auto& t : _spliceTxns) t.since -= d;
 		for (auto& t : _spliceTombs) t.since -= d;
 	}
@@ -626,7 +633,7 @@ public:
 	// BYE past Timer F (32 s) without waiting for it.
 	void sweepTransactionsForTest(std::chrono::steady_clock::time_point now)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_txLayer.sweep(now);
 	}
 	// #479: the boot-built conference room, so a test can make its driver fail.
@@ -639,7 +646,7 @@ public:
 	// sweep as of `now`.
 	void setMulticastTxForTest(McastTx* tx)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_mcastPager.setTxForTest(tx);
 	}
 	bool multicastPageActiveForTest() const { return _mcastPager.isActive(); }
@@ -650,7 +657,7 @@ public:
 		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
 		std::vector<std::pair<bool, std::string>> localLogs;
 		{
-			std::lock_guard<std::mutex> lock(_mutex);
+			std::lock_guard<pd::TimedMutex> lock(_mutex);
 			sweepMulticastPage(now);
 			localOutbox = drainOutbox();
 			localLogs = std::move(_logQueue);
@@ -667,7 +674,7 @@ public:
 	// through the same dispatchRaw() the receive task calls. False if not relayed.
 	bool trunkRtpForTest(const std::string& callID, bool fromCarrier)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		auto sit = _sessions.find(callID);
 		if (sit == _sessions.end() || !sit->second->isTrunk()) return false;
 		const int slot = sit->second->getTrunkRelaySlot();
@@ -682,7 +689,7 @@ public:
 	// #861: where a trunk call's relay sends the handset's audio toward the carrier.
 	bool trunkCarrierPeerForTest(const std::string& callID, sockaddr_in& out)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		auto sit = _sessions.find(callID);
 		if (sit == _sessions.end() || !sit->second->isTrunk()) return false;
 		const int slot = sit->second->getTrunkRelaySlot();
@@ -858,12 +865,12 @@ public:
 	// produce one record. Not compiled into device firmware.
 	void recordCallForTest(const std::string& src, const std::string& dest)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_cdr.record(nullptr, src, dest);
 	}
 	std::vector<CallDetailRecord> cdrSnapshotForTest()
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		return _cdr.snapshot();
 	}
 	// Test-only: live DTMF accumulators, so a teardown path can be checked for
@@ -871,7 +878,7 @@ public:
 	// rather than only erasing the session (issue #228).
 	size_t dtmfAccumulatorCountForTest()
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		return _dtmf.accumulatorCount();
 	}
 
@@ -923,7 +930,7 @@ public:
 	{
 		bool handled = false;
 		{
-			std::lock_guard<std::mutex> lock(_mutex);
+			std::lock_guard<pd::TimedMutex> lock(_mutex);
 			auto caller = findClient(callerExt);
 			if (!caller.has_value()) return false;
 			handled = placeSipTrunkCall(data, caller.value(), destination, placedOut);
@@ -938,13 +945,13 @@ public:
 	// never the host suite's Loopback. Not compiled into device firmware.
 	void anchorMediaNeverOpenedForTest(const std::string& participantId)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		anchorMediaNeverOpenedLocked(participantId);
 	}
 	// Test-only (#880): what the anchor event callback does on CallEvent::Dropped.
 	void anchorDroppedForTest(const std::string& participantId)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		anchorDroppedLocked(participantId);
 	}
 
@@ -971,7 +978,7 @@ public:
 	// Test-only (#533): make `ext` look silent for `idle`, then run the client sweep.
 	void idleClientAndSweepForTest(const std::string& ext, std::chrono::seconds idle)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		if (auto c = findClient(ext)) c.value()->setLastActiveTimeForTest(std::chrono::steady_clock::now() - idle);
 		sweepExpired();
 	}
@@ -982,7 +989,7 @@ public:
 		// the BYEs endCall() enqueues actually leave.
 		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
 		{
-			std::lock_guard<std::mutex> lock(_mutex);
+			std::lock_guard<pd::TimedMutex> lock(_mutex);
 			_passThroughMsg = nullptr;
 			if (auto c = findClient(ext)) c.value()->expireLeaseForTest();
 			sweepExpired();
@@ -994,7 +1001,7 @@ public:
 	// between its expiry and the next sweep; the next handle() does not sweep.
 	void expireLeaseUnsweptForTest(const std::string& ext)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		if (auto c = findClient(ext)) c.value()->expireLeaseForTest();
 		_lastSweep = std::chrono::steady_clock::now();
 	}
@@ -1002,7 +1009,7 @@ public:
 	// handle() sweep, so one pass both reads the binding and prunes it.
 	void expireLeaseForNextSweepForTest(const std::string& ext)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		if (auto c = findClient(ext)) c.value()->expireLeaseForTest();
 		_lastSweep = std::chrono::steady_clock::time_point{};
 	}
@@ -1010,20 +1017,20 @@ public:
 	void adoptDeviceForTest(const std::string& mac, const std::string& ext, Registrar::DeviceState state = Registrar::DeviceState::Learned,
 		bool locked = false)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_registrar.adoptDeviceForTest(mac, ext, state, locked);
 		refreshDeviceSnapshot();
 	}
 	// Test-only (#515): Learn's minimum lock age; fixtures that REGISTER on the real clock set 0.
 	void setLearnLockMinAgeForTest(std::chrono::seconds age)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_registrar.setLockMinAgeForTest(age);
 	}
 	// Test-only (#864): make every recorded ARP request `d` older.
 	void ageArpRequestsForTest(std::chrono::steady_clock::duration d)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		for (auto& s : _arpRequestSlots) s.at -= d;
 		_arpWindowStart -= d;
 	}
@@ -1032,7 +1039,7 @@ public:
 	// emergency number) and pin the defence-in-depth checks behind it.
 	void bindClientBypassingGuardsForTest(const std::string& ext, const sockaddr_in& addr)
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		(void)allocateClient(ext, addr, 3600);
 	}
 #endif
@@ -1879,7 +1886,7 @@ public:
 		const std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& msgs)
 	{
 		{
-			std::lock_guard<std::mutex> lock(_mutex);
+			std::lock_guard<pd::TimedMutex> lock(_mutex);
 			for (const auto& m : msgs) _outbox.push_back(m);
 			drainPassLocked(_rxOutboxScratch, _rxLogScratch);
 		}
@@ -2780,7 +2787,9 @@ private:
 	// Call-ID it tears down, so a leg that dies mid-splice can't leak one forever.
 	std::vector<std::string> _transferPendingAcks;
 
-	std::mutex _mutex;
+	// Not recursive. A TimedMutex is a std::mutex that records each hold (#986), so
+	// every guard on it names that type.
+	pd::TimedMutex _mutex;
 	OnHandledEvent _onHandled;
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _outbox;
 	// Take everything queued this pass, registering outgoing INVITEs for
@@ -2831,6 +2840,9 @@ private:
 	                     std::vector<std::pair<bool, std::string>>& logScratch);
 	void flushPass(std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outScratch,
 	               std::vector<std::pair<bool, std::string>>& logScratch);
+	// #986: one witness line per call site whose _mutex hold went over 20 ms, once
+	// per boot. Called by tick() after its lock scope; never with _mutex held.
+	void reportSlowMutexHolds();
 	// Print one drained log batch: errors to stderr, the rest to stdout. Used by
 	// flushPass() and by every config setter that drains _logQueue itself (#702).
 	static void printLogs(const std::vector<std::pair<bool, std::string>>& logs);

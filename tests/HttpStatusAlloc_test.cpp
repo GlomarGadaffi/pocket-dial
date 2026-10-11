@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <regex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -218,6 +219,20 @@ TEST(HttpStatusAlloc, LearnArpRequestsLimitedIsOnStatus)
 	EXPECT_NE(resp.find("\"learnArpRequestsLimited\":1,"), std::string::npos) << resp;
 }
 
+TEST(HttpStatusAlloc, TheMutexHoldIsOnStatus)
+{
+	// #986 slice 0: how long RequestsHandler::_mutex has been held. The values
+	// depend on the host's scheduler, so this pins the shape: four fields, the
+	// address a hex string. The anonymous route carries it too, like the heap figures.
+	StatusBench b;
+	const std::regex shape("\"mutexHold\":\\{\"max\":[0-9]+,\"p99\":[0-9]+,\"over\":[0-9]+,\"maxPc\":\"0x[0-9a-f]+\"\\}");
+	for (bool authed : {false, true})
+	{
+		const std::string resp = b.serve(authed);
+		EXPECT_TRUE(std::regex_search(resp, shape)) << resp;
+	}
+}
+
 namespace
 {
 	// The top-level keys of a compact JSON object, in order. Tracks string and
@@ -277,7 +292,7 @@ TEST(HttpStatusAlloc, TheStatusKeyListIsPinnedAndTheDramAccountGuardAddsOnlyItsO
 		"freeHeapInternal", "largestFreeBlockInternal", "freeHeapDma", "largestFreeBlockDma", "resetReason",
 		"stackHwm_sip_server_task", "stackHwm_udp_receiver_task", "stackHwm_rtp_media_tx", "stackHwm_rtp_media_rx",
 		"stackHwm_conf_mix_tick", "stackHwm_tel_ctl0", "stackHwm_tel_ctl1", "stackHwm_tel_drop", "stackHwm_tel_sos",
-		"stackHwm_http_conn", "httpConnWorstRoute", "coredump", "l2Tx", "memory",
+		"stackHwm_http_conn", "httpConnWorstRoute", "coredump", "l2Tx", "memory", "mutexHold",
 	};
 #if POCKETDIAL_HTTP_DRAM_ACCOUNT
 	want.push_back("httpDramAccount");
