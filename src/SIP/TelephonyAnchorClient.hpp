@@ -21,7 +21,7 @@
 #include "freertos/semphr.h"  // #43: worker-pool done semaphore (+ existing _rxDoneSem)
 #include "PsramTask.hpp"      // #479: pd::StaticTaskSlot (the slot's tel_media_rx stack + TCB)
 #include "TelephonyAnchorLogic.hpp"   // #379: telephony::AnchorOwnLegs
-#include "SosStatusGet.hpp"           // #948: telephony::BodyArena, SosWitness
+#include "SosStatusGet.hpp"           // #948: telephony::SosBodyArena, SosWitness
 #endif
 
 #include "PoolConfig.hpp"     // #100: POCKETDIAL_MAX_ANCHOR_CALLS (per-call slot count)
@@ -326,13 +326,13 @@ private:
 	// #948: the sos GET's body arena, reserved with the handle (start()'s warm GET is the first to
 	// need it) and freed with it, both under the claim. A body that does not fit is an error, never
 	// truncated. 16 participant objects at 768 B: telephony::sosBodyArenaBytes() gives the basis.
-	// ~BodyArena frees it without the claim, which is safe: this client is a member of
+	// ~SosBodyArena frees it without the claim, which is safe: this client is a member of
 	// RequestsHandler (RequestsHandler.hpp:2483), whose destructor stops the anchor first
 	// (RequestsHandler.cpp:765, _anchorClient->stop(), which drains through closeSosStatusClient())
 	// and which on the device never runs at all (RequestsHandler.hpp:2203, "the handler lives as
 	// long as the device"). A GET in flight at destruction would already be a use of a destroyed
 	// `this` (makeCall and httpGetBody read _mutex, _baseUrl and the callbacks), claim or no claim.
-	telephony::BodyArena          _sosBody;
+	telephony::SosBodyArena          _sosBody;
 	telephony::SosWitness         _sosWitness;
 	telephony::SosBodyWitness     _sosBodyWitness;   // #948: the largest sos body this boot, for sizing the arena
 	static constexpr std::size_t  kSosBodyArenaBytes = telephony::sosBodyArenaBytes(POCKETDIAL_MAX_ANCHOR_CALLS);

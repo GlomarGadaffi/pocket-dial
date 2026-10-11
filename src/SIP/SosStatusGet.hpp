@@ -40,18 +40,18 @@ namespace telephony
 
 // One block, reserved with the sos handle and freed with it. The allocator is passed in: the
 // ESP build uses psram::allocPreferPsram, and a test can refuse the allocation.
-class BodyArena
+class SosBodyArena
 {
 public:
 	using AllocFn = void* (*)(std::size_t);
 	using FreeFn  = void (*)(void*);
 
-	BodyArena() = default;
-	BodyArena(const BodyArena&) = delete;
-	BodyArena& operator=(const BodyArena&) = delete;
+	SosBodyArena() = default;
+	SosBodyArena(const SosBodyArena&) = delete;
+	SosBodyArena& operator=(const SosBodyArena&) = delete;
 	// Frees the block without the sos claim. Safe because the owner is destroyed only with no GET
 	// in flight: see the note at TelephonyAnchorClient::_sosBody.
-	~BodyArena() { release(); }
+	~SosBodyArena() { release(); }
 
 	// True when the block is there. A block already reserved is kept, so a handle rebuild or a
 	// second GET costs nothing.
@@ -137,7 +137,7 @@ inline const char* bodyReadName(BodyRead r)
 // throws std::bad_alloc, which a real heap cannot be made to do on demand. The hand-back is the
 // one allocation here: a throw is caught, out is left empty, the result is AllocFailed.
 template <class ReadFn, class CompleteFn, class Out>
-BodyRead readSosBody(const BodyArena& arena, ReadFn&& read, CompleteFn&& complete, Out& out)
+BodyRead readSosBody(const SosBodyArena& arena, ReadFn&& read, CompleteFn&& complete, Out& out)
 {
 	out.clear();
 	char* const buf = arena.data();

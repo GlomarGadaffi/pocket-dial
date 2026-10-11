@@ -61,7 +61,7 @@ std::string patternBody(std::size_t n)
 }
 
 template <class Out>
-BodyRead readAll(const BodyArena& arena, ScriptedRead& src, Out& out)
+BodyRead readAll(const SosBodyArena& arena, ScriptedRead& src, Out& out)
 {
 	return readSosBody(
 		arena, [&](char* p, int n) { return src.read(p, n); }, [&] { return src.complete(); }, out);
@@ -83,7 +83,7 @@ struct ThrowingString
 	}
 };
 
-bool reserveReal(BodyArena& a, std::size_t cap)
+bool reserveReal(SosBodyArena& a, std::size_t cap)
 {
 	return a.reserve(cap, &psram::allocPreferPsram, &psram::freePreferPsram);
 }
@@ -107,7 +107,7 @@ void countingFree(void* p)
 
 TEST(SosStatusBody, AWholeBodyIsReturnedWithNoAllocationPerRead)
 {
-	BodyArena arena;
+	SosBodyArena arena;
 	ASSERT_TRUE(reserveReal(arena, 4096));
 	ScriptedRead src;
 	src.body = patternBody(3000);   // six reads of 512 and a tail
@@ -123,7 +123,7 @@ TEST(SosStatusBody, AWholeBodyIsReturnedWithNoAllocationPerRead)
 
 TEST(SosStatusBody, ABodyExactlyTheSizeOfTheArenaFits)
 {
-	BodyArena arena;
+	SosBodyArena arena;
 	ASSERT_TRUE(reserveReal(arena, 1024));
 	ScriptedRead src;
 	src.body = patternBody(1024);
@@ -135,7 +135,7 @@ TEST(SosStatusBody, ABodyExactlyTheSizeOfTheArenaFits)
 
 TEST(SosStatusBody, ABodyOverTheArenaIsAnErrorNeverATruncatedBody)
 {
-	BodyArena arena;
+	SosBodyArena arena;
 	ASSERT_TRUE(reserveReal(arena, 1024));
 	ScriptedRead src;
 	src.body = patternBody(1025);   // one byte more than fits
@@ -148,7 +148,7 @@ TEST(SosStatusBody, ABodyOverTheArenaIsAnErrorNeverATruncatedBody)
 
 TEST(SosStatusBody, AReadErrorAfterPartialDataReturnsNoData)
 {
-	BodyArena arena;
+	SosBodyArena arena;
 	ASSERT_TRUE(reserveReal(arena, 4096));
 	ScriptedRead src;
 	src.body   = patternBody(2000);
@@ -164,7 +164,7 @@ TEST(SosStatusBody, APeerCloseBeforeTheBodyIsCompleteIsAnErrorNotAShortBody)
 {
 	// esp_http_client_read returns 0 for a FIN before Content-Length bytes arrived; 0 alone is
 	// not the end of the body.
-	BodyArena arena;
+	SosBodyArena arena;
 	ASSERT_TRUE(reserveReal(arena, 4096));
 	ScriptedRead src;
 	src.body  = patternBody(2000);
@@ -178,7 +178,7 @@ TEST(SosStatusBody, APeerCloseBeforeTheBodyIsCompleteIsAnErrorNotAShortBody)
 
 TEST(SosStatusBody, AFailedReserveIsAnErrorAndNothingIsRead)
 {
-	BodyArena arena;
+	SosBodyArena arena;
 	EXPECT_FALSE(arena.reserve(4096, &refuseAlloc, &psram::freePreferPsram));
 	EXPECT_EQ(arena.data(), nullptr);
 	ScriptedRead src;
@@ -194,7 +194,7 @@ TEST(SosStatusBody, AFailedReserveIsAnErrorAndNothingIsRead)
 TEST(SosStatusBody, AnEarlierAttemptsBytesNeverReachALaterBody)
 {
 	// httpGetBody rebuilds the handle and retries once after a failed read; the arena stays.
-	BodyArena arena;
+	SosBodyArena arena;
 	ASSERT_TRUE(reserveReal(arena, 4096));
 	std::string out;
 
@@ -232,7 +232,7 @@ TEST(SosStatusBody, AFullListOfTheLargestParticipantsFitsTheArena)
 	EXPECT_EQ(sosBodyArenaBytes(calls), 12288u);
 	EXPECT_EQ(sosBodyArenaBytes(1), 7680u) << "the constrained build's single call slot";
 
-	BodyArena arena;
+	SosBodyArena arena;
 	ASSERT_TRUE(reserveReal(arena, sosBodyArenaBytes(calls)));
 	ScriptedRead src;
 	src.body = list;
@@ -245,7 +245,7 @@ TEST(SosStatusBody, AFailedHandBackAllocationIsAnErrorNotAnEscapingException)
 {
 	// An exhausted heap during a 911 status GET must come back as an error. Uncaught, the
 	// std::bad_alloc from the hand-back string is std::terminate on the 911's task.
-	BodyArena arena;
+	SosBodyArena arena;
 	ASSERT_TRUE(reserveReal(arena, 4096));
 	ScriptedRead src;
 	src.body = patternBody(300);
@@ -267,7 +267,7 @@ TEST(SosStatusBody, AFailedHandBackAllocationIsAnErrorNotAnEscapingException)
 
 TEST(SosStatusBody, TheOtherErrorsNeverReachTheHandBackAllocation)
 {
-	BodyArena arena;
+	SosBodyArena arena;
 	ASSERT_TRUE(reserveReal(arena, 1024));
 	ThrowingString out;
 
@@ -282,7 +282,7 @@ TEST(SosStatusBody, TheOtherErrorsNeverReachTheHandBackAllocation)
 	shortRead.body  = patternBody(900);
 	shortRead.endAt = 400;
 	EXPECT_EQ(readAll(arena, shortRead, out), BodyRead::Short);
-	BodyArena none;
+	SosBodyArena none;
 	ScriptedRead any;
 	EXPECT_EQ(readAll(none, any, out), BodyRead::NoArena);
 
@@ -294,7 +294,7 @@ TEST(SosStatusBody, TheArenaIsReservedOnceAndFreedOnce)
 {
 	g_allocs = g_frees = 0;
 	{
-		BodyArena arena;
+		SosBodyArena arena;
 		EXPECT_TRUE(arena.reserve(2048, &countingAlloc, &countingFree));
 		EXPECT_TRUE(arena.reserve(2048, &countingAlloc, &countingFree)) << "a second GET or a handle rebuild";
 		EXPECT_EQ(g_allocs, 1);
@@ -523,7 +523,7 @@ TEST(SosStatusTeardown, TheNinetyOneOneGetTakesTheFallbackWithoutWaiting)
 struct SosListRead
 {
 	std::atomic<bool> claim{false};
-	BodyArena         arena;
+	SosBodyArena         arena;
 	ScriptedRead      response;   // each read gets a fresh copy: a new response
 	SosWitness        witness;
 	std::atomic<int>  pauses{0};

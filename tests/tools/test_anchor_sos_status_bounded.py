@@ -136,7 +136,7 @@ class AnchorSosStatusBoundedTest(unittest.TestCase):
         self.assertEqual(start.count("warmStatusConnection();"), 1)
         warm_at = start.index("warmStatusConnection();")
         # after the token, so the warm GET reads HTTP 200 (the bench line), and after the WS connect
-        self.assertGreater(warm_at, start.index("fetchToken()"))
+        self.assertGreater(warm_at, start.index("fetchToken("))  # main: fetchToken(TokenLane::Ordinary, true)
         self.assertGreater(warm_at, start.index("connectWs()"), "the warm GET follows connectWs()")
         self.assertGreater(warm_at, start.index("startWsWorkers();"))
         self.assertGreater(warm_at, start.index("warmCtrlConnection();"), "main's order: ctrl warm, then status warm")
