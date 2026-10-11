@@ -986,15 +986,3 @@ TEST(EmittedConformance, EmergencyOnALoopbackOnlyBoardIsRefused)
 	b.call(a, "933", "e933-1@192.168.77.10");
 	EXPECT_TRUE(b.sent(a, "SIP/2.0 503")) << b.dump();
 }
-
-TEST(EmittedConformance, EmergencyWithATrunkGoesToTheCarrier)
-{
-	Bench b("emergency_trunk");
-	Phone& a = b.party("pa", "201", "192.168.77.10");
-	Phone& sbc = b.party("sbc", "carrier", kCarrierIp, false);
-	b.h->setTrunkConfig(trunkConfig());
-	const std::string id = b.call(a, "911", "e911-2@192.168.77.10");
-	for (int i = 0; i < 3 && !b.sent(sbc, "INVITE "); ++i) b.tick();
-	b.bye(a, id);
-	EXPECT_TRUE(b.sent(sbc, "INVITE sip:911@")) << b.dump();
-}

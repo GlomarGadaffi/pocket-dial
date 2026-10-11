@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Build
+
+- The constrained build (`SIP_CONSTRAINED=1`) is anchor-only. `SIP_OUTSIDE_LINE=trunk` is refused at configure time, so the constrained leg no longer builds a SIP trunk (#933; part of #731; committee findings #938).
+
 ## v1.5.1 — 2026-10-03
 
 Two firmware changes on top of `v1.5.0` (`b8b4f0b`), from the v1.5.0 release reviews. None of the changes below is claimed bench-verified one by one.

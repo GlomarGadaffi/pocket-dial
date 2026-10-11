@@ -368,8 +368,8 @@ namespace
 		Bench b;
 		b.handler.handle(makeInvite(number, number, "in-" + number, kSbcIp, true, kExt));
 
-		EXPECT_FALSE(b.firstTo("INVITE sip:" + number, kSbcIp).empty())
-			<< number << " reached the emergency branch and went out on the trunk, as before #398";
+		EXPECT_FALSE(b.firstTo("SIP/2.0 503 Emergency Call Not Routable", kSbcIp).empty())
+			<< number << " reached the emergency branch, which has no route and refuses it (desmo, 2026-10-08)";
 		EXPECT_TRUE(b.firstTo("404", kSbcIp).empty()) << "not refused as an unmapped DID";
 		EXPECT_TRUE(b.firstTo("480", kSbcIp).empty());
 	}
@@ -441,8 +441,9 @@ TEST(TrunkInbound, APsapCallbackToTheDidOfA911CallerIsNotRefusedForAnOptionTag)
 	ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
 	b.handler.handle(makeRegister("2002", "192.168.50.22"));
 	ASSERT_EQ(b.handler.setDidMapping("+12025550189", "2002"), "");
+	b.handler.setAnchorPlacesRealCallsForTest(true);
 	b.handler.handle(makeInvite("911", "911", "in-818-911", kPhoneIp, true, kExt));
-	ASSERT_FALSE(b.firstTo("INVITE sip:911@", kSbcIp).empty()) << "precondition: 2001 dialed 911";
+	ASSERT_FALSE(b.firstTo("SIP/2.0 200", kPhoneIp).empty()) << "precondition: the anchor placed 2001's 911";
 	b.sent.clear();
 
 	b.handler.handle(makeInvite(kDid, kDid, "in-818-cb", kSbcIp, true, "+12025550177", 101, "Require: 100rel\r\n"));
@@ -485,8 +486,9 @@ TEST(TrunkInbound, APsapCallbackToTheDidCarryingLocationIsUnwrappedAndForked)
 	ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
 	b.handler.handle(makeRegister("2002", "192.168.50.22"));
 	ASSERT_EQ(b.handler.setDidMapping("+12025550189", "2002"), "");
+	b.handler.setAnchorPlacesRealCallsForTest(true);
 	b.handler.handle(makeInvite("911", "911", "in-818-mp-911", kPhoneIp, true, kExt));
-	ASSERT_FALSE(b.firstTo("INVITE sip:911@", kSbcIp).empty()) << "precondition: 2001 dialed 911";
+	ASSERT_FALSE(b.firstTo("SIP/2.0 200", kPhoneIp).empty()) << "precondition: the anchor placed 2001's 911";
 	b.sent.clear();
 
 	b.handler.handle(multipartFromCarrier(kDid, "in-818-mp-cb"));

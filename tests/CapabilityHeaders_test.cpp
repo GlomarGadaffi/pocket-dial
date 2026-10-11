@@ -231,9 +231,10 @@ TEST(CapabilityHeaders, TimerIsClaimedOnTheRegistrarPath)
 	EXPECT_NE(supported.find("replaces"), std::string::npos)
 		<< "Supported omits \"replaces\": " << supported;
 	EXPECT_EQ(supported.find("100rel"), std::string::npos)
-		<< "100rel needs PRACK, which has no handler";
+		<< "100rel is honoured only in Require on the 777 echo (#172), so Supported must not claim it";
 	// Under-claiming is the safe direction, so the method list must not grow
-	// entries the handler table cannot actually dispatch.
+	// entries the PBX does not answer for every caller. PRACK has a handler
+	// (onPrack, #172) but answers on the 777 echo only, so it stays out of Allow.
 	const std::string allow = headerValue(ok, "Allow");
 	EXPECT_EQ(allow.find("PRACK"), std::string::npos);
 	EXPECT_EQ(allow.find("PUBLISH"), std::string::npos);

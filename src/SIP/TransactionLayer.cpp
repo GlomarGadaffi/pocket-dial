@@ -95,6 +95,20 @@ TransactionLayer::classify(const sockaddr_in& peer, const std::shared_ptr<SipMes
 		{
 			return Type::NonInviteServer;
 		}
+
+		// PRACK (#172) is tracked for its 2xx only. The 777 echo answers a matching PRACK
+		// once, so a retransmission re-run would draw a 481 for the provisional it already
+		// acknowledged, and the cached 200 stops that. A 481, or a 420 from the header
+		// gate, re-processes to the same answer and takes no slot, so a flood of refused
+		// PRACKs cannot fill the pool ahead of the 200. Only the first matching PRACK of
+		// an echo call is ever answered 2xx, so this is at most one slot per reliable echo
+		// call. With no free slot the 200 still goes out (maybeTrack is bookkeeping and
+		// never holds a message back), uncached, and a retransmission of it then draws 481.
+		if (method == "PRACK")
+		{
+			return msg->getStatusInfo()->klass == PocketDial::SipStatusClass::Success
+				? Type::NonInviteServer : Type::None;
+		}
 		return Type::None;
 	}
 

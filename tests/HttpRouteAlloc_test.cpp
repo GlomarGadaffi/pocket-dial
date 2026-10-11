@@ -41,6 +41,7 @@
 
 #include "AdminAuth.hpp"
 #include "AllocCounter.hpp"
+#include "DeviceConfig.hpp"
 #include "HttpServer.hpp"
 #include "RequestsHandler.hpp"
 
@@ -146,6 +147,7 @@ namespace
 			handler = std::make_unique<RequestsHandler>("10.0.0.1", 5060,
 				[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
 			server.attachHandler(handler.get());
+			DeviceConfig::resetWifiForTest();   // /api/config/export escapes the SSID: a long one an earlier test left costs an allocation
 			AdminAuth::clearCredential();
 			EXPECT_TRUE(AdminAuth::setLoginCredential("admin", "gatepassword123"));
 			const std::string token = AdminAuth::createSession(AdminAuth::Role::Owner);
@@ -235,6 +237,21 @@ TEST(HttpRouteAlloc, TheGateSeesAnAllocatingRoute)
 	const Route cdr{"GET /api/cdr", "GET", "/api/cdr", "", true};
 	b.serve(cdr);
 	EXPECT_GT(b.serve(cdr), 0);
+}
+
+TEST(HttpRouteAlloc, TheConfigExportCountDoesNotDependOnAWifiSsidAnEarlierTestLeft)
+{
+	// The host's WiFi station mirror is process-global and DeviceConfig::clearAll()
+	// leaves it alone, so ConfigExportImportTest.PasswordGatedRoundTrip... once left
+	// "TestOfficeWifi" in it for every later test. jsonEscape() reserves for any
+	// value of 8+ characters, and /api/config/export escapes the SSID: one more
+	// allocation than the ceiling, in the shuffled orders that ran that test first.
+	struct CleanUp { ~CleanUp() { DeviceConfig::resetWifiForTest(); } } cleanUp;
+	ASSERT_TRUE(DeviceConfig::setWifiConfig("TestOfficeWifi", 1));
+	RouteBench b;
+	const Route exp{"GET /api/config/export", "GET", "/api/config/export", "", true};
+	b.serve(exp);   // warm-up
+	EXPECT_LE(b.serve(exp), kAllocCeiling.at("GET /api/config/export"));
 }
 
 #endif
