@@ -45,7 +45,8 @@ MAX_ALLOWLIST = 2
 IMPLEMENTED_METHODS = {"INVITE", "ACK", "CANCEL", "BYE", "OPTIONS", "REGISTER",
                        "INFO", "MESSAGE", "REFER", "SUBSCRIBE", "UPDATE"}
 # Option tags with an implementation behind them (RFC 3891 Replaces, RFC 4028
-# Session Timers #198). "100rel" until #172.
+# Session Timers #198). Not "100rel": it is honoured only in Require on the 777
+# echo INVITE (#172), so Supported never claims it.
 IMPLEMENTED_OPTION_TAGS = {"replaces", "timer"}
 
 # Every message type the brief requires the scenarios to make the PBX emit.

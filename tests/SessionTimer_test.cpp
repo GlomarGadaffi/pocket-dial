@@ -327,10 +327,10 @@ TEST(SessionTimer, OptionsAdvertisesTheMethodsAndOptionTagsThisPbxReallyHandles)
 			<< "Allow omits " << m << ", which this PBX dispatches: " << allow;
 	}
 
-	// ...and nothing aspirational. There is no PRACK handler and nothing accepts
-	// an inbound NOTIFY, so a phone must not be told to send either.
+	// ...and nothing aspirational. PRACK is answered on the 777 echo only (#172)
+	// and nothing accepts an inbound NOTIFY, so a phone must not be told to send either.
 	EXPECT_EQ(allow.find("PRACK"), std::string::npos)
-		<< "Allow claims PRACK; no handler exists for it: " << allow;
+		<< "Allow claims PRACK; only the 777 echo answers it: " << allow;
 	EXPECT_EQ(allow.find("NOTIFY"), std::string::npos)
 		<< "Allow claims NOTIFY; BlfSubscriptions only SENDS them: " << allow;
 	EXPECT_EQ(allow.find("PUBLISH"), std::string::npos) << allow;
@@ -348,7 +348,7 @@ TEST(SessionTimer, OptionsAdvertisesTheMethodsAndOptionTagsThisPbxReallyHandles)
 	EXPECT_NE(supported.find("timer"), std::string::npos)
 		<< "Supported omits \"timer\" (RFC 4028 §3): " << supported;
 	EXPECT_EQ(supported.find("100rel"), std::string::npos)
-		<< "Supported claims \"100rel\" but there is no PRACK handler: " << supported;
+		<< "Supported claims \"100rel\" but only the 777 echo honours it, in Require (#172): " << supported;
 
 	// Bodies the PBX genuinely parses, and the one SUBSCRIBE package it accepts.
 	const std::string accept = headerValue(ok, "Accept");

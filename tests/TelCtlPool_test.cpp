@@ -310,3 +310,34 @@ TEST(TelCtlPool, A911WithNoWorkerAnywhereIsRefused503)
 	EXPECT_FALSE(b.handler->getSession("Call-ID: " + callId(sos)).has_value());
 	EXPECT_TRUE(b.sent("NOT ROUTED"));
 }
+
+// #691 step 0: the no-answer reap of an outbound call whose makeCall() is still on the wire
+// has no leg id to drop yet. It drops nothing (an empty id is not handed to dropCall()); the
+// worker then names the leg, finds no session and drops it, once (#379 Case A). Pin of today's
+// behaviour: it passes on the sources from before releaseFarLeg() too.
+TEST(FarLegReleasePin, ARingReapBeforeMakeCallNamesTheLegDropsNothingAndTheWorkerDropsItOnce)
+{
+	Bench b;
+	b.handler->holdTelCtlForTest(true);
+	b.dial(0, "555");
+	ASSERT_TRUE(waitFor([&] { return b.handler->telCtlParkedForTest() == 1; }));
+	auto found = b.handler->getSession("Call-ID: " + callId(0));
+	ASSERT_TRUE(found.has_value());
+	const std::shared_ptr<Session> session = found.value();
+	ASSERT_TRUE(session->getAnchorParticipantId().empty()) << "precondition: makeCall() has not named the leg";
+	const unsigned before = b.loopback()->dropCallCount();
+
+	session->armRingTimer(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	b.handler->forceNextTickForTest();
+	b.handler->tick();
+
+	ASSERT_FALSE(b.handler->getSession("Call-ID: " + callId(0)).has_value()) << "the reap ended the call";
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	EXPECT_EQ(b.loopback()->dropCallCount(), before) << "no leg yet: nothing may be dropped, an empty id included";
+
+	b.handler->holdTelCtlForTest(false);
+	EXPECT_TRUE(waitFor([&] { return b.loopback()->dropCallCount() == before + 1; }))
+		<< "makeCall() returned to no session and did not drop the leg it named";
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	EXPECT_EQ(b.loopback()->dropCallCount(), before + 1) << "the leg is dropped exactly once";
+}
