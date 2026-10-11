@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "AllocCounter.hpp"
 #include "TelephonyAnchorLogic.hpp"
 
 namespace
@@ -21,26 +22,38 @@ using namespace telephony;
 TEST(TelephonyLogic, Base64UrlDecodesPlainJson)
 {
 	// {"a":1} -> base64url "eyJhIjoxfQ" (no padding)
-	std::vector<uint8_t> out;
-	ASSERT_TRUE(base64UrlDecode("eyJhIjoxfQ", out));
-	std::string s(out.begin(), out.end());
-	EXPECT_EQ(s, "{\"a\":1}");
+	char out[16];
+	std::size_t n = 0;
+	ASSERT_TRUE(base64UrlDecode("eyJhIjoxfQ", out, sizeof out, n));
+	EXPECT_EQ(std::string(out, n), "{\"a\":1}");
 }
 
 TEST(TelephonyLogic, Base64UrlRejectsInvalidByte)
 {
-	std::vector<uint8_t> out;
-	EXPECT_FALSE(base64UrlDecode("not valid!", out));   // space + '!' are non-alphabet
+	char out[16];
+	std::size_t n = 0;
+	EXPECT_FALSE(base64UrlDecode("not valid!", out, sizeof out, n));   // space + '!' are non-alphabet
 }
 
 TEST(TelephonyLogic, Base64UrlHandlesUrlAlphabet)
 {
 	// '-' and '_' are the URL-safe substitutes for '+' and '/'. Decoding must
 	// accept them without requiring a prior translation step.
-	std::vector<uint8_t> a, b;
-	ASSERT_TRUE(base64UrlDecode("-_-_", a));
-	ASSERT_TRUE(base64UrlDecode("+/+/", b));
-	EXPECT_EQ(a, b);   // same bytes either way
+	char a[8], b[8];
+	std::size_t na = 0, nb = 0;
+	ASSERT_TRUE(base64UrlDecode("-_-_", a, sizeof a, na));
+	ASSERT_TRUE(base64UrlDecode("+/+/", b, sizeof b, nb));
+	EXPECT_EQ(std::string(a, na), std::string(b, nb));   // same bytes either way
+}
+
+TEST(TelephonyLogic, Base64UrlRefusesWhatDoesNotFitTheBufferLentToIt)
+{
+	// "eyJhIjoxfQ" is 7 bytes. #951: the buffer is the caller's, so a short one is an error, never a prefix.
+	char out[16];
+	std::size_t n = 0;
+	EXPECT_FALSE(base64UrlDecode("eyJhIjoxfQ", out, 6, n));
+	EXPECT_TRUE(base64UrlDecode("eyJhIjoxfQ", out, 7, n));
+	EXPECT_EQ(n, 7u);
 }
 
 // ── scanJsonNumber ──────────────────────────────────────────────────────────
@@ -92,36 +105,111 @@ static std::string makeJwt(const std::string& payloadJson)
 	return enc("{\"alg\":\"HS256\"}") + "." + enc(payloadJson) + ".sigsig";
 }
 
+// decodeJwtLifetimeUs() is lent its scratch (#951): fetchToken() lends the arena's unused tail.
+static int64_t lifetimeOf(std::string_view jwt)
+{
+	std::vector<char> scratch(jwt.size() + 1);
+	return decodeJwtLifetimeUs(jwt, scratch.data(), scratch.size());
+}
+
 TEST(TelephonyLogic, DecodeJwtLifetimeRealClaims)
 {
 	// exp - iat = 3600s -> 3.6e9 µs.
 	std::string jwt = makeJwt("{\"iat\":1700000000,\"exp\":1700003600}");
-	EXPECT_EQ(decodeJwtLifetimeUs(jwt), 3600LL * 1000000);
+	EXPECT_EQ(lifetimeOf(jwt), 3600LL * 1000000);
 }
 
 TEST(TelephonyLogic, DecodeJwtFallbackOnMalformed)
 {
 	// No dots / one dot / empty payload all fall back to the safe lifetime —
 	// never the bogus OAuth expires_in:60 that would trigger a refresh storm.
-	EXPECT_EQ(decodeJwtLifetimeUs("not-a-jwt"), kTokenFallbackLifetimeUs);
-	EXPECT_EQ(decodeJwtLifetimeUs("header.only"), kTokenFallbackLifetimeUs);
-	EXPECT_EQ(decodeJwtLifetimeUs("a..c"), kTokenFallbackLifetimeUs);
+	EXPECT_EQ(lifetimeOf("not-a-jwt"), kTokenFallbackLifetimeUs);
+	EXPECT_EQ(lifetimeOf("header.only"), kTokenFallbackLifetimeUs);
+	EXPECT_EQ(lifetimeOf("a..c"), kTokenFallbackLifetimeUs);
 }
 
 TEST(TelephonyLogic, DecodeJwtFallbackOnMissingClaims)
 {
 	// Payload decodes but lacks iat — fall back.
-	EXPECT_EQ(decodeJwtLifetimeUs(makeJwt("{\"exp\":1700003600}")), kTokenFallbackLifetimeUs);
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"exp\":1700003600}")), kTokenFallbackLifetimeUs);
 }
 
 TEST(TelephonyLogic, DecodeJwtFallbackOnInsaneSpan)
 {
 	// Negative span (exp before iat) and an over-a-day span are both rejected by
 	// the sanity window -> fallback, not a garbage lifetime.
-	EXPECT_EQ(decodeJwtLifetimeUs(makeJwt("{\"iat\":1700003600,\"exp\":1700000000}")),
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"iat\":1700003600,\"exp\":1700000000}")),
 	          kTokenFallbackLifetimeUs);
-	EXPECT_EQ(decodeJwtLifetimeUs(makeJwt("{\"iat\":1700000000,\"exp\":1700200000}")),
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"iat\":1700000000,\"exp\":1700200000}")),
 	          kTokenFallbackLifetimeUs);   // ~55h
+}
+
+TEST(TelephonyLogic, DecodeJwtLifetimeFromARealisticPayload)
+{
+	// More members than exp and iat, in the order an issuer writes them, with a space and an
+	// array in the way. This is what the cJSON version it replaced (#862) read on the board.
+	const std::string payload =
+	    "{\"iss\":\"https://pbx.example.com\",\"aud\":[\"call_control\"],\"nbf\":1700000000,"
+	    "\"exp\": 1700003600,\"iat\":1700000000,\"client_id\":\"900\",\"scope\":\"exp iat\"}";
+	EXPECT_EQ(lifetimeOf(makeJwt(payload)), 3600LL * 1000000);
+}
+
+TEST(TelephonyLogic, DecodeJwtLifetimeFallsBackOnAFractionOrAnExponent)
+{
+	// Supersedes the earlier "a fraction is cut, not rounded" (#862). Cutting exp and iat each to
+	// whole seconds can put the lifetime up to a second HIGH, the unsafe direction (exp 101.0 and
+	// iat 100.9 would read as 1 s for 0.1 s), and "1.7e9" used to read as 1. A number with a '.',
+	// 'e' or 'E' after its digits is not read at all, so the lifetime is the 50 minute fallback.
+	for (const char* payload : {
+	         "{\"iat\":1700000000.2,\"exp\":1700003600.9}", "{\"iat\":1700000000,\"exp\":1700003600.5}",
+	         "{\"iat\":1700000000.5,\"exp\":1700003600}", "{\"iat\":1.7e9,\"exp\":1.7000036e9}",
+	         "{\"iat\":1700000000,\"exp\":1700003600E0}", "{\"iat\":1700000000,\"exp\":17000036e2}"})
+	{
+		EXPECT_EQ(lifetimeOf(makeJwt(payload)), kTokenFallbackLifetimeUs) << payload;
+	}
+}
+
+TEST(TelephonyLogic, ScanJsonNumberRefusesWhatItCannotReadExactly)
+{
+	int64_t v = 777;
+	// "1.7e9" must not read as 1, and 19 or more digits must not overflow a signed 64-bit value.
+	for (const char* json : {"{\"exp\":1.7e9}", "{\"exp\":1700000000.5}", "{\"exp\":1700000000E0}", "{\"exp\":17e8}",
+	                         "{\"exp\":1234567890123456789}", "{\"exp\":9223372036854775808}",
+	                         "{\"exp\":99999999999999999999999}"})
+	{
+		EXPECT_FALSE(scanJsonNumber(json, "exp", v)) << json;
+	}
+	EXPECT_EQ(v, 777) << "a refusal leaves out alone";
+	// What it can read exactly still reads: 18 digits is the most it takes.
+	ASSERT_TRUE(scanJsonNumber("{\"exp\":123456789012345678}", "exp", v));
+	EXPECT_EQ(v, 123456789012345678);
+	ASSERT_TRUE(scanJsonNumber("{\"exp\":-5}", "exp", v));
+	EXPECT_EQ(v, -5);
+	for (const char* json : {"{\"exp\":42}", "{\"exp\":42,\"x\":1}", "{\"exp\":42 }", "{\"a\":[1],\"exp\":42}"})
+	{
+		v = 0;
+		ASSERT_TRUE(scanJsonNumber(json, "exp", v)) << json;
+		EXPECT_EQ(v, 42) << json;
+	}
+}
+
+TEST(TelephonyLogic, DecodeJwtLifetimeTakesNoHeap)
+{
+	// fetchToken() decodes this on every fetch, into the arena's unused tail (#951). It was three
+	// allocations (payload, decoded bytes, JSON text); the caller lends the scratch now, so none.
+	const std::string jwt = makeJwt(
+	    "{\"iss\":\"https://pbx.example.com\",\"aud\":[\"call_control\"],\"nbf\":1700000000,"
+	    "\"exp\":1700003600,\"iat\":1700000000,\"client_id\":\"900\"}");
+	char scratch[512];
+	int64_t lifetime = 0;
+	std::size_t heap = 0;
+	{
+		AllocGuard g;
+		lifetime = decodeJwtLifetimeUs(jwt, scratch, sizeof scratch);
+		heap = g.delta();
+	}
+	EXPECT_EQ(lifetime, 3600LL * 1000000);
+	EXPECT_EQ(heap, 0u);
 }
 
 // ── entity-path tokenizer + participant parse ───────────────────────────────

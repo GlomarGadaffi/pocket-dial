@@ -14,12 +14,18 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "AllocCounter.hpp"
 #include "ArpLookup.hpp"
 #include "HttpServer.hpp"
+#include "PoolConfig.hpp"       // POCKETDIAL_HTTP_DRAM_ACCOUNT (#410/#328)
 #include "PsramAllocator.hpp"   // #479: psram::dynamicTaskCreates()
 #include "RequestsHandler.hpp"
+
+#ifndef POCKETDIAL_HTTP_DRAM_ACCOUNT
+#error "PoolConfig.hpp must define POCKETDIAL_HTTP_DRAM_ACCOUNT (default 0)"
+#endif
 
 #if !defined(_WIN32) && !defined(_WIN64)   // socketpair(): POSIX host only
 
@@ -210,6 +216,83 @@ TEST(HttpStatusAlloc, LearnArpRequestsLimitedIsOnStatus)
 	b.handler->handle(makeRegister("201"));
 	const std::string resp = b.serve(false);
 	EXPECT_NE(resp.find("\"learnArpRequestsLimited\":1,"), std::string::npos) << resp;
+}
+
+namespace
+{
+	// The top-level keys of a compact JSON object, in order. Tracks string and
+	// nesting state, so keys of nested objects and arrays, and string values
+	// containing a colon, are not reported.
+	std::vector<std::string> topLevelKeys(const std::string& json)
+	{
+		std::vector<std::string> keys;
+		std::string cur, pending;
+		int depth = 0;
+		bool inStr = false, esc = false, havePending = false;
+		char prev = 0;
+		for (char c : json)
+		{
+			if (inStr)
+			{
+				if (esc) { esc = false; cur += c; }
+				else if (c == '\\') esc = true;
+				else if (c == '"')
+				{
+					inStr = false;
+					if (depth == 1 && (prev == '{' || prev == ',')) { pending = cur; havePending = true; }
+					prev = '"';
+				}
+				else cur += c;
+				continue;
+			}
+			if (c == '"') { inStr = true; cur.clear(); continue; }
+			if (c == ':' && havePending) keys.push_back(pending);
+			havePending = false;
+			if (c == '{' || c == '[') ++depth;
+			else if (c == '}' || c == ']') --depth;
+			prev = c;
+		}
+		return keys;
+	}
+}
+
+TEST(HttpStatusAlloc, TheStatusKeyListIsPinnedAndTheDramAccountGuardAddsOnlyItsOwnKey)
+{
+	// #410/#328: POCKETDIAL_HTTP_DRAM_ACCOUNT is bench-only and defaults to 0.
+	// Off, /api/status must be exactly what it was before the accounting existed:
+	// these are main's top-level keys, in main's order, taken from main's output
+	// before the guard was added. On, the one extra key is httpDramAccount, last.
+	StatusBench b;
+	std::vector<std::string> want = {
+		"ip", "port", "httpPort", "version", "httpReadDeadlineDrops", "httpPerSourceRefusals",
+		"httpStatusRefusals", "wifiCapable", "emergencyRoute", "uptime", "cdrPersistFailures", "cdrPersistSuppressed",
+		"cdrLoadFailures", "packetsProcessed", "packetsDropped", "msgPoolRefusals", "vpeerPoolRefusals", "repliesRefused",
+		"optionsPingTruncated", "byeTruncated", "trunkForgedRegisterResponses", "trunkForgedDialogResponses",
+		"trunkRefusedDialogByes", "emergencyRtpReaps", "learnArpRequestsLimited", "e911Configured", "droppedInvalid",
+		"droppedRate", "keepalivesCrlf", "droppedNoPool", "droppedOversize", "rtpRxOversize", "rtpTxPoolRefused",
+		"rtpTxPoolRetired", "recvErrors", "lastRecvErrno", "recentDrops", "sd", "resetIncomplete", "resetIncompleteStage",
+		"resetFailedMask", "resetJournal", "resetJournalWriteFailures", "clients", "clientCount", "rosterVisible",
+		"sessionCount", "oldestSessionSec", "sessions", "dnd", "voicemail", "forwards", "groups", "dialplan",
+		"parkedCount", "parkedCalls", "freeHeap", "minFreeHeap", "minFreeHeapSpiram", "minFreeHeapInternal",
+		"freeHeapInternal", "largestFreeBlockInternal", "freeHeapDma", "largestFreeBlockDma", "resetReason",
+		"stackHwm_sip_server_task", "stackHwm_udp_receiver_task", "stackHwm_rtp_media_tx", "stackHwm_rtp_media_rx",
+		"stackHwm_conf_mix_tick", "stackHwm_tel_ctl0", "stackHwm_tel_ctl1", "stackHwm_tel_drop", "stackHwm_tel_sos",
+		"stackHwm_http_conn", "httpConnWorstRoute", "coredump", "l2Tx", "memory",
+	};
+#if POCKETDIAL_HTTP_DRAM_ACCOUNT
+	want.push_back("httpDramAccount");
+#endif
+	for (bool authed : {false, true})
+	{
+		SCOPED_TRACE(authed ? "with session" : "anonymous");
+		const std::string resp = b.serve(authed);
+		ASSERT_EQ(resp.rfind("HTTP/1.1 200", 0), 0u) << resp.substr(0, 200);
+		const std::string body = resp.substr(resp.find("\r\n\r\n") + 4);
+		EXPECT_EQ(topLevelKeys(body), want);
+#if !POCKETDIAL_HTTP_DRAM_ACCOUNT
+		EXPECT_EQ(body.find("httpDramAccount"), std::string::npos);
+#endif
+	}
 }
 
 #endif

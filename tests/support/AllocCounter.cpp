@@ -21,10 +21,17 @@ namespace
 	std::atomic<std::size_t> g_liveBlocks{0};
 	std::atomic<std::size_t> g_liveBytes{0};
 
-	void count()
+	std::atomic<std::size_t> g_watchedSize{0};
+	thread_local std::size_t t_watchedAllocs = 0;
+
+	thread_local std::size_t t_failSize = 0;
+	thread_local int t_failLeft = 0;
+
+	void count(std::size_t bytes)
 	{
 		g_allocs.fetch_add(1, std::memory_order_relaxed);
 		++t_allocs;
+		if (bytes == g_watchedSize.load(std::memory_order_relaxed)) ++t_watchedAllocs;
 	}
 
 	// The C library's size for a block: what operator new adds to the live
@@ -95,12 +102,24 @@ std::size_t threadHeapAllocCount() { return t_allocs; }
 std::size_t heapLiveBlocks() { return g_liveBlocks.load(std::memory_order_relaxed); }
 std::size_t heapLiveBytes() { return g_liveBytes.load(std::memory_order_relaxed); }
 bool heapLiveTracked() { return kLiveTracked; }
+void watchAllocSize(std::size_t bytes) { g_watchedSize.store(bytes, std::memory_order_relaxed); }
+std::size_t threadWatchedAllocCount() { return t_watchedAllocs; }
+void failAllocOfSize(std::size_t bytes, int times)
+{
+	t_failSize = bytes;
+	t_failLeft = times;
+}
 
 // The nothrow forms are not replaced: the standard library implements them by
 // calling these, so they are counted through here.
 void* operator new(std::size_t n)
 {
-	count();
+	if (t_failLeft > 0 && n == t_failSize)
+	{
+		--t_failLeft;
+		throw std::bad_alloc();
+	}
+	count(n);
 	if (void* p = std::malloc(n ? n : 1))
 	{
 		taken(blockBytes(p));
@@ -117,7 +136,7 @@ void operator delete[](void* p, std::size_t) noexcept { plainFree(p); }
 // Over-aligned types (alignas > __STDCPP_DEFAULT_NEW_ALIGNMENT__) go through these.
 void* operator new(std::size_t n, std::align_val_t al)
 {
-	count();
+	count(n);
 	if (void* p = alignedAlloc(n, al))
 	{
 		taken(alignedBlockBytes(p, static_cast<std::size_t>(al)));

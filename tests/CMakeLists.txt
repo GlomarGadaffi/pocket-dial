@@ -102,6 +102,14 @@ add_executable(sip_parser_tests
     # sendmsg() (byte-identical, short writes resumed, zero allocation).
     HttpSendPath_test.cpp
     HttpStatusAlloc_test.cpp
+    # Issues #410/#328: the per-connection read buffer is reserved per slot (PSRAM
+    # where there is some), not allocated per request.
+    HttpReadBuf_test.cpp
+    # Issues #410/#328: 3 concurrent connections, 2 per source, the 4th gets 503.
+    HttpConnCap_test.cpp
+    # Issue #410/#328: the bench-only HTTP internal-DRAM accounting (counter
+    # arithmetic always; the HttpServer wiring only with the guard on).
+    HttpDramAccount_test.cpp
     # Issue #410 done-when 4: the per-route allocation gate.
     HttpRouteAlloc_test.cpp
     # Issue #412: every allocateVirtualPeer() caller must survive an exhausted
@@ -113,6 +121,11 @@ add_executable(sip_parser_tests
     # BEFORE building any 180/200, mirroring the ordinary call-to-call INVITE
     # path, so a full session pool gets a real 503 instead of a false 200.
     Invite777SessionPool_test.cpp
+    # Issue #172: RFC 3262 Require: 100rel is honoured on the 777 echo route only.
+    Prack100rel_test.cpp
+    # Issue #172 step 3: with the default-off flag, a plain extension call carrying
+    # Require: 100rel is forwarded without it and its 180 is made reliable here.
+    Forward100rel_test.cpp
     # Relay codec policy: filterAudioCodecs()/offersSupportedAudio() replaced the
     # blind enforceG711() "0 8 101" rewrite on peer-to-peer legs -- offer order
     # preserved, G.722 admitted, unsupported payloads (and their rtpmap/fmtp)
@@ -346,6 +359,8 @@ add_executable(sip_parser_tests
     PsramPlacement_test.cpp
     AnchorClient_test.cpp
     MediaBridge_test.cpp
+    # #946 option A: every ring is allocated once at init; a call only clears it.
+    RingPin_test.cpp
     # Wires the AnchorClient/MediaBridge/TelephonyProvider extension point into
     # RequestsHandler's own call routing (virtual extension 555, opt-in, docs/
     # FEATURE_ROADMAP.md's "Anchored media") — the boot-time provider selection +
@@ -396,7 +411,12 @@ add_executable(sip_parser_tests
     # Issue #948: the 911/933 lane's status GET -- the failure contract on its body arena and the
     # bounded claim (src/SIP/SosStatusGet.hpp), the code the anchor client's sos lane calls.
     SosStatusGet_test.cpp
+    # #862: the token-body arena and its bounded field scanner (the #948 contract).
+    TokenBodyArena_test.cpp
+    FetchTokenOwnCode_test.cpp
     MixBus_test.cpp
+    # Issue #169: VAD energy-gating of mix participation (default off).
+    VadGate_test.cpp
     # Issue #75: MixBus wired into MediaBridge (BUS mode) and made dialable as the
     # 888 meet-me room. Covers the N-way minus-self mix end-to-end through the real
     # µ-law rim, a leg leaving mid-conference, and the RequestsHandler 888 intercept.

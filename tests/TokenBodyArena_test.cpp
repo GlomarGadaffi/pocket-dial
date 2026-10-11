@@ -1,0 +1,1951 @@
+// TokenBodyArena_test.cpp -- the token-body arena and its bounded field scanner (#862).
+//
+// The contract is the one the operator recorded on #948 for the 911/933 lane:
+//   1. a bounded arena, reserved with the client, no per-read std::vector and no spill;
+//   2. a body that does not fit, or a read that fails, is an ERROR and the arena then
+//      shows no bytes at all -- never a prefix. The caller keeps the token it has;
+//   3. no mutex is held across the socket read, and nobody waits for the arena;
+//   4. one test per failure branch: arena full, read error, timeout;
+//   5. a 911/933 has an arena of its own (telephony::TokenLanes): it never waits on an ordinary
+//      fetch, is never turned away by one, and its own failure branches leave nothing behind.
+//
+// The ESP arm (TelephonyAnchorClient::readJsonStringField / fetchToken) cannot be host
+// compiled. These tests drive the host-compiled halves it calls: telephony::BodyArena,
+// its Lease::collect(), telephony::TokenLanes and telephony::jsonStringField().
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include "AllocCounter.hpp"
+#include "TelephonyAnchorLogic.hpp"
+#include "Witness.hpp"
+
+namespace
+{
+	using Arena = telephony::BodyArena<telephony::kTokenBodyBytes>;
+	using telephony::BodyStatus;
+	constexpr std::size_t kN = telephony::kTokenBodyBytes;
+
+	// A scripted socket. read() answers exactly as esp_http_client_read() does: n > 0 bytes,
+	// 0 at the end of the body, a negative code on an error. Like the real call it hands back
+	// 0 for a request of 0 bytes, which is why asking for 0 is a test failure here: that answer
+	// is indistinguishable from the end of the body.
+	class Script
+	{
+	public:
+		Script& bytes(std::string b) { _steps.push_back({std::move(b), 0, false}); return *this; }
+		Script& code(int c) { _steps.push_back({std::string(), c, true}); return *this; }
+		Script& chunk(std::size_t n) { _chunk = n; return *this; }
+		Script& perReadUs(std::int64_t us, std::int64_t* clock) { _perReadUs = us; _clock = clock; return *this; }
+
+		int read(char* dst, std::size_t room)
+		{
+			EXPECT_GT(room, 0u) << "a read of 0 bytes reads as 'end of body'";
+			++_calls;
+			if (_clock) *_clock += _perReadUs;
+			if (_i >= _steps.size() || room == 0) return 0;
+			Step& s = _steps[_i];
+			if (s.isCode) { ++_i; return s.code; }
+			std::size_t n = s.data.size() - _pos;
+			if (n > room) n = room;
+			if (n > _chunk) n = _chunk;
+			for (std::size_t k = 0; k < n; ++k) dst[k] = s.data[_pos + k];
+			_pos += n;
+			_consumed += n;
+			if (_pos == s.data.size()) { ++_i; _pos = 0; }
+			return static_cast<int>(n);
+		}
+
+		std::size_t consumed() const { return _consumed; }
+		std::size_t calls() const { return _calls; }
+
+	private:
+		struct Step { std::string data; int code; bool isCode; };
+		std::vector<Step> _steps;
+		std::size_t       _i = 0, _pos = 0, _chunk = 512, _consumed = 0, _calls = 0;
+		std::int64_t      _perReadUs = 0;
+		std::int64_t*     _clock = nullptr;
+	};
+
+	BodyStatus run(Arena::Lease& lease, Script& s, std::int64_t& clockUs,
+	               std::int64_t budgetUs = telephony::kTokenBodyBudgetUs)
+	{
+		return lease.collect([&](char* d, std::size_t room) { return s.read(d, room); },
+		                     [&] { return clockUs; }, budgetUs);
+	}
+
+	std::string_view held(Arena::Lease& lease) { return std::string_view(lease.data(), lease.size()); }
+
+	std::string filler(std::size_t n)
+	{
+		std::string s;
+		for (std::size_t i = 0; i < n; ++i) s.push_back(static_cast<char>('a' + i % 26));
+		return s;
+	}
+
+	std::string tokenBody(const std::string& token)
+	{
+		return "{\"token_type\":\"Bearer\",\"expires_in\":60,\"access_token\":\"" + token +
+		       "\",\"scope\":\"call_control\"}";
+	}
+
+	constexpr std::int64_t kT0 = 5000000;   // not 0: the deadline must be relative to the start
+}
+
+// ── the arena: happy path and the capacity edge ────────────────────────────────────
+
+TEST(TokenBodyArena, ABodyThatFitsIsCollectedAndScannedWithoutTheHeap)
+{
+	const std::string token = filler(1400);               // a JWT-sized token
+	const std::string body = tokenBody(token);
+	Arena arena;
+	Script script;
+	script.bytes(body);
+	std::int64_t clock = kT0;
+	std::string_view got;
+	BodyStatus st = BodyStatus::ReadError;
+	bool found = false;
+	std::size_t heap = 0;
+	{
+		AllocGuard g;
+		Arena::Lease lease = arena.tryClaim();
+		ASSERT_TRUE(lease);
+		st = run(lease, script, clock);
+		found = telephony::jsonStringField(lease.data(), lease.size(), "access_token", got);
+		heap = g.delta();
+		EXPECT_EQ(got, token);
+	}
+	EXPECT_EQ(st, BodyStatus::Ok);
+	EXPECT_TRUE(found);
+	EXPECT_EQ(heap, 0u) << "claim + read + scan must not touch the heap";
+}
+
+TEST(TokenBodyArena, ABodyExactlyTheArenaSizeIsAccepted)
+{
+	const std::string body = filler(kN);
+	Arena arena;
+	Script script;
+	script.bytes(body);
+	std::int64_t clock = kT0;
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	EXPECT_EQ(run(lease, script, clock), BodyStatus::Ok);
+	EXPECT_EQ(lease.size(), kN);
+	EXPECT_EQ(held(lease), body) << "all of it, in order";
+}
+
+TEST(TokenBodyArena, ABodyOneByteOverTheArenaIsRefusedNotTruncated)
+{
+	Arena arena;
+	Script script;
+	script.bytes(filler(kN + 1));
+	std::int64_t clock = kT0;
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	EXPECT_EQ(run(lease, script, clock), BodyStatus::ArenaFull);
+	EXPECT_EQ(lease.size(), 0u) << "a refused body leaves no bytes behind, not even the first N";
+	EXPECT_EQ(script.consumed(), kN + 1) << "it reads the one byte that proves the overflow, and no more";
+}
+
+// ── the three failure branches ─────────────────────────────────────────────────────
+
+TEST(TokenBodyArena, FailureArenaFull_AHugeBodyIsRefusedAndNotReadPastTheProbeByte)
+{
+	Arena arena;
+	Script script;
+	script.bytes(filler(10 * kN));
+	std::int64_t clock = kT0;
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	EXPECT_EQ(run(lease, script, clock), BodyStatus::ArenaFull);
+	EXPECT_EQ(lease.size(), 0u);
+	EXPECT_EQ(script.consumed(), kN + 1) << "a hostile server cannot make the read run on";
+}
+
+TEST(TokenBodyArena, FailureReadError_BeforeAnyDataIsAnError)
+{
+	Arena arena;
+	Script script;
+	script.code(-1);
+	std::int64_t clock = kT0;
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	EXPECT_EQ(run(lease, script, clock), BodyStatus::ReadError);
+	EXPECT_EQ(lease.size(), 0u);
+}
+
+TEST(TokenBodyArena, FailureReadError_AfterPartOfTheBodyLeavesNoPartialBody)
+{
+	Arena arena;
+	Script script;
+	script.bytes(tokenBody(filler(900)).substr(0, 700)).code(-1);
+	std::int64_t clock = kT0;
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	EXPECT_EQ(run(lease, script, clock), BodyStatus::ReadError);
+	EXPECT_EQ(lease.size(), 0u) << "the 700 bytes that did arrive must not be offered to the parser";
+	EXPECT_GT(script.consumed(), 0u) << "the failure really came after data, or this proves nothing";
+}
+
+TEST(TokenBodyArena, FailureTimeout_TheReadTimingOutBeforeAnyDataIsATimeout)
+{
+	Arena arena;
+	Script script;
+	script.code(telephony::kHttpReadTimedOut);
+	std::int64_t clock = kT0;
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	EXPECT_EQ(run(lease, script, clock), BodyStatus::Timeout);
+	EXPECT_EQ(lease.size(), 0u);
+}
+
+TEST(TokenBodyArena, FailureTimeout_TheReadTimingOutAfterPartOfTheBodyLeavesNoPartialBody)
+{
+	Arena arena;
+	Script script;
+	script.bytes(filler(300)).code(telephony::kHttpReadTimedOut);
+	std::int64_t clock = kT0;
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	EXPECT_EQ(run(lease, script, clock), BodyStatus::Timeout);
+	EXPECT_EQ(lease.size(), 0u);
+	EXPECT_EQ(script.consumed(), 300u);
+}
+
+TEST(TokenBodyArena, FailureTimeout_ABodyDrippedPastTheTotalBudgetIsATimeoutAndStopsReading)
+{
+	// One byte per read, each read a second later. Every read succeeds, so only the total
+	// budget can stop it; without one this runs for kN reads, i.e. over an hour.
+	Arena arena;
+	Script script;
+	std::int64_t clock = kT0;
+	script.bytes(filler(kN)).chunk(1).perReadUs(1000000, &clock);
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	EXPECT_EQ(run(lease, script, clock, 3000000), BodyStatus::Timeout);
+	EXPECT_EQ(lease.size(), 0u);
+	EXPECT_EQ(script.calls(), 3u) << "it must stop at the deadline, not read on";
+}
+
+TEST(TokenBodyArena, ABodyInsideTheBudgetIsNotTimedOut)
+{
+	// The same one-byte drip, a millisecond per read: 2,000 reads, 2 s, inside a 3 s budget.
+	const std::string body = filler(2000);
+	Arena arena;
+	Script script;
+	std::int64_t clock = kT0;
+	script.bytes(body).chunk(1).perReadUs(1000, &clock);
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	EXPECT_EQ(run(lease, script, clock, 3000000), BodyStatus::Ok);
+	EXPECT_EQ(held(lease), body);
+}
+
+// ── the budget is enforced per transport read, as the device reads ───────────────────
+// The tests above hand collect() a read() that returns after one transport read. The board's
+// esp_http_client_read() (ESP-IDF v6.0.1) does not: it loops transport reads until `len` bytes
+// of body are stored or the body ends, so one read() with room for 4,097 bytes can hold the
+// socket for a whole dripped body. These model that, so the budget has to be checked often
+// enough for that to be bounded.
+
+namespace
+{
+	class IdfRead
+	{
+	public:
+		// Each transport read delivers the next byte `gapUs` of clock after the last. chunk > 0: a
+		// chunked response spends `framing` transport reads on size-line bytes that carry no body
+		// before every `chunk` bytes of body.
+		IdfRead(std::string body, std::int64_t gapUs, std::int64_t* clock, std::size_t chunk = 0, std::size_t framing = 0)
+		    : _body(std::move(body)), _gapUs(gapUs), _clock(clock), _chunk(chunk), _framing(framing) {}
+
+		int read(char* dst, std::size_t len)
+		{
+			++_calls;
+			_maxRoom = std::max(_maxRoom, len);
+			std::size_t stored = 0;
+			while (stored < len && _pos < _body.size())
+			{
+				if (_chunk != 0 && _left == 0)
+				{
+					for (std::size_t i = 0; i < _framing; ++i) tick();
+					_left = _chunk;
+				}
+				tick();
+				dst[stored++] = _body[_pos++];
+				if (_chunk != 0) --_left;
+			}
+			return static_cast<int>(stored);   // 0 once the body is over
+		}
+
+		std::size_t transportReads() const { return _transportReads; }
+		std::size_t calls() const { return _calls; }
+		std::size_t maxRoom() const { return _maxRoom; }
+
+	private:
+		void tick() { *_clock += _gapUs; ++_transportReads; }
+
+		std::string  _body;
+		std::int64_t _gapUs;
+		std::int64_t* _clock;
+		std::size_t  _chunk, _framing, _left = 0, _pos = 0, _transportReads = 0, _calls = 0, _maxRoom = 0;
+	};
+}
+
+TEST(TokenBodyArena, FailureTimeout_AServerDrippingBytesIsStoppedAtTheBudgetEvenWhenEachReadBlocksForItsWholeRoom)
+{
+	// 2,000 bytes, one a second, a 3 s budget. If collect() let one read() ask for the whole
+	// arena, that read would loop 2,000 transport reads, i.e. 2,000 s, before collect() could
+	// look at the clock. The room it asks for has to stay small enough to look every transport read.
+	Arena arena;
+	std::int64_t clock = kT0;
+	IdfRead dev(filler(2000), 1000000, &clock);
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	const BodyStatus st = lease.collect([&](char* d, std::size_t room) { return dev.read(d, room); },
+	                                    [&] { return clock; }, 3000000);
+	EXPECT_EQ(st, BodyStatus::Timeout);
+	EXPECT_EQ(lease.size(), 0u);
+	EXPECT_LE(clock - kT0, 3000000 + 1000000) << "stopped at the budget plus the one transport read already in progress";
+	EXPECT_LE(dev.transportReads(), 4u);
+}
+
+TEST(TokenBodyArena, FailureTimeout_ChunkFramingCanOverrunTheBudgetByOneReadsFramingAndNoMore)
+{
+	// A chunked body spends transport reads on the size line inside a read() that stores one
+	// body byte. That is the overrun left: the budget plus the framing reads of one chunk.
+	constexpr std::size_t kFraming = 7;
+	Arena arena;
+	std::int64_t clock = kT0;
+	IdfRead dev(filler(2000), 1000000, &clock, /*chunk=*/64, kFraming);
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	const BodyStatus st = lease.collect([&](char* d, std::size_t room) { return dev.read(d, room); },
+	                                    [&] { return clock; }, 3000000);
+	EXPECT_EQ(st, BodyStatus::Timeout);
+	EXPECT_LE(clock - kT0, 3000000 + static_cast<std::int64_t>(kFraming + 1) * 1000000);
+	EXPECT_LE(dev.transportReads(), 3u + kFraming + 1);
+}
+
+TEST(TokenBodyArena, NoReadIsAskedForMoreThanTheSliceSoTheClockIsLookedAtEveryTransportRead)
+{
+	Arena arena;
+	std::int64_t clock = kT0;
+	const std::string body = tokenBody(filler(1400));
+	IdfRead dev(body, 1000, &clock);   // 1 ms a byte: well inside the budget
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	ASSERT_EQ(lease.collect([&](char* d, std::size_t room) { return dev.read(d, room); },
+	                        [&] { return clock; }, telephony::kTokenBodyBudgetUs),
+	          BodyStatus::Ok);
+	EXPECT_EQ(held(lease), body) << "reading a byte at a time loses nothing";
+	EXPECT_LE(dev.maxRoom(), telephony::kTokenReadSliceBytes);
+	EXPECT_EQ(telephony::kTokenReadSliceBytes, 1u);
+}
+
+TEST(TokenBodyArena, TheHttpReadAnswerIsMappedTheWayCollectNeeds)
+{
+	using telephony::httpReadResult;
+	constexpr int kEspFail = -1;
+	EXPECT_EQ(httpReadResult(1, false), 1);
+	EXPECT_EQ(httpReadResult(512, true), 512) << "data is data, whatever the completeness says";
+	EXPECT_EQ(httpReadResult(0, true), 0) << "the end of a whole body";
+	EXPECT_EQ(httpReadResult(0, false), -1) << "a 0 from a body that is not whole is an error, never a shorter token";
+	EXPECT_EQ(httpReadResult(telephony::kHttpReadTimedOut, false), telephony::kHttpReadTimedOut) << "EAGAIN is a timeout";
+	EXPECT_EQ(httpReadResult(telephony::kHttpReadTimedOut, true), telephony::kHttpReadTimedOut);
+	EXPECT_EQ(httpReadResult(kEspFail, false), -1) << "ESP_FAIL";
+	EXPECT_EQ(httpReadResult(kEspFail, true), -1);
+	EXPECT_EQ(httpReadResult(-0x7002, false), -1) << "any other transport error";
+	EXPECT_EQ(httpReadResult(std::numeric_limits<int>::min(), true), -1);
+	// Through collect(): the three answers end in Ok, Timeout and ReadError.
+	for (const auto& c : {std::make_pair(telephony::kHttpReadTimedOut, BodyStatus::Timeout),
+	                      std::make_pair(kEspFail, BodyStatus::ReadError)})
+	{
+		Arena arena;
+		Arena::Lease lease = arena.tryClaim();
+		ASSERT_TRUE(lease);
+		EXPECT_EQ(lease.collect([&](char*, std::size_t) { return httpReadResult(c.first, false); },
+		                        [] { return kT0; }, telephony::kTokenBodyBudgetUs),
+		          c.second);
+	}
+}
+
+TEST(TokenBodyArena, AZeroFromABodyThatIsNotWholeIsAReadErrorAndAWholeOneEndsIt)
+{
+	// 700 bytes of a longer body, then the connection closes: the transport says 0, the response
+	// says it is not whole. That must not come back as a 700-byte token.
+	const std::string part = tokenBody(filler(900)).substr(0, 700);
+	for (const bool whole : {false, true})
+	{
+		Arena arena;
+		Arena::Lease lease = arena.tryClaim();
+		ASSERT_TRUE(lease);
+		std::size_t pos = 0;
+		const BodyStatus st = lease.collect(
+		    [&](char* d, std::size_t room) {
+			    const std::size_t n = std::min(room, part.size() - pos);
+			    std::memcpy(d, part.data() + pos, n);
+			    pos += n;
+			    return telephony::httpReadResult(static_cast<int>(n), whole);
+		    },
+		    [] { return kT0; }, telephony::kTokenBodyBudgetUs);
+		EXPECT_EQ(st, whole ? BodyStatus::Ok : BodyStatus::ReadError) << "whole=" << whole;
+		EXPECT_EQ(lease.size(), whole ? part.size() : 0u);
+	}
+}
+
+// ── the claim: nobody waits, nothing is held across the read ───────────────────────
+
+TEST(TokenBodyArena, ASecondClaimIsRefusedAtOnceAndTheHolderIsNotDisturbed)
+{
+	Arena arena;
+	Arena::Lease first = arena.tryClaim();
+	ASSERT_TRUE(first);
+	Arena::Lease second = arena.tryClaim();
+	EXPECT_FALSE(second) << "refused, not queued";
+	Script script;
+	script.bytes("{}");
+	std::int64_t clock = kT0;
+	EXPECT_EQ(run(first, script, clock), BodyStatus::Ok) << "the refused claim must not have touched the holder";
+	EXPECT_EQ(held(first), "{}");
+}
+
+TEST(TokenBodyArena, ACallerOnAnotherThreadIsRefusedWhileTheSocketIsBeingRead)
+{
+	Arena arena;
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	int callsWhileReading = 0;
+	bool otherThreadGotIt = true;
+	const std::string body = tokenBody("abc");
+	std::size_t pos = 0;
+	const BodyStatus st = lease.collect(
+	    [&](char* dst, std::size_t room) -> int {
+		    // This is inside the socket read: a second fetch arrives on another task now.
+		    std::thread other([&] { otherThreadGotIt = static_cast<bool>(arena.tryClaim()); });
+		    other.join();
+		    ++callsWhileReading;
+		    if (pos >= body.size()) return 0;
+		    const std::size_t n = std::min(room, body.size() - pos);
+		    for (std::size_t k = 0; k < n; ++k) dst[k] = body[pos + k];
+		    pos += n;
+		    return static_cast<int>(n);
+	    },
+	    [] { return kT0; }, telephony::kTokenBodyBudgetUs);
+	EXPECT_EQ(st, BodyStatus::Ok);
+	EXPECT_GT(callsWhileReading, 0);
+	EXPECT_FALSE(otherThreadGotIt) << "the second task is turned away and carries on; it does not wait for this read";
+}
+
+TEST(TokenBodyArena, ALeaseReleasesTheArenaOnEveryExitAndTheNextClaimStartsEmpty)
+{
+	Arena arena;
+	std::int64_t clock = kT0;
+	{
+		Arena::Lease lease = arena.tryClaim();
+		ASSERT_TRUE(lease);
+		Script bad;
+		bad.bytes("{\"a\"").code(-1);
+		EXPECT_EQ(run(lease, bad, clock), BodyStatus::ReadError);
+	}   // lease goes out of scope on the failure path
+	Arena::Lease again = arena.tryClaim();
+	ASSERT_TRUE(again) << "a failed read must not leave the arena claimed";
+	EXPECT_EQ(again.size(), 0u);
+	Script good;
+	good.bytes(tokenBody("tok"));
+	EXPECT_EQ(run(again, good, clock), BodyStatus::Ok);
+	std::string_view got;
+	EXPECT_TRUE(telephony::jsonStringField(again.data(), again.size(), "access_token", got));
+	EXPECT_EQ(got, "tok");
+}
+
+TEST(TokenBodyArena, ReleasingTheArenaWipesItSoNeitherATokenNorAPartialBodyStaysInRam)
+{
+	// The arena is reserved for the life of the client. Whatever was read into it, a whole token
+	// or the first part of a body that then failed, stays there until the next fetch overwrites
+	// it unless the release clears it. (The token also lives in the client's own strings; this is
+	// the copy that is nobody's.)
+	auto nonZero = [](Arena::Lease& l) {
+		return static_cast<std::size_t>(std::count_if(l.data(), l.data() + kN + 1, [](char c) { return c != 0; }));
+	};
+	const std::string token = filler(1400);
+	for (const int how : {0, 1, 2})
+	{
+		Arena arena;
+		std::int64_t clock = kT0;
+		{
+			Arena::Lease lease = arena.tryClaim();
+			ASSERT_TRUE(lease);
+			Script script;
+			switch (how)
+			{
+				case 0: script.bytes(tokenBody(token)); break;                                  // a whole token
+				case 1: script.bytes(tokenBody(token).substr(0, 700)).code(-1); break;          // a read error mid-body
+				default: script.bytes(filler(kN + 1)); break;                                   // too big: the probe byte is written
+			}
+			const BodyStatus st = run(lease, script, clock);
+			EXPECT_EQ(st, how == 0 ? BodyStatus::Ok : (how == 1 ? BodyStatus::ReadError : BodyStatus::ArenaFull));
+			EXPECT_GT(nonZero(lease), 0u) << "something really is in the arena before the release, case " << how;
+		}
+		Arena::Lease again = arena.tryClaim();
+		ASSERT_TRUE(again);
+		EXPECT_EQ(nonZero(again), 0u) << "case " << how << ": the release must clear every byte, the probe byte included";
+	}
+}
+
+TEST(TokenBodyArena, AMovedLeaseKeepsTheClaimOnceAndReleasesItOnce)
+{
+	Arena arena;
+	Arena::Lease a = arena.tryClaim();
+	ASSERT_TRUE(a);
+	Arena::Lease b = std::move(a);
+	EXPECT_FALSE(a);
+	EXPECT_TRUE(b);
+	EXPECT_FALSE(arena.tryClaim()) << "still claimed through the new owner";
+	b = Arena::Lease();   // move-assigning an empty lease releases the old claim
+	EXPECT_TRUE(arena.tryClaim());
+}
+
+TEST(TokenBodyArena, AnEmptyBodyIsCollectedAsEmptyAndHasNoToken)
+{
+	Arena arena;
+	Script script;   // nothing: the first read answers 0
+	std::int64_t clock = kT0;
+	Arena::Lease lease = arena.tryClaim();
+	ASSERT_TRUE(lease);
+	EXPECT_EQ(run(lease, script, clock), BodyStatus::Ok);
+	EXPECT_EQ(lease.size(), 0u);
+	std::string_view got;
+	EXPECT_FALSE(telephony::jsonStringField(lease.data(), lease.size(), "access_token", got));
+}
+
+// ── the 911/933 lane: an arena of its own (#862, Rule 5) ───────────────────────────
+// A 911/933 never waits on an ordinary token fetch and is never turned away by one, and a
+// failed 911/933 read costs nothing but the read. The ESP arm (fetchToken) cannot be host
+// compiled; it claims through telephony::TokenLanes, which these tests drive with the same
+// calls. The sleeper counts instead of sleeping, so "did not wait" is exact: no wall clock.
+
+namespace
+{
+	using Lanes = telephony::TokenLanes;
+	using telephony::TokenLane;
+
+	// What fetchToken() gives claimWaiting() for start(): 50 polls, 100 ms apart.
+	constexpr int           kPolls  = 50;
+	constexpr std::uint32_t kPollMs = 100;
+
+	struct Sleeper
+	{
+		int           calls = 0;
+		std::uint64_t ms    = 0;
+		void operator()(std::uint32_t m) { ++calls; ms += m; }
+	};
+
+	// A 911/933 fetch whose body read ends in `want`, while an ordinary fetch holds its own arena
+	// mid-fetch. Afterwards the emergency arena shows no bytes and can be claimed again at once,
+	// the 911/933 never slept, and the ordinary lane's arena and claim are exactly as they were.
+	void expectEmergencyReadFailsCleanly(Script& script, std::int64_t& clock, BodyStatus want,
+	                                     std::int64_t budgetUs = telephony::kTokenBodyBudgetUs)
+	{
+		Lanes lanes;
+		Sleeper sleeper;
+		Arena::Lease ordinary = lanes.claim(TokenLane::Ordinary);
+		ASSERT_TRUE(ordinary);
+		Script ordinaryBody;
+		ordinaryBody.bytes(tokenBody("ordinary"));
+		ASSERT_EQ(run(ordinary, ordinaryBody, clock), BodyStatus::Ok);
+		const std::string ordinaryBytes(held(ordinary));
+
+		{
+			Arena::Lease emergency = lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper);
+			ASSERT_TRUE(emergency) << "the 911/933 arena is its own: an ordinary fetch does not hold it";
+			EXPECT_EQ(run(emergency, script, clock, budgetUs), want);
+			EXPECT_EQ(emergency.size(), 0u) << "a failed read offers the parser no bytes, not even the ones that arrived";
+		}   // the lease goes out of scope on the failure path
+
+		EXPECT_EQ(sleeper.calls, 0) << "a 911/933 never waits for its arena";
+		EXPECT_EQ(held(ordinary), ordinaryBytes) << "the ordinary lane's arena is not touched by a 911/933 failure";
+		EXPECT_FALSE(lanes.claim(TokenLane::Ordinary)) << "the ordinary fetch still holds its own claim";
+		Arena::Lease again = lanes.claim(TokenLane::Emergency);
+		EXPECT_TRUE(again) << "a failed 911/933 read must not leave its arena claimed";
+		EXPECT_EQ(again.size(), 0u);
+
+		// The failed read installed nothing, so the 911/933 dials on the token it had: here one
+		// with 4 minutes of life, inside the 5 minute refresh margin. It dials, and leaves the witness.
+		constexpr std::int64_t kMin = 60LL * 1000000;
+		pdwitness::clear();
+		lanes.noteSosDial(telephony::tokenIsExpiringSoon(156 * kMin, 100 * kMin, 60 * kMin, 5 * kMin));
+		EXPECT_EQ(pdwitness::count("token_sos_fallback_862"), 1u);
+	}
+}
+
+TEST(TokenLanes, Emergency_ArenaFull_ABodyOverTheArenaIsRefusedAndLeavesNoBytes)
+{
+	Script script;
+	script.bytes(filler(10 * kN));
+	std::int64_t clock = kT0;
+	expectEmergencyReadFailsCleanly(script, clock, BodyStatus::ArenaFull);
+	EXPECT_EQ(script.consumed(), kN + 1) << "a hostile server cannot make the 911/933 read run on";
+}
+
+TEST(TokenLanes, Emergency_ReadError_AfterPartOfTheBodyLeavesNoPartialBody)
+{
+	Script script;
+	script.bytes(tokenBody(filler(900)).substr(0, 700)).code(-1);
+	std::int64_t clock = kT0;
+	expectEmergencyReadFailsCleanly(script, clock, BodyStatus::ReadError);
+	EXPECT_GT(script.consumed(), 0u) << "the failure really came after data, or this proves nothing";
+}
+
+TEST(TokenLanes, Emergency_Timeout_TheReadTimingOutAfterPartOfTheBodyLeavesNoPartialBody)
+{
+	Script script;
+	script.bytes(filler(300)).code(telephony::kHttpReadTimedOut);
+	std::int64_t clock = kT0;
+	expectEmergencyReadFailsCleanly(script, clock, BodyStatus::Timeout);
+	EXPECT_EQ(script.consumed(), 300u);
+}
+
+TEST(TokenLanes, Emergency_Timeout_ABodyDrippedPastTheTotalBudgetStopsReading)
+{
+	Script script;
+	std::int64_t clock = kT0;
+	script.bytes(filler(kN)).chunk(1).perReadUs(1000000, &clock);
+	expectEmergencyReadFailsCleanly(script, clock, BodyStatus::Timeout, 3000000);
+	EXPECT_EQ(script.calls(), 3u) << "the 911/933 stops at the deadline, not after kN reads";
+}
+
+TEST(TokenLanes, Emergency_ClaimHeldByAnother911FallsThroughAtOnceAndRefusesNothing)
+{
+	Lanes lanes;
+	std::int64_t clock = kT0;
+	Arena::Lease first = lanes.claim(TokenLane::Emergency);   // another 911/933's fetch
+	ASSERT_TRUE(first);
+	Script firstBody;
+	firstBody.bytes(tokenBody("first"));
+	ASSERT_EQ(run(first, firstBody, clock), BodyStatus::Ok);
+
+	Sleeper sleeper;
+	Arena::Lease second = lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper);
+	EXPECT_FALSE(second) << "turned away, not queued: the caller carries on with the token it has";
+	EXPECT_EQ(sleeper.calls, 0) << "it did not wait at all, so well inside the 10 ms the lane may spend";
+	EXPECT_EQ(sleeper.ms, 0u);
+	EXPECT_EQ(held(first), tokenBody("first")) << "the refused claim must not have touched the holder";
+
+	Arena::Lease ordinary = lanes.claim(TokenLane::Ordinary);
+	EXPECT_TRUE(ordinary) << "the ordinary lane is not involved";
+}
+
+// Operator ruling 4 on #945 (interim): two 911/933s both answered 401, the loser's fetch is turned
+// away at the arena claim and its call falls to #880. The line says which 911/933 lost and why.
+TEST(TokenLanes, Emergency_ClaimLossWitnessNamesTheLosing911AndAnOrdinaryLossLeavesNone)
+{
+	Lanes lanes;
+	Sleeper sleeper;
+	Lanes::EmergencyScope holder(lanes, true);   // call 1: its fetch holds the 911/933 arena
+	Lanes::EmergencyScope loser(lanes, true);    // call 2: turned away
+	ASSERT_EQ(holder.id(), 1u);
+	ASSERT_EQ(loser.id(), 2u);
+	Arena::Lease held = lanes.claim(TokenLane::Emergency);
+	ASSERT_TRUE(held);
+
+	pdwitness::clear();
+	Arena::Lease turnedAway = lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper, loser.id());
+	EXPECT_FALSE(turnedAway);
+	EXPECT_EQ(sleeper.calls, 0) << "and it still did not wait";
+	EXPECT_EQ(pdwitness::count("token_sos_claim_lost_862"), 1u) << "one line for the one loss";
+	const std::vector<std::string> lines = pdwitness::lines();
+	ASSERT_EQ(lines.size(), 1u);
+	EXPECT_NE(lines[0].find("call 2 "), std::string::npos) << "names the 911/933 that lost: " << lines[0];
+	EXPECT_EQ(lines[0].find("call 1 "), std::string::npos) << "and not the one holding the arena: " << lines[0];
+	EXPECT_NE(lines[0].find("another 911/933 token fetch holds the arena"), std::string::npos) << "and why: " << lines[0];
+
+	pdwitness::clear();
+	Arena::Lease ordinaryHeld = lanes.claim(TokenLane::Ordinary);
+	ASSERT_TRUE(ordinaryHeld);
+	EXPECT_FALSE(lanes.claimWaiting(TokenLane::Ordinary, 0, kPollMs, sleeper));
+	EXPECT_EQ(pdwitness::count("token_sos_claim_lost_862"), 0u) << "an ordinary fetch turned away is not a 911/933 that lost";
+
+	held = Arena::Lease();   // the holder's fetch is over
+	EXPECT_TRUE(lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper, loser.id()));
+	EXPECT_EQ(pdwitness::count("token_sos_claim_lost_862"), 0u) << "a claim that is granted leaves no line";
+}
+
+TEST(TokenLanes, Emergency_ClaimWhileAnOrdinaryFetchHoldsItsArenaProceedsAtOnce)
+{
+	Lanes lanes;
+	std::int64_t clock = kT0;
+	Arena::Lease ordinary = lanes.claim(TokenLane::Ordinary);   // an ordinary refresh, mid-read
+	ASSERT_TRUE(ordinary);
+	Script ordinaryBody;
+	ordinaryBody.bytes(tokenBody("ordinary"));
+	ASSERT_EQ(run(ordinary, ordinaryBody, clock), BodyStatus::Ok);
+
+	Sleeper sleeper;
+	Arena::Lease emergency = lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper);
+	ASSERT_TRUE(emergency) << "an ordinary fetch must not hold up a 911/933";
+	EXPECT_EQ(sleeper.calls, 0) << "and the 911/933 did not wait to find out";
+	EXPECT_NE(emergency.data(), ordinary.data());
+	Script sos;
+	sos.bytes(tokenBody("sos"));
+	ASSERT_EQ(run(emergency, sos, clock), BodyStatus::Ok);
+	std::string_view got;
+	ASSERT_TRUE(telephony::jsonStringField(emergency.data(), emergency.size(), "access_token", got));
+	EXPECT_EQ(got, "sos");
+	EXPECT_EQ(held(ordinary), tokenBody("ordinary")) << "and the ordinary fetch is undisturbed";
+}
+
+TEST(TokenLanes, Emergency_FetchCompletesWhileAnOrdinaryReadIsStillInProgress)
+{
+	Lanes lanes;
+	Arena::Lease ordinary = lanes.claim(TokenLane::Ordinary);
+	ASSERT_TRUE(ordinary);
+	std::string sosToken;
+	int sosSleeps = -1;
+	bool ordinaryReadDuringSos = false;
+	const std::string body = tokenBody("ordinary");
+	std::size_t pos = 0;
+	const BodyStatus st = ordinary.collect(
+	    [&](char* dst, std::size_t room) -> int {
+		    // Inside the ordinary socket read, a 911/933 arrives on another task and finishes its
+		    // whole fetch. If it had to wait for this read, the join below would never return.
+		    if (pos == 0)
+		    {
+			    std::thread other([&] {
+				    Sleeper s;
+				    Arena::Lease e = lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, s);
+				    sosSleeps = s.calls;
+				    if (!e) return;
+				    Script sos;
+				    sos.bytes(tokenBody("sos"));
+				    std::int64_t c = kT0;
+				    if (run(e, sos, c) != BodyStatus::Ok) return;
+				    std::string_view tok;
+				    if (telephony::jsonStringField(e.data(), e.size(), "access_token", tok)) sosToken.assign(tok);
+			    });
+			    other.join();
+			    ordinaryReadDuringSos = true;
+		    }
+		    if (pos >= body.size()) return 0;
+		    const std::size_t n = std::min(room, body.size() - pos);
+		    std::memcpy(dst, body.data() + pos, n);
+		    pos += n;
+		    return static_cast<int>(n);
+	    },
+	    [] { return kT0; }, telephony::kTokenBodyBudgetUs);
+	EXPECT_EQ(st, BodyStatus::Ok);
+	EXPECT_TRUE(ordinaryReadDuringSos);
+	EXPECT_EQ(sosSleeps, 0);
+	EXPECT_EQ(sosToken, "sos") << "the 911/933 fetched its token while the ordinary read was still open";
+	EXPECT_EQ(held(ordinary), body);
+}
+
+TEST(TokenLanes, AnOrdinaryFetchIsNeverHandedTheEmergencyArena)
+{
+	Lanes lanes;
+	Arena::Lease ordinary = lanes.claim(TokenLane::Ordinary);
+	ASSERT_TRUE(ordinary);
+	// The 911/933 arena is free, and an ordinary caller that finds its own busy, even one that
+	// polls for it, still does not borrow it.
+	Sleeper sleeper;
+	Arena::Lease second = lanes.claimWaiting(TokenLane::Ordinary, kPolls, kPollMs, sleeper);
+	EXPECT_FALSE(second) << "the free 911/933 arena is not for an ordinary fetch";
+	Arena::Lease emergency = lanes.claim(TokenLane::Emergency);
+	ASSERT_TRUE(emergency) << "and it was never taken";
+	EXPECT_NE(emergency.data(), ordinary.data());
+	// The other way round: with the 911/933 arena held, an ordinary claim gets the ordinary one.
+	ordinary = Arena::Lease();
+	Arena::Lease again = lanes.claim(TokenLane::Ordinary);
+	ASSERT_TRUE(again);
+	EXPECT_NE(again.data(), emergency.data());
+}
+
+TEST(TokenLanes, TheOrdinaryLaneStillPollsForItsClaimForStartAndTheEmergencyLaneNeverDoes)
+{
+	Lanes lanes;
+	// start() polls: it loses the claim to a refresh, and gets it when that refresh lets go.
+	Arena::Lease holder = lanes.claim(TokenLane::Ordinary);
+	ASSERT_TRUE(holder);
+	int sleeps = 0;
+	Arena::Lease got = lanes.claimWaiting(TokenLane::Ordinary, kPolls, kPollMs, [&](std::uint32_t ms) {
+		EXPECT_EQ(ms, kPollMs);
+		if (++sleeps == 3) holder = Arena::Lease();
+	});
+	EXPECT_TRUE(got);
+	EXPECT_EQ(sleeps, 3);
+	// It gives up after the polls it was given, and a plain fetch (0 polls) does not poll at all.
+	Sleeper giveUp;
+	EXPECT_FALSE(lanes.claimWaiting(TokenLane::Ordinary, kPolls, kPollMs, giveUp));
+	EXPECT_EQ(giveUp.calls, kPolls);
+	Sleeper plain;
+	EXPECT_FALSE(lanes.claimWaiting(TokenLane::Ordinary, 0, kPollMs, plain));
+	EXPECT_EQ(plain.calls, 0);
+	// The same polls, asked of the 911/933 lane with its arena busy: not one sleep.
+	Arena::Lease sos = lanes.claim(TokenLane::Emergency);
+	ASSERT_TRUE(sos);
+	Sleeper emergency;
+	EXPECT_FALSE(lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, emergency));
+	EXPECT_EQ(emergency.calls, 0) << "no waitForArena for a 911/933, whoever asks";
+}
+
+TEST(TokenLanes, TheThreeArenasAreTheWholeCost)
+{
+	// "Three arenas of 4,096 B usable each" (ordinary, 911/933, background refresh): kTokenBodyBytes of
+	// body plus the byte that shows an overflow, and the flag and length beside it. Three of them is
+	// what the client carries, reserved with it, and a host's pointer-sized padding is the most the
+	// bound allows beyond the buffers. The five 32-bit counters beside them (the fifth is #951's witness cap) and their padding are the 24 bytes.
+	EXPECT_GE(sizeof(Arena), kN + 1);
+	EXPECT_LE(sizeof(Arena), kN + 1 + 3 * sizeof(void*));
+	EXPECT_GE(sizeof(Lanes), 3 * sizeof(Arena));
+	EXPECT_LE(sizeof(Lanes), 3 * sizeof(Arena) + 24) << "three arenas and nothing that grows";
+}
+
+// ── a 911/933 with a token POSTs at once; no token is the only reason to fetch first ─────
+
+TEST(TokenLanes, ASosDialWithAnyCachedTokenNeverFetchesFirstWhateverItsAge)
+{
+	using telephony::SosFirstStep;
+	constexpr std::int64_t kMinute = 60LL * 1000000;
+	constexpr std::int64_t kMargin = 5 * kMinute;
+	// A token fetched at t=100 min with an hour of life: fresh, near expiry, just expired, long dead.
+	for (const std::int64_t nowMin : {100, 140, 156, 160, 161, 400})
+	{
+		const bool cached = true;
+		const bool stale = telephony::tokenIsExpiringSoon(nowMin * kMinute, 100 * kMinute, 60 * kMinute, kMargin);
+		EXPECT_EQ(telephony::sosFirstStep(cached), SosFirstStep::PostNow)
+		    << "at " << nowMin << " min (stale=" << stale << ") a 911/933 still POSTs at once, 401 is how it learns";
+	}
+	EXPECT_EQ(telephony::sosFirstStep(false), SosFirstStep::FetchThenPost) << "no token at all is the one exception";
+}
+
+TEST(TokenLanes, NoFreshTokenReachesTheWitnessFirstThenEverySixteenth)
+{
+	constexpr std::int64_t kMinute = 60LL * 1000000;
+	constexpr std::int64_t kMargin = 5 * kMinute;
+	// The three states with no fresh token: never fetched, inside the refresh margin, past expiry.
+	struct State { std::int64_t now, obtained, lifetime; const char* what; };
+	const State states[] = {
+	    {1000, 0, 0, "never fetched"},
+	    {156 * kMinute, 100 * kMinute, 60 * kMinute, "4 minutes of life left"},
+	    {300 * kMinute, 100 * kMinute, 60 * kMinute, "expired"},
+	};
+	for (const State& s : states)
+	{
+		Lanes lanes;
+		pdwitness::clear();
+		const bool stale = telephony::tokenIsExpiringSoon(s.now, s.obtained, s.lifetime, kMargin);
+		ASSERT_TRUE(stale) << s.what;
+		lanes.noteSosDial(stale);
+		EXPECT_EQ(pdwitness::count("token_sos_fallback_862"), 1u) << s.what << ": the first fallback of a boot is logged";
+		for (int i = 2; i <= 40; ++i) lanes.noteSosDial(stale);
+		EXPECT_EQ(pdwitness::count("token_sos_fallback_862"), 3u) << s.what << ": calls 1, 17 and 33 of 40";
+	}
+	// The line carries no number or credential (Witness.hpp): the only digits are the issue number
+	// and the 911/933 it names. And nothing in it reads as the harness's upset counter.
+	pdwitness::clear();
+	Lanes lanes;
+	lanes.noteSosDial(true);
+	const std::vector<std::string> lines = pdwitness::lines();
+	ASSERT_EQ(lines.size(), 1u);
+	std::string body = lines[0].substr(lines[0].find(": ") + 2);   // past the "e911" tag
+	for (const char* known : {"862", "911/933"})
+	{
+		for (std::size_t p; (p = body.find(known)) != std::string::npos;) body.erase(p, std::strlen(known));
+	}
+	EXPECT_EQ(body.find_first_of("0123456789"), std::string::npos) << lines[0];
+	EXPECT_EQ(lines[0].find("pset"), std::string::npos);
+}
+
+TEST(TokenLanes, AFreshTokenLeavesNoWitnessAndSpendsNoSample)
+{
+	Lanes lanes;
+	pdwitness::clear();
+	for (int i = 0; i < 100; ++i) lanes.noteSosDial(false);
+	EXPECT_EQ(pdwitness::count("token_sos_fallback_862"), 0u);
+	lanes.noteSosDial(true);
+	EXPECT_EQ(pdwitness::count("token_sos_fallback_862"), 1u) << "fresh dials did not use up the first sample";
+}
+
+// ── no ordinary refresh while a 911/933 is pending (#862, Rule 5) ────────────────────
+
+TEST(TokenLanes, AnOrdinaryRefreshDoesNotStartWhileA911IsPendingAndTheSosLaneIsNeverHeldBack)
+{
+	Lanes lanes;
+	Sleeper sleeper;
+	EXPECT_TRUE(lanes.ordinaryRefreshMayStart(false));
+	{
+		Lanes::EmergencyScope sos(lanes, true);
+		EXPECT_FALSE(lanes.ordinaryRefreshMayStart(false)) << "its new token would revoke the one the 911/933's POST carries";
+		EXPECT_TRUE(lanes.ordinaryRefreshMayStart(true)) << "start() is not a refresh ahead of a call: the anchor must come up";
+		Arena::Lease emergency = lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper);
+		EXPECT_TRUE(emergency) << "the 911/933's own fetch is never held back";
+		EXPECT_EQ(sleeper.calls, 0);
+		{
+			Lanes::EmergencyScope second(lanes, true);   // two 911/933 calls at once
+			Lanes::EmergencyScope notSos(lanes, false);   // and an ordinary call's scope does nothing
+		}
+		EXPECT_FALSE(lanes.ordinaryRefreshMayStart(false)) << "the first 911/933 is still pending";
+	}
+	EXPECT_TRUE(lanes.ordinaryRefreshMayStart(false)) << "once the last 911/933 has returned, refreshes start again";
+	Lanes::EmergencyScope ordinaryCall(lanes, false);
+	EXPECT_TRUE(lanes.ordinaryRefreshMayStart(false)) << "an ordinary call holds nothing back";
+}
+
+TEST(TokenLanes, ThePendingCountBalancesWhenManyCallsComeAndGoOnManyThreads)
+{
+	Lanes lanes;
+	std::vector<std::thread> threads;
+	std::atomic<int> sawHeld{0};
+	for (int t = 0; t < 8; ++t)
+	{
+		threads.emplace_back([&] {
+			for (int i = 0; i < 2000; ++i)
+			{
+				Lanes::EmergencyScope sos(lanes, true);
+				if (!lanes.ordinaryRefreshMayStart(false)) sawHeld.fetch_add(1, std::memory_order_relaxed);
+			}
+		});
+	}
+	for (std::thread& th : threads) th.join();
+	EXPECT_EQ(sawHeld.load(), 8 * 2000) << "a pending 911/933 always held an ordinary refresh back";
+	EXPECT_TRUE(lanes.ordinaryRefreshMayStart(false)) << "and the count came back to 0, none leaked";
+}
+
+// ── the 911/933 fetch's overall deadline (#862, Rule 5) ──────────────────────────────
+
+TEST(TokenLanes, AnOperationGetsItsOwnCapWhileTheBudgetHasRoomAndWhatIsLeftAfter)
+{
+	constexpr std::int64_t kNow = 7000000;
+	const std::int64_t deadline = kNow + telephony::kSosTokenBudgetUs;
+	EXPECT_EQ(telephony::kSosTokenBudgetUs, 3000000);
+	EXPECT_EQ(telephony::opTimeoutMs(kNow, deadline, 2000), 2000) << "3 s left, a 2 s cap";
+	EXPECT_EQ(telephony::opTimeoutMs(deadline - 2000000, deadline, 2000), 2000);
+	EXPECT_EQ(telephony::opTimeoutMs(deadline - 1500000, deadline, 2000), 1500) << "less is left than the cap";
+	EXPECT_EQ(telephony::opTimeoutMs(deadline - 1001, deadline, 2000), 2) << "rounded up, never down to a poll";
+	EXPECT_EQ(telephony::opTimeoutMs(deadline - 1, deadline, 2000), 1);
+}
+
+TEST(TokenLanes, ASpentBudgetGivesZeroSoTheOperationIsNotStarted)
+{
+	constexpr std::int64_t kNow = 7000000;
+	EXPECT_EQ(telephony::opTimeoutMs(kNow, kNow, 2000), 0);
+	EXPECT_EQ(telephony::opTimeoutMs(kNow + 1, kNow, 2000), 0);
+	EXPECT_EQ(telephony::opTimeoutMs(kNow + 100000000, kNow, 2000), 0) << "long overdue is still 0, never negative";
+}
+
+TEST(TokenLanes, AServerThatStallsEveryOperationCannotTakeMoreThanTheBudget)
+{
+	// Every operation lasts min(the timeout it was given, the server's gap). The fetch asks for the
+	// next operation's timeout until it is told 0. However small or large the gap, the operations
+	// together never outlast the budget, and none was given more than its cap or than was left.
+	for (const std::int64_t gapMs : {1, 3, 100, 700, 1999, 2000, 5000})
+	{
+		const std::int64_t startUs = 90000000;
+		const std::int64_t deadline = startUs + telephony::kSosTokenBudgetUs;
+		std::int64_t now = startUs;
+		int ops = 0;
+		for (;;)
+		{
+			const int ms = telephony::opTimeoutMs(now, deadline, 2000);
+			if (ms == 0) break;
+			ASSERT_GT(ms, 0);
+			ASSERT_LE(ms, 2000);
+			ASSERT_LE(now + static_cast<std::int64_t>(ms) * 1000, deadline + 999) << "never more than was left";
+			now += std::min<std::int64_t>(ms, gapMs) * 1000;
+			++ops;
+			ASSERT_LT(ops, 5000);
+		}
+		EXPECT_LE(now - startUs, telephony::kSosTokenBudgetUs) << "gap " << gapMs << " ms";
+		EXPECT_GE(now, deadline - 1000) << "and it ran until the budget was spent, gap " << gapMs << " ms";
+	}
+}
+
+// ── a 911/933 POST answered 401: one fetch, one retry (#862, operator ruling on #945) ─────
+// makeCall() (ESP arm) drives telephony::sosRetryOn401 with the real fetchToken() and
+// httpPostBody(); here both are a small fake "network" whose bearer is read at each POST, as
+// httpPostBody() does. What happens after a failure here (the final response to the caller, the
+// NOT ROUTED correction) is RequestsHandler's, pinned by the #880 tests in EmergencyNotify_test.cpp;
+// these tests pin that the failed result comes back unchanged and that nothing retries again.
+
+namespace
+{
+	struct Net
+	{
+		std::string              cachedToken = "old";   // _bearerHeader
+		std::string              grantedByFetch = "new";
+		bool                     fetchLands = true;
+		bool                     retryFails = false;    // the second POST answers retryAnswer, whatever the bearer
+		int                      retryAnswer = 0;
+		std::vector<std::string> events;                // "post:<bearer>" and "fetch", in order
+		int                      fetches = 0, posts = 0;
+
+		// 200 iff the bearer is the one a fetch grants, else 401: a dead token.
+		telephony::PostResult post()
+		{
+			++posts;
+			events.push_back("post:" + cachedToken);
+			if (retryFails && posts > 1) return {false, retryAnswer};
+			return cachedToken == grantedByFetch ? telephony::PostResult{true, 200} : telephony::PostResult{false, 401};
+		}
+		bool fetch()
+		{
+			++fetches;
+			events.push_back("fetch");
+			if (fetchLands) cachedToken = grantedByFetch;
+			return fetchLands;
+		}
+	};
+
+	// The sequence makeCall() runs for a 911/933: the first step by token state, the first POST,
+	// then the 401 step on whatever the POST answered. anotherLive is makeCall()'s own question,
+	// asked only after a 401: is another 911/933 pending or up?
+	template <class OtherLive>
+	telephony::PostResult sosDial(Net& n, bool haveToken, std::uint32_t callId, OtherLive&& anotherLive)
+	{
+		if (telephony::sosFirstStep(haveToken) == telephony::SosFirstStep::FetchThenPost) n.fetch();
+		const telephony::PostResult first = n.post();
+		return telephony::sosRetryOn401(first, callId, anotherLive, [&] { return n.fetch(); }, [&] { return n.post(); });
+	}
+
+	telephony::PostResult sosDial(Net& n, bool haveToken)
+	{
+		return sosDial(n, haveToken, 1, [] { return false; });
+	}
+}
+
+TEST(Sos401, FetchAfter401SucceedsAndTheRetryUsesTheNewToken)
+{
+	Net net;
+	pdwitness::clear();
+	const telephony::PostResult r = sosDial(net, /*haveToken=*/true);
+	EXPECT_TRUE(r.ok);
+	EXPECT_EQ(r.status, 200);
+	const std::vector<std::string> want = {"post:old", "fetch", "post:new"};
+	EXPECT_EQ(net.events, want) << "the first POST goes out at once on the cached token, then one fetch, then one retry";
+	EXPECT_EQ(net.fetches, 1);
+	EXPECT_EQ(net.posts, 2);
+	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 1u);
+}
+
+TEST(Sos401, AFetchThatFailsLeavesTheFailedPostAndTheCallFailsLikeAnyFailedMakecall)
+{
+	Net net;
+	net.fetchLands = false;
+	pdwitness::clear();
+	const telephony::PostResult r = sosDial(net, true);
+	EXPECT_FALSE(r.ok);
+	EXPECT_EQ(r.status, 401) << "the caller sees the 401 it would have seen, and handles it as a failed makecall (#880)";
+	const std::vector<std::string> want = {"post:old", "fetch"};
+	EXPECT_EQ(net.events, want) << "no retry without a new token";
+	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 0u);
+}
+
+TEST(Sos401, ARetryThatFailsIsTheEndNoSecondFetchAndNoSecondRetry)
+{
+	for (const int retryAnswer : {401, 403, 500, -1})
+	{
+		Net net;
+		net.retryFails = true;
+		net.retryAnswer = retryAnswer;
+		pdwitness::clear();
+		const telephony::PostResult r = sosDial(net, true);
+		EXPECT_FALSE(r.ok) << retryAnswer;
+		EXPECT_EQ(r.status, retryAnswer) << "the retry's own answer is what the caller handles";
+		EXPECT_EQ(net.fetches, 1) << retryAnswer;
+		EXPECT_EQ(net.posts, 2) << retryAnswer << ": exactly one retry, even when it is a 401 again";
+		EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 1u);
+		EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 1u);
+	}
+}
+
+TEST(Sos401, AnyAnswerButA401IsReturnedUntouchedWithNoFetchAndNoWitness)
+{
+	using telephony::PostResult;
+	for (const PostResult first : {PostResult{true, 200}, PostResult{true, 201}, PostResult{false, 403},
+	                               PostResult{false, 404}, PostResult{false, 500}, PostResult{false, -1},
+	                               PostResult{false, 0}})
+	{
+		int fetches = 0, retries = 0;
+		pdwitness::clear();
+		int asked = 0;
+		const PostResult r = telephony::sosRetryOn401(
+		    first, 1, [&] { ++asked; return true; },
+		    [&] { ++fetches; return true; }, [&] { ++retries; return PostResult{true, 200}; });
+		EXPECT_EQ(asked, 0) << first.status << ": the live-911 question is asked after a 401 only";
+		EXPECT_EQ(r.ok, first.ok);
+		EXPECT_EQ(r.status, first.status);
+		EXPECT_EQ(fetches + retries, 0) << first.status;
+		EXPECT_EQ(pdwitness::count("_862"), 0u) << first.status;
+	}
+}
+
+TEST(Sos401, ACachedTokenNeverMeansAFetchBeforeThePostAndNoTokenMeansExactlyOne)
+{
+	{   // alive: one POST, no fetch at all
+		Net net;
+		net.grantedByFetch = "old";
+		const telephony::PostResult r = sosDial(net, true);
+		EXPECT_TRUE(r.ok);
+		const std::vector<std::string> want = {"post:old"};
+		EXPECT_EQ(net.events, want);
+	}
+	{   // dead: the POST goes first, the fetch only after its 401
+		Net net;
+		sosDial(net, true);
+		ASSERT_FALSE(net.events.empty());
+		EXPECT_EQ(net.events.front(), "post:old") << "never a fetch ahead of the POST";
+	}
+	{   // no token: the one inline fetch, then the POST on what it granted, and no 401 step to spend
+		Net net;
+		net.cachedToken.clear();
+		const telephony::PostResult r = sosDial(net, false);
+		EXPECT_TRUE(r.ok);
+		const std::vector<std::string> want = {"fetch", "post:new"};
+		EXPECT_EQ(net.events, want);
+	}
+	{   // no token and the inline fetch fails: still POSTs (Rule 5), 401, and then the one recovery
+		Net net;
+		net.cachedToken.clear();
+		net.fetchLands = false;
+		const telephony::PostResult r = sosDial(net, false);
+		EXPECT_FALSE(r.ok);
+		const std::vector<std::string> want = {"fetch", "post:", "fetch"};
+		EXPECT_EQ(net.events, want) << "it dialled without a token rather than refusing, then recovered once";
+	}
+}
+
+// ── a 911/933 answered 401 fetches whether or not another 911/933 is live (#862, ruling 1 on #945, revised) ──
+// The interim skip is gone: a 911/933 that draws a 401 does ONE bounded fetch and ONE retry on the
+// 911/933 arena, whether or not another 911/933 is pending or up. What is left is a count for #952's
+// bench: when the fetch starts while another 911/933 has live streams (a call slot marked 911/933 with
+// its media up; a makeCall() that is only pending does not count), token_sos_live_fetch_862 names both
+// calls. It is never sampled and never decides whether the fetch runs.
+
+TEST(Sos401, AnotherPending911WithNoLiveStreamsStillFetchesAndRetriesAndLeavesNoLiveFetchLine)
+{
+	Lanes lanes;
+	Lanes::EmergencyScope first(lanes, true);    // still in makeCall(): pending, no slot with media up yet
+	Lanes::EmergencyScope second(lanes, true);   // its POST was answered 401
+	ASSERT_EQ(first.id(), 1u);
+	ASSERT_EQ(second.id(), 2u);
+	Net net;
+	pdwitness::clear();
+	const telephony::PostResult r = sosDial(net, true, second.id(), [] { return 0u; });   // the slot scan finds none
+	EXPECT_TRUE(r.ok);
+	EXPECT_EQ(r.status, 200);
+	const std::vector<std::string> want = {"post:old", "fetch", "post:new"};
+	EXPECT_EQ(net.events, want) << "the one fetch and the one retry run";
+	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_live_fetch_862"), 0u) << "pending alone is not a live call";
+	EXPECT_EQ(pdwitness::count("token_sos_401_skip_862"), 0u) << "and there is no skip";
+}
+
+TEST(Sos401, A911401WhileAnother911HasLiveStreamsStillFetchesAndRetriesAndTheLineNamesBothCalls)
+{
+	Lanes lanes;
+	Lanes::EmergencyScope first(lanes, true);    // in the real client call 1 has returned from makeCall(): its slot has media up
+	Lanes::EmergencyScope second(lanes, true);   // its POST was answered 401
+	Net net;
+	pdwitness::clear();
+	const telephony::PostResult r = sosDial(net, true, second.id(), [&] { return first.id(); });
+	EXPECT_TRUE(r.ok);
+	EXPECT_EQ(r.status, 200);
+	const std::vector<std::string> want = {"post:old", "fetch", "post:new"};
+	EXPECT_EQ(net.events, want) << "the live call does not hold the fetch back";
+	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_401_skip_862"), 0u);
+	ASSERT_EQ(pdwitness::count("token_sos_live_fetch_862"), 1u);
+	for (const std::string& l : pdwitness::lines())
+	{
+		if (l.find("token_sos_live_fetch_862") == std::string::npos) continue;
+		const std::size_t fetching = l.find("call 2 ");
+		const std::size_t live = l.find("call 1 ");
+		EXPECT_NE(fetching, std::string::npos) << "names the 911/933 that fetched: " << l;
+		EXPECT_NE(live, std::string::npos) << "and the one with live streams: " << l;
+		EXPECT_LT(fetching, live) << "the fetching call first: " << l;
+		EXPECT_NE(l.find("live streams"), std::string::npos) << l;
+	}
+}
+
+TEST(Sos401, TheLiveStreamsLineIsNeverSampledEveryOccurrenceIsEmitted)
+{
+	pdwitness::clear();
+	for (std::uint32_t i = 1; i <= 40; ++i)
+	{
+		Net net;
+		sosDial(net, true, 100 + i, [i] { return i; });
+	}
+	EXPECT_EQ(pdwitness::count("token_sos_live_fetch_862"), 40u) << "the bench counts them: none is dropped";
+	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 40u);
+}
+
+TEST(Sos401, WithNoOther911LiveTheOneFetchAndTheOneRetryAreAsTheyWere)
+{
+	Lanes lanes;
+	Lanes::EmergencyScope only(lanes, true);
+	Lanes::EmergencyScope ordinaryCall(lanes, false);   // an ordinary call is not a live 911/933
+	Net net;
+	pdwitness::clear();
+	const telephony::PostResult r = sosDial(net, true, only.id(), [] { return 0u; });
+	EXPECT_TRUE(r.ok);
+	EXPECT_EQ(r.status, 200);
+	const std::vector<std::string> want = {"post:old", "fetch", "post:new"};
+	EXPECT_EQ(net.events, want);
+	EXPECT_EQ(pdwitness::count("token_sos_live_fetch_862"), 0u);
+	EXPECT_EQ(pdwitness::count("token_sos_401_fetch_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 1u);
+}
+
+// ── ruling 4, revised: two 911/933s, the loser is refused the arena at once ───────────
+// Two calls both fetch and the second is turned away at the arena claim. It does not wait: it goes on
+// with the best token it has (none cached: its POST goes out with no usable bearer), and a failed POST
+// takes the existing failure path, the 401 step's one fetch and one retry and then #880. The line says
+// which 911/933 lost and why. This scenario is reachable on the 401 path again now that the skip is gone.
+TEST(Sos401, TheLoserOfTwoFetchesIsTurnedAwayAtTheArenaClaimAndFallsToNotRouted)
+{
+	Lanes lanes;
+	Sleeper sleeper;
+	Lanes::EmergencyScope winner(lanes, true);
+	Lanes::EmergencyScope loser(lanes, true);
+	Arena::Lease winnersFetch = lanes.claim(TokenLane::Emergency);   // call 1's fetch, mid-read
+	ASSERT_TRUE(winnersFetch);
+	Net net;
+	int fetchesRun = 0;
+	pdwitness::clear();
+	const telephony::PostResult first = net.post();
+	const telephony::PostResult r = telephony::sosRetryOn401(
+	    first, loser.id(), [] { return 0u; },
+	    [&] {
+		    Arena::Lease lease = lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper, loser.id());
+		    if (!lease) return false;   // fetchToken() returns false here, before any I/O
+		    ++fetchesRun;
+		    return net.fetch();
+	    },
+	    [&] { return net.post(); });
+	EXPECT_FALSE(r.ok);
+	EXPECT_EQ(r.status, 401) << "the 401 comes back unchanged, which is what #880 handles";
+	EXPECT_EQ(fetchesRun, 0) << "no fetch ran for the loser";
+	EXPECT_EQ(sleeper.calls, 0) << "and it did not wait for the arena";
+	const std::vector<std::string> want = {"post:old"};
+	EXPECT_EQ(net.events, want) << "and no retry";
+	EXPECT_EQ(pdwitness::count("token_sos_claim_lost_862"), 1u);
+	EXPECT_EQ(pdwitness::count("token_sos_401_retry_862"), 0u);
+	bool named = false, why = false;
+	for (const std::string& l : pdwitness::lines())
+	{
+		if (l.find("token_sos_claim_lost_862") == std::string::npos) continue;
+		named = l.find("call 2 ") != std::string::npos;
+		why = l.find("another 911/933 token fetch holds the arena") != std::string::npos;
+	}
+	EXPECT_TRUE(named) << "the loser is call 2";
+	EXPECT_TRUE(why) << "and the line says why";
+}
+
+TEST(Sos401, TwoCallsWithNoTokenTheLoserIsRefusedAtOnceAndPostsOnTheBestTokenItHas)
+{
+	ASSERT_EQ(telephony::sosFirstStep(false), telephony::SosFirstStep::FetchThenPost);
+	auto namesOnlyCall2 = [](std::size_t& n) {
+		n = 0;
+		bool all = true;
+		for (const std::string& l : pdwitness::lines())
+		{
+			if (l.find("token_sos_claim_lost_862") == std::string::npos) continue;
+			++n;
+			all = all && l.find("call 2 ") != std::string::npos && l.find("refused at once") != std::string::npos;
+		}
+		return all;
+	};
+
+	{   // call 1's fetch is still running when call 2's POST goes out: no bearer, so a 401
+		Lanes lanes;
+		Sleeper sleeper;
+		Lanes::EmergencyScope one(lanes, true);
+		Lanes::EmergencyScope two(lanes, true);
+		Arena::Lease onesFetch = lanes.claim(TokenLane::Emergency);
+		ASSERT_TRUE(onesFetch);
+		Net net;
+		net.cachedToken.clear();
+		pdwitness::clear();
+		EXPECT_FALSE(lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper, two.id()))
+		    << "the first step's fetch is refused the arena";
+		const telephony::PostResult r = telephony::sosRetryOn401(
+		    net.post(), two.id(), [] { return 0u; },
+		    [&] {
+			    Arena::Lease l = lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper, two.id());
+			    return l ? net.fetch() : false;
+		    },
+		    [&] { return net.post(); });
+		EXPECT_EQ(sleeper.calls, 0) << "neither claim waited";
+		const std::vector<std::string> want = {"post:"};
+		EXPECT_EQ(net.events, want) << "the POST went out on the best token it has: none, so no usable bearer";
+		EXPECT_FALSE(r.ok);
+		EXPECT_EQ(r.status, 401) << "the existing failure path: the 401 step's fetch is refused too, and #880 takes it";
+		std::size_t lost = 0;
+		EXPECT_TRUE(namesOnlyCall2(lost));
+		EXPECT_EQ(lost, 2u) << "the first step's claim and the 401 step's, both naming call 2";
+	}
+	{   // call 1's fetch lands before call 2's POST goes out: the best token call 2 has is call 1's
+		Lanes lanes;
+		Sleeper sleeper;
+		Lanes::EmergencyScope one(lanes, true);
+		Lanes::EmergencyScope two(lanes, true);
+		Arena::Lease onesFetch = lanes.claim(TokenLane::Emergency);
+		ASSERT_TRUE(onesFetch);
+		Net net;
+		net.cachedToken.clear();
+		pdwitness::clear();
+		EXPECT_FALSE(lanes.claimWaiting(TokenLane::Emergency, kPolls, kPollMs, sleeper, two.id()));
+		net.fetch();                 // call 1's fetch lands and installs
+		onesFetch = Arena::Lease();
+		const telephony::PostResult r = telephony::sosRetryOn401(
+		    net.post(), two.id(), [] { return 0u; }, [&] { return net.fetch(); }, [&] { return net.post(); });
+		EXPECT_TRUE(r.ok);
+		const std::vector<std::string> want = {"fetch", "post:new"};
+		EXPECT_EQ(net.events, want) << "call 2 posted on call 1's token and needed no 401 step";
+		std::size_t lost = 0;
+		EXPECT_TRUE(namesOnlyCall2(lost));
+		EXPECT_EQ(lost, 1u);
+	}
+}
+
+TEST(TokenLanes, Every911ScopeGetsItsOwnNumberAndAnOrdinaryCallGetsNone)
+{
+	Lanes lanes;
+	Lanes::EmergencyScope ordinary(lanes, false);
+	EXPECT_EQ(ordinary.id(), 0u) << "an ordinary call has no 911/933 number";
+	Lanes::EmergencyScope first(lanes, true);
+	EXPECT_EQ(first.id(), 1u);
+	{
+		Lanes::EmergencyScope second(lanes, true);
+		EXPECT_EQ(second.id(), 2u);
+	}
+	Lanes::EmergencyScope third(lanes, true);
+	EXPECT_EQ(third.id(), 3u) << "numbers keep counting up, so a line names one call";
+	Lanes::EmergencyScope ordinaryAgain(lanes, false);
+	EXPECT_EQ(ordinaryAgain.id(), 0u);
+	Lanes::EmergencyScope fourth(lanes, true);
+	EXPECT_EQ(fourth.id(), 4u) << "an ordinary call does not use up a number";
+}
+
+// ── a token is installed only if it looks like a JWT (#862) ────────────────────────────
+
+TEST(TokenCheck, AJwtShapedTokenIsAccepted)
+{
+	EXPECT_EQ(telephony::checkToken("eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjF9.c2ln"), telephony::TokenCheck::Ok);
+	EXPECT_EQ(telephony::checkToken("a.b.c"), telephony::TokenCheck::Ok);
+	EXPECT_EQ(telephony::checkToken("a.b.c.d"), telephony::TokenCheck::Ok) << "more than two dots still has two";
+}
+
+TEST(TokenCheck, AnEmptyTokenIsRejectedWithItsReason)
+{
+	// What jsonStringField() hands back for {"access_token":""}: found, a string, and nothing in it.
+	std::string json = "{\"token_type\":\"Bearer\",\"access_token\":\"\"}";
+	std::string_view tok = "x";
+	ASSERT_TRUE(telephony::jsonStringField(json.data(), json.size(), "access_token", tok));
+	EXPECT_EQ(telephony::checkToken(tok), telephony::TokenCheck::Empty);
+	EXPECT_STREQ(telephony::tokenCheckName(telephony::TokenCheck::Empty), "empty");
+}
+
+TEST(TokenCheck, ATokenWithoutTwoDotsIsRejectedWithItsReason)
+{
+	for (const char* t : {"abc", "a.b", ".", "opaque-token-with-no-dots", "a"})
+	{
+		EXPECT_EQ(telephony::checkToken(t), telephony::TokenCheck::NotAJwt) << t;
+	}
+	EXPECT_NE(std::string(telephony::tokenCheckName(telephony::TokenCheck::NotAJwt)).find("JWT"), std::string::npos);
+}
+
+// ── a response is installed only if its request was issued after the installed token's ─────
+// Operator ruling 2 on #945. Both lanes can have a fetch in flight, Telephony drops the older token
+// when it grants a newer one, and the lanes finish in either order. "Newer" is when the request was
+// ISSUED, not when it finished: the installed token is the one whose request was issued last, an
+// older response is discarded and logged (sampled), and the token it would have replaced stays.
+// fetchToken() (ESP arm) offers each response to a TokenInstallGate under _mutex; these tests drive
+// the gate with the lanes' real arenas and the same body, JSON and JWT checks.
+
+namespace
+{
+	struct Cache
+	{
+		telephony::TokenInstallGate gate;
+		std::string                 token;   // what fetchToken() installed: "" = none
+	};
+
+	// One fetch in flight on `lane`: its request was issued at issuedUs and its arena is claimed.
+	struct Flight
+	{
+		TokenLane      lane;
+		std::int64_t   issuedUs;
+		std::string    token;
+		Arena::Lease   lease;
+	};
+
+	Flight startFetch(Lanes& lanes, TokenLane lane, std::int64_t issuedUs, std::string token)
+	{
+		Flight f{lane, issuedUs, std::move(token), lanes.claim(lane)};
+		EXPECT_TRUE(f.lease) << "each lane has its own arena, so both fetches can be in flight together";
+		return f;
+	}
+
+	// The response lands: the body is read, the token scanned and checked, then offered to the gate,
+	// as fetchToken() does it. Returns what fetchToken() returns: a discard is a success, because a
+	// token issued later is installed.
+	bool land(Cache& c, Flight& f, std::int64_t& clock)
+	{
+		Script body;
+		body.bytes(tokenBody(f.token));
+		if (run(f.lease, body, clock) != BodyStatus::Ok) return false;
+		std::string_view tok;
+		if (!telephony::jsonStringField(f.lease.data(), f.lease.size(), "access_token", tok)) return false;
+		if (telephony::checkToken(tok) != telephony::TokenCheck::Ok) return false;
+		if (!c.gate.installIfNewer(f.issuedUs))
+		{
+			c.gate.noteDiscarded(f.lane);
+			return true;
+		}
+		c.token.assign(tok);
+		return true;
+	}
+
+	constexpr const char* kEarlierToken = "e30.earlier.sig";
+	constexpr const char* kLaterToken   = "e30.later.sig";
+}
+
+TEST(TokenInstall, TheLaterIssuedFetchFinishingFirstStaysInstalledWhenTheEarlierIssuedOneFinishesAfterIt)
+{
+	for (const bool emergencyIsLater : {true, false})
+	{
+		Lanes lanes;
+		Cache cache;
+		std::int64_t clock = kT0;
+		const TokenLane earlierLane = emergencyIsLater ? TokenLane::Ordinary : TokenLane::Emergency;
+		const TokenLane laterLane   = emergencyIsLater ? TokenLane::Emergency : TokenLane::Ordinary;
+		Flight earlier = startFetch(lanes, earlierLane, kT0 + 1000000, kEarlierToken);
+		Flight later   = startFetch(lanes, laterLane, kT0 + 2000000, kLaterToken);
+
+		pdwitness::clear();
+		EXPECT_TRUE(land(cache, later, clock));
+		EXPECT_EQ(cache.token, kLaterToken);
+		EXPECT_EQ(pdwitness::count("token_install_older_862"), 0u);
+
+		EXPECT_TRUE(land(cache, earlier, clock)) << "a discard is not a failed fetch: a token issued later is in hand";
+		EXPECT_EQ(cache.token, kLaterToken) << "the response issued earlier did not replace it, though it finished last"
+		                                    << (emergencyIsLater ? " (911/933 lane later)" : " (ordinary lane later)");
+		EXPECT_EQ(pdwitness::count("token_install_older_862"), 1u) << "and the discard is logged";
+	}
+}
+
+TEST(TokenInstall, TheLaterIssuedFetchFinishingSecondReplacesTheEarlierIssuedOneThatFinishedFirst)
+{
+	for (const bool emergencyIsLater : {true, false})
+	{
+		Lanes lanes;
+		Cache cache;
+		std::int64_t clock = kT0;
+		const TokenLane earlierLane = emergencyIsLater ? TokenLane::Ordinary : TokenLane::Emergency;
+		const TokenLane laterLane   = emergencyIsLater ? TokenLane::Emergency : TokenLane::Ordinary;
+		Flight earlier = startFetch(lanes, earlierLane, kT0 + 1000000, kEarlierToken);
+		Flight later   = startFetch(lanes, laterLane, kT0 + 2000000, kLaterToken);
+
+		pdwitness::clear();
+		EXPECT_TRUE(land(cache, earlier, clock));
+		EXPECT_EQ(cache.token, kEarlierToken);
+		EXPECT_TRUE(land(cache, later, clock));
+		EXPECT_EQ(cache.token, kLaterToken) << (emergencyIsLater ? "911/933 lane later" : "ordinary lane later");
+		EXPECT_EQ(pdwitness::count("token_install_older_862"), 0u) << "nothing was discarded";
+	}
+}
+
+TEST(TokenInstall, TheFirstTokenIsAlwaysInstalledAndAnEqualOrEarlierIssueTimeIsNot)
+{
+	telephony::TokenInstallGate gate;
+	EXPECT_TRUE(gate.installIfNewer(0)) << "nothing is installed yet: even a request issued at boot time 0 installs";
+	EXPECT_FALSE(gate.installIfNewer(0)) << "the same issue time is not later";
+	EXPECT_TRUE(gate.installIfNewer(1));
+	EXPECT_FALSE(gate.installIfNewer(0));
+	telephony::TokenInstallGate fresh;
+	EXPECT_TRUE(fresh.installIfNewer(5000000));
+	EXPECT_FALSE(fresh.installIfNewer(4999999));
+	EXPECT_FALSE(fresh.installIfNewer(5000000));
+	EXPECT_TRUE(fresh.installIfNewer(5000001));
+}
+
+TEST(TokenInstall, TheDiscardLogsFirstThenEverySixteenthAndNamesTheLaneButNoToken)
+{
+	telephony::TokenInstallGate gate;
+	ASSERT_TRUE(gate.installIfNewer(100));
+	pdwitness::clear();
+	for (int i = 1; i <= 40; ++i)
+	{
+		ASSERT_FALSE(gate.installIfNewer(50));
+		gate.noteDiscarded(i <= 16 ? TokenLane::Ordinary : TokenLane::Emergency);
+	}
+	EXPECT_EQ(pdwitness::count("token_install_older_862"), 3u) << "discards 1, 17 and 33 of 40";
+	const std::vector<std::string> lines = pdwitness::lines();
+	ASSERT_EQ(lines.size(), 3u);
+	EXPECT_NE(lines[0].find("ordinary lane"), std::string::npos) << "the first discard says which lane: " << lines[0];
+	EXPECT_NE(lines[1].find("911/933 lane"), std::string::npos) << "and the 17th, on the other lane: " << lines[1];
+	for (const std::string& l : lines)
+	{
+		EXPECT_EQ(l.find("e30"), std::string::npos) << "a witness never carries a token: " << l;
+		EXPECT_EQ(l.find("pset"), std::string::npos) << "nothing in it reads as the harness's upset counter: " << l;
+	}
+}
+
+// The background refresh is a third fetch that can be in flight beside the other two, so the same
+// gate decides it. It is a fetch on its own lane like any other: no new install logic.
+TEST(TokenInstall, AMaintenanceRefreshIssuedBeforeTheInstalledTokenIsDiscardedAndLogged)
+{
+	for (const TokenLane laterLane : {TokenLane::Ordinary, TokenLane::Emergency})
+	{
+		Lanes lanes;
+		Cache cache;
+		std::int64_t clock = kT0;
+		Flight refresh = startFetch(lanes, TokenLane::Maintenance, kT0 + 1000000, kEarlierToken);
+		Flight later   = startFetch(lanes, laterLane, kT0 + 2000000, kLaterToken);
+
+		pdwitness::clear();
+		EXPECT_TRUE(land(cache, later, clock));
+		EXPECT_EQ(cache.token, kLaterToken);
+		EXPECT_TRUE(land(cache, refresh, clock)) << "a discard is a success: a token issued later is in hand";
+		EXPECT_EQ(cache.token, kLaterToken) << "the refresh was issued first, so it did not replace the installed token";
+		ASSERT_EQ(pdwitness::count("token_install_older_862"), 1u) << "and the discard is logged";
+		EXPECT_NE(pdwitness::lines()[0].find("maintenance lane"), std::string::npos)
+		    << "naming the lane it came from: " << pdwitness::lines()[0];
+	}
+}
+
+TEST(TokenInstall, AMaintenanceRefreshIssuedAfterTheInstalledTokenReplacesItWithNoDiscard)
+{
+	Lanes lanes;
+	Cache cache;
+	std::int64_t clock = kT0;
+	Flight ordinary = startFetch(lanes, TokenLane::Ordinary, kT0 + 1000000, kEarlierToken);
+	Flight refresh  = startFetch(lanes, TokenLane::Maintenance, kT0 + 2000000, kLaterToken);
+
+	pdwitness::clear();
+	EXPECT_TRUE(land(cache, ordinary, clock));
+	EXPECT_EQ(cache.token, kEarlierToken);
+	EXPECT_TRUE(land(cache, refresh, clock));
+	EXPECT_EQ(cache.token, kLaterToken);
+	EXPECT_EQ(pdwitness::count("token_install_older_862"), 0u) << "nothing was discarded";
+}
+
+// ── the background token refresh (#862, #945) ────────────────────────────────────────────
+// A token is kept at least ten minutes from its expiry by a refresh that runs on tel_maint. The ESP
+// arm (tick(), the tel_maint job, fetchToken()'s Maintenance lane) cannot be host compiled; these
+// tests drive what it calls: the decision, the witnesses and the lane's arena.
+
+namespace
+{
+	using telephony::MaintRefreshReason;
+
+	constexpr std::int64_t kSec      = 1000000;
+	constexpr std::int64_t kMinute   = 60 * kSec;
+	constexpr std::int64_t kHour     = 60 * kMinute;
+	constexpr std::int64_t kStamp    = 100 * kMinute;   // when the token was obtained; 0 would mean "no token"
+	constexpr std::int64_t kDueAtUs  = kStamp + kHour - 10 * kMinute;   // age 50 min of a 60 min token
+
+	telephony::MaintRefreshDecision decide(std::int64_t nowUs, bool streams = false, bool emergency = false,
+	                                       bool inFlight = false)
+	{
+		return telephony::maintRefreshDecision(nowUs, kStamp, kHour, streams, emergency, inFlight);
+	}
+
+	void expectSkip(const telephony::MaintRefreshDecision& d, MaintRefreshReason why, const char* what)
+	{
+		EXPECT_FALSE(d.refresh) << what;
+		EXPECT_EQ(static_cast<int>(d.reason), static_cast<int>(why)) << what;
+	}
+}
+
+TEST(TokenMaint, Due_ATokenTenMinutesFromExpiryWithNothingInTheWayIsRefreshed)
+{
+	const telephony::MaintRefreshDecision d = decide(kDueAtUs + kMinute);
+	EXPECT_TRUE(d.refresh);
+	EXPECT_EQ(static_cast<int>(d.reason), static_cast<int>(MaintRefreshReason::Due));
+	EXPECT_TRUE(decide(kStamp + 3 * kHour).refresh) << "and a token long past expiry is refreshed too, not given up on";
+}
+
+TEST(TokenMaint, NotDue_AFreshTokenIsLeftAlone)
+{
+	expectSkip(decide(kStamp), MaintRefreshReason::NotDue, "just obtained");
+	expectSkip(decide(kStamp + 30 * kMinute), MaintRefreshReason::NotDue, "half its life");
+	expectSkip(decide(kDueAtUs - 1), MaintRefreshReason::NotDue, "one microsecond short");
+}
+
+TEST(TokenMaint, NoToken_NothingIsFetchedInTheBackgroundWhenNoTokenWasEverInstalled)
+{
+	// start() owns the first fetch; a refresh with no token to refresh is not its job.
+	expectSkip(telephony::maintRefreshDecision(kStamp + kHour, 0, kHour, false, false, false),
+	           MaintRefreshReason::NoToken, "no obtained stamp");
+	expectSkip(telephony::maintRefreshDecision(kStamp + kHour, kStamp, 0, false, false, false),
+	           MaintRefreshReason::NoToken, "no lifetime");
+	expectSkip(telephony::maintRefreshDecision(kStamp + kHour, 0, 0, true, true, true),
+	           MaintRefreshReason::NoToken, "neither, and everything else in the way");
+}
+
+TEST(TokenMaint, StreamsLive_ADueTokenIsNotRefreshedWhileAStreamIsUp)
+{
+	// A new grant revokes the old token and the live streams hold it. This is the #952 gap: a call
+	// that outlasts the token's remaining life can see it expire.
+	expectSkip(decide(kDueAtUs + kMinute, /*streams=*/true), MaintRefreshReason::StreamsLive, "due, streams live");
+	expectSkip(decide(kStamp + 3 * kHour, true), MaintRefreshReason::StreamsLive, "even past expiry");
+}
+
+TEST(TokenMaint, EmergencyPending_ADueTokenIsNotRefreshedWhileA911IsPending)
+{
+	expectSkip(decide(kDueAtUs + kMinute, false, /*emergency=*/true), MaintRefreshReason::EmergencyPending,
+	           "due, 911/933 pending");
+}
+
+TEST(TokenMaint, FetchInFlight_ADueTokenIsNotRefreshedWhileAnotherFetchRuns)
+{
+	expectSkip(decide(kDueAtUs + kMinute, false, false, /*inFlight=*/true), MaintRefreshReason::FetchInFlight,
+	           "due, a fetch in flight");
+}
+
+TEST(TokenMaint, Boundary_AgeExactlyLifetimeMinusTenMinutesIsDueAndOneSecondLessIsNot)
+{
+	EXPECT_EQ(telephony::kMaintRefreshMarginUs, 10 * kMinute) << "the margin is ten minutes";
+	const std::int64_t exactly = kStamp + (kHour - telephony::kMaintRefreshMarginUs);
+	EXPECT_TRUE(decide(exactly).refresh) << "age == lifetime - 10 min";
+	expectSkip(decide(exactly - kSec), MaintRefreshReason::NotDue, "one second less");
+	EXPECT_TRUE(decide(exactly + kSec).refresh) << "one second more";
+	EXPECT_TRUE(telephony::maintTokenDue(exactly, kStamp, kHour));
+	EXPECT_FALSE(telephony::maintTokenDue(exactly - kSec, kStamp, kHour));
+}
+
+TEST(TokenMaint, Precedence_NotDueAndNoTokenComeFirstThenTheBlockersInTheOrderOfTheirRisk)
+{
+	const std::int64_t due = kDueAtUs + kMinute;
+	// A token that is not due is not due, whatever else is going on: a long call does not leave a skip
+	// line for a refresh nobody wanted.
+	expectSkip(decide(kStamp + kMinute, true, true, true), MaintRefreshReason::NotDue, "not due, everything in the way");
+	expectSkip(decide(due, true, true, true), MaintRefreshReason::EmergencyPending, "a 911/933 is named before streams");
+	expectSkip(decide(due, true, false, true), MaintRefreshReason::StreamsLive, "streams before another fetch");
+	expectSkip(decide(due, false, false, true), MaintRefreshReason::FetchInFlight, "only the fetch");
+	EXPECT_TRUE(decide(due, false, false, false).refresh);
+}
+
+TEST(TokenMaint, ATokenThatLivesNoLongerThanTheMarginIsNeverDue)
+{
+	// age >= lifetime - 10 min holds at every age once the lifetime is under ten minutes, so the
+	// refresh would run again the moment it finished. Such a token cannot be kept ten minutes from
+	// expiry; the ordinary refresh ahead of a call (5 minutes) still renews it.
+	for (const std::int64_t life : {telephony::kMaintRefreshMarginUs, 5 * kMinute, kSec})
+	{
+		expectSkip(telephony::maintRefreshDecision(kStamp + 3 * kHour, kStamp, life, false, false, false),
+		           MaintRefreshReason::NotDue, "short-lived token");
+		EXPECT_FALSE(telephony::maintRefreshWakeDue(kStamp + 3 * kHour, kStamp, life, 0));
+	}
+	EXPECT_TRUE(telephony::maintTokenDue(kStamp + 1, kStamp, telephony::kMaintRefreshMarginUs + 1))
+	    << "one microsecond over the margin is due at age 1 us: the boundary still holds";
+}
+
+TEST(TokenMaint, TheWakeIsSpacedByTheRetryFloorSoADownedEndpointIsNotHammered)
+{
+	constexpr std::int64_t kNow = kDueAtUs + kMinute;
+	EXPECT_EQ(telephony::kMaintRefreshRetryUs, 60 * kSec);
+	EXPECT_FALSE(telephony::maintRefreshWakeDue(kStamp, kStamp, kHour, 0)) << "not due: nothing wakes";
+	EXPECT_TRUE(telephony::maintRefreshWakeDue(kNow, kStamp, kHour, 0)) << "due, never tried";
+	EXPECT_FALSE(telephony::maintRefreshWakeDue(kNow, kStamp, kHour, kNow - telephony::kMaintRefreshRetryUs + 1))
+	    << "due, but the last try was under the floor ago";
+	EXPECT_TRUE(telephony::maintRefreshWakeDue(kNow, kStamp, kHour, kNow - telephony::kMaintRefreshRetryUs))
+	    << "due, and the floor has passed";
+	EXPECT_FALSE(telephony::maintRefreshWakeDue(kNow, 0, kHour, 0)) << "no token: nothing wakes";
+}
+
+// ── the maintenance lane's arena ──────────────────────────────────────────────────────────
+
+TEST(TokenMaint, AMaintenanceClaimThatIsBusyIsRefusedAtOnceAndNothingWaits)
+{
+	Lanes lanes;
+	Sleeper sleeper;
+	Arena::Lease holder = lanes.claim(TokenLane::Maintenance);
+	ASSERT_TRUE(holder);
+	std::int64_t clock = kT0;
+	Script body;
+	body.bytes(tokenBody("holder"));
+	ASSERT_EQ(run(holder, body, clock), BodyStatus::Ok);
+
+	pdwitness::clear();
+	Arena::Lease second = lanes.claimWaiting(TokenLane::Maintenance, kPolls, kPollMs, sleeper);
+	EXPECT_FALSE(second) << "turned away: the refresh is skipped this tick";
+	EXPECT_EQ(sleeper.calls, 0) << "and it did not wait, though start()'s polls were offered";
+	EXPECT_EQ(held(holder), tokenBody("holder")) << "the refused claim did not touch the holder";
+	ASSERT_EQ(pdwitness::count("token_maint_skip_862"), 1u) << "the skip is witnessed";
+	EXPECT_NE(pdwitness::lines()[0].find(telephony::maintRefreshReasonName(MaintRefreshReason::FetchInFlight)),
+	          std::string::npos) << pdwitness::lines()[0];
+	EXPECT_EQ(pdwitness::count("token_sos_claim_lost_862"), 0u) << "and it is not a 911/933 that lost";
+
+	holder = Arena::Lease();
+	EXPECT_TRUE(lanes.claim(TokenLane::Maintenance)) << "a refresh that finished leaves the arena free";
+}
+
+TEST(TokenMaint, AMaintenanceFetchNeverGetsTheEmergencyOrTheOrdinaryArenaAndTheyNeverGetItsEither)
+{
+	Lanes lanes;
+	Arena::Lease ordinary  = lanes.claim(TokenLane::Ordinary);
+	Arena::Lease emergency = lanes.claim(TokenLane::Emergency);
+	ASSERT_TRUE(ordinary);
+	ASSERT_TRUE(emergency);
+	// Both of the others are busy and the maintenance arena is free: it gets its own, no polling.
+	Sleeper sleeper;
+	Arena::Lease maintenance = lanes.claimWaiting(TokenLane::Maintenance, kPolls, kPollMs, sleeper);
+	ASSERT_TRUE(maintenance) << "a 911/933 fetch and an ordinary fetch do not hold the maintenance arena";
+	EXPECT_EQ(sleeper.calls, 0);
+	EXPECT_NE(maintenance.data(), ordinary.data());
+	EXPECT_NE(maintenance.data(), emergency.data());
+	EXPECT_NE(ordinary.data(), emergency.data());
+	// And the other way: with the maintenance arena busy, the other two still claim their own.
+	ordinary = Arena::Lease();
+	emergency = Arena::Lease();
+	Arena::Lease ordinaryAgain  = lanes.claim(TokenLane::Ordinary);
+	Arena::Lease emergencyAgain = lanes.claim(TokenLane::Emergency);
+	ASSERT_TRUE(ordinaryAgain) << "a background refresh does not hold up an ordinary fetch";
+	ASSERT_TRUE(emergencyAgain) << "or a 911/933's";
+	EXPECT_NE(ordinaryAgain.data(), maintenance.data());
+	EXPECT_NE(emergencyAgain.data(), maintenance.data());
+	// A maintenance read that fails leaves the others' bytes alone.
+	std::int64_t clock = kT0;
+	Script other;
+	other.bytes(tokenBody("ordinary"));
+	ASSERT_EQ(run(ordinaryAgain, other, clock), BodyStatus::Ok);
+	Script big;
+	big.bytes(filler(10 * kN));
+	EXPECT_EQ(run(maintenance, big, clock), BodyStatus::ArenaFull);
+	EXPECT_EQ(held(ordinaryAgain), tokenBody("ordinary"));
+}
+
+TEST(TokenMaint, TheDecisionSeesAFetchOnAnyLaneAndAFreeArenaLetsTheRefreshThrough)
+{
+	constexpr std::int64_t kNow = kDueAtUs + kMinute;
+	Lanes lanes;
+	pdwitness::clear();
+	EXPECT_FALSE(lanes.fetchInFlight());
+	EXPECT_TRUE(lanes.maintRefreshWanted(kNow, kStamp, kHour, false, false)) << "all three arenas free";
+	for (const TokenLane busy : {TokenLane::Ordinary, TokenLane::Emergency, TokenLane::Maintenance})
+	{
+		Arena::Lease l = lanes.claim(busy);
+		ASSERT_TRUE(l);
+		EXPECT_TRUE(lanes.fetchInFlight()) << telephony::laneName(busy) << " fetch";
+		EXPECT_FALSE(lanes.maintRefreshWanted(kNow, kStamp, kHour, false, false)) << telephony::laneName(busy) << " fetch in flight";
+	}
+	EXPECT_FALSE(lanes.fetchInFlight()) << "every lease released";
+	EXPECT_TRUE(lanes.maintRefreshWanted(kNow, kStamp, kHour, false, false));
+}
+
+TEST(TokenMaint, ASosScopeAndASosSlotEachHoldTheRefreshBackAndStreamsToo)
+{
+	constexpr std::int64_t kNow = kDueAtUs + kMinute;
+	Lanes lanes;
+	EXPECT_TRUE(lanes.maintRefreshWanted(kNow, kStamp, kHour, false, false));
+	{
+		Lanes::EmergencyScope sos(lanes, true);   // a 911/933 makeCall() is pending
+		EXPECT_FALSE(lanes.maintRefreshWanted(kNow, kStamp, kHour, false, false));
+	}
+	EXPECT_FALSE(lanes.maintRefreshWanted(kNow, kStamp, kHour, false, /*sosSlotUp=*/true)) << "its slot, until the slot is freed";
+	EXPECT_FALSE(lanes.maintRefreshWanted(kNow, kStamp, kHour, /*streamsLive=*/true, false));
+	EXPECT_TRUE(lanes.maintRefreshWanted(kNow, kStamp, kHour, false, false)) << "and the scope's count came back to 0";
+}
+
+// ── the maintenance witnesses ────────────────────────────────────────────────────────────
+
+TEST(TokenMaint, TheRefreshLineIsEmittedForEveryRefreshAndNeverSampled)
+{
+	Lanes lanes;
+	pdwitness::clear();
+	for (int i = 0; i < 40; ++i) lanes.noteMaintRefresh((50 + i) * kMinute + 7 * kSec);
+	EXPECT_EQ(pdwitness::count("token_maint_refresh_862"), 40u) << "the bench counts them: none is dropped";
+	const std::vector<std::string> lines = pdwitness::lines();
+	ASSERT_EQ(lines.size(), 40u);
+	EXPECT_NE(lines[0].find("3007 s"), std::string::npos) << "the first carries the token's age in seconds: " << lines[0];
+	EXPECT_NE(lines[39].find("5347 s"), std::string::npos) << lines[39];
+	for (const std::string& l : lines)
+	{
+		EXPECT_EQ(l.find("e30"), std::string::npos) << "a witness never carries a token: " << l;
+		EXPECT_EQ(l.find("pset"), std::string::npos) << "nothing in it reads as the harness's upset counter: " << l;
+		EXPECT_EQ(l.find("e911"), std::string::npos) << "a routine refresh is not an emergency line: " << l;
+	}
+	EXPECT_EQ(pdwitness::count("token_maint_skip_862"), 0u);
+}
+
+TEST(TokenMaint, TheSkipLineIsSampledFirstThenEverySixteenthAndNamesTheReason)
+{
+	constexpr std::int64_t kNow = kDueAtUs + kMinute;
+	Lanes lanes;
+	pdwitness::clear();
+	for (int i = 1; i <= 40; ++i) EXPECT_FALSE(lanes.maintRefreshWanted(kNow, kStamp, kHour, /*streamsLive=*/i != 17, i == 17));
+	EXPECT_EQ(pdwitness::count("token_maint_skip_862"), 3u) << "skips 1, 17 and 33 of 40";
+	EXPECT_EQ(pdwitness::count("token_maint_refresh_862"), 0u) << "a skip is not a refresh";
+	const std::vector<std::string> lines = pdwitness::lines();
+	ASSERT_EQ(lines.size(), 3u);
+	EXPECT_NE(lines[0].find(telephony::maintRefreshReasonName(MaintRefreshReason::StreamsLive)), std::string::npos)
+	    << "the first names its reason: " << lines[0];
+	EXPECT_NE(lines[1].find(telephony::maintRefreshReasonName(MaintRefreshReason::EmergencyPending)), std::string::npos)
+	    << "and the 17th, a different one: " << lines[1];
+	for (const std::string& l : lines)
+	{
+		EXPECT_EQ(l.find("pset"), std::string::npos) << l;
+		EXPECT_EQ(l.find("e911"), std::string::npos) << l;
+	}
+}
+
+TEST(TokenMaint, EveryReasonHasItsOwnNameAndAWantedRefreshLeavesNoSkipLineAndSpendsNoSample)
+{
+	std::vector<std::string> names;
+	for (const MaintRefreshReason r : {MaintRefreshReason::Due, MaintRefreshReason::NotDue, MaintRefreshReason::NoToken,
+	                                   MaintRefreshReason::EmergencyPending, MaintRefreshReason::StreamsLive,
+	                                   MaintRefreshReason::FetchInFlight})
+	{
+		names.emplace_back(telephony::maintRefreshReasonName(r));
+		EXPECT_FALSE(names.back().empty());
+		EXPECT_NE(names.back(), "?");
+	}
+	std::sort(names.begin(), names.end());
+	EXPECT_EQ(std::adjacent_find(names.begin(), names.end()), names.end()) << "no two reasons share a name";
+
+	Lanes lanes;
+	pdwitness::clear();
+	for (int i = 0; i < 100; ++i) EXPECT_TRUE(lanes.maintRefreshWanted(kDueAtUs + kMinute, kStamp, kHour, false, false));
+	EXPECT_EQ(pdwitness::count("token_maint_skip_862"), 0u);
+	EXPECT_FALSE(lanes.maintRefreshWanted(kDueAtUs + kMinute, kStamp, kHour, true, false));
+	EXPECT_EQ(pdwitness::count("token_maint_skip_862"), 1u) << "refreshes did not use up the first sample";
+}
+
+// ── the bounded field scanner ──────────────────────────────────────────────────────
+
+namespace
+{
+	// jsonStringField() unescapes in place, so it takes a writable copy.
+	bool scan(std::string json, std::string_view key, std::string& value)
+	{
+		std::string_view v;
+		if (!telephony::jsonStringField(json.data(), json.size(), key, v)) return false;
+		value.assign(v.data(), v.size());
+		return true;
+	}
+}
+
+TEST(JsonStringField, FindsTheTokenAmongOtherMembers)
+{
+	std::string v;
+	ASSERT_TRUE(scan("{ \"token_type\" : \"Bearer\", \"expires_in\": 60,\n \"access_token\" :\t\"a.b-c_d\", \"scope\": \"x\" }",
+	                 "access_token", v));
+	EXPECT_EQ(v, "a.b-c_d");
+}
+
+TEST(JsonStringField, TheKeyTextInsideAStringValueIsNotTheMember)
+{
+	std::string v;
+	ASSERT_TRUE(scan("{\"error_description\":\"no \\\"access_token\\\": here\",\"access_token\":\"real\"}", "access_token", v));
+	EXPECT_EQ(v, "real");
+	EXPECT_FALSE(scan("{\"error_description\":\"{\\\"access_token\\\":\\\"fake\\\"}\"}", "access_token", v));
+}
+
+TEST(JsonStringField, OnlyATopLevelMemberCounts)
+{
+	std::string v;
+	ASSERT_TRUE(scan("{\"meta\":{\"access_token\":\"inner\",\"k\":[1,{\"access_token\":\"deeper\"}]},\"access_token\":\"outer\"}",
+	                 "access_token", v));
+	EXPECT_EQ(v, "outer");
+	EXPECT_FALSE(scan("{\"meta\":{\"access_token\":\"inner\"},\"list\":[\"access_token\"]}", "access_token", v));
+}
+
+TEST(JsonStringField, UnescapesInPlaceWhatAServerMayEscape)
+{
+	std::string v;
+	// \/ is legal JSON for '/', and .NET writes '+' as +.
+	ASSERT_TRUE(scan("{\"access_token\":\"ab\\/cd\\u002Bef\\\\g\\\"h\\n\"}", "access_token", v));
+	EXPECT_EQ(v, "ab/cd+ef\\g\"h\n");
+	ASSERT_TRUE(scan("{\"access_token\":\"\\u00e9\\u20ac\"}", "access_token", v));
+	EXPECT_EQ(v, "\xC3\xA9\xE2\x82\xAC") << "BMP code points come out as UTF-8";
+}
+
+TEST(JsonStringField, AnEscapeItCannotRepresentIsAnErrorNotAGuess)
+{
+	std::string v;
+	EXPECT_FALSE(scan("{\"access_token\":\"a\\ud83d\\ude00b\"}", "access_token", v)) << "surrogate pair";
+	EXPECT_FALSE(scan("{\"access_token\":\"a\\u0000b\"}", "access_token", v)) << "NUL would end a C string";
+	EXPECT_FALSE(scan("{\"access_token\":\"a\\qb\"}", "access_token", v)) << "not a JSON escape";
+	EXPECT_FALSE(scan("{\"access_token\":\"a\\u12\"}", "access_token", v)) << "short \\u";
+	EXPECT_FALSE(scan("{\"access_token\":\"a\\u12G4\"}", "access_token", v)) << "non-hex digit";
+}
+
+TEST(JsonStringField, AMemberThatIsNotAStringIsNotAToken)
+{
+	std::string v;
+	EXPECT_FALSE(scan("{\"access_token\":12345}", "access_token", v));
+	EXPECT_FALSE(scan("{\"access_token\":null}", "access_token", v));
+	EXPECT_FALSE(scan("{\"access_token\":{\"x\":\"y\"}}", "access_token", v));
+	EXPECT_FALSE(scan("{\"access_token\":[\"y\"]}", "access_token", v));
+}
+
+TEST(JsonStringField, ABodyCutShortBeforeTheTokenStringIsClosedIsAnErrorAndNeverAPrefix)
+{
+	// Every input here ends, or goes wrong, before the access_token string is closed (or before it
+	// starts): there is no whole token in it, and a prefix of one must never come back as one.
+	const char* bad[] = {
+	    "", "   ", "[]", "\"access_token\"", "{", "{\"access_token", "{\"access_token\"", "{\"access_token\":",
+	    "{\"access_token\":\"abc", "{\"access_token\":\"abc\\", "{\"access_token\" \"abc\"}", "{access_token:\"abc\"}",
+	    "{\"a\":\"b\" \"access_token\":\"abc\"}",
+	};
+	for (const char* b : bad)
+	{
+		std::string_view out;
+		std::string copy(b);
+		EXPECT_FALSE(telephony::jsonStringField(copy.data(), copy.size(), "access_token", out)) << "input: " << b;
+		EXPECT_TRUE(out.empty()) << "no partial value for: " << b;
+	}
+}
+
+TEST(JsonStringField, ABodyCutShortAfterTheTokenStringIsClosedStillHasTheWholeToken)
+{
+	// Pinned, so the test above is not read to say more than it does: a body that stops after the
+	// token's closing quote (no closing brace, or cut in a later member) returns true with the whole
+	// token. That is the entire string, not a prefix of it. A body cut short never reaches the scanner
+	// from the device anyway: a read that ends before the response is whole is an error (httpReadResult).
+	std::string v;
+	ASSERT_TRUE(scan("{\"access_token\":\"abc\"", "access_token", v));
+	EXPECT_EQ(v, "abc");
+	ASSERT_TRUE(scan("{\"token_type\":\"Bearer\",\"access_token\":\"abc\",\"expires_in\":6", "access_token", v));
+	EXPECT_EQ(v, "abc");
+	EXPECT_FALSE(scan("{\"access_token\":\"ab", "access_token", v)) << "cut inside the token is the error";
+}
+
+TEST(JsonStringField, TheFirstOfTwoMembersWithTheSameKeyWins)
+{
+	std::string v;
+	ASSERT_TRUE(scan("{\"access_token\":\"one\",\"access_token\":\"two\"}", "access_token", v));
+	EXPECT_EQ(v, "one");
+}
+
+TEST(JsonStringField, ScansWithoutTheHeap)
+{
+	std::string json = tokenBody(filler(1400));
+	std::string_view out;
+	bool ok = false;
+	std::size_t heap = 0;
+	{
+		AllocGuard g;
+		ok = telephony::jsonStringField(json.data(), json.size(), "access_token", out);
+		heap = g.delta();
+	}
+	EXPECT_TRUE(ok);
+	EXPECT_EQ(heap, 0u);
+	EXPECT_EQ(out.size(), 1400u);
+}

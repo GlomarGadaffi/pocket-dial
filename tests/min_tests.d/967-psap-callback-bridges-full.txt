@@ -1,0 +1,2 @@
+# EmergencyRoute_test.cpp section G: 3 new tests (#967 step 1: inbound PSAP callback, ordinary inbound, PSAP callback with a free bridge; bridges-full recorded as dropped today)
+3

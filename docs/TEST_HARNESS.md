@@ -341,6 +341,70 @@ syslog. A run whose counter is 0 is INVALID, never PASS.
 | `x379_never_opened` | #379 (PR1) | 1 call, 6101 (Contact `;line=pd6101`) → the far end with `get_status=404` (a 404 is "not ready yet" and keeps the whole budget; a 403 gives up early, #902) and `get_max_attempts=12`, ≤ 30 s | `get_budget_spent`: `GET stream … attempt 12/12` | both faults' `fired` ≥ 1; attempt lines count to `/12`; the board drops the leg once on its own after the spent budget, before any `endCall` of the call (MediaNeverOpened); exactly one BYE at 6101, matching Call-ID and tags, at its registered Contact, answered 200 (UA and `/api/pcap`). A give-up by the transport or rebuild branch is INVALID, with its drop count recorded (#384 S6) |
 | `x518_403_clean_giveup` | #518, #379, #902 | the same run with `get_status=403` | `get_403_failfast_902`: `GET stream: HTTP 403 on 6 consecutive attempts for /callcontrol/<dn>/participants/<leg>/stream -- giving up now, not at attempt 12 (#902)` | everything `x379_never_opened` needs, but the give-up is the fail-fast line (6 consecutive 403s, counted before the answer too since #932), not the spent budget; the `GET stream refused (HTTP 403) for …` line (`get_refused_403`, #518) for that leg is still required. Two outcomes are valid (#937): the give-up comes after the answer (one BYE at 6101, as `x379`), or, usually, before it, about 3 s after dial: a final 503 to the caller, no BYE, one drop, `endCall … reason=anchor dropped the leg before it connected` and the `anchor dropped a ringing outbound leg` line (#880). No fail-fast line (the 12 attempts were spent instead) is INVALID; the fail-fast on `x379` (a 404) is a FAIL |
 | `x279_degraded_bye` | #279 (Connected variant) | 1 answered call, 6101 sends RTP (Contact `;line=pd6101`); `post_stream_fail` armed 1.5 s after its POST stream opens; the BYE due within 3 s | `degraded_endcall`: `endCall <Call-ID> reason=anchor audio write failure` | `fired` ≥ 1; exactly one BYE at 6101, matching Call-ID and tags, Request-URI = its registered Contact with its parameters, answered 200; the leg dropped once (syslog only); sessionCount back to baseline; a re-INVITE on the dead dialog gets 481 |
+| `x952_token_age_held` | #952, #945 | 1 answered call (voicemail counts), 6101 sends RTP (Contact `;line=pd6101`), held `--hold-s` seconds (default 330; it must exceed 300, the old 5-minute token margin, and is at most 900) after `token_age` fires. `token_age` is armed once the call's POST stream is open (`--arm-at mid-call`, the default). `--arm-at before-call` arms it before the INVITE, where `makeCall()` refreshes the aged token at origination, so nothing is aged under a live stream. `--runs` held calls (default 1), at most `--run-cap` (default 1, ceiling 3). The call cap is the hold plus 30 s. The INVITE waits up to 45 s for the far end, or its voicemail, to answer (the agent's default 16 s would CANCEL a far end still ringing toward voicemail), then CANCELs | `bench_token_age`: `BENCHFAULT token_age fired` | `fired` ≥ 1 (the run gives up at once, with no long hold, if it does not fire within 5 s); the call answered with its POST stream open and still up past the old margin; a BYE answered 200 (the harness's, or the PBX's at 6101's registered Contact if it ended past the margin); each leg dropped once; sessionCount back to baseline. A call that ends within the margin is INVALID. **It reports, it does not judge the refresh**: per run the hold reached and the token witnesses below counted from when the token was aged, in `manifest.json` (`summary`) and `run.log`. On main nothing refreshes a token mid-call (`ensureToken()`'s only caller is `makeCall()`, before any stream opens), so by the code the expected counts are `bench_token_age=1` and zeros; anything else is the finding. The four #862 witnesses (`token_maint_*_862`, `token_sos_*_862`) are counted too: main does not emit them, so on a main image they are zeros, and they count on the #945 image. Needs an `--approval-url` in `LONG_HOLD_APPROVALS` (below) |
+| `x888_ws_upsert` | #888 | three synthetic upserts through `handleWsEvent()` with `ws_upsert` armed once per case (1 an unknown participant, no call; 2 the same while 6101's one call to the far end rings; 3 our own leg, no call); case 2 is CANCELled 0.5 s after the fire (one short ring, call cap 1, ≤ 30 s). 911, 933, 113, 1001 and any emergency number are refused as the far end before anything is armed or dialled | `bench_ws_upsert`: `BENCHFAULT ws_upsert fired` | `fired` = 3; each case's branch logs **exactly one** witness line for its own synthetic part id (`pdb-u<case>-<n>`): `Upset dropped, work item not queued` (1), `Upset absorbed while an outbound is in flight` (2), `Upset dropped as own leg with no outbound slot` (3). A branch with 0 lines is INVALID for that case, never PASS; a second line, or a line in another branch for the same upsert, is a FAIL; a synthetic participant in an `Inbound call on DN` line is a FAIL. The call ends 487 (CANCEL answered 200) or, if the far end answered first, is BYEd; the leg is dropped once; no INVITE at 6101 or 6104 but the register beep. One line per case and a summary are printed |
+| `x370_pressure_rebuild` | #370 | 1 call, 6101 → the far end (one ring, ≤ 30 s) with `get_status=404`, `get_max_attempts=8` and a DRAM ballast at the probe's 8192 B floor held across it (dead-man 35 s), CANCELled 2 s after the first GET transport failure (10 s at the latest); no HTTP request to the board between the hold and the release, which comes the moment the call returns and again in a `finally`. 911, 933, 113, 1001 and any emergency number are refused as the far end before anything is armed, held or dialled | `get_transport_fail`: `GET stream transport failure (no HTTP response, status=-1), attempt k/N` or `GET stream open failed (…), attempt k/N` | `fired` ≥ 1 for both faults; the rebuild witness: a failure at attempt k followed by an attempt line at k+1 of the same budget (a rebuild that worked; the firmware logs no success line for it, `TelephonyAnchorClient.cpp:3895-3899`). A failure with no next attempt, none at all, or only the `could not rebuild client` line (it is also logged when the loop is being torn down) is INVALID, never PASS; so is no leg (the far end never rang) or a ballast that did not take. FAIL: a panic line, a coredump, a reboot or a hang after the release (uptime back, reset reason changed, no `/api/status`), an `ORPHANED` line (#349: the ballast is held across `makeCall()`'s POST), a second rx task, one drop not met. Details: [BENCH_PROBE.md](BENCH_PROBE.md) |
+| `h947_http_load` | #947, for #410 | idle, dashboard and dashboard-call runs, `--repeats` (3) of each, at most `--run-cap` (9) runs in all; only dashboard-call rings: 6101 → the designated far end, one call per run held `hold_s` (24 s, inside the 30 s cap), never put on SIP hold; `--call-mode ringing` (default: the far end rings and is not answered, a CANCEL at the window's end) or `answered` | `initiated` (INVALID if 0 when a call was placed) | `answered`: a call that answers and ends once (a harness BYE answered 200, one drop, sessionCount back to baseline); `ringing`: a 180 Ringing seen, the window held for `hold_s`, one CANCEL as it closes answered 200, the INVITE ended 487, no BYE, one drop, sessionCount back to baseline (no 180 is INVALID; a far end that answers anyway is held and BYEd as in `answered`); every dashboard path answers 200 at least once (else INVALID: its handler never ran; a path only the per-source cap refused with 503 is not held against it); no uptime drop inside a run (a reboot is a FAIL); at least one probe answered per run; no panic line; the usual S1/phantom/coredump checks. A slow or refused (503) answer is a measurement, not a failure |
+
+**HTTP under load (`h947_http_load`, #947 for #410).** `tests/load/http_load.py` holds the traffic, the
+percentiles and the summary; its self-test is `tests/tools/test_http_load.py`. Every run: a `before` read of
+`/api/status`, the dashboard's pollers (the `setInterval` block of `index_html.h`: status 2 s, cdr 5 s,
+admin/status 15 s, ota/status 15 s, and with a panel open trace 1.5 s, moh 3 s), a sequential probe of
+`GET /api/status` (the #410 `.244` recipe, 200 back to back by default), a burst of concurrent
+`GET /api/status` (4 clients by default; the board serves 2 per source and refuses the rest with 503), the rest of
+the window, an `after` read. `idle` polls the always-on four; `dashboard` all six; `dashboard-call` all six
+with one held call. The pollers send the admin session (a logged-in dashboard's `fetch()` does; cdr, trace and
+moh answer 401 without one and never run their handler); the probe and the burst do not. The scenario starts
+no `status_logger.sh` (a second poller is load on the thing measured). Runs go lightest first, `--repeats` of
+a mode before the next mode, because both watermarks only fall.
+
+What it reads, from `/api/status` as `sendApiStatus` writes it on main: `freeHeapInternal` (a gauge, so its
+per-run min and max are the swing), `minFreeHeapInternal` and `stackHwm_http_conn` (since boot, never rise:
+a run shows a low-water only if it went below every earlier run, so the summary prints each run's
+before and after), `httpConnWorstRoute`, `httpPerSourceRefusals`, `httpReadDeadlineDrops`,
+`httpStatusRefusals`, `uptime`. **Not emitted, so never reported:** a peak or active-connection count
+(`_activeConnections` has only `activeConnectionsForTest()`), the global 503-busy count (stderr, at powers of
+two), a per-request thread cost. Peak concurrency is therefore the harness's own: the most served requests
+(any answer but 503) in flight at once from the one address it runs on, which is at most the per-source cap.
+It is printed twice per run: `polls` (the dashboard's own traffic alone, where "an open dashboard reaches the
+per-source cap by itself" would show) and `all` (with the harness's probe, burst, reads and S1 checkpoints), with
+the 503 counts split the same way.
+During a call the S1 checkpoint (`GET /api/did-mapping` and an authed status) is skipped while the burst holds
+every slot and tried again, up to 3 times, after a 503; a probe or poll landing on the same instant can still
+clash. A reboot is a FAIL inside a run or between two runs (the watchdog `status_logger.sh` used to be the
+only check for it). A SIP reply time during the burst (#947 item 3) is not measured. p50 and p99 are nearest-rank
+(`sorted[ceil(p·n/100) − 1]`, integers); p99 of fewer than 100 samples is the maximum and the summary says so.
+`stackHwm_http_conn` is the smallest free stack any connection thread has had, of `kHttpConnStackBytes`
+(4096); the summary prints the lowest reading with the log line it came from (`http-load.jsonl`) and the route
+that produced it. A reading within an hour of boot is flagged (#405): re-read after hours of use.
+
+**Call mode** (`--call-mode`, default `ringing`). A far end that only rings (a 180, never answered) was INVALID
+before this flag: the agent's own 16 s INVITE bound CANCELled it before the window ran at all. It is a valid
+`dashboard-call` in `ringing` mode: the INVITE waits on a thread for `hold_s + 2` s (the agent's
+`invite(invite_timeout=)`, the call cap still 30 s), the dashboard window runs on the run's thread for `hold_s`
+from the INVITE, and the CANCEL goes at the planned hold, INVITE + `hold_s`, not when the window's teardown ends
+(its pollers can sit in a 5 s request on a slow board, and the ring must not outlast the hold); or at once if the
+window is cut short: a phantom, a signal, a lapsed pin. There is no dialog, so no BYE (RFC 3261 s9.1); the far side must answer the CANCEL 200 and the
+INVITE 487 (s9.2), else a FAIL. The call is valid only with a 180 Ringing seen before the window closed and the
+window held for the planned hold (`http_load.ringing_call`; the reason is on the run's summary line and in the
+verdict: `| call ringing: valid, 180 Ringing at +6 ms, window held 24.0 s, CANCEL at +24020 ms answered 200,
+INVITE ended 487, no BYE`, or `INVALID, no 180 Ringing seen ...`). A final before the planned hold (486, 503,
+a 487 nobody asked for) is INVALID, since the ring did not last the hold; the syslog (for the pre-answer drop,
+`anchor dropped a ringing outbound leg`) says who ended it. **The 180 is the PBX's own local ringback**,
+sent at INVITE time (see CANCEL timing below): it does not show the far phone alerting; the `initiated` path
+counter and the one drop line are the only evidence of the anchored leg. A 200 in ringing mode is the answered
+case: the window still runs to `hold_s`, then the harness BYEs. `answered` is the previous behaviour, unchanged:
+the far end must answer, else INVALID. The ring is bounded the same either way: one INVITE,
+`hold_s` (24 s) plus the CANCEL round trip, and at worst `hold_s` + 2 s (the CANCEL's own backstops: +1 s if the
+window overruns, +2 s if no provisional ever arrives), inside the 30 s cap; the ring gate refuses 911, 933, 113,
+1001 and the rest before the INVITE in both modes.
+
+Ring OK is per run with a cap. `--run-cap` (default 9, at most 30) bounds the runs in all: modes × repeats past
+it is refused before anything is sent, and the run loop takes one budget unit per run and stops at the cap.
+Only `dashboard-call` rings, once a run, and `calls` follows the plan (at most 10). The far end carries every
+refusal above (911/933 anywhere in it, 112, 113, 999, 1001-1003, PBX numbers), and the ring itself checks it
+again just before the INVITE. Evidence adds `http-load.jsonl` (every request and every status reading, raw)
+and `http-summary.txt`.
 
 **CANCEL timing.** 3CX's makecall response took 1.8-3.2 s on a real tenant (Stray's corrections on
 [#379](https://github.com/GlomarGadaffi/pocket-dial/issues/379#issuecomment-5985894096) and
@@ -361,7 +425,7 @@ far end's state, not of this harness. The reliable fix is an automated far end (
 answered by a harness UA), which needs desmo and the tenant; until then a diverted run is INVALID, not a
 firmware finding.
 
-**Probe scenarios** (`x349`, `x379`, `x518`, `x279`) drive the bench probe image
+**Probe scenarios** (`x349`, `x379`, `x518`, `x279`, `x952`, `x888`) drive the bench probe image
 ([BENCH_PROBE.md](BENCH_PROBE.md)). On top of the preconditions below, `--expect-version` must be
 a `-probe` stamp, and the admin login must be the owner when an owner credential exists
 (`PD_BOARD_ADMIN_USER`). Each run reads `/api/bench/fault` before and after, and arms only its
@@ -394,11 +458,36 @@ the firmware formats.
 | `trunk_911_exempt_889` | `trunk: 911/933 dialog held past its no-answer bound: a provisional came, no PBX-side timeout \(#712, #889\)` | #712/#889: a trunk 911/933 that drew a provisional is not timed out; once per dialog |
 | `stray_final_890` | `trunk: final (\d+) after the call was answered ignored \(#890\)` | #890: a carrier final after the 2xx is ignored, the call stays up |
 | `beep_uri_856` | `beep: register beep Request-URI: (registered Contact\|bare \(no Contact stored\))` | #856: which form the register beep's Request-URI took |
-| `upset_ignored_pending_888` | `Upset ignored while (\d+) makeCall\(s\) pending \(oldest (-?\d+) ms old\): 3CX does not repeat a Connected one \(#888\)` | #888: an upsert ignored while a makeCall was pending (a Connected one is not repeated by 3CX, so a route-point inbound or a PSAP callback may be lost); the pending age shows the window. ESP-only |
+| `upset_ignored_pending_888` | `Upset ignored while (\d+) makeCall\(s\) pending \(oldest (-?\d+) ms old\): nin=\d+ active=\d+ part=\S+: 3CX does not repeat a Connected one \(#888\)` | #888: an upsert ignored while a makeCall was pending (nin is 0 here by construction; active = outbound slots with a call; part = the upsert's participant id). The pending age shows the window. Not rate-limited: bounded by the pending window. ESP-only |
+| `upset_absorbed_inflight_888` | `Upset absorbed while an outbound is in flight: nin=(\d+) pending=(\d+) active=(\d+) part=(\S+) own=(\S+) seen=(\d+) \(#888\)` | #888: an unmatched upsert mapped to an in-flight outbound leg (nin >= 1), so a route-point inbound or PSAP callback would be taken as that far leg. `own` is the in-flight leg's id: distinct from `part` means the far leg has its own partId. Rate: one sighting per upsert, per partId the first and every 16th (`seen`), with a 256-line cap per boot shared by the #888 witnesses other than the pending one (`witness_cap_888` marks it). An upsert that is also unqueued is logged once, as `upset_dropped_unqueued_888`. ESP-only |
+| `upset_dropped_own_leg_888` | `Upset dropped as own leg (?:with no outbound slot\|at the worker re-check): nin=(\d+) pending=(\d+) active=(\d+) part=(\S+) seen=(\d+) \(#888\)` | #888: an unmatched upsert dropped as one of our own legs with no outbound slot (#379), in handleWsEvent or at the worker re-check. Same rate limit. ESP-only |
+| `upset_dropped_unqueued_888` | `Upset dropped, work item not queued: nin=(\d+) pending=(\d+) active=(\d+) part=(\S+) seen=(\d+) \(#888\)` | #888: an unmatched upsert whose work item was not queued (queue full or no allocation) for at least one of its legs, so it was lost before the worker. One sighting per upsert, after the leg loop. Same rate limit. ESP-only |
+| `witness_cap_888` | `witness cap reached: no further #888 witness lines this boot` | #888: the 256-line per-boot cap on the absorbed, own-leg and unqueued witnesses was hit; logged once per boot, then those witnesses stay silent until reboot. ESP-only |
 | `e911_degraded_kept_906` | `e911: audio to the anchor keeps failing on a connected 911/933: kept up, not hung up \(#906\)` | #906: the degraded-audio sweep kept a connected 911/933 up and told the notify list (once per call) |
 | `get_403_failfast_902` | `GET stream: HTTP 403 on (\d+) consecutive attempts for /callcontrol/<dn>/participants/([^/\s]+)/stream -- giving up now, not at attempt (\d+) \(#902\)` | #902/#932: 6 consecutive 403s, before the answer or after it, gave up an ordinary outbound leg early (MediaNeverOpened follows). ESP-only |
 | `cdr_callee_dialed_901` | `CDR callee is the dialed number \((anchor reap\|anchor audio write failure)\) \(#901\)` | #901: the degraded (audio write failure) and reaped anchor teardowns write the dialed number as the CDR callee |
+| `bench_token_age` | `BENCHFAULT token_age fired` | #952: the probe aged the token (`BenchProbe.cpp`, `fire()`); `x952`'s path counter |
+| `token_refresh_near_expiry` | `Access token near expiry \S+ refreshing` | #952: `ensureToken()` refetched a token within 5 minutes of expiry with no stream live (only at `makeCall()`). The dash is U+2014 on the board |
+| `token_refresh_deferred_live` | `Token near expiry but media streams active \S+ deferring refresh` | #952: `ensureToken()` found the token near expiry while a stream was live and kept it (reached only by a `makeCall()` while another call is up). U+2014 dash |
+| `token_retrieved` | `Retrieved access token \(len=\d+, lifetime=(\d+)s\)` | #952: a token fetch succeeded; group 1 is the lifetime in seconds |
+| `token_fetch_failed` | `Token (?:request returned HTTP -?\d+\|failed to write body: -?\d+\|HTTP connection failed to open: )` | #952: a token fetch failed |
+| `ws_restart_stale_token` | `WS disconnected/errored with an expiring token \S+ requesting anchor restart to refresh it` | #336/#952: the websocket dropped while the token read as expiring, so the anchor restarts (stop/start) to refetch it. U+2014 dash |
+| `token_maint_refresh_862` | `token_maint_refresh_862:` | #862/#945: the background refresh is issuing its request, one line per refresh (never sampled), with the age in seconds of the token it replaces. Not emitted on main (reads 0) |
+| `token_maint_skip_862` | `token_maint_skip_862:` | #862/#945: the background refresh did not start, and why. Sampled. Not emitted on main (reads 0) |
+| `token_sos_live_fetch_862` | `token_sos_live_fetch_862:` | #862/#945: a 911/933 call fetched a token while another 911/933 call had live streams. Not emitted on main (reads 0); no scenario dials a 911/933 |
+| `token_sos_401_fetch_862` | `token_sos_401_fetch_862:` | #862/#945: a 911/933 POST was answered 401 and fetched one token on its own arena. Not emitted on main (reads 0); no scenario dials a 911/933 |
 | `ctrl_request_884` | `ctrl request: attempt (\d+) (reused\|resumed\|cold) in (\d+) ms \(#884\)` | #884: one line per successful control request (drop or answer) saying whether it rode an open socket (`reused`, no connect event), reconnected on the kept handle in 400 ms or less (`resumed`) or paid a full handshake (`cold`: a fresh handle, or a connect above 400 ms, which is the repo's cut and a timing heuristic, not proof of resumption). Group 3 is the elapsed ms. After #884 a `reused` is a bug. A failed attempt logs `Control request failed ... on attempt N` instead. ESP-only |
+| `token_lifetime_fields_951` | `token_lifetime_fields_951: expires_in=(-?\d+) exp_minus_iat=(-?\d+) lifetime_used=(-?\d+) \(seconds; -1: not read\) \(#951\)` | #951: one line per token fetch for the first eight of a boot: the response's `expires_in`, the claims' `exp - iat` and the lifetime installed, in seconds (-1: not read). The bench check of what `expires_in` really is: the lifetime comes from the claims, never from it |
+
+The six `bench_token_age` … `ws_restart_stale_token` rows are existing `esp_log` lines on main, not
+`Witness.hpp` witnesses; `tests/tools/test_anchor_witness_wiring.py` checks each one's format string in
+`TelephonyAnchorClient.cpp` and `BenchProbe.cpp`. The four `_862` rows below them are `Witness.hpp`
+witnesses (`PD_WITNESS_W` = `ESP_LOGW`, `TelephonyAnchorLogic.hpp`) from the #945 tree. They are registered
+and counted by `x952` (`TOKEN_WITNESSES`), and main does not emit them, so on a main image they read 0; they
+count on the #945 image. `token_maint_skip_862` is sampled (the first of a boot, then every `kWitnessSampleEvery`-th), so its count
+is a floor. The two `token_sos_*_862` lines fire only on a 911/933 POST path, which no scenario here dials, so
+`x952` is expected to read them 0 even on the #945 image. No wiring test pins their format strings yet (the
+source is not on main); add one when #945 lands.
 
 **Safety preconditions.** Each one is refused before anything is sent (exit 2), except
 the S1 pin and the far-end check, which are made against the board:
@@ -409,6 +498,15 @@ the S1 pin and the far-end check, which are made against the board:
 - the far end comes from a 0600 file (`PD_ANCHOR_FAR_END_FILE`) or from `PD_ANCHOR_FAR_END`,
   never from argv. It is refused if it holds 911 or 933 anywhere, or is 112, 113, 999, an owner
   extension (1001, 1002, 1003, 113, plus `PD_OWNER_EXTS`), a test UA or a PBX service number;
+- **a held call** (`x952`): the recorded approvals allow about 30 s a call, so `--approval-url` must be in
+  `LONG_HOLD_APPROVALS`, which holds desmo's recorded 330 s OK for it (a comment on PR #958, relayed by the
+  operator; an old approval never covers it, and a held approval covers no other scenario).
+  `--hold-s` must be finite, over 300 s and at most 900 s; `--runs` may not exceed `--run-cap` (1 by default,
+  at most 3). `--hold-s`, `--runs` and `--arm-at` are refused on every other scenario, and `--run-cap` on every
+  one but `h947_http_load`, where it caps the runs in all (default 9). The ceiling of 30 s a call (`MAX_CALL_S`) is
+  unchanged for them. The far end is refused like any other: 911, 933, 113 and 1001 included. Immediately
+  before every INVITE the probe's `emergencyLive` is read again (it covers a 911/933 and a session in a
+  PSAP-callback window, BENCH_PROBE.md), and a live one stops the run INVALID. The scenario never dials one;
 - the board is `.195` or `.244`, and the admin PIN comes from `PD_BOARD_ADMIN_PIN`;
 - `--expect-version` names the image (the provenance the closure rule needs); the board's
   `/api/status` version must match it, or the run is INVALID before the first call;

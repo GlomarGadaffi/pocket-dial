@@ -1740,3 +1740,42 @@ TEST(AnchorRouting, ARingingEmergencyAnchorCallIsNeverReapedForNoAnswer)
 		EXPECT_NE(raw.rfind("SIP/2.0 5", 0), 0u) << "the 911 caller got a failure:\n" << raw;
 	}
 }
+
+// #691 step 0: how an outbound anchored call's far leg is released. Both paths below leave the
+// leg dropped exactly once (or not at all, when 3CX dropped it): the session is marked released,
+// so endCall()'s no-bridge fallback does not drop it a second time (#379). The mark is not
+// readable afterwards (endCall() recycles the Session), so a missing mark shows as a second drop.
+// Pins of today's behaviour: they pass on the sources from before releaseFarLeg() too.
+TEST(FarLegReleasePin, ALegThe3cxDroppedIsNotDroppedAgain)
+{
+	CdrRig rig("555", "anchor-691-rm");
+	const std::string leg = rig.leg("anchor-691-rm");
+	ASSERT_FALSE(leg.empty());
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(rig.handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr) << "host suite is expected to boot the Loopback anchor";
+	const unsigned before = loop->dropCallCount();
+
+	rig.handler.anchorDroppedForTest(leg);   // 3CX's Participant Remove on a connected call
+
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: anchor-691-rm").has_value()) << "the call ended";
+	EXPECT_EQ(loop->dropCallCount(), before) << "3CX already dropped the leg: the PBX drops nothing";
+}
+
+TEST(FarLegReleasePin, AnAckDeadlineReapOfAnOutboundCallDropsTheLegOnce)
+{
+	CdrRig rig("555", "anchor-691-reap");
+	auto found = rig.handler.getSession("Call-ID: anchor-691-reap");
+	ASSERT_TRUE(found.has_value());
+	const std::shared_ptr<Session> session = found.value();
+	ASSERT_FALSE(session->getAnchorParticipantId().empty());
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(rig.handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr) << "host suite is expected to boot the Loopback anchor";
+	const unsigned before = loop->dropCallCount();
+
+	session->armRingTimer(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	rig.handler.forceNextTickForTest();
+	rig.handler.tick();
+
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: anchor-691-reap").has_value()) << "the call ended";
+	EXPECT_EQ(loop->dropCallCount(), before + 1) << "the leg is dropped exactly once, not again by endCall()";
+}

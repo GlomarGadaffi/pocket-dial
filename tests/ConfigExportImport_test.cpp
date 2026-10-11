@@ -191,6 +191,7 @@ namespace
 			_handler.reset();
 			AdminAuth::clearCredential();
 			DeviceConfig::clearAll();
+			DeviceConfig::resetWifiForTest();   // clearAll() leaves the WiFi mirror: an SSID set here outlived the test
 			TrunkConfigStore::resetForTest();   // #483: process-global on host
 			EmailConfigStore::resetForTest();
 			resetguard::resetForTest();   // the host reset door leaves the guard up (no restart)

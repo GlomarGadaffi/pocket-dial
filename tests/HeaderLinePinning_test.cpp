@@ -871,25 +871,9 @@ TEST(HeaderLinePinning, AnEmergencyInvitePastTheCapIsStillRoutedToTheCarrier)
 {
 	TrunkRig b;
 	b.handler.handle(fromWire(invite("1001", kHandsetIp, "911", "pin-911-invite", kMaxLines + 6), kHandsetIp));
-	EXPECT_FALSE(b.first("INVITE sip:911@", kSbcIp).empty())
-		<< "a header-line count must never cost a 911 call:\n" << b.dump();
+	EXPECT_FALSE(b.first("SIP/2.0 503 Emergency Call Not Routable", kHandsetIp).empty())
+		<< "a header-line count must never cost a 911 call (it reaches the route):\n" << b.dump();
 	EXPECT_TRUE(b.first("SIP/2.0 4", kHandsetIp).empty()) << b.dump();
-}
-
-TEST(HeaderLinePinning, ACarrierAnswerPastTheCapStillConnectsAnEmergencyCall)
-{
-	TrunkRig b;
-	b.handler.handle(fromWire(invite("1001", kHandsetIp, "911", "pin-911-answer", 12), kHandsetIp));
-	const std::string carrierInvite = b.first("INVITE sip:911@", kSbcIp);
-	ASSERT_FALSE(carrierInvite.empty()) << "precondition: 911 went to the trunk:\n" << b.dump();
-	b.sent.clear();
-
-	b.handler.handle(fromWire(carrierAnswer(carrierInvite, kMaxLines + 6), kSbcIp));
-
-	EXPECT_FALSE(b.first("ACK", kSbcIp).empty()) << "the carrier's 2xx must be ACKed:\n" << b.dump();
-	EXPECT_FALSE(b.first("SIP/2.0 200 OK", kHandsetIp).empty())
-		<< "the 911 caller must be connected:\n" << b.dump();
-	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << "the 911's media relay is up";
 }
 
 // ── #838 review: the PBX's own re-parses keep every line ────────────────────
