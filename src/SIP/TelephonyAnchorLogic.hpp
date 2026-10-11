@@ -37,19 +37,16 @@
 namespace telephony
 {
 
-// Fallback token lifetime when the JWT can't be decoded: 50 minutes (µs). This
-// is the JWT's real ~1h validity minus margin, deliberately NOT the OAuth
-// expires_in (Telephony reports 60s there, which would cause a refresh storm).
-inline constexpr int64_t kTokenFallbackLifetimeUs = 50LL * 60 * 1000000;
-
-// #951: the lifetime of a token whose payload is too big for the scratch and whose claims are not in
-// the start of it: 5 minutes. It errs short on purpose. The 50 minute constant above errs long (a
-// token that really lives 10 minutes would be called valid for 50, and expire under a call), and is
-// left as it is for a payload that cannot be parsed at all (#975). A token this short is never due
-// for the background refresh (maintTokenDue: a lifetime within the 10 minute margin is not), so it
-// is renewed ahead of an ordinary call, or by the one fetch a 911/933 makes after its POST is
-// answered 401. The token is installed whatever is cached: Telephony drops the old token the moment
-// it grants a new one, so keeping the old one would keep a dead token.
+// The lifetime of a token whose claims cannot be read: 5 minutes (µs). Either the JWT does not decode
+// (no dots, an empty payload, bad base64, no exp or iat, a span out of range: #975) or its payload is
+// too big for the scratch and the claims are not in the start of it (#951). It errs short on purpose: a
+// 911/933 with a cached token POSTs at once and never fetches inline, so a short guess never delays it,
+// while a long one (it was 50 minutes) can send it into a 401 on an expired token. It is deliberately
+// NOT the OAuth expires_in either (Telephony reports 60s there for a token that lives about an hour).
+// A token this short is never due for the background refresh (maintTokenDue: a lifetime within the 10
+// minute margin is not), so it is renewed ahead of an ordinary call, or by the one fetch a 911/933
+// makes after its POST is answered 401. The token is installed whatever is cached: Telephony drops the
+// old token the moment it grants a new one, so keeping the old one would keep a dead token.
 inline constexpr int64_t kTokenShortFallbackLifetimeUs = 5LL * 60 * 1000000;
 
 // What decodeJwtLifetimeUs() returns when the payload's decoded bytes do not fit the scratch it was
@@ -147,7 +144,7 @@ inline bool scanJsonNumber(std::string_view json, std::string_view key, int64_t&
 }
 
 // Decode a JWT's declared lifetime (exp - iat) in microseconds from its payload
-// segment. Returns kTokenFallbackLifetimeUs if anything is unparseable. The span
+// segment. Returns kTokenShortFallbackLifetimeUs (5 minutes, #975) if anything is unparseable. The span
 // must be positive and under a day, else the fallback.
 //
 // The payload is decoded into scratch[0..scratchBytes), lent by the caller: fetchToken() lends the
@@ -159,25 +156,25 @@ inline int64_t decodeJwtLifetimeUs(std::string_view jwt, char* scratch, std::siz
                                    int64_t* spanSecondsOut = nullptr)
 {
 	const size_t firstDot = jwt.find('.');
-	if (firstDot == std::string_view::npos) return kTokenFallbackLifetimeUs;
+	if (firstDot == std::string_view::npos) return kTokenShortFallbackLifetimeUs;
 	const size_t secondDot = jwt.find('.', firstDot + 1);
-	if (secondDot == std::string_view::npos) return kTokenFallbackLifetimeUs;
+	if (secondDot == std::string_view::npos) return kTokenShortFallbackLifetimeUs;
 
 	const std::string_view payload = jwt.substr(firstDot + 1, secondDot - firstDot - 1);
-	if (payload.empty()) return kTokenFallbackLifetimeUs;
+	if (payload.empty()) return kTokenShortFallbackLifetimeUs;
 	if (payload.size() * 3 / 4 > scratchBytes) return kLifetimeNoScratch;
 
 	size_t n = 0;
 	if (!base64UrlDecode(payload, scratch, scratchBytes, n) || n == 0)
 	{
-		return kTokenFallbackLifetimeUs;
+		return kTokenShortFallbackLifetimeUs;
 	}
 
 	const std::string_view json(scratch, n);
 	int64_t exp = 0, iat = 0;
 	if (!scanJsonNumber(json, "exp", exp) || !scanJsonNumber(json, "iat", iat))
 	{
-		return kTokenFallbackLifetimeUs;
+		return kTokenShortFallbackLifetimeUs;
 	}
 
 	int64_t span = exp - iat; // seconds
@@ -186,16 +183,16 @@ inline int64_t decodeJwtLifetimeUs(std::string_view jwt, char* scratch, std::siz
 		if (spanSecondsOut) *spanSecondsOut = span;
 		return span * 1000000;
 	}
-	return kTokenFallbackLifetimeUs;
+	return kTokenShortFallbackLifetimeUs;
 }
 
 // ── The lifetime a fetched token is installed with (#951) ───────────────────────────────────
 // The claims decide it: exp - iat of the token's payload. The response's expires_in is read and
 // logged (token_lifetime_fields_951, the bench check) but never used: the code comments say
 // Telephony reports expires_in:60 for a token that lives about an hour (operator ruling on #951).
-//  * The payload fits the scratch: decodeJwtLifetimeUs(), exactly as before. A payload it cannot
-//    parse (no dots, bad base64, no exp or iat, a span out of range) still takes
-//    kTokenFallbackLifetimeUs; that is unchanged here and tracked in #975.
+//  * The payload fits the scratch: decodeJwtLifetimeUs(). A payload it cannot parse (no dots, bad
+//    base64, no exp or iat, a span out of range) takes kTokenShortFallbackLifetimeUs (5 minutes,
+//    errs short; it was 50 minutes before #975).
 //  * The payload does not fit: exp - iat from the start of the payload, decoded as far as the
 //    scratch goes and cut back to its last ',' so a number the cut went through is never read; if
 //    the claims are not in that start, kTokenShortFallbackLifetimeUs (5 minutes, errs short).

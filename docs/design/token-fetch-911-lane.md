@@ -74,7 +74,7 @@ bearers, a token staged off-path could serve the retry and (b) would remove the 
 maintenance lane on a 401 seen by any non-911 lane, so a revoked token is replaced before a 911 meets it. That is host-testable.
 
 **(c) (b) extended, plus our own allocations removed, with (a) deferred.** Slice 1, no hardware: rows 1, 4, 6, 7, 8 gone (fixed
-`char` buffers filled at `init()`; the JWT segment decoded into a fixed buffer, falling back to `kTokenFallbackLifetimeUs` when it does not
+`char` buffers filled at `init()`; the JWT segment decoded into a fixed buffer, falling back to `kTokenShortFallbackLifetimeUs` when it does not
 fit; `_accessToken` dropped; the WS header update moved to `tel_maint` behind a flag). Decode and header build leave `_mutex`.
 Slice 2, only after the heap readings: (a) for the 911 lane. TLS and IDF internals stay the one named exemption, under the #948 failure contract.
 

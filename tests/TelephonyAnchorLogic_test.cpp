@@ -119,29 +119,90 @@ TEST(TelephonyLogic, DecodeJwtLifetimeRealClaims)
 	EXPECT_EQ(lifetimeOf(jwt), 3600LL * 1000000);
 }
 
-TEST(TelephonyLogic, DecodeJwtFallbackOnMalformed)
+// #975: a JWT the decoder cannot read is installed with the 5 minute fallback, not 50. It errs short
+// on purpose: a 911 with a cached token POSTs at once and never fetches inline, so a short guess never
+// delays it, while a long one can send it into a 401 on an expired token. One test per decode-failure
+// branch of decodeJwtLifetimeUs(); the expectations are the literal 300 s, so changing the constant or
+// any one return back to the 50 minute value turns them red.
+static constexpr int64_t kFiveMinutesUs = 300LL * 1000000;
+
+TEST(TelephonyLogic, DecodeJwtFallbackNoDotsIsFiveMinutes)
 {
-	// No dots / one dot / empty payload all fall back to the safe lifetime —
-	// never the bogus OAuth expires_in:60 that would trigger a refresh storm.
-	EXPECT_EQ(lifetimeOf("not-a-jwt"), kTokenFallbackLifetimeUs);
-	EXPECT_EQ(lifetimeOf("header.only"), kTokenFallbackLifetimeUs);
-	EXPECT_EQ(lifetimeOf("a..c"), kTokenFallbackLifetimeUs);
+	EXPECT_EQ(lifetimeOf("not-a-jwt"), kFiveMinutesUs);
+	EXPECT_EQ(lifetimeOf(""), kFiveMinutesUs);
+	EXPECT_EQ(lifetimeOf("header.only"), kFiveMinutesUs) << "one dot: no second one to close the payload";
 }
 
-TEST(TelephonyLogic, DecodeJwtFallbackOnMissingClaims)
+TEST(TelephonyLogic, DecodeJwtFallbackEmptyPayloadIsFiveMinutes)
 {
-	// Payload decodes but lacks iat — fall back.
-	EXPECT_EQ(lifetimeOf(makeJwt("{\"exp\":1700003600}")), kTokenFallbackLifetimeUs);
+	EXPECT_EQ(lifetimeOf("a..c"), kFiveMinutesUs);
+	EXPECT_EQ(lifetimeOf(".."), kFiveMinutesUs);
 }
 
-TEST(TelephonyLogic, DecodeJwtFallbackOnInsaneSpan)
+TEST(TelephonyLogic, DecodeJwtFallbackBadBase64IsFiveMinutes)
 {
-	// Negative span (exp before iat) and an over-a-day span are both rejected by
-	// the sanity window -> fallback, not a garbage lifetime.
-	EXPECT_EQ(lifetimeOf(makeJwt("{\"iat\":1700003600,\"exp\":1700000000}")),
-	          kTokenFallbackLifetimeUs);
-	EXPECT_EQ(lifetimeOf(makeJwt("{\"iat\":1700000000,\"exp\":1700200000}")),
-	          kTokenFallbackLifetimeUs);   // ~55h
+	// '-' '_' '+' '/' are in the alphabet and '=' is padding; '!', ' ' and '*' are not.
+	EXPECT_EQ(lifetimeOf("h.!!!!.s"), kFiveMinutesUs);
+	EXPECT_EQ(lifetimeOf("h.eyJ hbGciOiJub25lIn0.s"), kFiveMinutesUs);
+	EXPECT_EQ(lifetimeOf("h.eyJ*.s"), kFiveMinutesUs);
+}
+
+TEST(TelephonyLogic, DecodeJwtFallbackZeroBytePayloadIsFiveMinutes)
+{
+	// Valid base64 characters that decode to no whole byte: one 6-bit group, or padding at once.
+	EXPECT_EQ(lifetimeOf("a.b.c"), kFiveMinutesUs);
+	EXPECT_EQ(lifetimeOf("a.A.c"), kFiveMinutesUs);
+	EXPECT_EQ(lifetimeOf("a.=.c"), kFiveMinutesUs);
+}
+
+TEST(TelephonyLogic, DecodeJwtFallbackMissingExpIsFiveMinutes)
+{
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"iat\":1700000000}")), kFiveMinutesUs);
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"iat\":1700000000,\"exp\":\"1700003600\"}")), kFiveMinutesUs) << "exp is not a number";
+	EXPECT_EQ(lifetimeOf(makeJwt("not json at all")), kFiveMinutesUs);
+}
+
+TEST(TelephonyLogic, DecodeJwtFallbackMissingIatIsFiveMinutes)
+{
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"exp\":1700003600}")), kFiveMinutesUs);
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"exp\":1700003600,\"iat\":\"1700000000\"}")), kFiveMinutesUs) << "iat is not a number";
+}
+
+TEST(TelephonyLogic, DecodeJwtFallbackSpanOutOfRangeIsFiveMinutes)
+{
+	// exp - iat <= 0 and >= 86400 are both outside the sanity window -> the fallback, not a garbage lifetime.
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"iat\":1700003600,\"exp\":1700000000}")), kFiveMinutesUs) << "exp before iat";
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"iat\":1700000000,\"exp\":1700000000}")), kFiveMinutesUs) << "a span of 0";
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"iat\":1700000000,\"exp\":1700086400}")), kFiveMinutesUs) << "exactly a day";
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"iat\":1700000000,\"exp\":1700200000}")), kFiveMinutesUs) << "~55h";
+	// the window's edges are still lifetimes: 1 s and 86399 s are read, not replaced by the fallback
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"iat\":1700000000,\"exp\":1700000001}")), 1LL * 1000000);
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"iat\":1700000000,\"exp\":1700086399}")), 86399LL * 1000000);
+}
+
+TEST(TelephonyLogic, DecodeJwtFallbackIsFiveMinutesNotFiftyOnEveryFailurePath)
+{
+	// The mutation guard: the constant is 5 minutes, and every way the decode can fail returns it.
+	EXPECT_EQ(kTokenShortFallbackLifetimeUs, 5LL * 60 * 1000000);
+	EXPECT_EQ(kTokenShortFallbackLifetimeUs, kFiveMinutesUs);
+	EXPECT_NE(kTokenShortFallbackLifetimeUs, 50LL * 60 * 1000000);
+	const std::string failing[] = {
+	    "not-a-jwt",                                                    // no dots
+	    "header.only",                                                  // one dot
+	    "a..c",                                                         // empty payload
+	    "h.!!!!.s",                                                     // not base64
+	    "a.b.c",                                                        // decodes to no byte
+	    makeJwt("{\"iat\":1700000000}"),                                // no exp
+	    makeJwt("{\"exp\":1700003600}"),                                // no iat
+	    makeJwt("{\"iat\":1700003600,\"exp\":1700000000}"),             // exp before iat
+	    makeJwt("{\"iat\":1700000000,\"exp\":1700086400}"),             // a day
+	    makeJwt("{\"iat\":1700000000.5,\"exp\":1700003600}"),           // a fraction
+	};
+	for (const std::string& jwt : failing)
+	{
+		EXPECT_EQ(lifetimeOf(jwt), 300LL * 1000000) << jwt;
+		EXPECT_LT(lifetimeOf(jwt), 50LL * 60 * 1000000) << jwt;
+	}
 }
 
 TEST(TelephonyLogic, DecodeJwtLifetimeFromARealisticPayload)
@@ -159,13 +220,13 @@ TEST(TelephonyLogic, DecodeJwtLifetimeFallsBackOnAFractionOrAnExponent)
 	// Supersedes the earlier "a fraction is cut, not rounded" (#862). Cutting exp and iat each to
 	// whole seconds can put the lifetime up to a second HIGH, the unsafe direction (exp 101.0 and
 	// iat 100.9 would read as 1 s for 0.1 s), and "1.7e9" used to read as 1. A number with a '.',
-	// 'e' or 'E' after its digits is not read at all, so the lifetime is the 50 minute fallback.
+	// 'e' or 'E' after its digits is not read at all, so the lifetime is the 5 minute fallback (#975).
 	for (const char* payload : {
 	         "{\"iat\":1700000000.2,\"exp\":1700003600.9}", "{\"iat\":1700000000,\"exp\":1700003600.5}",
 	         "{\"iat\":1700000000.5,\"exp\":1700003600}", "{\"iat\":1.7e9,\"exp\":1.7000036e9}",
 	         "{\"iat\":1700000000,\"exp\":1700003600E0}", "{\"iat\":1700000000,\"exp\":17000036e2}"})
 	{
-		EXPECT_EQ(lifetimeOf(makeJwt(payload)), kTokenFallbackLifetimeUs) << payload;
+		EXPECT_EQ(lifetimeOf(makeJwt(payload)), kFiveMinutesUs) << payload;
 	}
 }
 

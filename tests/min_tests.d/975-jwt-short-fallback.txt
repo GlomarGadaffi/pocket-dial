@@ -1,0 +1,9 @@
+# #975, an unparseable JWT is installed with the 5 minute fallback, not 50. Net +5 (a floor line is the net change in the gtest count):
+#   TelephonyAnchorLogic_test.cpp: 3 tests removed (DecodeJwtFallbackOnMalformed, DecodeJwtFallbackOnMissingClaims,
+#   DecodeJwtFallbackOnInsaneSpan: each asserted the 50 minute constant and mixed branches) and 8 added, one per decode-failure branch
+#   of decodeJwtLifetimeUs() plus the mutation guard: TelephonyLogic.DecodeJwtFallbackNoDotsIsFiveMinutes,
+#   DecodeJwtFallbackEmptyPayloadIsFiveMinutes, DecodeJwtFallbackBadBase64IsFiveMinutes, DecodeJwtFallbackZeroBytePayloadIsFiveMinutes,
+#   DecodeJwtFallbackMissingExpIsFiveMinutes, DecodeJwtFallbackMissingIatIsFiveMinutes, DecodeJwtFallbackSpanOutOfRangeIsFiveMinutes,
+#   DecodeJwtFallbackIsFiveMinutesNotFiftyOnEveryFailurePath. FetchTokenOwnCode_test.cpp: expectations moved to 5 minutes, one test
+#   renamed (ANormalSizePayloadIsReadAsBeforeIgnoresExpiresInAndAnUnparseableOneTakesTheFiveMinuteFallback), no count change.
+5
