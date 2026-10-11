@@ -159,6 +159,8 @@ namespace
 		uint16_t   port       = Syslog::kDefaultPort;
 #if SYSLOG_HAS_UDP
 		int        sock       = -1;
+#else
+		Syslog::HostSink hostSink = nullptr;
 #endif
 	};
 
@@ -471,9 +473,23 @@ namespace Syslog
 #else
 		// Off-device there is no socket by design (Syslog.hpp's layering note).
 		// The frame was still built — that path is what tests/Syslog_test.cpp
-		// asserts against, through formatFrame() directly.
+		// asserts against, through formatFrame() directly. A test that wants to see
+		// what send() would have emitted installs a HostSink.
+		if (s.hostSink != nullptr)
+		{
+			s.hostSink(frame, len);
+		}
 #endif
 	}
+
+#if !SYSLOG_HAS_UDP
+	void setHostSink(HostSink sink)
+	{
+		SyslogState& s = state();
+		std::lock_guard<std::mutex> lock(s.mutex);
+		s.hostSink = sink;
+	}
+#endif
 
 	void send(Severity severity, const char* appName, const char* msg)
 	{

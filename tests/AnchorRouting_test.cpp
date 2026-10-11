@@ -30,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "AlertCapture.hpp"
 #include "LoopbackAnchorClient.hpp"
 #include "PoolConfig.hpp"
 #include "RequestsHandler.hpp"
@@ -1152,6 +1153,29 @@ TEST(AnchorRouting, ADegradedConnected911Or933IsKeptUpAndReportedOnce)
 		rig.handler.handle(makeBye("501", dialed, "192.168.9.51", callId));
 		EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
 	}
+}
+
+// #986: this notify runs inside tick(), not handle(): its pbx-911 Alert must leave
+// on tick()'s own flushPass(), unlocked, and exactly once.
+TEST(AnchorRouting, ADegradedConnected911SendsItsPbx911AlertOnTheTickPassOnce)
+{
+	DegradedRig rig("911", "anchor-986-tick");
+	ASSERT_NE(rig.bridge, nullptr);
+	ASSERT_TRUE(rig.degrade());
+	AlertCapture cap;
+	EngineLockProbe probe(rig.handler);
+	AlertCapture::onSend() = [&] { probe.run(); };
+
+	rig.handler.forceNextTickForTest();
+	rig.handler.tick();
+
+	ASSERT_EQ(AlertCapture::frames().size(), 1u);
+	EXPECT_NE(AlertCapture::frames()[0].find("CALL STILL UP, AUDIO DEGRADED"), std::string::npos);
+	EXPECT_TRUE(probe.freeAtRun()) << "tick() sent the Alert with the engine lock held";
+
+	rig.handler.forceNextTickForTest();
+	rig.handler.tick();
+	EXPECT_EQ(AlertCapture::frames().size(), 1u) << "a later tick re-sent a stale Alert";
 }
 
 TEST(AnchorRouting, ADegradedOrdinaryCallIsStillHungUpAndNotReported)

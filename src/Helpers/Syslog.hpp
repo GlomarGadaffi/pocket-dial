@@ -238,6 +238,14 @@ namespace Syslog
 	{
 		send(severity, appName.c_str(), msg.c_str());
 	}
+
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+	// Host tests only: called, under the sink's own lock, with each frame send()
+	// would have put on the wire (it emits nothing off-device). A plain function
+	// pointer, so nothing can dangle; nullptr removes it.
+	using HostSink = void (*)(const char* frame, size_t len);
+	void setHostSink(HostSink sink);
+#endif
 }
 
 #endif // SYSLOG_HPP

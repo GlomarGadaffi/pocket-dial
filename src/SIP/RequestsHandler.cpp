@@ -1348,6 +1348,10 @@ void RequestsHandler::flushPass(
 	// moved into _onHandled above, so nothing here still pins a pooled message.
 	outScratch.clear();
 	logScratch.clear();
+	// #986: the pbx-911 Alert is staged by EmergencyNotifier::notify() under
+	// _mutex and sent here, unlocked, and after the call legs and the MESSAGEs
+	// above: its blocking syslog send must not sit in front of either.
+	_e911Notifier.flushStaged();
 }
 
 std::shared_ptr<Session> RequestsHandler::noteDialogCSeq(std::string_view callID, uint32_t cseq,

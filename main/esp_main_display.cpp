@@ -162,8 +162,16 @@ extern "C" {
     vprintf_like_t original_log_vprintf = NULL;
     int screen_log_vprintf(const char *fmt, va_list tag) {
         char buf[256];
-        int len = vsnprintf(buf, sizeof(buf) - 1, fmt, tag);
+        // vsnprintf consumes its va_list, and original_log_vprintf() below needs
+        // `tag` intact: a second pass over a used va_list is undefined (C11 7.16.1).
+        va_list copy;
+        va_copy(copy, tag);
+        int len = vsnprintf(buf, sizeof(buf) - 1, fmt, copy);
+        va_end(copy);
         if (len > 0) {
+            // vsnprintf returns the length it WOULD have written, not what fit: at most
+            // sizeof(buf) - 2 characters are stored, and the trim below reads buf[len-1].
+            if (len > (int)sizeof(buf) - 2) len = (int)sizeof(buf) - 2;
             // Trim carriage returns and newlines
             while(len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) {
                 buf[len-1] = '\0';
