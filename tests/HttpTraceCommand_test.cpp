@@ -169,11 +169,22 @@ TEST(HttpTraceCommand, ApiTraceRoundTripsRawSipTextWithQuotesAndBackslashes)
 
 	// Give the accept loop a moment to come up rather than a fixed sleep before
 	// the first probe.
-	for (int i = 0; i < 50 && !canConnect(18120); ++i)
+	bool up = false;
+	for (int i = 0; i < 50 && !(up = canConnect(18120)); ++i)
 	{
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
-	ASSERT_TRUE(canConnect(18120));
+	ASSERT_TRUE(up);
+	// #982: each probe is a real connection from 127.0.0.1, and its handler
+	// holds a kMaxConnectionsPerSource share until it has read the EOF. One
+	// probe (no second one above), drained here, so the GET below is never the
+	// third connection from this source and never gets the per-source 503.
+	for (int i = 0; i < 500 && server.activeConnectionsForTest() > 0; ++i)
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	ASSERT_EQ(server.activeConnectionsForTest(), 0)
+		<< "probe connection never drained in 5 s; the GET would be refused 503 (#982)";
 
 	// A synthetic REGISTER whose Authorization header carries a backslash-
 	// escaped quote inside the nonce, the same shape a real digest challenge

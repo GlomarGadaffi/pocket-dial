@@ -642,11 +642,22 @@ TEST(PcapCapture, ApiDiagnosticsPcapServesValidGlobalHeaderAndOneRecordOverRealS
 	server.attachHandler(&handler);
 	server.start();
 
-	for (int i = 0; i < 50 && !canConnect(18116); ++i)
+	bool up = false;
+	for (int i = 0; i < 50 && !(up = canConnect(18116)); ++i)
 	{
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
-	ASSERT_TRUE(canConnect(18116));
+	ASSERT_TRUE(up);
+	// #982: each probe is a real connection from 127.0.0.1, and its handler
+	// holds a kMaxConnectionsPerSource share until it has read the EOF. One
+	// probe (no second one above), drained here, so the GET below is never the
+	// third connection from this source and never gets the per-source 503.
+	for (int i = 0; i < 500 && server.activeConnectionsForTest() > 0; ++i)
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	ASSERT_EQ(server.activeConnectionsForTest(), 0)
+		<< "probe connection never drained in 5 s; the GET would be refused 503 (#982)";
 
 	const sockaddr_in src = addr("192.168.4.80", 5060);
 	const std::string raw =
