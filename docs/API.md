@@ -2952,7 +2952,7 @@ The following matrix audits every outbound HTTP and WebSocket interaction initia
     * `tests/tools/test_anchor_emergency_slot_wait.py` (Issue #743): Pins that `makeCall()` keeps retrying tearing-down slots for emergency calls.
 
 #### Check 2: Token Lifecycle, Expiration Math, and 401 Handling
-* **Token Lifetime**: 3CX bearer tokens carry an official lifetime of 3600 seconds (1 hour). Pocket-Dial inspects the standard JWT claims (`exp - iat`) upon receipt to determine actual token validity dynamically, defaulting to 3000 seconds (50 minutes) if token claim parsing fails.
+* **Token Lifetime**: 3CX bearer tokens carry an official lifetime of 3600 seconds (1 hour). Pocket-Dial inspects the standard JWT claims (`exp - iat`) upon receipt to determine actual token validity dynamically, defaulting to 300 seconds (5 minutes) if token claim parsing fails (#975). The fallback errs short on purpose: the token is installed either way, a 911 POSTs the cached token at once, and a short guess is renewed ahead of the next ordinary call or by the one fetch a 911 makes after a 401. The response's `expires_in` is logged, never used.
 * **Proactive Token Refresh**:
   * Scheduled at $T_{\text{refresh}} = T_{\text{exp}} - 300\text{ s}$ (`kRefreshMarginUs = 300,000,000` µs = 5 minutes prior to expiration).
   * **Critical Streaming Guard**: 3CX immediately invalidates the prior bearer token when issuing a new token. If either anchor slot is actively streaming audio (`isStreamingActive()`), `ensureToken()` defers the refresh cycle until active streams conclude. Attempting to refresh mid-call immediately severs active chunked HTTP audio streams with `401 Unauthorized`.

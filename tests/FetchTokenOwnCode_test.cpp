@@ -463,7 +463,7 @@ TEST(FetchTokenOwnCode, ATokenAtTheLimitIsCachedWholeAndItsHeaderIsBuiltWithNoHe
 	EXPECT_EQ(heap, 0u) << "the string reserved at init() holds the longest token without growing";
 	EXPECT_EQ(std::string(cache.bearer), "Bearer " + token);
 	EXPECT_EQ(std::string(cap.ws), "Authorization: Bearer " + token + "\r\n");
-	EXPECT_EQ(cache.lifetimeUs, telephony::kTokenFallbackLifetimeUs) << "no claims in it: the fallback";
+	EXPECT_EQ(cache.lifetimeUs, telephony::kTokenShortFallbackLifetimeUs) << "no claims in it: the 5 minute fallback (#975)";
 }
 
 TEST(FetchTokenOwnCode, AShortReadIsAnErrorWithNoBytesAndNoTokenTheCachedOneStays)
@@ -580,7 +580,6 @@ TEST(FetchTokenLifetime, PayloadTooBigWithUnreadableClaimsInstallsWithTheFiveMin
 	EXPECT_EQ(heap, 0u);
 	EXPECT_EQ(cache.lifetimeUs, telephony::kTokenShortFallbackLifetimeUs) << "not the 600 s expires_in says";
 	EXPECT_EQ(telephony::kTokenShortFallbackLifetimeUs, 5LL * 60 * 1000000);
-	EXPECT_LT(telephony::kTokenShortFallbackLifetimeUs, telephony::kTokenFallbackLifetimeUs) << "it errs short";
 	EXPECT_EQ(std::string(cache.bearer), "Bearer " + token);
 	EXPECT_EQ(pdwitness::count("token_lifetime_short_951"), 1u);
 }
@@ -637,7 +636,7 @@ TEST(FetchTokenLifetime, ANumberTheScratchCutsThroughIsNeverReadAsIfItWereWhole)
 	EXPECT_EQ(wide.spanS, 3600);
 }
 
-TEST(FetchTokenLifetime, ANormalSizePayloadIsReadAsBeforeIgnoresExpiresInAndAnUnparseableOneKeepsTheOldFallback)
+TEST(FetchTokenLifetime, ANormalSizePayloadIsReadAsBeforeIgnoresExpiresInAndAnUnparseableOneTakesTheFiveMinuteFallback)
 {
 	std::vector<char> scratch(4096);
 	const telephony::TokenLifetime fits =
@@ -646,16 +645,16 @@ TEST(FetchTokenLifetime, ANormalSizePayloadIsReadAsBeforeIgnoresExpiresInAndAnUn
 	    << "Telephony reports expires_in:60 for a token that lives an hour: a payload that fits is not min()'d with it";
 	EXPECT_EQ(fits.spanS, 3600);
 	EXPECT_EQ(fits.expiresInS, 60);
-	// exp and iat missing from a payload that fits: the unchanged #945 fallback, tracked in #975
+	// exp and iat missing from a payload that fits: the 5 minute fallback (#975), not expires_in's 600 and not 50 minutes
 	const std::string noClaims = b64url("{\"alg\":\"none\"}") + "." + b64url("{\"iss\":\"x\"}") + ".sig";
 	const telephony::TokenLifetime unparsed =
 	    telephony::readTokenLifetime("{\"expires_in\":600}", noClaims, scratch.data(), scratch.size());
-	EXPECT_EQ(unparsed.lifetimeUs, telephony::kTokenFallbackLifetimeUs);
+	EXPECT_EQ(unparsed.lifetimeUs, telephony::kTokenShortFallbackLifetimeUs);
+	EXPECT_EQ(unparsed.lifetimeUs, 300LL * 1000000);
 	EXPECT_EQ(unparsed.spanS, -1);
 	EXPECT_EQ(unparsed.expiresInS, 600);
 	EXPECT_EQ(telephony::readTokenLifetime("{}", "not-a-jwt", scratch.data(), scratch.size()).lifetimeUs,
-	          telephony::kTokenFallbackLifetimeUs);
-	EXPECT_EQ(telephony::kTokenFallbackLifetimeUs, 50LL * 60 * 1000000);
+	          telephony::kTokenShortFallbackLifetimeUs);
 }
 
 // token_lifetime_fields_951: the bench's check of what expires_in really is (#951)
@@ -678,9 +677,9 @@ TEST(FetchTokenLifetime, TheLifetimeFieldsWitnessLogsExpiresInTheSpanAndTheLifet
 	ASSERT_EQ(fields.size(), 3u);
 	EXPECT_EQ(fields[0], "anchor: token_lifetime_fields_951: expires_in=60 exp_minus_iat=3600 lifetime_used=3600 "
 	                     "(seconds; -1: not read) (#951)");
-	EXPECT_EQ(fields[1], "anchor: token_lifetime_fields_951: expires_in=-1 exp_minus_iat=-1 lifetime_used=3000 "
+	EXPECT_EQ(fields[1], "anchor: token_lifetime_fields_951: expires_in=-1 exp_minus_iat=-1 lifetime_used=300 "
 	                     "(seconds; -1: not read) (#951)")
-	    << "nothing read: -1 twice, and the unparseable-JWT fallback (#975) as the lifetime";
+	    << "nothing read: -1 twice, and the 5 minute unparseable-JWT fallback (#975) as the lifetime";
 	EXPECT_EQ(fields[2], "anchor: token_lifetime_fields_951: expires_in=900 exp_minus_iat=-1 lifetime_used=300 "
 	                     "(seconds; -1: not read) (#951)")
 	    << "expires_in read and logged, not used";
