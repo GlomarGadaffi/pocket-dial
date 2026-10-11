@@ -408,6 +408,9 @@ add_executable(sip_parser_tests
     UrlEncode_test.cpp
     JsonEscape_test.cpp
     TelephonyAnchorLogic_test.cpp
+    # Issue #948: the 911/933 lane's status GET -- the failure contract on its body arena and the
+    # bounded claim (src/SIP/SosStatusGet.hpp), the code the anchor client's sos lane calls.
+    SosStatusGet_test.cpp
     # #862: the token-body arena and its bounded field scanner (the #948 contract).
     TokenBodyArena_test.cpp
     FetchTokenOwnCode_test.cpp
