@@ -22,26 +22,38 @@ using namespace telephony;
 TEST(TelephonyLogic, Base64UrlDecodesPlainJson)
 {
 	// {"a":1} -> base64url "eyJhIjoxfQ" (no padding)
-	std::vector<uint8_t> out;
-	ASSERT_TRUE(base64UrlDecode("eyJhIjoxfQ", out));
-	std::string s(out.begin(), out.end());
-	EXPECT_EQ(s, "{\"a\":1}");
+	char out[16];
+	std::size_t n = 0;
+	ASSERT_TRUE(base64UrlDecode("eyJhIjoxfQ", out, sizeof out, n));
+	EXPECT_EQ(std::string(out, n), "{\"a\":1}");
 }
 
 TEST(TelephonyLogic, Base64UrlRejectsInvalidByte)
 {
-	std::vector<uint8_t> out;
-	EXPECT_FALSE(base64UrlDecode("not valid!", out));   // space + '!' are non-alphabet
+	char out[16];
+	std::size_t n = 0;
+	EXPECT_FALSE(base64UrlDecode("not valid!", out, sizeof out, n));   // space + '!' are non-alphabet
 }
 
 TEST(TelephonyLogic, Base64UrlHandlesUrlAlphabet)
 {
 	// '-' and '_' are the URL-safe substitutes for '+' and '/'. Decoding must
 	// accept them without requiring a prior translation step.
-	std::vector<uint8_t> a, b;
-	ASSERT_TRUE(base64UrlDecode("-_-_", a));
-	ASSERT_TRUE(base64UrlDecode("+/+/", b));
-	EXPECT_EQ(a, b);   // same bytes either way
+	char a[8], b[8];
+	std::size_t na = 0, nb = 0;
+	ASSERT_TRUE(base64UrlDecode("-_-_", a, sizeof a, na));
+	ASSERT_TRUE(base64UrlDecode("+/+/", b, sizeof b, nb));
+	EXPECT_EQ(std::string(a, na), std::string(b, nb));   // same bytes either way
+}
+
+TEST(TelephonyLogic, Base64UrlRefusesWhatDoesNotFitTheBufferLentToIt)
+{
+	// "eyJhIjoxfQ" is 7 bytes. #951: the buffer is the caller's, so a short one is an error, never a prefix.
+	char out[16];
+	std::size_t n = 0;
+	EXPECT_FALSE(base64UrlDecode("eyJhIjoxfQ", out, 6, n));
+	EXPECT_TRUE(base64UrlDecode("eyJhIjoxfQ", out, 7, n));
+	EXPECT_EQ(n, 7u);
 }
 
 // ── scanJsonNumber ──────────────────────────────────────────────────────────
@@ -93,35 +105,42 @@ static std::string makeJwt(const std::string& payloadJson)
 	return enc("{\"alg\":\"HS256\"}") + "." + enc(payloadJson) + ".sigsig";
 }
 
+// decodeJwtLifetimeUs() is lent its scratch (#951): fetchToken() lends the arena's unused tail.
+static int64_t lifetimeOf(std::string_view jwt)
+{
+	std::vector<char> scratch(jwt.size() + 1);
+	return decodeJwtLifetimeUs(jwt, scratch.data(), scratch.size());
+}
+
 TEST(TelephonyLogic, DecodeJwtLifetimeRealClaims)
 {
 	// exp - iat = 3600s -> 3.6e9 µs.
 	std::string jwt = makeJwt("{\"iat\":1700000000,\"exp\":1700003600}");
-	EXPECT_EQ(decodeJwtLifetimeUs(jwt), 3600LL * 1000000);
+	EXPECT_EQ(lifetimeOf(jwt), 3600LL * 1000000);
 }
 
 TEST(TelephonyLogic, DecodeJwtFallbackOnMalformed)
 {
 	// No dots / one dot / empty payload all fall back to the safe lifetime —
 	// never the bogus OAuth expires_in:60 that would trigger a refresh storm.
-	EXPECT_EQ(decodeJwtLifetimeUs("not-a-jwt"), kTokenFallbackLifetimeUs);
-	EXPECT_EQ(decodeJwtLifetimeUs("header.only"), kTokenFallbackLifetimeUs);
-	EXPECT_EQ(decodeJwtLifetimeUs("a..c"), kTokenFallbackLifetimeUs);
+	EXPECT_EQ(lifetimeOf("not-a-jwt"), kTokenFallbackLifetimeUs);
+	EXPECT_EQ(lifetimeOf("header.only"), kTokenFallbackLifetimeUs);
+	EXPECT_EQ(lifetimeOf("a..c"), kTokenFallbackLifetimeUs);
 }
 
 TEST(TelephonyLogic, DecodeJwtFallbackOnMissingClaims)
 {
 	// Payload decodes but lacks iat — fall back.
-	EXPECT_EQ(decodeJwtLifetimeUs(makeJwt("{\"exp\":1700003600}")), kTokenFallbackLifetimeUs);
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"exp\":1700003600}")), kTokenFallbackLifetimeUs);
 }
 
 TEST(TelephonyLogic, DecodeJwtFallbackOnInsaneSpan)
 {
 	// Negative span (exp before iat) and an over-a-day span are both rejected by
 	// the sanity window -> fallback, not a garbage lifetime.
-	EXPECT_EQ(decodeJwtLifetimeUs(makeJwt("{\"iat\":1700003600,\"exp\":1700000000}")),
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"iat\":1700003600,\"exp\":1700000000}")),
 	          kTokenFallbackLifetimeUs);
-	EXPECT_EQ(decodeJwtLifetimeUs(makeJwt("{\"iat\":1700000000,\"exp\":1700200000}")),
+	EXPECT_EQ(lifetimeOf(makeJwt("{\"iat\":1700000000,\"exp\":1700200000}")),
 	          kTokenFallbackLifetimeUs);   // ~55h
 }
 
@@ -132,7 +151,7 @@ TEST(TelephonyLogic, DecodeJwtLifetimeFromARealisticPayload)
 	const std::string payload =
 	    "{\"iss\":\"https://pbx.example.com\",\"aud\":[\"call_control\"],\"nbf\":1700000000,"
 	    "\"exp\": 1700003600,\"iat\":1700000000,\"client_id\":\"900\",\"scope\":\"exp iat\"}";
-	EXPECT_EQ(decodeJwtLifetimeUs(makeJwt(payload)), 3600LL * 1000000);
+	EXPECT_EQ(lifetimeOf(makeJwt(payload)), 3600LL * 1000000);
 }
 
 TEST(TelephonyLogic, DecodeJwtLifetimeFallsBackOnAFractionOrAnExponent)
@@ -146,7 +165,7 @@ TEST(TelephonyLogic, DecodeJwtLifetimeFallsBackOnAFractionOrAnExponent)
 	         "{\"iat\":1700000000.5,\"exp\":1700003600}", "{\"iat\":1.7e9,\"exp\":1.7000036e9}",
 	         "{\"iat\":1700000000,\"exp\":1700003600E0}", "{\"iat\":1700000000,\"exp\":17000036e2}"})
 	{
-		EXPECT_EQ(decodeJwtLifetimeUs(makeJwt(payload)), kTokenFallbackLifetimeUs) << payload;
+		EXPECT_EQ(lifetimeOf(makeJwt(payload)), kTokenFallbackLifetimeUs) << payload;
 	}
 }
 
@@ -174,26 +193,23 @@ TEST(TelephonyLogic, ScanJsonNumberRefusesWhatItCannotReadExactly)
 	}
 }
 
-TEST(TelephonyLogic, DecodeJwtLifetimeTakesThreeAllocationsAndNoJsonTree)
+TEST(TelephonyLogic, DecodeJwtLifetimeTakesNoHeap)
 {
-	// The token path decodes this on every fetch. payload, decoded bytes and json text are the
-	// three; the cJSON tree and the vector's growth steps are gone.
+	// fetchToken() decodes this on every fetch, into the arena's unused tail (#951). It was three
+	// allocations (payload, decoded bytes, JSON text); the caller lends the scratch now, so none.
 	const std::string jwt = makeJwt(
 	    "{\"iss\":\"https://pbx.example.com\",\"aud\":[\"call_control\"],\"nbf\":1700000000,"
 	    "\"exp\":1700003600,\"iat\":1700000000,\"client_id\":\"900\"}");
+	char scratch[512];
 	int64_t lifetime = 0;
 	std::size_t heap = 0;
 	{
 		AllocGuard g;
-		lifetime = decodeJwtLifetimeUs(jwt);
+		lifetime = decodeJwtLifetimeUs(jwt, scratch, sizeof scratch);
 		heap = g.delta();
 	}
 	EXPECT_EQ(lifetime, 3600LL * 1000000);
-#if !(defined(_MSC_VER) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL > 0)
-	EXPECT_LE(heap, 3u);   // MSVC debug iterators allocate a proxy per container, so the count is not portable there
-#else
-	(void)heap;
-#endif
+	EXPECT_EQ(heap, 0u);
 }
 
 // ── entity-path tokenizer + participant parse ───────────────────────────────

@@ -30,6 +30,8 @@
 #include <string_view>
 #include <vector>
 
+#include "PsramAllocator.hpp"   // #951: the cached bearer string's storage
+#include "UrlEncode.hpp"  // #951: urlEncodeInto(), the token request's credentials without a std::string
 #include "Witness.hpp"   // #862: the 911/933 token witnesses (one-line, no numbers)
 
 namespace telephony
@@ -40,11 +42,26 @@ namespace telephony
 // expires_in (Telephony reports 60s there, which would cause a refresh storm).
 inline constexpr int64_t kTokenFallbackLifetimeUs = 50LL * 60 * 1000000;
 
+// #951: the lifetime of a token whose payload is too big for the scratch and whose claims are not in
+// the start of it: 5 minutes. It errs short on purpose. The 50 minute constant above errs long (a
+// token that really lives 10 minutes would be called valid for 50, and expire under a call), and is
+// left as it is for a payload that cannot be parsed at all (#975). A token this short is never due
+// for the background refresh (maintTokenDue: a lifetime within the 10 minute margin is not), so it
+// is renewed ahead of an ordinary call, or by the one fetch a 911/933 makes after its POST is
+// answered 401. The token is installed whatever is cached: Telephony drops the old token the moment
+// it grants a new one, so keeping the old one would keep a dead token.
+inline constexpr int64_t kTokenShortFallbackLifetimeUs = 5LL * 60 * 1000000;
+
+// What decodeJwtLifetimeUs() returns when the payload's decoded bytes do not fit the scratch it was
+// lent: it did not look, and readTokenLifetime() decides what to do. Not a lifetime (they are positive).
+inline constexpr int64_t kLifetimeNoScratch = -1;
+
 // ── base64url decode (no padding required) ───────────────────────────────────
-// Decodes a JWT payload segment. Accepts the URL alphabet ('-'/'_'), tolerates
-// missing '=' padding, and ignores a trailing partial group. Returns false only
-// if a non-alphabet byte is encountered. Output is appended to `out`.
-inline bool base64UrlDecode(const std::string& in, std::vector<uint8_t>& out)
+// Decodes a JWT payload segment into dst[0..cap). Accepts the URL alphabet ('-'/'_'), tolerates
+// missing '=' padding, and ignores a trailing partial group. Returns false if a non-alphabet byte
+// is met or the bytes do not fit in cap. n is how many were written. The caller lends the buffer,
+// so nothing here allocates (#951).
+inline bool base64UrlDecode(std::string_view in, char* dst, std::size_t cap, std::size_t& n)
 {
 	auto val = [](char c) -> int {
 		if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -57,17 +74,19 @@ inline bool base64UrlDecode(const std::string& in, std::vector<uint8_t>& out)
 
 	uint32_t buf = 0;
 	int bits = 0;
+	n = 0;
 	for (char c : in)
 	{
-		if (c == '=') break;          // padding: stop
+		if (c == '=') break; // padding: stop
 		int v = val(c);
-		if (v < 0) return false;      // invalid byte
+		if (v < 0) return false; // invalid byte
 		buf = (buf << 6) | static_cast<uint32_t>(v);
 		bits += 6;
 		if (bits >= 8)
 		{
 			bits -= 8;
-			out.push_back(static_cast<uint8_t>((buf >> bits) & 0xFF));
+			if (n == cap) return false;
+			dst[n++] = static_cast<char>((buf >> bits) & 0xFF);
 		}
 	}
 	return true;
@@ -79,19 +98,25 @@ inline bool base64UrlDecode(const std::string& in, std::vector<uint8_t>& out)
 // is absent or the value is not numeric. Sufficient for JWT `exp`/`iat` claims,
 // which are integer seconds as Telephony issues them. A number it cannot read exactly (a
 // fraction, an exponent, 19 or more digits) is refused, not cut or wrapped.
-inline bool scanJsonNumber(const std::string& json, const std::string& key, int64_t& out)
+inline bool scanJsonNumber(std::string_view json, std::string_view key, int64_t& out)
 {
-	const std::string needle = "\"" + key + "\"";
+	const size_t needleLen = key.size() + 2; // "key", quotes included; matched in place, no string built
 	size_t pos = 0;
-	while ((pos = json.find(needle, pos)) != std::string::npos)
+	while ((pos = json.find('"', pos)) != std::string_view::npos)
 	{
-		size_t i = pos + needle.size();
+		if (pos + needleLen > json.size() || json.compare(pos + 1, key.size(), key) != 0 ||
+		    json[pos + needleLen - 1] != '"')
+		{
+			++pos;
+			continue;
+		}
+		size_t i = pos + needleLen;
 		// Skip whitespace then a single ':'.
 		while (i < json.size() && (json[i] == ' ' || json[i] == '\t')) ++i;
 		if (i >= json.size() || json[i] != ':')
 		{
-			pos += needle.size();
-			continue;   // a string value that merely contains the key text
+			pos += needleLen;
+			continue; // a string value that merely contains the key text
 		}
 		++i;
 		while (i < json.size() && (json[i] == ' ' || json[i] == '\t')) ++i;
@@ -101,13 +126,13 @@ inline bool scanJsonNumber(const std::string& json, const std::string& key, int6
 		if (json[i] == '-') { neg = true; ++i; }
 		if (i >= json.size() || json[i] < '0' || json[i] > '9')
 		{
-			return false;   // not a number (e.g. a quoted/boolean value)
+			return false; // not a number (e.g. a quoted/boolean value)
 		}
 		int64_t v = 0;
 		int digits = 0;
 		while (i < json.size() && json[i] >= '0' && json[i] <= '9')
 		{
-			if (++digits > 18) return false;   // 19 digits can overflow an int64; no JWT time has them
+			if (++digits > 18) return false; // 19 digits can overflow an int64; no JWT time has them
 			v = v * 10 + (json[i] - '0');
 			++i;
 		}
@@ -124,36 +149,99 @@ inline bool scanJsonNumber(const std::string& json, const std::string& key, int6
 // Decode a JWT's declared lifetime (exp - iat) in microseconds from its payload
 // segment. Returns kTokenFallbackLifetimeUs if anything is unparseable. The span
 // must be positive and under a day, else the fallback.
-inline int64_t decodeJwtLifetimeUs(const std::string& jwt)
+//
+// The payload is decoded into scratch[0..scratchBytes), lent by the caller: fetchToken() lends the
+// arena's unused tail, so this allocates nothing (#951; it was three allocations: the payload, the
+// decoded bytes and the JSON text). A payload whose decoded bytes do not fit returns
+// kLifetimeNoScratch, not a lifetime: readTokenLifetime() decides from there. *spanSecondsOut, if
+// given, is set to exp - iat when the claims were read and the span is sane, and left alone otherwise.
+inline int64_t decodeJwtLifetimeUs(std::string_view jwt, char* scratch, std::size_t scratchBytes,
+                                   int64_t* spanSecondsOut = nullptr)
 {
-	size_t firstDot = jwt.find('.');
-	if (firstDot == std::string::npos) return kTokenFallbackLifetimeUs;
-	size_t secondDot = jwt.find('.', firstDot + 1);
-	if (secondDot == std::string::npos) return kTokenFallbackLifetimeUs;
+	const size_t firstDot = jwt.find('.');
+	if (firstDot == std::string_view::npos) return kTokenFallbackLifetimeUs;
+	const size_t secondDot = jwt.find('.', firstDot + 1);
+	if (secondDot == std::string_view::npos) return kTokenFallbackLifetimeUs;
 
-	std::string payload = jwt.substr(firstDot + 1, secondDot - firstDot - 1);
+	const std::string_view payload = jwt.substr(firstDot + 1, secondDot - firstDot - 1);
 	if (payload.empty()) return kTokenFallbackLifetimeUs;
+	if (payload.size() * 3 / 4 > scratchBytes) return kLifetimeNoScratch;
 
-	std::vector<uint8_t> decoded;
-	decoded.reserve(payload.size());   // one allocation, not a doubling series
-	if (!base64UrlDecode(payload, decoded) || decoded.empty())
+	size_t n = 0;
+	if (!base64UrlDecode(payload, scratch, scratchBytes, n) || n == 0)
 	{
 		return kTokenFallbackLifetimeUs;
 	}
 
-	std::string json(decoded.begin(), decoded.end());
+	const std::string_view json(scratch, n);
 	int64_t exp = 0, iat = 0;
 	if (!scanJsonNumber(json, "exp", exp) || !scanJsonNumber(json, "iat", iat))
 	{
 		return kTokenFallbackLifetimeUs;
 	}
 
-	int64_t span = exp - iat;                 // seconds
-	if (span > 0 && span < 86400)             // sanity: positive, under a day
+	int64_t span = exp - iat; // seconds
+	if (span > 0 && span < 86400) // sanity: positive, under a day
 	{
+		if (spanSecondsOut) *spanSecondsOut = span;
 		return span * 1000000;
 	}
 	return kTokenFallbackLifetimeUs;
+}
+
+// ── The lifetime a fetched token is installed with (#951) ───────────────────────────────────
+// The claims decide it: exp - iat of the token's payload. The response's expires_in is read and
+// logged (token_lifetime_fields_951, the bench check) but never used: the code comments say
+// Telephony reports expires_in:60 for a token that lives about an hour (operator ruling on #951).
+//  * The payload fits the scratch: decodeJwtLifetimeUs(), exactly as before. A payload it cannot
+//    parse (no dots, bad base64, no exp or iat, a span out of range) still takes
+//    kTokenFallbackLifetimeUs; that is unchanged here and tracked in #975.
+//  * The payload does not fit: exp - iat from the start of the payload, decoded as far as the
+//    scratch goes and cut back to its last ',' so a number the cut went through is never read; if
+//    the claims are not in that start, kTokenShortFallbackLifetimeUs (5 minutes, errs short).
+// The token is always installed. Nothing here refuses it, whatever is cached.
+struct TokenLifetime
+{
+	std::int64_t lifetimeUs;   // what the token is installed with; always positive
+	std::int64_t expiresInS;   // the response's expires_in in seconds; -1: not read. Logged, never used
+	std::int64_t spanS;        // exp - iat in seconds; -1: not read
+};
+
+inline TokenLifetime readTokenLifetime(std::string_view body, std::string_view jwt, char* scratch, std::size_t scratchBytes)
+{
+	TokenLifetime t{0, -1, -1};
+	int64_t expiresIn = 0;
+	if (scanJsonNumber(body, "expires_in", expiresIn)) t.expiresInS = expiresIn;
+	t.lifetimeUs = decodeJwtLifetimeUs(jwt, scratch, scratchBytes, &t.spanS);
+	if (t.lifetimeUs != kLifetimeNoScratch) return t;
+
+	PD_WITNESS_W("anchor", "token_lifetime_scratch_951: the token's payload does not fit the arena's unused bytes, so "
+	                       "its claims are read from the start of it (#951)");
+	// decodeJwtLifetimeUs() only answers kLifetimeNoScratch for a payload with both dots around it
+	const size_t firstDot = jwt.find('.');
+	const size_t secondDot = jwt.find('.', firstDot + 1);
+	const std::string_view payload = jwt.substr(firstDot + 1, secondDot - firstDot - 1);
+	size_t n = 0;
+	if (base64UrlDecode(payload, scratch, scratchBytes, n) || n == scratchBytes)   // false at the cap: n bytes are its start
+	{
+		std::string_view head(scratch, n);
+		const size_t comma = head.rfind(',');
+		if (comma != std::string_view::npos)
+		{
+			head = head.substr(0, comma + 1);
+			int64_t exp = 0, iat = 0;
+			if (scanJsonNumber(head, "exp", exp) && scanJsonNumber(head, "iat", iat) && exp - iat > 0 && exp - iat < 86400)
+			{
+				t.spanS = exp - iat;   // the span rule decodeJwtLifetimeUs() applies
+				t.lifetimeUs = t.spanS * 1000000;
+				return t;
+			}
+		}
+	}
+	PD_WITNESS_W("anchor", "token_lifetime_short_951: the token's claims are not in the start of its payload: installed "
+	                       "with the short fallback (#951)");
+	t.lifetimeUs = kTokenShortFallbackLifetimeUs;
+	return t;
 }
 
 // ── WS entity-path tokenizer ─────────────────────────────────────────────────
@@ -616,9 +704,11 @@ private:
 
 // ── The token body: bounded arenas and a bounded scanner (#862) ─────────────────
 // The OAuth token response is read into an arena that is reserved with the client and never
-// grows: no std::vector per read and no spill to the heap. That is the body read only (#945);
-// the rest of the token fetch (the request, the TLS client, the token copies) is not covered
-// here (#951). The contract is the one recorded on #948 for the 911/933 lane:
+// grows: no std::vector per read and no spill to the heap. That was the body read only (#945).
+// #951 slice 1 puts the rest of fetchToken's own buffers in the same claim (the request, the
+// lifetime decode's scratch, the WebSocket header) and keeps the cached token in a string reserved
+// once; what stays is esp_http_client_init and TLS, which are ESP-IDF's. The contract is the one
+// recorded on #948 for the 911/933 lane:
 //   * Fits or fails. A body that does not fit is an error (ArenaFull), never a prefix, and a
 //     failed read (an error, a timeout, a stream that stops short) is an error too. After any
 //     error the arena shows no bytes at all, and the caller keeps the token it already has.
@@ -665,15 +755,31 @@ inline int httpReadResult(int n, bool bodyComplete)
 	return n == kHttpReadTimedOut ? kHttpReadTimedOut : -1;
 }
 
+// The most bytes an access_token may have and still be cached (#951). The cached copy is
+// "Bearer " + token in a string reserved once (BearerHeader::reserve), and the WebSocket's
+// "Authorization: Bearer <token>\r\n" is rebuilt in the lane's arena (wsAuthHeaderInPlace), so the
+// limit is what that line leaves of the arena. A bigger token is refused, never cut. The arena
+// could hold a token of 4077 bytes (it is 4096 less {"access_token":""}); this refuses only
+// 4073 and more, where a Telephony JWT is expected to be 1-2 KB (kTokenBodyBytes).
+inline constexpr char kWsAuthPrefix[] = "Authorization: Bearer ";
+inline constexpr std::size_t kWsAuthPrefixBytes = sizeof(kWsAuthPrefix) - 1;
+inline constexpr std::size_t kWsAuthSuffixBytes = 3; // "\r\n" and the NUL
+inline constexpr std::size_t kMaxTokenBytes = kTokenBodyBytes + 1 - kWsAuthPrefixBytes - kWsAuthSuffixBytes;
+inline constexpr char kBearerPrefix[] = "Bearer ";
+inline constexpr std::size_t kBearerPrefixBytes = sizeof(kBearerPrefix) - 1;
+inline constexpr std::size_t kBearerHeaderBytes = kBearerPrefixBytes + kMaxTokenBytes;
+
 // Whether an access_token from the token response is worth installing (#862). It has to be
-// non-empty and have the two dots of a JWT's three segments, which is what decodeJwtLifetimeUs()
-// and Telephony's tokens assume. Anything else is not installed and the caller keeps the token it
-// has: an empty or garbled one would replace a working token with one every request answers 401.
-enum class TokenCheck : std::uint8_t { Ok, Empty, NotAJwt };
+// non-empty, no longer than kMaxTokenBytes (#951) and have the two dots of a JWT's three segments,
+// which is what decodeJwtLifetimeUs() and Telephony's tokens assume. Anything else is not installed
+// and the caller keeps the token it has: an empty or garbled one would replace a working token with
+// one every request answers 401, and a cut one is the same.
+enum class TokenCheck : std::uint8_t { Ok, Empty, NotAJwt, TooBig };
 
 inline TokenCheck checkToken(std::string_view token)
 {
 	if (token.empty()) return TokenCheck::Empty;
+	if (token.size() > kMaxTokenBytes) return TokenCheck::TooBig;
 	const std::size_t first = token.find('.');
 	if (first == std::string_view::npos || token.find('.', first + 1) == std::string_view::npos)
 	{
@@ -686,11 +792,91 @@ inline const char* tokenCheckName(TokenCheck c)
 {
 	switch (c)
 	{
-		case TokenCheck::Ok:      return "ok";
-		case TokenCheck::Empty:   return "empty";
+		case TokenCheck::Ok: return "ok";
+		case TokenCheck::Empty: return "empty";
 		case TokenCheck::NotAJwt: return "not a JWT (no two dots)";
+		case TokenCheck::TooBig: return "too big for the token cache";
 	}
 	return "?";
+}
+
+// The token request, built where the response will be read (#951). fetchToken() builds it in the
+// claimed lane's arena before any I/O: the arena is empty until the body is read into it, the
+// claim is the lane's alone, and release() wipes it, the client secret with it. So the URL, the
+// form body and the percent-encoding take no heap and no stack. The response overwrites the
+// request later, by which time the client has copied the URL and the body has been written.
+struct TokenRequest
+{
+	const char* url = nullptr;  // NUL-terminated, inside buf
+	const char* body = nullptr; // bodyLen bytes, inside buf
+	std::size_t bodyLen = 0;
+};
+
+// baseUrl + "/connect/token" (the same as tokenUrl()), then the form body with both credentials
+// percent-encoded (a carrier secret commonly holds '+', '/' and '=', which corrupt an unencoded
+// x-www-form-urlencoded body). False when buf (cap bytes) cannot hold all of it: nothing is cut.
+inline bool buildTokenRequest(char* buf, std::size_t cap, std::string_view baseUrl, std::string_view clientId,
+                              std::string_view clientSecret, TokenRequest& out)
+{
+	std::size_t n = 0;
+	auto put = [&](std::string_view s) {
+		if (cap - n < s.size()) return false;
+		if (!s.empty()) std::memcpy(buf + n, s.data(), s.size());
+		n += s.size();
+		return true;
+	};
+	if (!put(baseUrl) || !put("/connect/token") || !put(std::string_view("", 1))) return false;
+	const std::size_t bodyAt = n;
+	if (!put("grant_type=client_credentials&client_id=") || !urlEncodeInto(clientId, buf, cap, n) ||
+	    !put("&client_secret=") || !urlEncodeInto(clientSecret, buf, cap, n))
+	{
+		return false;
+	}
+	out.url = buf;
+	out.body = buf + bodyAt;
+	out.bodyLen = n - bodyAt;
+	return true;
+}
+
+// The cached "Bearer <token>" (TelephonyAnchorClient::_bearerHeader, under _mutex). init() reserves
+// it once for the longest token checkToken() lets through, so set() assigns inside its capacity and
+// never reallocates under the lock. Nothing is cut: a longer token is refused by checkToken() before
+// it gets here. Its storage is PSRAM where the board has it (PsramAllocator: internal DRAM on a
+// board without, or when PSRAM is exhausted, counted in psram::internalFallbacks()), 4 KB that
+// would otherwise sit in the scarce internal heap. Only anchor tasks touch it, and none writes
+// flash (the allocator's rule), and the readers copy it under _mutex: a string copy, not a hot path.
+// The readers are unchanged: `std::string s = _bearerHeader;` converts through operator std::string.
+class BearerHeader
+{
+public:
+	using Storage = std::basic_string<char, std::char_traits<char>, PsramAllocator<char>>;
+
+	void reserve() { _s.reserve(kBearerHeaderBytes); }
+	void set(std::string_view token)
+	{
+		_s.assign(kBearerPrefix, kBearerPrefixBytes);
+		_s.append(token.data(), token.size());
+	}
+	bool        empty() const { return _s.empty(); }
+	std::size_t capacity() const { return _s.capacity(); }
+	operator std::string() const { return std::string(_s.data(), _s.size()); }   // NOLINT: the readers' one copy-out
+
+private:
+	Storage _s;
+};
+
+// Rewrites buf[0..cap) in place into "Authorization: Bearer <token>\r\n" plus a NUL and returns it,
+// or nullptr when that does not fit. `token` is a view into buf (the arena holding the response),
+// which is moved right to make room for the prefix. The caller no longer needs the response by now.
+inline const char* wsAuthHeaderInPlace(char* buf, std::size_t cap, std::string_view token)
+{
+	if (token.size() > cap || cap - token.size() < kWsAuthPrefixBytes + kWsAuthSuffixBytes) return nullptr;
+	std::memmove(buf + kWsAuthPrefixBytes, token.data(), token.size());
+	std::memcpy(buf, kWsAuthPrefix, kWsAuthPrefixBytes);
+	buf[kWsAuthPrefixBytes + token.size()] = '\r';
+	buf[kWsAuthPrefixBytes + token.size() + 1] = '\n';
+	buf[kWsAuthPrefixBytes + token.size() + 2] = '\0';
+	return buf;
 }
 
 enum class BodyStatus : std::uint8_t { Ok, ArenaFull, ReadError, Timeout };
@@ -763,6 +949,14 @@ public:
 
 		char*       data() { return _a->_buf; }
 		std::size_t size() const { return _a->_used; }
+
+		// The claim holder's workspace (#951). data() is the whole arena, capacity() its size.
+		// spare() is what the body does not use: all of it before the read, the tail behind the
+		// body after. Neither moves size(), so a request built before the read is not a body, and
+		// release() wipes whatever was put there.
+		static constexpr std::size_t capacity() { return N + 1; }
+		char*       spare() { return _a->_buf + _a->_used; }
+		std::size_t spareBytes() const { return N + 1 - _a->_used; }
 
 	private:
 		friend BodyArena;
@@ -839,6 +1033,11 @@ inline const char* laneName(TokenLane lane)
 // The sampled witnesses (token_sos_fallback_862, token_install_older_862, token_maint_skip_862) log
 // the first of a boot and then every this-many-th, so a run of them cannot flood the log.
 inline constexpr std::uint32_t kWitnessSampleEvery = 16;
+
+// token_lifetime_fields_951 is logged for the first this-many fetches of a boot and then no more. Not
+// sampled like the lines above: the bench wants the first few fetches whole (expires_in against exp -
+// iat, for #951), and a boot that fetches a token every few minutes must not fill the log with them.
+inline constexpr std::uint32_t kLifetimeFieldsWitnessCap = 8;
 
 // ── The background refresh keeps a token ten minutes from its expiry (#862, #945) ───────────
 // tick() wakes a job on tel_maint when the token is due (maintRefreshWakeDue, atomics only); the job
@@ -1039,6 +1238,32 @@ public:
 		             maintRefreshReasonName(why));
 	}
 
+	// One line per fetch for the first kLifetimeFieldsWitnessCap fetches of a boot (#951): what the
+	// response's expires_in said, what the claims said (exp - iat), and the lifetime the token was
+	// installed with, in seconds, -1 where nothing was read. Durations only: never the token, never
+	// the payload, never the credentials. It is how the bench finds out what expires_in really is.
+	void noteLifetimeFields(const TokenLifetime& t)
+	{
+		if (_lifetimeFieldLines.load(std::memory_order_relaxed) >= kLifetimeFieldsWitnessCap) return;
+		if (_lifetimeFieldLines.fetch_add(1, std::memory_order_relaxed) >= kLifetimeFieldsWitnessCap) return;
+		PD_WITNESS_W("anchor",
+		             "token_lifetime_fields_951: expires_in=%lld exp_minus_iat=%lld lifetime_used=%lld (seconds; -1: not read) (#951)",
+		             static_cast<long long>(t.expiresInS), static_cast<long long>(t.spanS),
+		             static_cast<long long>(t.lifetimeUs / 1000000));
+	}
+
+	// A fetch that was started and did not end in a token it could use: the request did not fit, the
+	// client was not made, the connect, the write or the status failed, the body did not read or the
+	// token was refused (checkToken). One line each, never sampled: a fetch is a TLS handshake, so
+	// they come no faster than that. The token already cached is kept; the reason is in the error
+	// line before this one. It names the lane and nothing else: no number, no credential.
+	void noteFetchFailed(TokenLane lane)
+	{
+		PD_WITNESS_W("anchor",
+		             "token_fetch_failed_951: the %s lane's token fetch failed, the token already cached is kept (#951)",
+		             laneName(lane));
+	}
+
 private:
 	Arena& arena(TokenLane lane)
 	{
@@ -1058,6 +1283,7 @@ private:
 	std::atomic<int>           _emergenciesPending{0};
 	std::atomic<std::uint32_t> _sosCalls{0};
 	std::atomic<std::uint32_t> _maintSkips{0};
+	std::atomic<std::uint32_t> _lifetimeFieldLines{0};
 };
 
 // ── The cache keeps the token whose request was issued last (#862, ruling 2 on #945) ───────

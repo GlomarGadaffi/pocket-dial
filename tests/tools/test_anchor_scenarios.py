@@ -647,6 +647,8 @@ class WitnessSampleTest(unittest.TestCase):
                                   "not hung up (#906)",
         "cdr_callee_dialed_901": "I (99001) pbx: CDR callee is the dialed number (anchor audio write failure) (#901)",
         "ctrl_request_884": "I (52010) TelephonyAnchor: ctrl request: attempt 0 resumed in 131 ms (#884)",
+        "token_lifetime_fields_951": "W (52100) anchor: token_lifetime_fields_951: expires_in=60 exp_minus_iat=3600 "
+                                     "lifetime_used=3600 (seconds; -1: not read) (#951)",
         # #952/#945: main's token witnesses, as TelephonyAnchorClient.cpp and BenchProbe.cpp format them
         "bench_token_age": "W (51000) BenchProbe: BENCHFAULT token_age fired",
         "token_refresh_near_expiry": "I (51100) TelephonyAnchor: Access token near expiry — refreshing",

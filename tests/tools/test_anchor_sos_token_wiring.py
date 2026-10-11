@@ -79,7 +79,7 @@ class SosTokenWiringTest(unittest.TestCase):
         self.assertLess(claim, issued, "stamped after the lane claim, which start() may have waited for")
         self.assertLess(issued, opened, "and before the request is issued")
         gate = self.fetch.index("installed = _tokenGate.installIfNewer(issuedUs);")
-        assign = self.fetch.index("_accessToken.assign(")
+        assign = self.fetch.index("_bearerHeader.set(")
         lock = self.fetch.rindex("std::lock_guard<std::mutex> lock(_mutex);", 0, gate)
         self.assertLess(gate, assign, "the cache is assigned only after the gate says so")
         self.assertIn("if (installed)", self.fetch[gate:assign])

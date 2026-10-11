@@ -155,6 +155,7 @@ bool TelephonyAnchorClient::init(const std::string& baseUrl,
 	_clientId     = clientId;
 	_clientSecret = clientSecret;
 	_sourceDn     = sourceDn;
+	_bearerHeader.reserve();
 	return true;
 }
 
@@ -1005,7 +1006,8 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 	// waits: an ordinary fetch can be in flight beside it, and it carries on regardless. The
 	// background refresh (Maintenance) has one too and never waits either: a lost claim is a skipped
 	// tick, and claimWaiting() leaves the token_maint_skip_862 line for it.
-	// This covers the body read only (#945); the rest of fetchToken is #951.
+	// The arena covers the body read (#945) and, from #951 slice 1, the request, the lifetime decode's
+	// scratch and the WebSocket header. esp_http_client_init and TLS allocate in ESP-IDF; those stay.
 	constexpr int      kClaimWaitPolls  = 50;
 	constexpr uint32_t kClaimWaitPollMs = 100;
 	telephony::TokenLanes::Lease lease = _tokenLanes.claimWaiting(
@@ -1031,30 +1033,32 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 		return false;
 	}
 
-	std::string tokenUrl;
-	std::string clientId, clientSecret;
+	// The request is built in the lane's arena (#951): no heap, no stack, and the client secret is
+	// wiped with the arena when the lease ends. _mutex covers the copy out of the members and
+	// nothing else; the percent-encoding is a bounded loop over the credentials, not I/O.
+	telephony::TokenRequest req;
+	bool built = false;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		tokenUrl = _baseUrl + "/connect/token";
-		clientId = _clientId;
-		clientSecret = _clientSecret;
+		built = telephony::buildTokenRequest(lease.data(), lease.capacity(), _baseUrl, _clientId, _clientSecret, req);
+	}
+	if (!built)
+	{
+		ESP_LOGE(TAG, "Token request (URL and credentials) does not fit the %u byte arena, keeping the token we have",
+		         static_cast<unsigned>(lease.capacity()));
+		_tokenLanes.noteFetchFailed(lane);
+		return false;
 	}
 
-	esp_http_client_handle_t client = makeAuthedClient(tokenUrl, HTTP_METHOD_POST, 1024);
+	esp_http_client_handle_t client = makeAuthedClient(req.url, HTTP_METHOD_POST, 1024);
 	if (!client)
 	{
 		ESP_LOGE(TAG, "Failed to init HTTP client for fetchToken");
+		_tokenLanes.noteFetchFailed(lane);
 		return false;
 	}
 
 	esp_http_client_set_header(client, "Content-Type", "application/x-www-form-urlencoded");
-
-	// Percent-encode both credential values: a real carrier secret commonly
-	// contains '+', '/', '=' (base64-shaped), any of which corrupts an
-	// unencoded x-www-form-urlencoded body -- same urlEncode() this file
-	// already uses for the device_id path segment above.
-	std::string body = "grant_type=client_credentials&client_id=" + urlEncode(clientId) +
-	                   "&client_secret=" + urlEncode(clientSecret);
 
 	// issuedUs is when this request is issued, after the lane claim (start() may have waited for it) and
 	// before the connect: the response is installed only if no later-issued fetch has installed first
@@ -1076,11 +1080,11 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 
 	bool success = false;
 	esp_err_t err = ESP_ERR_TIMEOUT;
-	if (armTokenOpTimeout(client, deadlineUs)) err = esp_http_client_open(client, body.length());
+	if (armTokenOpTimeout(client, deadlineUs)) err = esp_http_client_open(client, static_cast<int>(req.bodyLen));
 	if (err == ESP_OK)
 	{
 		int writeBytes = -1;
-		if (armTokenOpTimeout(client, deadlineUs)) writeBytes = esp_http_client_write(client, body.c_str(), body.length());
+		if (armTokenOpTimeout(client, deadlineUs)) writeBytes = esp_http_client_write(client, req.body, static_cast<int>(req.bodyLen));
 		if (writeBytes >= 0)
 		{
 			int fetch_res = -1;
@@ -1097,34 +1101,31 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 				std::string_view tokenStr;   // views the arena, which `lease` holds until this returns
 				if (readJsonStringField(client, lease, "access_token", tokenStr, deadlineUs) && acceptToken(tokenStr))
 				{
-					// _mutex guards _accessToken/_bearerHeader (std::strings, genuinely need it).
-					// _tokenObtainedUs/_tokenLifetimeUs are std::atomic (#344) and do not
-					// need it -- they're written here under the lock anyway only because
-					// this block already holds it for _accessToken, not because they
-					// require it. Do not read that as redundant and drop the atomics.
-					std::string wsHeaders;   // built under the lock, sent after it is released
+					// The lifetime is exp - iat from the JWT's claims, read before the lock into the arena's unused
+					// tail: CPU only, no heap. The response's expires_in is only logged (#951).
+					const int tokenLen = static_cast<int>(tokenStr.size());
+					const telephony::TokenLifetime life = telephony::readTokenLifetime(
+					    std::string_view(lease.data(), lease.size()), tokenStr, lease.spare(), lease.spareBytes());
+					_tokenLanes.noteLifetimeFields(life);
+					const int64_t lifetimeUs = life.lifetimeUs;
+					// _mutex guards _bearerHeader, reserved at init() for the longest token acceptToken() lets
+					// through, so the install is the gate, one assign inside that capacity and the atomics:
+					// no I/O and no allocation. _tokenObtainedUs/_tokenLifetimeUs are std::atomic (#344) and
+					// do not need it -- they're written here under the lock anyway only because this block
+					// already holds it for _bearerHeader, not because they require it. Do not read that as
+					// redundant and drop the atomics.
 					esp_websocket_client_handle_t ws = nullptr;
-					int      tokenLen = 0;
-					int64_t  lifetimeUs = 0;
-					bool     installed = false;
+					bool installed = false;
 					{
 						std::lock_guard<std::mutex> lock(_mutex);
 						// Decided under the same lock as the assignment, so two landings cannot interleave.
 						installed = _tokenGate.installIfNewer(issuedUs);
 						if (installed)
 						{
-							_accessToken.assign(tokenStr.data(), tokenStr.size());
-							_bearerHeader.assign("Bearer ");
-							_bearerHeader.append(tokenStr.data(), tokenStr.size());
+							_bearerHeader.set(tokenStr);
 							_tokenObtainedUs = esp_timer_get_time();
-							lifetimeUs = telephony::decodeJwtLifetimeUs(_accessToken);
 							_tokenLifetimeUs = lifetimeUs;
-							tokenLen = static_cast<int>(_accessToken.length());
-							if (_wsClient)
-							{
-								ws = _wsClient;
-								wsHeaders = "Authorization: " + _bearerHeader + "\r\n";
-							}
+							ws = _wsClient;
 						}
 					}
 					// Older than the installed token: discarded, and the token that is installed stays.
@@ -1152,7 +1153,19 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 						// taker of _mutex, a 911/933 makeCall() included, for as long as the WS task holds
 						// it. The handle was read under _mutex; shutdownImpl() destroys it without that
 						// lock, a race this block already had and does not widen.
-						esp_websocket_client_set_headers(ws, wsHeaders.c_str());
+						//
+						// #951: the header is rebuilt in the arena, which holds the response and is this
+						// fetch's alone, so it needs no string and does not read the cached token outside
+						// _mutex. acceptToken() has already refused a token that would not fit.
+						const char* wsHeaders = telephony::wsAuthHeaderInPlace(lease.data(), lease.capacity(), tokenStr);
+						if (wsHeaders)
+						{
+							esp_websocket_client_set_headers(ws, wsHeaders);
+						}
+						else
+						{
+							ESP_LOGW(TAG, "WebSocket Authorization header not refreshed: it does not fit the arena");
+						}
 					}
 					if (installed)
 					{
@@ -1179,6 +1192,7 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 	}
 
 	esp_http_client_cleanup(client);
+	if (!success) _tokenLanes.noteFetchFailed(lane);
 	return success;
 }
 
@@ -2376,11 +2390,11 @@ void TelephonyAnchorClient::restartTaskTrampoline(void* arg)
 	self->_restartInFlight.store(false, std::memory_order_release);
 }
 
-esp_http_client_handle_t TelephonyAnchorClient::makeAuthedClient(const std::string& url, esp_http_client_method_t method, int txBufSize, const std::string& token,
+esp_http_client_handle_t TelephonyAnchorClient::makeAuthedClient(const char* url, esp_http_client_method_t method, int txBufSize, const std::string& token,
                                                               http_event_handle_cb onEvent, void* eventUser)
 {
 	esp_http_client_config_t config = {};
-	config.url = url.c_str();
+	config.url = url;
 	config.event_handler = onEvent;
 	config.user_data = eventUser;
 	config.method = method;
