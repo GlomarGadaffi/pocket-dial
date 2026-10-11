@@ -51,6 +51,24 @@ if(DEFINED ENV{IDF_PATH})
         target_compile_definitions(${pd_lwip_lib} PRIVATE "ARP_TABLE_SIZE=40")
     endif()
 
+    # Issues #410 / #328, BENCH ONLY (docs/BENCH_PROBE.md): the HTTP DRAM accounting image
+    # reads lwIP's per-pool memp counters (httpDramAccount.memp). lwIP keeps them only when
+    # MEMP_STATS is 1; its default is (MEMP_MEM_MALLOC == 0), which IDF's MEMP_MEM_MALLOC=1
+    # makes 0, and IDF's Kconfig has no option for it. struct stats_ and struct memp_desc
+    # change layout with it, so lwIP and HttpServer.cpp (main/CMakeLists.txt) must agree.
+    # It needs LWIP_STATS (sdkconfig.defaults.accounting): lwIP's opt.h redefines MEMP_STATS
+    # to 0 without it, so defining it then would break the build, and the image reports
+    # "memp":null instead. A release image (the option off) sets none of this.
+    if(POCKETDIAL_HTTP_DRAM_ACCOUNT)
+        idf_build_get_config(pd_lwip_stats CONFIG_LWIP_STATS)
+        if(pd_lwip_stats)
+            target_compile_definitions(${pd_lwip_lib} PRIVATE "MEMP_STATS=1")
+        else()
+            message(WARNING "POCKETDIAL_HTTP_DRAM_ACCOUNT without CONFIG_LWIP_STATS: httpDramAccount.memp will be null. "
+                            "Use a fresh build directory with -DSDKCONFIG_DEFAULTS=\"sdkconfig.defaults;sdkconfig.defaults.accounting\" (#410)")
+        endif()
+    endif()
+
     # Issue #420: the Ethernet transports leave the SAR ADC entropy source on
     # for their whole uptime (esp_main_eth*.cpp). Fail the build if the linked
     # image ever gains an ADC / RF (or, on lan8720's classic ESP32, I2S) driver
