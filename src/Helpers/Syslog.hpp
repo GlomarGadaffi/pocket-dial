@@ -77,13 +77,19 @@
 // MSGID (§6.2.7) is left free for a future event-class taxonomy.
 //
 // ── Hot-path contract ────────────────────────────────────────────────────────
-// send() formats into a fixed stack buffer and does ONE fire-and-forget UDP
-// send() on a persistent, pre-connected socket: no heap (CLAUDE.md invariant 1),
-// no retry, no queue, no TCP/TLS, and the result is not checked — a dropped
-// syslog line must never cost the calling thread, which may be a real-time task
-// or the log-drain task. Reliable delivery is the aggregator's problem.
+// send() formats into a fixed static buffer and does ONE fire-and-forget UDP
+// ::send() on a persistent, pre-connected socket: no heap (CLAUDE.md invariant 1),
+// no retry, no queue, no TCP/TLS, and the result is not checked. A dropped
+// syslog line is not reported; reliable delivery is the aggregator's problem.
 // `host` must be a NUMERIC IPv4 address: no DNS, so no blocking resolver call
 // and no dependency beyond the socket itself.
+//
+// IT CAN BLOCK. The socket is in blocking mode and the whole of send() runs under
+// the sink's mutex, so on ESP-IDF's lwIP the ::send() can wait on the tcpip
+// thread's mailbox, and every other sender (the log-drain task, and
+// EmergencyNotifier::flushStaged()) waits behind it. Call it with no lock held
+// that the SIP thread needs; the pbx-911 Alert is staged under the engine mutex
+// and sent after it is released for exactly this reason (#986).
 //
 // RE-ENTRANCY RULE: nothing in this file may call ESP_LOGx (or printf to the
 // log). The intended producer is the LogQueue drain task (LogQueue.hpp), so a
@@ -222,8 +228,10 @@ namespace Syslog
 	// NVS refuses the write -- callers surface that rather than silently no-op.
 	bool saveToNvs(const std::string& host, uint16_t port);
 
-	// Emit one frame. No-op when unconfigured. Never blocks, never throws, never
-	// logs (see the RE-ENTRANCY RULE above). `appName` is the event class the
+	// Emit one frame. No-op when unconfigured. Never throws, never logs (see the
+	// RE-ENTRANCY RULE above). It MAY block: it holds the sink's mutex across a
+	// blocking-mode UDP ::send() (see the hot-path contract above), so call it
+	// with no lock held that the SIP thread needs. `appName` is the event class the
 	// collector filters on ("pbx-call", "pbx-register", "pbx-log"); `msg` is free
 	// text, conventionally space-separated key=value pairs.
 	void send(Severity severity, Facility facility, const char* appName, const char* msg);

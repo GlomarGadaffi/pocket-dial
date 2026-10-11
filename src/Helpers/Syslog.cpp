@@ -464,11 +464,14 @@ namespace Syslog
 		}
 
 #if SYSLOG_HAS_UDP
-		// Fire-and-forget. One datagram on a connected UDP socket cannot block
-		// waiting for a peer, and the result is deliberately unchecked: there is
-		// nothing to do about a failure that would not cost the calling thread far
-		// more than the lost line is worth — and logging it would re-enter this
-		// function through the log drain (the RE-ENTRANCY RULE in Syslog.hpp).
+		// Fire-and-forget: one datagram, and the result is deliberately unchecked:
+		// there is nothing to do about a failure that would not cost the calling
+		// thread far more than the lost line is worth — and logging it would
+		// re-enter this function through the log drain (the RE-ENTRANCY RULE in
+		// Syslog.hpp). A connected UDP datagram needs no peer, but this socket is
+		// blocking-mode and s.mutex is held across the call: on lwIP ::send() can
+		// wait on the tcpip thread, and every other caller of send() waits behind
+		// it (#986).
 		::send(s.sock, frame, len, 0);
 #else
 		// Off-device there is no socket by design (Syslog.hpp's layering note).

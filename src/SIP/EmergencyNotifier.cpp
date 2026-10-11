@@ -170,13 +170,18 @@ void EmergencyNotifier::flushStaged()
 			std::lock_guard<std::mutex> lock(_slotMutex);
 			if (!_staged.load())
 			{
-				return;   // another flusher took it between the loop test and here
+				// Another flusher took it between the loop test and here. Look again
+				// rather than leave: a notify that stages in the window before this
+				// unlock, whose flusher try_lock failed against our hold, would be
+				// stranded until the next pass.
+				continue;
 			}
 			// Taken and cleared in one step, before the send: whoever sends a frame
 			// has emptied the slot, so no other flusher can send it again.
 			std::memcpy(_sendBuf, _slot, sizeof(_sendBuf));
 			replaced = _slotOverwritten;
 			_slotOverwritten = 0;
+			_staged.store(false);
 		}
 
 		// The blocking part: Syslog::send holds the syslog mutex across a UDP send().
