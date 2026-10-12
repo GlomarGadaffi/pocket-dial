@@ -101,7 +101,7 @@ The diagram shows the design. The anchor leg is drawn as a port, but it is not o
                                   one 20 ms clock
 ```
 
-- **Handset ports** compand at the rim (µ-law ↔ linear), exactly as `MediaBridge` does now.
+- **Handset ports** compand at the rim (µ-law ↔ linear), exactly as `MediaBridge` does.
 - **Anchor-leg ports** are already linear (`feedRx`/`writeAudio` take `int16_t*`), so they
   need **no compand at all**.
 - The bus sees only int16 frames. The codec edge sits outside the bus.
@@ -315,46 +315,52 @@ mix_sum4_s16:                       # out[i] = sat16(a+b+c+d); args a2=out a3..a
 - **One function per `.S` file** (the S3 gotcha: multiple PIE functions in one file misbehave).
 
 ### 6b. Large/variable N: int32 sum-once-subtract (parity with scalar)
-This matches the scalar reference bit-for-bit, but the vector body needs **int32-lane and
-narrowing ops I have not personally confirmed assemble**:
+This matches the scalar reference bit-for-bit. The vector body needs **int32-lane and
+narrowing ops that are not yet confirmed to assemble**.
 
-> **Status, checked 2026-10-09 against the ESP32-S3 TRM v1.8 and a GNU as probe (issue #171):**
-> - CONFIRMED: `ee.vadds.s32` and `ee.vsubs.s32` exist, saturate, and assemble. `ee.vsubs.s32` computes qy - qx (operand order matters).
-> - NOT FOUND: widening int16 to int32 into QR registers. Widening exists only into QACC (`EE.LDQA.S16.128.IP`, `EE.MOV.S16.QACC`).
-> - NOT FOUND: a QR-to-QR saturating narrow from int32 to int16. `ee.srs.qacc` and `ee.srs.s16.qacc` do not assemble. The only saturating narrow to int16 is `EE.SRCMB.S16.QACC`, which reads QACC.
-> - CORRECTED: the QACC 20-bit segment is the 8-bit case. 16-bit data uses 40-bit segments (TRM section 1.3.3). The safe-leg bound is about 16.7M legs, not about 16. The real ceiling is int16 saturation on readback.
-> - NO int32 readback from QACC exists (TRM section 1.5.3). Readback is EE.SRCMB.S16.QACC (saturates to int16) or the QACC_L/QACC_H store forms (packed 40-bit segments).
-> - Assembles: `ee.zero.qacc`, `ee.vmulas.s16.qacc`, `ee.srcmb.s16.qacc`, `ee.vadds.s16`, `ee.vld.128.ip`, `ee.vst.128.ip`.
->
-> **Status: the vector kernel is NOT built and NOT linked.** `POCKETDIAL_MIXBUS_PIE` is defined nowhere, and `src/SIP/pie/*.S` is in no CMake list. Keep the scalar `mix_accumulate` and `mix_minus_self` bodies, which are correct today. The vector path needs its twin kernels, the CMake entries, and the macro before it can link. Open question before any build: the scalar stand-in clips once, while `mix_sum4_s16.S` saturates per add, so mixed-sign input can differ on-target. Test that before swapping.
+Status, checked 2026-10-09 against the ESP32-S3 TRM v1.8 and a GNU as probe (issue #171):
 
-### 6c. Next honest PIE target: VAD gating
+- Confirmed: `ee.vadds.s32` and `ee.vsubs.s32` exist, saturate, and assemble. `ee.vsubs.s32` computes qy - qx, so operand order matters.
+- Not found: widening int16 to int32 into QR registers. Widening exists only into QACC (`EE.LDQA.S16.128.IP`, `EE.MOV.S16.QACC`).
+- Not found: a QR-to-QR saturating narrow from int32 to int16. `ee.srs.qacc` and `ee.srs.s16.qacc` do not assemble. The only saturating narrow to int16 is `EE.SRCMB.S16.QACC`, which reads QACC.
+- For 16-bit data, QACC uses 40-bit segments (TRM section 1.3.3); the 20-bit segment is the 8-bit case. The safe-leg bound is about 16.7M legs. The real ceiling is int16 saturation on readback.
+- There is no int32 readback from QACC (TRM section 1.5.3). Readback is `EE.SRCMB.S16.QACC` (saturates to int16) or the QACC_L/QACC_H store forms (packed 40-bit segments).
+- Assembles: `ee.zero.qacc`, `ee.vmulas.s16.qacc`, `ee.srcmb.s16.qacc`, `ee.vadds.s16`, `ee.vld.128.ip`, `ee.vst.128.ip`.
+
+**Status:** the vector kernel is not built and not linked. `POCKETDIAL_MIXBUS_PIE` is defined nowhere, and `src/SIP/pie/*.S` is in no CMake list. Keep the scalar `mix_accumulate` and `mix_minus_self` bodies, which are correct. The vector path needs its twin kernels, the CMake entries, and the macro before it can link.
+
+**Open question before any build:** the scalar stand-in clips once, while `mix_sum4_s16.S` saturates per add, so mixed-sign input can differ on target. Test that before swapping.
+
+### 6c. Next PIE target: VAD gating
 When you want it to *sound* like a conference (not just be correct), gate the mix to ports
 that are actually speaking. That drops the noise floor and the clip risk simultaneously, and
 the per-frame energy test is **sum-of-squares**, a clean vector MAC (`ee.vmulas.s16.accx`),
 which is the same kernel shape as a Goertzel/correlation detector.
 
-**Scalar gate shipped, default off (Issue #169).** `MixBus(bool vadGate = false)`; the 888 room
-passes `POCKETDIAL_CONF_VAD` (`PoolConfig.hpp`, default 0, no admin knob). On, `tick()`
+**The scalar gate ships, default off (issue #169).** `MixBus(bool vadGate = false)`; the 888 room
+passes `POCKETDIAL_CONF_VAD` (`PoolConfig.hpp`, default 0, no admin knob). When it is on, `tick()`
 asks `pd::vad::step()` (`src/SIP/VadGate.hpp`, pure) per port per frame. Energy is sum-of-squares
 in int64; the gate opens on the first loud frame and holds for `kHangoverFrames` (10 = 200 ms)
 quiet frames. A gated port's frame is zeroed before the accumulate but the port stays present,
 so it still hears the others and minus-self stays exact. `kOpenEnergy` and the hangover are
-**unmeasured placeholders** pending the .244 idle-vs-speaking energy measurement; an all-quiet room
-becomes digital silence. `MixBus::setEmergency()` exempts a port (Rule 5); no call path sets it
-today, and the REFER/transfer routes into 888 have not been audited for an emergency leg, so
-audit them before enabling `POCKETDIAL_CONF_VAD`. No PIE energy kernel is built.
+**unmeasured placeholders** pending the .244 idle-vs-speaking energy measurement. An all-quiet
+room becomes digital silence.
 
-## 7. Integration with `MediaBridge` (the diff)
+`MixBus::setEmergency()` exempts a port (Rule 5). No call path sets it. The REFER/transfer routes
+into 888 have not been audited for an emergency leg, so audit them before enabling
+`POCKETDIAL_CONF_VAD`, which `PoolConfig.hpp` also pins to 0 at compile time. No PIE energy
+kernel is built.
 
-**Shipped** (Issue #75). `MediaBridge` gained a BUS mode: `init()` takes an optional `MixBus*`,
-and a non-null bus swaps both media callbacks at their far end. `ConferenceRoom`
-(`src/SIP/ConferenceRoom.*`) owns one bus, up to `POCKETDIAL_CONF_LEGS` legs of
-`{RtpReceiver, RtpSender, MediaBridge}`, and the single 20 ms tick driver; `RequestsHandler`
+## 7. Integration with `MediaBridge`
+
+This is the shipped integration (issue #75). `MediaBridge` has a BUS mode: `init()` takes an
+optional `MixBus*`, and a non-null bus swaps both media callbacks at their far end.
+`ConferenceRoom` (`src/SIP/ConferenceRoom.*`) owns one bus, up to `POCKETDIAL_CONF_LEGS` legs of
+`{RtpReceiver, RtpSender, MediaBridge}`, and the single 20 ms tick driver. `RequestsHandler`
 intercepts the virtual extension **`888`** in `onInvite()` (alongside `777`/`999`/`440`/park) and
-joins the caller. The diff as it landed:
+joins the caller. The table compares the 1:1 path with BUS mode.
 
-| Today (`MediaBridge`) | With the bus |
+| `MediaBridge` without the bus | With the bus |
 |---|---|
 | RX cb: `mulawDecodeBuffer` → `_anchor->writeAudio` | RX cb: `mulawDecodeBuffer` → `bus.inputFrame(port, pcm, n)` |
 | TX cb: `_playoutBuffer.read` → `ulawEncodeBuffer` | TX cb: `bus.outputFrame(port, pcm, n)` → `ulawEncodeBuffer` |
@@ -363,17 +369,17 @@ joins the caller. The diff as it landed:
 | `feedRx` writes the single playout buffer | BUS mode refuses it, see the caveat below |
 | one mutex-guarded single bridge | N ports, one shared bus, one tick driver |
 
-The single tick driver replaces nothing in `MediaBridge`: it is one new periodic task inside
-`ConferenceRoom` (Core 0, `RtpSender`'s media priority, on device; a `std::thread` off it).
-Deliberately **not** hung off the existing sender cadence: there are N senders and one bus, so
-that would be N clocks racing to drain the same rings. `ConferenceRoom::tickOnce()` lets the host
-suite step the clock instead of running the driver.
+The single tick driver replaces nothing in `MediaBridge`. It is one new periodic task inside
+`ConferenceRoom` (on Core 0 at `RtpSender`'s media priority on device, or a `std::thread` on the
+host). It is deliberately **not** hung off the existing sender cadence: there are N senders and
+one bus, so that would be N clocks racing to drain the same rings. `ConferenceRoom::tickOnce()`
+lets the host suite step the clock instead of running the driver.
 
-> **Caveat: the anchor leg is still outside the bus.** The row above is the one line of this
-> sketch that did not ship as drawn. A bussed `MediaBridge` holds exactly one port, its handset
-> leg; `feedRx()` returns `false` in BUS mode rather than writing into a `_playoutBuffer` the
-> sender no longer reads. Giving the anchor its own port (and a pump for its return direction) is
-> follow-up work. Nothing in the local conference needs it; handset legs alone are enough ports.
+The anchor leg is still outside the bus. A bussed `MediaBridge` holds exactly one port, its
+handset leg. `feedRx()` returns `false` in BUS mode rather than writing into a `_playoutBuffer`
+that the sender no longer reads. Giving the anchor its own port, and a pump for its return
+direction, is follow-up work. The local conference does not need it, because handset legs alone
+are enough ports.
 
 ## 8. Traps (pre-flight checklist)
 
@@ -381,13 +387,14 @@ suite step the clock instead of running the driver.
    the self-test.)
 2. **Lifetime/concurrency.** The `Free → Active → Draining → Free` state machine; tick is the
    sole ring-clearer. (§5.)
-3. **New input-direction ring.** A 1:1 `MediaBridge` only buffers anchor→handset today; the
-   mixer needs handset→bus buffered too. Same `PlayoutBuffer`, second instance per port.
+3. **New input-direction ring.** A 1:1 `MediaBridge` buffers only anchor→handset. The mixer also
+   needs handset→bus buffering. Same `PlayoutBuffer`, second instance per port.
 4. **Alignment.** 16-byte-align every frame buffer; `frameLen % 8 == 0`. Misaligned `ee.vld.128`
    reads the wrong window silently. (§6.)
-5. **Frame cadence.** Bus `FRAME` must equal the RTP ptime. Mixed ptimes (G.723.1 = 30 ms,
-   G.729 = 10 ms, Opus 2.5–60 ms) need per-port repacketization before the bus, a
-   correctness/jitter problem, not a compute one.
+5. **Frame cadence.** `FRAME` is the ptime this bus sends (160 samples, 20 ms at 8 kHz). A leg at
+   another ptime is absorbed by its input ring. The tick reads only whole frames and leaves any
+   residue for the next tick (#170). Mixed ptimes (G.723.1 = 30 ms, G.729 = 10 ms, Opus
+   2.5–60 ms) are a jitter and latency question, not a compute one.
 6. **Headroom vs. feel.** Naive clip is fine in practice (one or two talkers at once). Add VAD
    gating when you want conference-grade quiet. (§6c.)
 7. **Vectorise last.** Scalar ships and is a rounding error at ≤8 narrowband legs. The PIE
@@ -401,12 +408,12 @@ src/SIP/MixBus.hpp                the bus + per-port state machine
 src/SIP/MixBus.cpp                attach/detach/tick (compiled, -Wall -Wextra clean)
 src/SIP/mix_kernels.h             kernel signatures + POCKETDIAL_MIXBUS_PIE toggle
 src/SIP/mix_kernels_scalar.cpp    correct scalar bodies (the default + fallback)
-src/SIP/pie/mix_sum4_s16.S        confirmed-ISA saturating int16 sum — NOT on the live
+src/SIP/pie/mix_sum4_s16.S        confirmed-ISA saturating int16 sum — not on the live
                                   path: MixBus::tick() calls mix_accumulate/mix_minus_self
-                                  unconditionally (MixBus.cpp:77,84). The only callers of
-                                  mix_sum4_s16 in the tree are tests/MixBus_test.cpp:120,127
-src/SIP/MediaBridge.hpp/.cpp      the transport endcap; BUS mode is §7's diff
-src/SIP/ConferenceRoom.hpp/.cpp   one bus + N legs + THE single tick driver; extension 888
+                                  unconditionally (MixBus.cpp:107,113). The only callers of
+                                  mix_sum4_s16 in the tree are tests/MixBus_test.cpp:167,174
+src/SIP/MediaBridge.hpp/.cpp      the transport endcap; BUS mode is described in §7
+src/SIP/ConferenceRoom.hpp/.cpp   one bus, N legs, and the single tick driver; extension 888
 tests/MixBus_test.cpp             verifies minus-self, no-over-saturation, reclaim (GoogleTest)
 tests/ConferenceRoom_test.cpp     the §7 wiring: N legs through the real µ-law rim, a leg
                                   leaving, the tick driver, and the 888 dial intercept

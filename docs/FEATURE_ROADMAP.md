@@ -8,7 +8,7 @@ Related documents: [ARCHITECTURE.md](ARCHITECTURE.md), [SCALING.md](SCALING.md),
 
 ## The media boundary
 
-pocket-dial does not touch RTP on an ordinary call. That fact still decides what is cheap and what is expensive here. It no longer describes the product as a whole, so stating it as a blanket rule misleads.
+pocket-dial does not touch RTP on an ordinary call. That fact still decides what is cheap and what is expensive here. It does not describe the product as a whole, so stating it as a blanket rule misleads.
 
 Three media paths are in use:
 
@@ -301,7 +301,6 @@ architecture, or, in a couple of cases, simply absent and not planned.
 | **Cloud control plane / remote management** | The device is intentionally self-contained. Note the asymmetry: the *outbound* path deliberately depends on a vendor API or an ITSP's SIP trunk, but nothing reaches *in*. |
 | **Unbounded dynamic allocation for "scale"** | Capacity is set by static pools by design; "scale up" means picking a tier or a wired board, not removing the pre-allocation that guarantees a fragmentation-free hot path. |
 | **DHCP Option 43 multi-vendor provisioning** | Brittle per-vendor TLV encoding; rejected in favour of an Option-66 `dhcpserver` fork. |
-
 
 ## 6. Top 3 recommendations (next-up)
 
