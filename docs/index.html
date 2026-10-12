@@ -102,7 +102,7 @@ cmake --build build --config Release
 <li>Forwarding (unconditional, busy, no answer) and do-not-disturb per extension, with star codes from the handset.</li>
 <li>BLF lamps through the <code>dialog</code> event package (RFC 4235).</li>
 <li>Meet-me conference on <code>888</code>, voicemail, hold music, and a dial plan of up to 16 rules.</li>
-<li>Outside lines through a cloud media anchor (3CX, Apidaze). The carrier-facing SIP trunk is <i>experimental</i>.</li>
+<li>Outside lines through a cloud media anchor (3CX, Apidaze). The direct carrier SIP trunk is shelved in favour of the anchors (<a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/ADR-002-PROGRAMMABLE-MEDIA-ANCHOR.md">ADR-002</a>).</li>
 </ul>
 <p>Not every one of these has run on real hardware yet. The <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/FEATURE_ROADMAP.md">feature roadmap</a> says which have, and which have only passed the host tests.</p>
 
