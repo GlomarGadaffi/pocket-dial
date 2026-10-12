@@ -179,9 +179,8 @@ quoted log line finds its current location.
   (`:4264`) line, and only the ballast can cause one, by chance. In a call that is not answered every GET answer is a
   404 on a kept connection, so the one handshake under pressure is the first open (`startRxIfNeeded()` in
   `makeCall()`, `:603` and its retry at `:614`, before `Successfully initiated call` at `:685`). That is why the
-  ballast is held **before the INVITE**. `get_status=404` and the
-  small `get_max_attempts` only keep the loop in its "not ready" retries for a short call; a 403 would trip the
-  #902 fail-fast and end it with a 503.
+  ballast is held **before the INVITE**. `get_status=404` and the small `get_max_attempts` only keep the loop in
+  its "not ready" retries for a short call; a 403 would trip the #902 fail-fast and end it with a 503.
 - **The witness is derived; the rebuild has no success line.** `:4277-4281` log only a failure (`:4279`, "could not
   rebuild client"). Every loop iteration that does not end it logs exactly one attempt line (`:4202`, `:4253`,
   `:4264`) and cannot `continue` past one, and the only way from a failure at attempt k to the next iteration is
@@ -282,7 +281,7 @@ Written and host-tested without a board: no rig, no 3CX, no phone. The ESP glue
 (`src/SIP/BenchProbe.cpp` and the `#if` blocks) has only been compiled. Every
 scenario's first run is also the first run of the probe on hardware.
 
-`ws_upsert` and `x888_ws_upsert` (#888) are newer still: the probe arm (`benchWsUpsert()`, the `enqueueWsWork()`
+`ws_upsert` and `x888_ws_upsert` (#888) are the least tested: the probe arm (`benchWsUpsert()`, the `enqueueWsWork()`
 refusal, the `tick()` call) was syntax-checked with the release build's compile flags plus
 `-DPOCKETDIAL_ANCHOR_BENCH_PROBE=1`, never linked into a probe image, and its stack use on the SIP task is
 unmeasured. The scenario has run only against the fake board in `tests/tools/test_anchor_scenarios.py`
@@ -296,8 +295,8 @@ log, not read from a line of its own.
 
 ## HTTP DRAM accounting (`POCKETDIAL_HTTP_DRAM_ACCOUNT`)
 
-Issues #410 and #328. A bench-only reading, not a fix. Under HTTP load alone `.244`'s
-`minFreeHeapInternal` fell from 31567 B to 475 B (#947), and nothing said which part of the
+This is a bench-only reading, not a fix (issues #410 and #328). Under HTTP load alone,
+`.244`'s `minFreeHeapInternal` fell from 31567 B to 475 B (#947), and nothing said which part of the
 HTTP path held the bytes. This build option adds one field to `GET /api/status`,
 `httpDramAccount`, that does. Release behaviour is unchanged: the option defaults to `0`
 (`src/SIP/PoolConfig.hpp`), every line it adds sits under `#if POCKETDIAL_HTTP_DRAM_ACCOUNT`
@@ -417,7 +416,8 @@ instants:
 
 1. Reboot, wait for the phones to register, and let the board go idle. Read `/api/status` once
    and write down `freeHeapInternal` (`F0`), `minFreeHeapInternal` (`M0`) and `httpDramAccount`.
-   The request that reads it is itself in flight, so `conns.now` is at least 1 (and `reqBuf.now` is 4096 only if its read buffer is in internal RAM, see the `reqBuf` row).
+   The request that reads it is itself in flight, so `conns.now` is at least 1. `reqBuf.now` is 4096 only if its
+   read buffer is in internal RAM (see the `reqBuf` row).
 2. Run the #961/#947 harness (idle, then dashboard), or `for i in $(seq 4); do curl ... & done`.
 3. Read `/api/status` again: `minFreeHeapInternal` (`M1`) and `httpDramAccount`.
 4. If `M1 < M0` the run set a new low-water mark, and `F0 - M1` is how far internal DRAM fell
@@ -428,40 +428,42 @@ instants:
      the floor was hit.
 5. Per consumer: `taskStack.hwm / 4096` is the peak connection threads, and each live connection
    costs at least `4096` (the stack), plus `4096` for a read buffer that is in internal RAM
-   (`reqBuf` row), before any request text. Before #410 moved the read buffer to PSRAM, with
-   `kMaxConcurrentConnections` at 4 that was `4096 + 4096` each, 32768 B, more than the 31567 B
-   low-water mark at the first read in #947. That is arithmetic from the code, a candidate to
-   confirm or reject with the reading, not a finding.
+   (`reqBuf` row), before any request text. With read buffers in internal RAM and the old cap of 4
+   (before #981), that was 4 x `4096 + 4096` = 32768 B, more than the 31567 B low-water mark at the
+   first read in #947. At the cap of 3 it is 3 x 8192 = 24576 B. That is arithmetic from the code, a
+   candidate to confirm or reject with the reading, not a finding.
 
 ### The lwIP share, and choosing a fix
 
-After #974 moved the read buffer to PSRAM the `.244` bench read `reqBuf` 0 and an accounted peak
-of 16930 B, but the drop under load was 38.4 KB: about 21.5 KB unaccounted (it was 5.4 KB). The
-probes above exist to name that share. This section is the **candidate** and what to read to
-confirm it; the numbers are arithmetic from the code and the config, not readings.
+With the read buffer in PSRAM (#974), the `.244` bench read `reqBuf` 0 and an accounted peak of 16930 B.
+The drop under load was 38.4 KB, so about 21.5 KB was unaccounted. The readings in this section predate #981,
+which lowered the connection cap from 4 to 3. The probes above exist to name that share. This section is the
+**candidate** and what to read to confirm it. The candidate figures below are arithmetic from the code and the
+config, not readings.
 
 **Candidate.** A socket send copies the response into heap pbufs and holds them until the peer
 acknowledges (`tcp_write` with `TCP_WRITE_FLAG_COPY`). Each connection can queue up to
 `CONFIG_LWIP_TCP_SND_BUF_DEFAULT` = 5760 B, four 1440 B segments, each with about 80 B of pbuf,
 header room and `tcp_seg` around it: about 1.06 B of heap per queued byte, 6.1 KB for a full queue.
 The dashboard document is sent in place from flash but still goes through that queue at the pace
-the peer acknowledges, so four browsers loading it hold four full queues for the whole load:
-4 x 6.1 = about 24 KB at the peak, the size of the unaccounted share. Each connection also costs
-what `connCreate` reads beyond its 4096 B stack (the TCB and pthread state) and about 0.7 KB of
+the peer acknowledges, so the dashboard load can hold three full queues at once for the whole load:
+3 x 6.1 = about 18 KB at the peak. At the old cap of 4 the same arithmetic gave 4 x 6.1 = about 24 KB,
+close to the unaccounted share. Each connection also costs what `connCreate` reads beyond its 4096 B stack
+(the TCB and pthread state) and about 0.7 KB of
 `tcp_pcb`, `netconn`, mailbox and semaphore (the `memp` rows size the pools).
 
 **Read after the harness run**, in one `/api/status`: `tcp.httpQueuedBytes.max`, `tcp.queuedBufs.max`,
 `memp` (`TCP_SEG`, `PBUF_REF/ROM`, `NETCONN`, `TCP_PCB` `bytesMax`), `connCreate.min`, `heap.largest.min`,
 `conns.hwm`, `httpPerSourceRefusals` and the busy refusals in the log.
 
-**Proposals** (none applied: no default changes in this change):
+**Proposals.** None is applied, and the defaults are unchanged. The connection cap is already 3, with 2
+connections per source address (`kMaxConcurrentConnections` and `kMaxConnectionsPerSource` in
+`src/Helpers/HttpServer.hpp`, #981). A fourth concurrent request gets a 503. Only the send buffer is still open:
 
-| Option | Expected saving at the four-connection peak | Costs | Pick it when the bench shows |
+| Option | Expected saving at the three-connection peak | Costs | Pick it when the bench shows |
 |---|---|---|---|
-| Smaller send buffer: `CONFIG_LWIP_TCP_SND_BUF_DEFAULT` 5760 to 2880 (the constrained profile's value), with `CONFIG_LWIP_TCP_WND_DEFAULT` left alone | Up to 4 x (5760 - 2880) x 1.06 = 12.2 KB, but only what was queued: about 1.06 x (`httpQueuedBytes.max` - min(`httpQueuedBytes.max`, 11520)) | Throughput of large downloads (two segments in flight; the document and `/api/coredump`, not the polled JSON); no concurrency lost | `tcp.httpQueuedBytes.max` near 4 x 5760 = 23040 (say 17 KB or more): the queues are the eater |
-| Connection cap 4 to 3 (`kMaxConcurrentConnections`) | One connection's whole cost: `connCreate.min` (about 4.7 KB if it reads the TCB at about 600 B) + a full queue 6.1 KB + 0.7 KB = about 11.5 KB | The fourth concurrent request is refused 503, and `kMaxConnectionsPerSource` falls from 3 to 2: a browser's third parallel connection is refused | `conns.hwm` is 4 only briefly, `httpPerSourceRefusals` reads 0 under the real dashboard load at cap 4, and the busy-refusal log is empty |
-| Both | 4 x (4.7 + 6.1 + 0.7) = 46 KB to 3 x (4.7 + 3.1 + 0.7) = 25.4 KB, about 20.6 KB | The two costs above | The first row's condition holds and the second row's saving alone is not enough |
-| Neither | none | | `tcp.httpQueuedBytes.max` is small (under about 8 KB) while the unaccounted share is still large: the queues are not it. Read `heap.largest.min` and `tasks` next and look at the response builders' transients (`std::ostringstream` plus `str()`, see below); do not change either knob on this evidence |
+| Smaller send buffer: `CONFIG_LWIP_TCP_SND_BUF_DEFAULT` 5760 to 2880 (the constrained profile's value), with `CONFIG_LWIP_TCP_WND_DEFAULT` left alone | Up to 3 x (5760 - 2880) x 1.06 = 9.2 KB, but only what was queued: about 1.06 x (`httpQueuedBytes.max` - min(`httpQueuedBytes.max`, 8640)) | Throughput of large downloads (two segments in flight; the document and `/api/coredump`, not the polled JSON); no concurrency lost | `tcp.httpQueuedBytes.max` near 3 x 5760 = 17280, which is all three queues full: the queues are the eater |
+| Neither | none | | `tcp.httpQueuedBytes.max` is small (under about 8 KB) while the unaccounted share is still large: the queues are not it. Read `heap.largest.min` and `tasks` next and look at the response builders' transients (`std::ostringstream` plus `str()`, see below); do not change the send buffer on this evidence |
 
 ### What it cannot see
 
@@ -492,8 +494,7 @@ Host-tested (`HttpDramAccount_test.cpp`, built with the option on and off), and
 `HttpServer.cpp` was compiled on its own with the ESP32-S3 toolchain (esp-15.2.0, flags of an
 existing `eth` build tree): with the option off the object is byte-identical to `origin/main`'s;
 with it on, code grows by 2653 B and `.bss` by 84 B, and `-fstack-usage` gives `handleClient()`
-448 -> 496 B and `sendResponseWithHeader()` 240 -> 256 B. Not done: a link or a full image
-(so no app-slot margin for the option-on image), the classic-ESP32 / `lan8720` and
+448 -> 496 B and `sendResponseWithHeader()` 240 -> 256 B. Not done: the classic-ESP32 / `lan8720` and
 `SIP_CONSTRAINED` profiles, any run on a board, and the first reading on `.244`.
 
 The probes (this section's second half) add to that:
@@ -511,7 +512,7 @@ The probes (this section's second half) add to that:
   `MEMP_STATS=1` under `MEMP_MEM_MALLOC`, and fail with `'MEMP_STATS' redefined` if it is set
   without `LWIP_STATS`, which is why the CMake sets it only when `CONFIG_LWIP_STATS` is on.
 - A full option-on ESP32-S3 `eth` image builds and links (`SipServer.bin` 2302448 B in a 6 MB app
-  slot, 63% free; the option-on image of #973 was 2297136 B).
+  slot, 63% free).
 - Not done: any run on a board, so no `memp`, `tcp` or `connCreate` value has been read; every number
   in the fix table above is arithmetic. The accept loop's 20 ms `select()` and the `tcpip_api_call`
   every 20 ms have not been timed.

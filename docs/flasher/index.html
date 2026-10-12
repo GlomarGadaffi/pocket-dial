@@ -186,7 +186,7 @@ footer{border-top:1px solid var(--rule);margin-top:2em;padding-top:1em;font-size
       <div class="step-num"><span>2</span></div>
       <div>
         <h2>Pick your board</h2>
-        <p class="muted" style="margin:0" id="detect-summary">Every build targets the ESP32-S3, so the chip alone can't say which one you have. The firmware differs by how it reaches the network.</p>
+        <p class="muted" style="margin:0" id="detect-summary">Every published build targets the ESP32-S3, so the chip alone can't say which one you have. The firmware differs by how it reaches the network.</p>
       </div>
     </div>
 
@@ -230,7 +230,7 @@ footer{border-top:1px solid var(--rule);margin-top:2em;padding-top:1em;font-size
 
     <label class="check">
       <input type="checkbox" id="erase-all">
-      <span><strong>Erase the whole chip first.</strong> <span class="muted">Wipes NVS (saved Wi-Fi, admin PIN, extensions) and both OTA slots. Use when moving a board from an old single-<code>factory</code> image to the dual-OTA layout, or to start clean. Adds a few seconds.</span></span>
+      <span><strong>Erase the whole chip first.</strong> <span class="muted">Erases the whole flash: the bootloader, partition table, NVS (saved Wi-Fi, admin PIN, extensions) and both OTA slots. Use when moving a board from an old single-<code>factory</code> image to the dual-OTA layout, or to start clean. Pair it with <em>Full flash</em>: after an erase, <em>App only</em> leaves the board unable to boot until a Full flash is written. Adds a few seconds.</span></span>
     </label>
 
     <!-- Flash-time configuration seed. Collapsed and opted out by default:
@@ -240,9 +240,9 @@ footer{border-top:1px solid var(--rule);margin-top:2em;padding-top:1em;font-size
 
       <p class="muted">Writes a small settings blob to the board's <code>cfgseed</code> partition. The firmware reads it
         once on the next boot, copies what's flagged into NVS, and then ignores it until the flasher writes a newer one.
-        This is the only way to hand a passphrase to the headless <em>Ethernet</em> and <em>Wi-Fi access point</em> builds,
-        which have no screen to show one on &mdash; and, today, the only way to set the SIP registrar's admission mode on
-        any board before its first boot.</p>
+        Until first-use setup replaces the default admin login, this is the only way to hand a passphrase to the headless
+        <em>Wi-Fi access point</em> build, which has no screen to show one on. After that, the dashboard can read and change
+        it. Today it is also the only way to set the SIP registrar's admission mode on any board before its first boot.</p>
 
       <label class="check">
         <input type="checkbox" id="seed-enable">
@@ -272,7 +272,7 @@ footer{border-top:1px solid var(--rule);margin-top:2em;padding-top:1em;font-size
           <p style="margin-bottom:0"><strong>Switching the access point to WPA2 breaks every existing connection.</strong>
             <span class="muted">Phones, ATAs and laptops already associated with the open network cannot rejoin until each
             one is re-paired with the new passphrase. Write the passphrase down before you flash &mdash; on a headless board
-            the only other copy is the serial log.</span></p>
+            before first-use setup, the only other copy is the serial log. After that, the dashboard can show it.</span></p>
         </div>
 
         <div class="field">
@@ -290,7 +290,7 @@ footer{border-top:1px solid var(--rule);margin-top:2em;padding-top:1em;font-size
           <label for="seed-wifi-mode">Wi-Fi mode</label>
           <select id="seed-wifi-mode">
             <option value="keep" selected>Leave as is</option>
-            <option value="0">Captive portal (default)</option>
+            <option value="0">Default (captive portal on the touch display, access point on the Wi-Fi build)</option>
             <option value="1">Station &mdash; join an existing network</option>
             <option value="2">Standalone access point</option>
           </select>
@@ -339,8 +339,10 @@ footer{border-top:1px solid var(--rule);margin-top:2em;padding-top:1em;font-size
             the strongest setting, secure them and switch to <em>Secure</em> from the dashboard.</span></p>
         </div>
 
-        <p class="muted" style="margin-bottom:0">The seed is written on both <em>Full flash</em> and <em>App only</em>, but a board
-          whose partition table predates this feature has no <code>cfgseed</code> partition to read &mdash; run a
+        <p class="muted" style="margin-bottom:0">The seed is written on both <em>Full flash</em> and <em>App only</em>. The Ethernet
+          build has no Wi-Fi radio, so its access-point and Wi-Fi fields have no effect there. A release whose partition table
+          predates this feature has no <code>cfgseed</code> partition for the firmware to read. The page still writes the seed
+          to the fallback address and reports the passphrase as written, but the firmware ignores it. Run a
           <em>Full flash</em> so the new partition table lands too.</p>
       </fieldset>
 
@@ -389,7 +391,7 @@ footer{border-top:1px solid var(--rule);margin-top:2em;padding-top:1em;font-size
   <p><a href="https://github.com/GlomarGadaffi/pocket-dial">pocket-dial</a>
   &middot; <a href="../">project site</a>
   &middot; flashing powered by <a href="https://github.com/espressif/esptool-js">esptool-js</a>
-  &middot; nothing leaves your machine &mdash; firmware is fetched from GitHub and written by your browser</p>
+  &middot; nothing leaves your machine &mdash; firmware is served from this site (GitHub Pages) and written by your browser</p>
 </footer>
 
 </div>
@@ -483,8 +485,9 @@ const PROJECT_NAME = "SipServer";
 // writing 256 bytes into whatever now lives at 0xFFF000.
 //
 // Its absence is also a capability signal: a release built before the partition
-// existed emits no `cfgseed_offset`, and its firmware ignores seeds anyway - the
-// page warns rather than pretending the settings took effect.
+// existed emits no `cfgseed_offset`, and its firmware ignores seeds anyway. In
+// that case the page logs a warning and still writes the seed at this fallback
+// offset, and the done message still reports the passphrase as written.
 const CFGSEED_OFFSET = 0xfff000;
 const DEFAULT_FLASH = { size: "16MB", mode: "dio", freq: "80m" };
 
@@ -623,7 +626,8 @@ function activeSlot(entry0, entry1) {
 //     6     2  flags     SEED_HAS_* bitmask
 //     8     4  gen       generation counter; a UNIX timestamp, so every opt-in
 //                        write is a new value and the firmware applies it once
-//    12     1  wifiMode  0 = captive-portal default, 1 = STATION, 2 = AP
+//    12     1  wifiMode  0 = build default (captive portal on the display build,
+//                        access point on the Wi-Fi build), 1 = STATION, 2 = AP
 //    13     1  regMode   SIP registrar admission: 1 = learn, 2 = secure (matches
 //                        the NVS key "reg_mode"); 0 was open, retired (#500)
 //    14     2  --        reserved, zero
@@ -1327,7 +1331,7 @@ async function readInstalled() {
       $("fact-version").textContent = "none (blank or unrecognised)";
       notice("detect-notice", "info", `<p style="margin-bottom:0">No firmware descriptor found on this board &mdash; it looks blank. Use a <em>Full flash</em>.</p>`);
     }
-    $("detect-summary").textContent = "Every build targets the ESP32-S3, so the chip alone can't say which one you have. Pick by how the board reaches the network.";
+    $("detect-summary").textContent = "Every published build targets the ESP32-S3, so the chip alone can't say which one you have. Pick by how the board reaches the network.";
   } catch (err) {
     logWarn(`Could not read the flash: ${err.message}`);
     $("fact-version").textContent = "unknown (read failed)";
@@ -1466,8 +1470,9 @@ function showDone() {
   const v = VARIANTS[state.selectedVariant];
   setStep("step-progress", "done");
 
-  // On the headless eth/wifi variants this page is the only place the
-  // passphrase is ever shown to a human - the firmware also puts it on the
+  // On the headless Wi-Fi access-point build, until first-use setup replaces the
+  // default admin login the dashboard cannot show the passphrase, so this page is
+  // the only place it is shown to a human. The firmware also puts it on the
   // serial log, but nobody has a serial monitor open at this point. So repeat
   // it here, in the log (so "Copy log" carries it), and behind a copy button.
   let pskBlock = "";
