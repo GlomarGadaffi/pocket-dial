@@ -7,67 +7,48 @@
 <title>pocket-dial: a SIP PBX on an ESP32-S3</title>
 <meta name="description" content="A self-contained SIP PBX that runs on a single ESP32-S3. No router, no server, no cloud. The same C++17 engine builds as a desktop binary.">
 <style>
-html{background:#fefefe}
-body{font-family:"Open Sans",Arial,sans-serif;color:#454545;font-size:16px;margin:2em auto;max-width:800px;padding:1em;line-height:1.4;hyphens:auto;-webkit-hyphens:auto;overflow-wrap:break-word}
-a{color:#07a}a:visited{color:#941352}
-h1{line-height:1.2}
-p.st{margin-top:-1em;font-style:italic}
-code,pre{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9em}
-pre{overflow-x:auto;padding:.6em .8em;background:#f4f4f4;border-left:3px solid #ccc}
+/* Same tokens as the Switchboard dashboard (src/Helpers/index_html.h). */
+:root{--bg:#14100C;--face:#221B15;--face-raised:#2B231C;--ink:#EAE1C8;--ink-dim:#A99A7B;--brass:#B08D52;--brass-hi:#D4AF6A;--brass-lo:#87714A;--line:rgba(176,141,82,.28);--alert:#D26F65;--ringing:#E8C43D;
+ --mono:ui-monospace,"SF Mono","Cascadia Code","Consolas","Liberation Mono",monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Avenir Next",Roboto,sans-serif}
+/* Invert: the same palette on paper. */
+html.inverted{--bg:#EAE1C8;--face:#E2D7BA;--face-raised:#D9CDAD;--ink:#221B15;--ink-dim:#5E5341;--brass:#87714A;--brass-hi:#6E5A36;--brass-lo:#B08D52;--line:rgba(135,113,74,.35);--alert:#A8382E;--ringing:#8A6D00}
+html.contrast{--ink:#fff;--ink-dim:#D9CFB5;--brass-hi:#F0D466;--line:rgba(212,175,106,.6)}
+html.inverted.contrast{--ink:#000;--ink-dim:#3A3226;--brass-hi:#4A3A1C;--line:rgba(74,58,28,.6)}
+html{background:var(--bg)}
+body{font-family:var(--sans);color:var(--ink);background:var(--bg);font-size:16px;margin:2em auto;max-width:800px;padding:1em;line-height:1.5;hyphens:auto;-webkit-hyphens:auto;overflow-wrap:break-word}
+a{color:var(--brass-hi);text-decoration-color:var(--brass-lo);text-underline-offset:.15em}a:visited{color:var(--brass)}a:hover{color:var(--ringing)}
+h1{font-family:var(--mono);font-weight:700;font-size:1.9em;letter-spacing:.14em;text-transform:uppercase;color:var(--ink);line-height:1.2;margin-bottom:.2em}
+h1 .dot{font-style:normal;color:var(--brass-hi)}
+h1 span{color:var(--brass-hi);font-weight:400;font-size:.55em;letter-spacing:.2em;margin-left:.6em;vertical-align:middle}
+h2{font-family:var(--mono);font-weight:600;font-size:.85em;letter-spacing:.1em;text-transform:uppercase;color:var(--brass-hi);margin:2.4em 0 .8em;padding-bottom:.4em;border-bottom:1px solid var(--line)}
+p.st{margin-top:0;color:var(--ink-dim);font-style:italic}
+b{color:var(--ink)}
+code,pre{font-family:var(--mono);font-size:.9em}
+code{color:var(--brass-hi)}
+pre{overflow-x:auto;padding:.7em .9em;background:var(--face);border:1px solid var(--line);border-left:3px solid var(--brass);border-radius:2px}
+pre code{color:var(--ink)}
 table{border-collapse:collapse;width:100%;font-size:.95em}
-th,td{text-align:left;padding:.3em .6em .3em 0;border-bottom:1px solid #ddd;vertical-align:top}
-img{max-width:100%;height:auto}
+th{font-family:var(--mono);font-weight:600;font-size:.75em;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-dim)}
+th,td{text-align:left;padding:.45em .8em .45em 0;border-bottom:1px solid var(--line);vertical-align:top}
+img{max-width:100%;height:auto;display:block;border:1px solid var(--line);border-radius:3px;box-shadow:0 2px 4px rgba(0,0,0,.5)}
 figure{margin:1.5em 0}
-figcaption{font-size:.8em}
+figcaption{font-family:var(--mono);font-size:.75em;color:var(--ink-dim);margin-top:.6em}
 small{font-size:.75em}
-.wr{color:#c0392b;font-weight:600}
-nav{font-size:.9em}
-footer{margin-top:3em;font-size:.85em}
-button.ci{cursor:pointer;border-radius:2px;position:fixed;right:10px;font-size:.8em;text-decoration:underline;border:0;padding:2px 5px;font-family:inherit}
-#contrast{top:10px;color:#000;background:#f0f0f0}
-#invmode{top:34px;color:#fff;background:#000}
+.wr{color:var(--alert);font-weight:600}
+nav{font-family:var(--mono);font-size:.8em;letter-spacing:.04em;color:var(--ink-dim)}
+footer{margin-top:3em;padding-top:1em;border-top:1px solid var(--line);font-size:.85em;color:var(--ink-dim)}
+button.ci{cursor:pointer;position:fixed;right:10px;font-family:var(--mono);font-size:.7em;letter-spacing:.1em;text-transform:uppercase;color:var(--brass-hi);background:var(--face-raised);border:1px solid var(--brass-lo);border-radius:2px;padding:4px 8px}
+button.ci:hover{color:var(--ringing);border-color:var(--brass-hi)}
+#contrast{top:10px}#invmode{top:40px}
 @media screen and (max-width:1080px){button.ci{position:absolute}}
-@media screen and (max-width:500px){th,td{padding-right:.3em}}
-
-/* high contrast */
-html.contrast body{color:#050505}
-html.contrast a{color:#03f}html.contrast a:visited{color:#7d013e}
-html.contrast .wr{color:#800}
-
-/* dark: either the OS asks for it and the reader has not inverted, or the OS
-   is light and the reader has inverted */
-@media (prefers-color-scheme:dark){
- html:not(.inverted){background:#000}
- html:not(.inverted) body{color:#d9d9d9}
- html:not(.inverted) a{color:#00a2e7}html:not(.inverted) a:visited{color:#ca1a70}
- html:not(.inverted) .wr{color:#d24637}
- html:not(.inverted) pre{background:#111;border-color:#444}
- html:not(.inverted) th,html:not(.inverted) td{border-color:#333}
- html:not(.inverted) #contrast{color:#fff;background:#000}
- html:not(.inverted).contrast body{color:#fff}
- html:not(.inverted).contrast a{color:#44c7ff}html:not(.inverted).contrast a:visited{color:#e9579e}
- html:not(.inverted).contrast .wr{color:#db695d}
- html.inverted #invmode{color:#000;background:#f0f0f0}
-}
-@media (prefers-color-scheme:light){
- html.inverted{background:#000}
- html.inverted body{color:#d9d9d9}
- html.inverted a{color:#00a2e7}html.inverted a:visited{color:#ca1a70}
- html.inverted .wr{color:#d24637}
- html.inverted pre{background:#111;border-color:#444}
- html.inverted th,html.inverted td{border-color:#333}
- html.inverted #contrast,html.inverted #invmode{color:#fff;background:#000}
- html.inverted.contrast body{color:#fff}
- html.inverted.contrast a{color:#44c7ff}html.inverted.contrast a:visited{color:#e9579e}
- html.inverted.contrast .wr{color:#db695d}
-}
+@media screen and (max-width:500px){th,td{padding-right:.5em}h1{font-size:1.5em;letter-spacing:.1em}h1 span{display:block;margin:.3em 0 0}}
 </style>
 </head>
 <body>
 <button class="ci" id="contrast" type="button">Contrast</button>
 <button class="ci" id="invmode" type="button">Invert</button>
 
-<h1>pocket-dial</h1>
+<h1>pocket<i class="dot">&middot;</i>dial<span>switchboard</span></h1>
 <p class="st">A SIP PBX on one ESP32-S3. No router, no server, no cloud.</p>
 
 <nav><a href="flasher/">Flash a board</a> · <a href="#quickstart">Quickstart</a> · <a href="#features">Features</a> · <a href="#hardware">Hardware</a> · <a href="#security">Security</a> · <a href="https://github.com/GlomarGadaffi/pocket-dial">Source</a> · <a href="https://github.com/GlomarGadaffi/pocket-dial/releases">Releases</a></nav>
