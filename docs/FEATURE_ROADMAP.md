@@ -50,8 +50,8 @@ The cheap/expensive axis still holds, and it is now measurable. Signalling featu
 |-----------|-------|-------|
 | Registrar + back-to-back call broker | `REGISTER`, `INVITE`, `ACK`, `BYE`, `CANCEL`, `OPTIONS`, provisional/final responses | `src/SIP/RequestsHandler.cpp` |
 | **SIP digest auth (RFC 2617)** | Implemented and operable. The default is `learn` (#441), and `open` is retired (#500/#502). Learn challenges Secured devices. Secure mode challenges every extension (see §1.4). Bypasses found in review are fixed: #507 by #487 (an ARP miss no longer admits a Secured extension without digest), #560 by #562 (the relayed ACK and re-INVITE/UPDATE no longer carry the INVITE's credential), #525 by #570 (a reused nonce or `nc` is re-challenged) and #549 by #555. | `src/Helpers/SipDigest.*`, `src/SIP/Registrar.*` |
-| Blind transfer (REFER) | Source-authorized against the dialog's own legs (#133). Moves the **transferee**: a new dialog to the target carries B's media, the transferor A is BYEd, and the A–B leg is kept. The old inverted topology (#197) is fixed by #211, and `tests/BlindTransfer_test.cpp` pins the corrected one. Unresolvable targets no longer destroy the call (#203). Remaining: the NOTIFY reports `200` as soon as the INVITE is queued, with no `100 Trying` progress. | `onRefer` |
-| Attended transfer (REFER + Replaces, RFC 3891) | Splices B and C, BYEs A out of both, relays a later BYE across the bridge. The hardcoded `CSeq: 100` of #257 was removed by its own fix (#308, per-dialog floors). #402 replaced those floors with `nextServerCSeq()` (`src/SIP/Session.hpp`). Only REFER `?Replaces=` is handled; an INVITE carrying `Replaces` (BLF pickup) is not. | `onRefer`, `handleTransferOk` |
+| Blind transfer (REFER) | Source-authorized against the dialog's own legs (#133). Moves the **transferee**: a new dialog to the target carries B's media, the transferor A is BYEd, and the A–B leg is kept. The inverted topology reported in #197 is fixed by #211, and `tests/BlindTransfer_test.cpp` pins the corrected topology. Unresolvable targets no longer destroy the call (#203). Remaining: the NOTIFY reports `200` as soon as the INVITE is queued, with no `100 Trying` progress. | `onRefer` |
+| Attended transfer (REFER + Replaces, RFC 3891) | Splices B and C, BYEs A out of both, relays a later BYE across the bridge. The hardcoded `CSeq: 100` of #257 is gone: #308 added per-dialog floors, and #402 replaced those with `nextServerCSeq()` (`src/SIP/Session.hpp`). Only REFER `?Replaces=` is handled; an INVITE carrying `Replaces` (BLF pickup) is not. | `onRefer`, `handleTransferOk` |
 | Hold / resume | Re-INVITE relayed with its **SDP** untouched, so the SDP survives. `Contact` is rewritten on every relayed re-INVITE (#425; see the `Contact` comment in `onReinvite`). | `onReinvite`, `onOk` |
 | RFC 3311 `UPDATE` | | `onUpdate` |
 | RFC 4028 session timers | Advertises `Supported: timer` (#198). An initial INVITE with too small a `Session-Expires` gets `422` + `Min-SE` (#591), and PBX-authored 2xx answers name `refresher=uac` (#724). | `armSessionTimer`, `answerSessionTimer` |
@@ -203,7 +203,7 @@ BLF, paging zones, pickup) are in §1. What remains is below.
 | P0 (done) | SIP digest auth (RFC 2617) | Shipped and operable via `/api/registrar` + the `cfgseed` `regMode` field. See the P0 above for what is left. | N/A |
 | P1 (done, #530) | **Per-IP brute-force tracking on login** | Done in #530: `req.clientIp` is set on every request. Residuals: the per-principal aggregate backstop still lets one address lock the admin out after 20 failures (THREAT_MODEL D-3), and web-login keys can evict the DTMF PIN's bucket (#561). | **S** |
 | **P1** | **Sign the OTA image** | Images are unsigned; the only controls are the admin session and the local link. | **S** (interim gate) / **L** (real signing) |
-| **P2** | **Secure Boot v2 + flash encryption + signed OTA** | Durable fix for the physical/supply-chain boundary; encrypts NVS at rest (Wi-Fi password, admin hash, **carrier API secrets**, which now exist and did not when this row was written). One-way eFuse burn, so it needs a secured factory flow. | **L** |
+| **P2** | **Secure Boot v2 + flash encryption + signed OTA** | Durable fix for the physical/supply-chain boundary; encrypts NVS at rest (Wi-Fi password, admin hash, **carrier API secrets**). One-way eFuse burn, so it needs a secured factory flow. | **L** |
 | **P2** | **Optional self-signed HTTPS for the dashboard** | Still not the primary control. Browser-warning UX is bad on a LAN appliance, TLS costs MCU RAM/CPU, and it protects only the dashboard. Documented add-on **on top of** WPA2. | **M** |
 | **P2** | **SRTP** | App-layer media encryption. WPA2 already encrypts media at the link layer for far less. Low priority given how little media the board carries. | **L** |
 
@@ -215,9 +215,9 @@ BLF, paging zones, pickup) are in §1. What remains is below.
 | **P1** | **Provisioning dashboard editor** | MAC→ext map, adoption window, capacity meter against `MAX_CLIENTS`, per-MAC token regen. The registrar roster is already surfaced; this is the editing half. | **M** |
 | **P1** | **Confirm the Yealink key set against a handset** | The `.cfg` renderer has never been validated by a phone consuming it. A T29 is now on the bench, so this is finally testable. | **S** (test) |
 | **P2** | **DHCP Option 66 true zero-touch** | Removes the typed URL. Requires forking the bundled `dhcpserver`; IDF-version-sensitive. | **M–L** |
-| ~~P2~~ **DONE** | **Multi-vendor provisioning** (Grandstream / Polycom / Cisco SPA) | **Shipped (#177, routing #234)**, ahead of the Yealink confirmation this row said it should wait for. None of the four renderers has been confirmed against a physical handset; see the row above. | N/A |
-| ~~P1~~ **DONE** | Live SIP tracer + PCAP export | Shipped: `/api/trace`, `/api/pcap`, `/api/diagnostics/pcap`, and a trace terminal in the dashboard. | N/A |
-| ~~P1~~ **DONE** | Zero-touch provisioning MVP | Shipped, with the Open-mode caveat in §2. | N/A |
+| P2 (done) | **Multi-vendor provisioning** (Grandstream / Polycom / Cisco SPA) | **Shipped (#177, routing #234).** None of the four renderers has been confirmed against a physical handset (see §2). | N/A |
+| P1 (done) | Live SIP tracer + PCAP export | Shipped: `/api/trace`, `/api/pcap`, `/api/diagnostics/pcap`, and a trace terminal in the dashboard. | N/A |
+| P1 (done) | Zero-touch provisioning MVP | Shipped. See the provisioning row in §2. | N/A |
 
 ## 4. Suggested sequencing
 
@@ -252,7 +252,7 @@ Iteration E+ ── Bigger bets
 
 Why this order:
 
-- **Verification first** because the project just crossed from "tested" to "tested and, in
+- **Verification first** because the project has moved from "tested" to "tested and, in
   one narrow path, *true*". The gap between those two words is now the largest risk in the
   codebase, and closing it costs bench time rather than design.
 - **The registrar default before any new hardening** because the expensive part (digest
@@ -281,26 +281,13 @@ architecture, or, in a couple of cases, simply absent and not planned.
 | **CDR export / billing** | The CDR is a 32-record NVS ring read over `GET /api/cdr`, plus, on SD builds, a per-day CSV archive on the card (§1.1). There is no download/export route for the archive, no persistence across a factory reset (both are wiped), and no billing model. |
 | **Fax / T.38, video** | Absent. T.38 would need a media path with timing guarantees this board does not offer. |
 | **Multi-tenancy** | One registrar, one flat extension space, one conference room. Not a gap, a scope boundary. |
-| **E911 location, emergency pre-emption** | Emergency *dialing* exists (§1.1, #166): `911`/`9911`/`933` bypass the dial plan, go to a real anchor provider or else the configured SIP trunk, trigger an on-site notification, and get `503 Emergency Call Not Routable` rather than a `404` when there is no route; since #538 the loopback simulator never answers one (#521, closed). What does **not** exist: **no location is conveyed to the PSAP** (`EmergencyNotifier.hpp:56`), an emergency call **does not pre-empt** a busy anchor slot, and **no route has been proved on a live call** (#546: the trunk route is reported as soon as it is configured; #550: an extension named like a prefixed emergency number, fix #564 open). Do not deploy this as anyone's only means of calling for help. |
+| **E911 location, emergency pre-emption** | Emergency *dialing* exists (§1.1, #166): `911`, `9911` and `933` bypass the dial plan, go only to a real anchor provider, trigger an on-site notification, and get `503 Emergency Call Not Routable` rather than a `404` when there is no route. The loopback simulator never answers one (#521, #538). What does **not** exist: **no location is conveyed to the PSAP** (`EmergencyNotifier.hpp`), an emergency call **does not pre-empt** a busy anchor slot, and **no route has been proved on a live call** (#550: an extension named like a prefixed emergency number, fix #564 open). **Warning:** do not deploy this as anyone's only means of calling for help. |
 | **TLS/SIPS signalling and SRTP as primary transport security** | On a LAN appliance, self-signed certs trigger browser warnings, cost MCU RAM/CPU, and protect only one leg. WPA2 encrypts dashboard, SIP and RTP together for far less. HTTPS/SRTP remain documented *optional* add-ons (§3.3). |
 | **WebRTC NAT traversal (ICE/TURN); TURN relay on-MCU** | Peer-mesh/WebRTC tools, and a TURN *server* would put N relayed media streams on the MCU. |
 | **Cloud control plane / remote management** | The device is intentionally self-contained. Note the asymmetry: the *outbound* path deliberately depends on a vendor API or an ITSP's SIP trunk, but nothing reaches *in*. |
 | **Unbounded dynamic allocation for "scale"** | Capacity is set by static pools by design; "scale up" means picking a tier or a wired board, not removing the pre-allocation that guarantees a fragmentation-free hot path. |
 | **DHCP Option 43 multi-vendor provisioning** | Brittle per-vendor TLV encoding; rejected in favour of an Option-66 `dhcpserver` fork. |
 
-> **Removed from this section (2026-06-09 → 2026-09-13):** "on-MCU media mixing /
-> conferencing wired into live calls" was listed here as a non-goal *while `MixBus` was
-> simultaneously described in §1 as wired up and dialable as `888`*. The §1 description was
-> the correct one. On-MCU mixing is shipped, capped at 4 legs, and is an opt-in exception to
-> the peer-to-peer default rather than a violation of it. Likewise "wideband / G.722
-> negotiation" was listed as a non-goal; relayed peer-to-peer legs **do** admit G.722 today,
-> and only the legs the board terminates itself refuse it.
->
-> **Removed 2026-09-27 (#401):** "Voicemail (on-device record/playback)" and
-> "music-on-hold" were listed here while both had shipped: on-device voicemail (#246) and
-> MoH on park and on held anchor calls (#162, #218), both in §1.2. "Special 911 / emergency
-> handling: there is none" was replaced by what is actually missing, because emergency
-> dialing (#166) exists; the do-not-rely-on-it warning stays.
 
 ## 6. Top 3 recommendations (next-up)
 
@@ -313,9 +300,8 @@ architecture, or, in a couple of cases, simply absent and not planned.
    fully closed: a Learned extension's INVITE is admitted unchallenged, though it must now
    come from the caller's registered address (#503).
 3. **Prove emergency dialing on hardware.** A default board now refuses a 911 it cannot
-   route (`503`, #538; #521 closed). What remains is a live 933 test call over a real
-   route, and verifying the trunk route before reporting it (#546).
+   route (`503`, #538; #521 closed). What remains is a live 933 test call over the anchor
+   route.
 
-(Config import/export, the previous third item, shipped in #186. Outbound E.164
-normalization is the strongest remaining *telephony* item: trunking works today for
-exactly one dial habit.)
+Outbound E.164 normalization is the strongest remaining *telephony* item: trunking works
+today for exactly one dial habit.
