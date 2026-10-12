@@ -25,7 +25,8 @@
 // Concurrency & Real-Time Model:
 // - SPI transmit is synchronous (spi_device_polling_transmit takes 52-85 us).
 // - Buffers are borrowed only for the duration of template copy + patchTick +
-//   transmitL2, then immediately returned.
+//   transmitL2 (twice when EgressChannel::transmit retries a driver error, #999),
+//   then immediately returned.
 // - At most 3 RTOS tasks ever transmit RTP (rtp_media_tx, hold_music_tx,
 //   conf_mix_tick). On a dual-core ESP32-S3, at most 2 cores execute at once.
 // - Sized to POCKETDIAL_DMA_FRAME_POOL_SIZE (default 6 frames, ~3.3 KB total).

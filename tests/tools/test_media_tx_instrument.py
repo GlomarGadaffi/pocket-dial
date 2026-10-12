@@ -79,8 +79,8 @@ class TheRecordingCallsOnlyRecord(unittest.TestCase):
 
     def test_the_recording_functions_are_only_atomic_arithmetic(self):
         for sig in (r"static void recordWrite\(", r"static void recordTickMiss\(", r"static void recordFeedFrame\(",
-                    r"static void recordL2Fail\(", r"static void noteSlow\(", r"void add\(",
-                    r"static void raiseTo\("):
+                    r"static void recordL2Fail\(", r"static void recordL2RetryOk\(", r"static void noteSlow\(",
+                    r"void add\(", r"static void raiseTo\("):
             body = func_body(self.stats, sig)
             for bad in FORBIDDEN_IN_THE_HOT_PATH:
                 self.assertNotIn(bad, body, sig + ": " + bad)
@@ -187,13 +187,74 @@ class TheStatusBlock(unittest.TestCase):
         hist = func_body(self.hs, r"static void pdAppendMediaTxHist\(")
         keys = set(re.findall(r'\\"([A-Za-z0-9]+)\\":', body + hist))
         self.assertTrue({"mediaTx", "nodelay", "write", "legOver", "hold", "feed", "l2", "build", "tx", "poolMin",
-                         "errPoolEmpty", "errZeroLen", "errNoHandle", "errDriver", "fallbackSendFail"} <= keys, keys)
+                         "errPoolEmpty", "errZeroLen", "errNoHandle", "errDriver", "retryOk",
+                         "fallbackSendFail"} <= keys, keys)
         # the field table's mediaTx rows, up to the note after the table
         start = self.api.index("| `mediaTx` |")
         rows = self.api[start:self.api.index("> **Task-Watchdog coverage", start)]
         for key in sorted(keys):
             self.assertRegex(rows, r"[`.]" + re.escape(key) + r"\b", "docs/API.md does not document mediaTx key " + key)
         self.assertIn("POST /api/media-tx", self.api)
+
+
+class TheL2RetryLivesInTransmitAndNowhereElse(unittest.TestCase):
+    """#999: one immediate retry of a driver error. Both producers (RtpSender::runLoop and
+    HoldMusic::runLoop) reach the driver through EgressChannel::transmit, so the retry is there
+    once; MediaTx_test.cpp holds the behaviour, this holds the shape the host cannot see."""
+
+    def setUp(self):
+        self.t = func_body(code("Helpers/L2RtpFrame.cpp"), r"bool EgressChannel::transmit\(")
+
+    def test_the_second_hand_off_is_the_same_frame_and_only_a_driver_error_reaches_it(self):
+        t = self.t
+        self.assertEqual(t.count("EthAccess::transmitL2("), 2)
+        self.assertIn("EthAccess::TxStatus status = EthAccess::transmitL2(frame.data(), len);", t)
+        gate = re.search(r"const bool retried = \(status == EthAccess::TxStatus::DriverError\);\s*"
+                         r"if \(retried\)\s*\{\s*status = EthAccess::transmitL2\(frame\.data\(\), len\);\s*\}", t)
+        self.assertIsNotNone(gate, "the retry is gated on DriverError and on nothing else")
+        self.assertLess(t.index("EthAccess::transmitL2("), gate.start(), "the retry follows the first attempt")
+        # one frame: not drawn again, not rebuilt
+        self.assertEqual(t.count("DmaFramePool::acquire("), 1)
+        self.assertEqual(t.count("patchTick("), 1)
+
+    def test_it_adds_no_wait_no_loop_and_no_clock_read(self):
+        t = self.t
+        for bad in ("for (", "while (", "do {", "taskYIELD", "vTaskDelay", "esp_rom_delay_us", "ets_delay_us",
+                    "usleep", "sleep_for", "xTask"):
+            self.assertNotIn(bad, t, "EgressChannel::transmit: " + bad)
+        self.assertEqual(t.count("nowUs()"), 3, "the three stamps of #985, none inside the retry")
+
+    def test_the_hand_off_stamp_is_taken_after_the_retry_and_a_rescue_is_not_a_failure(self):
+        t = self.t
+        gate_end = re.search(r"if \(retried\)\s*\{\s*status = EthAccess::transmitL2\(frame\.data\(\), len\);\s*\}", t).end()
+        self.assertGreater(t.index("const uint32_t t2 = pd::MediaTx::nowUs();"), gate_end,
+                           "l2.tx covers both attempts")
+        ok = re.search(r"if \(status == EthAccess::TxStatus::Ok\)\s*\{\s*if \(retried\)\s*\{\s*"
+                       r"pd::MediaTx::recordL2RetryOk\(\);\s*\}\s*return true;\s*\}", t)
+        self.assertIsNotNone(ok, "a retry that was accepted counts retryOk and returns true")
+        self.assertEqual(t.count("recordL2RetryOk("), 1)
+        # the failure counter is picked from the FINAL status, once
+        self.assertEqual(t.count("recordL2Fail("), 3)
+        self.assertIn("recordL2Fail(status == EthAccess::TxStatus::NoHandle", t)
+        self.assertLess(ok.end(), t.index("recordL2Fail(status =="))
+
+    def test_neither_producer_has_a_retry_of_its_own(self):
+        for path in ("SIP/RtpSender.cpp", "SIP/HoldMusic.cpp"):
+            text = code(path)
+            self.assertEqual(text.count("l2Channel.transmit("), 1, path)
+            for bad in ("transmitL2", "TxStatus", "DriverError", "recordL2RetryOk"):
+                self.assertNotIn(bad, text, path + ": " + bad)
+        users = [p for p, text in src_files() if "recordL2RetryOk(" in text]
+        self.assertEqual(sorted(users), ["Helpers/L2RtpFrame.cpp", "SIP/MediaTxStats.hpp"])
+
+    def test_retryok_sits_between_errdriver_and_fallbacksendfail_and_the_docs_state_the_sum(self):
+        body = func_body(code("Helpers/HttpServer.cpp"), r"static void pdAppendMediaTx\(JsonOut& json\)")
+        self.assertLess(body.index(r'\"errDriver\"'), body.index(r'\"retryOk\"'))
+        self.assertLess(body.index(r'\"retryOk\"'), body.index(r'\"fallbackSendFail\"'))
+        self.assertIn("pd::MediaTx::l2RetryOk()", body)
+        stats = code("SIP/MediaTxStats.hpp")
+        self.assertIn("s_.l2RetryOk.store(0, kRelaxed);", stats, "zeroed with its neighbours")
+        self.assertIn("first attempts that failed = `errDriver` + `retryOk`", read("docs/API.md", REPO))
 
 
 class TheNagleSwitch(unittest.TestCase):

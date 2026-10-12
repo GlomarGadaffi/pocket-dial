@@ -202,6 +202,9 @@ namespace l2rtp
 		// Each false return from a ready channel is counted once, by cause, in pd::MediaTx
 		// (#985: pool empty, zero-length frame, no eth handle, driver error); a not-ready
 		// channel is not a transmit attempt and counts nothing.
+		// #999: a driver error is retried once, immediately, with the same frame. A retry that
+		// is accepted returns true and counts in retryOk instead of errDriver; one that fails
+		// too counts errDriver once. The l2.tx histogram covers both attempts.
 		bool transmit(bool marker, uint8_t payloadType, uint16_t seq, uint32_t timestamp,
 		              const uint8_t* payload, size_t payloadLen);
 	};

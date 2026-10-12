@@ -240,7 +240,7 @@ TEST(HttpStatusAlloc, TheMediaTxBlockIsOnStatusAsSummariesAndCarriesTheNagleFlag
 		",\"hold\":{\"miss\":0,\"maxOverrun\":0},\"feed\":{\"n\":0,\"late\":0,\"max\":0}"
 		",\"l2\":{\"build\":" + zeroHist() + ",\"tx\":" + zeroHist() +
 		",\"poolMin\":" + std::to_string(l2rtp::DmaFramePool::kPoolSize) +
-		",\"errPoolEmpty\":0,\"errZeroLen\":0,\"errNoHandle\":0,\"errDriver\":0,\"fallbackSendFail\":0}}";
+		",\"errPoolEmpty\":0,\"errZeroLen\":0,\"errNoHandle\":0,\"errDriver\":0,\"retryOk\":0,\"fallbackSendFail\":0}}";
 	for (bool authed : {false, true})
 	{
 		SCOPED_TRACE(authed ? "with session" : "anonymous");
@@ -253,6 +253,7 @@ TEST(HttpStatusAlloc, TheMediaTxBlockIsOnStatusAsSummariesAndCarriesTheNagleFlag
 	pd::MediaTx::recordTickMiss(7000);
 	pd::MediaTx::recordFeedFrame(0, 100, 100 + 50000);
 	pd::MediaTx::recordL2Fail(pd::MediaTx::L2Fail::Driver);
+	pd::MediaTx::recordL2RetryOk();   // #999
 	pd::MediaTx::recordFallbackSendFail();
 	pd::MediaTx::setNodelay(true);
 	const std::string live = b.serve(false);
@@ -260,7 +261,7 @@ TEST(HttpStatusAlloc, TheMediaTxBlockIsOnStatusAsSummariesAndCarriesTheNagleFlag
 	          std::string::npos) << live;
 	EXPECT_NE(live.find("\"hold\":{\"miss\":1,\"maxOverrun\":7000}"), std::string::npos) << live;
 	EXPECT_NE(live.find("\"feed\":{\"n\":1,\"late\":1,\"max\":50000}"), std::string::npos) << live;
-	EXPECT_NE(live.find("\"errDriver\":1,\"fallbackSendFail\":1}}"), std::string::npos) << live;
+	EXPECT_NE(live.find("\"errDriver\":1,\"retryOk\":1,\"fallbackSendFail\":1}}"), std::string::npos) << live;
 }
 
 TEST(HttpStatusAlloc, TheMutexHoldIsOnStatus)
