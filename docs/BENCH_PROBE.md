@@ -200,13 +200,14 @@ quoted log line finds its current location.
   pins every one of these lines, the `3`, and the absence of a `continue` in the loop to the source, and fails if a
   success line is added, so the witness can then be made direct. The line would go right after the
   `if (!recreateGetClient()) {... break;}` block at `:4277-4281` (no `else`: the `if` breaks).
-- **Verdicts.** `PASS`: both faults fired, exactly one anchored leg, a rebuild witness (a failure followed by the next attempt),
-  the board answered `/api/status` after the release with a later uptime and the same reset reason, no panic line,
-  no coredump, no `ORPHANED` line, one drop. `FAIL`: any of the last five, a hang or reboot after the release, a
-  second rx task on the leg (#370's shape), a CANCEL not answered 200. `INVALID`: no transport failure (the
-  ballast did not bite), a failure with no next attempt, a lone "could not rebuild", no leg (the far end never rang; with the ballast held
-  across `makeCall()`'s POST that can be the pressure itself), the ballast not taking (`held` false), a `409`, the
-  dead-man releasing it first.
+- **Verdicts.** The run is `PASS` when both faults fired, there is exactly one anchored leg, a rebuild witness shows
+  (a failure followed by the next attempt), the board answers `/api/status` after the release with a later uptime and
+  the same reset reason, and there is no panic line, no coredump, no `ORPHANED` line and one drop. It is `FAIL` when
+  any of the last five checks in that list fails, on a second rx task on the leg (#370's shape), or on a CANCEL not
+  answered 200. It is `INVALID` for no transport failure (the ballast did not bite), a failure with no next attempt,
+  a lone "could not rebuild" line, no leg (the far end never rang; with the ballast held across `makeCall()`'s POST
+  that can be the pressure itself), the ballast not taking (`held` false), a `409`, or the dead-man releasing it
+  first.
 - **Pressure rules.** The board's HTTP may not answer while the ballast is held. The run makes no HTTP request
   between the hold and the release (`CANCEL` timing reads the syslog), starts no status logger (a second poller
   is load on the thing measured), releases first thing after the call and again in a `finally`
@@ -219,6 +220,17 @@ quoted log line finds its current location.
   pressure: the #349 ORPHAN variant (a live billable leg on 3CX) is possible, which the approval excludes (see
   `makecall_read_fail` above). An `ORPHANED` line is a `FAIL` with a note to check the route point. If the ballast
   makes the POST fail instead, the run is `INVALID` (no leg); raise `ballast_bytes` to ease it.
+
+The failure path of the GET loop, as the witness rows read it:
+
+```mermaid
+flowchart TD
+    A["GET attempt k fails: transport failure or open failed"] --> B{"Third transport failure in a row?"}
+    B -->|yes| C["Give up: consecutive transport failures"]
+    B -->|no| D{"recreateGetClient() returns true?"}
+    D -->|no| E["Give up: could not rebuild client"]
+    D -->|yes| F["Attempt k+1 on the rebuilt handle"]
+```
 
 ## Rule 5: 911 and 933 come first
 
@@ -239,6 +251,15 @@ quoted log line finds its current location.
   Undoing it keeps `ensureToken()` from refetching ahead of the 911.
 - **A fill in progress gives way.** A ballast fill checks the emergency gate before
   every block, and gives everything back if an emergency appears mid-fill.
+
+The fire decision for a fault site:
+
+```mermaid
+flowchart TD
+    A["A fault site is reached"] --> B{"Destination marked emergency, or an emergency session live?"}
+    B -->|no| C["The fault fires"]
+    B -->|yes| D["Disarm every fault and count emergencySkips for that fault"]
+```
 
 None of this has been exercised with a real emergency call, and it must not be.
 The host tests pin the decisions (`tests/BenchProbeLogic_test.cpp`).
@@ -335,7 +356,7 @@ the moment the **total** last set a new high. Everything is bytes except `conns`
 | `total` | Every row above added up, as `now` and as `hwm`. **`total.hwm` is the most the HTTP path ever held at once.** The rows' own `hwm` values peak at different instants and do not add up to it. |
 | `respBodyMax` | The largest single body counted in `respBody`. |
 | `conns` | Connection threads: `now` and the most ever alive at once. The board does not report this anywhere else (#947). |
-| `spawnFailures` | `connection thread spawn failed` events (stderr only until now). Non-zero means the heap floor was reached. |
+| `spawnFailures` | `connection thread spawn failed` events, which are otherwise written only to stderr. Non-zero means the heap floor was reached. |
 
 Counts are blocks the code asked for, by capacity; allocator overhead per block is not in them.
 A body, string or buffer is counted only if it is in internal RAM at the moment of counting
