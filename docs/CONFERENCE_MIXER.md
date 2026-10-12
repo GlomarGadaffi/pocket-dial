@@ -1,9 +1,10 @@
 # pocket-dial: Conference Mix Bus
 
-The summing junction for N-way audio on the ESP32-S3. This document covers the mix, the one
-operation that turns pocket-dial's anchored-media path into an N-way conference bridge: the
-design, the scalar reference that ships, the concurrency model, and the PIE vector kernels,
-with notes on which instructions are confirmed and which still need toolchain verification.
+This document covers the mix: the one operation that turns pocket-dial's anchored-media path
+(`MediaBridge` plus an `AnchorClient` implementation) into an N-way conference bridge on the
+ESP32-S3. It covers the design, the scalar reference that ships, the concurrency model, and the
+PIE vector kernels, and marks which instructions are confirmed and which still need toolchain
+verification.
 
 ## 0. Context and goals
 
@@ -38,7 +39,7 @@ board is in the media path for `440`, `555`, `888`, an outbound trunk call, and 
 with music on hold loaded. Two parts of the goal did not happen. Ordinary calls are still
 peer-to-peer and never touch `MixBus`, so the 1:1 special case is not retired. The anchor leg
 is still outside the bus: in BUS mode `MediaBridge` holds exactly one port, and `feedRx()`
-returns `false` (`MediaBridge.cpp:410-413`).
+returns `false` (the BUS-mode check in `src/SIP/MediaBridge.cpp`).
 
 ### Non-goals
 Transcoding (still G.711 at the rim, linear within), and per-codec edges beyond what
@@ -366,7 +367,7 @@ joins the caller. The table compares the 1:1 path with BUS mode.
 | TX cb: `_playoutBuffer.read` → `ulawEncodeBuffer` | TX cb: `bus.outputFrame(port, pcm, n)` → `ulawEncodeBuffer` |
 | `startBridge`: wire callbacks | `startBridge`: `port = bus.attach();` then wire |
 | `stopBridge`: stop sockets | `stopBridge`: `bus.detach(port);` then stop sockets |
-| `feedRx` writes the single playout buffer | BUS mode refuses it, see the caveat below |
+| `feedRx` writes the single playout buffer | BUS mode refuses it (see below) |
 | one mutex-guarded single bridge | N ports, one shared bus, one tick driver |
 
 The single tick driver replaces nothing in `MediaBridge`. It is one new periodic task inside
@@ -410,8 +411,8 @@ src/SIP/mix_kernels.h             kernel signatures + POCKETDIAL_MIXBUS_PIE togg
 src/SIP/mix_kernels_scalar.cpp    correct scalar bodies (the default + fallback)
 src/SIP/pie/mix_sum4_s16.S        confirmed-ISA saturating int16 sum — not on the live
                                   path: MixBus::tick() calls mix_accumulate/mix_minus_self
-                                  unconditionally (MixBus.cpp:107,113). The only callers of
-                                  mix_sum4_s16 in the tree are tests/MixBus_test.cpp:167,174
+                                  unconditionally (MixBus.cpp). The only callers of
+                                  mix_sum4_s16 in the tree are in tests/MixBus_test.cpp
 src/SIP/MediaBridge.hpp/.cpp      the transport endcap; BUS mode is described in §7
 src/SIP/ConferenceRoom.hpp/.cpp   one bus, N legs, and the single tick driver; extension 888
 tests/MixBus_test.cpp             verifies minus-self, no-over-saturation, reclaim (GoogleTest)
