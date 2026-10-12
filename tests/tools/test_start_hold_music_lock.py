@@ -28,7 +28,7 @@ class StartHoldMusicLockTest(unittest.TestCase):
         # every queueLog() is preceded, in its own lambda/block, by a _mutex lock
         for m in re.finditer(r"queueLog\(", b):
             before = b[: m.start()]
-            self.assertRegex(before[before.rfind("{"):], r"lock_guard<std::mutex>\s+\w+\(_mutex\)",
+            self.assertRegex(before[before.rfind("{"):], r"lock_guard<pd::TimedMutex>\s+\w+\(_mutex\)",
                              "queueLog() in startHoldMusic() without _mutex held")
 
     def test_clip_io_not_under_mutex(self):
