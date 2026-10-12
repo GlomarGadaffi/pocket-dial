@@ -32,9 +32,11 @@ namespace
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	Slot<kDevicesCap>* s_devices = nullptr;
 	Slot<kForwardsCap>* s_forwards = nullptr;
+	Slot<kDidMapCap>* s_didmap = nullptr;
 #else
 	Slot<kDevicesCap> s_devices;
 	Slot<kForwardsCap> s_forwards;
+	Slot<kDidMapCap> s_didmap;
 #endif
 	// The writer's own copy of whatever it took, sized to the largest key. The
 	// writer is one task and takes one item at a time, so one scratch serves all.
@@ -45,18 +47,26 @@ namespace
 	std::array<SlotRef, kKeyCount> slotRefs()
 	{
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-		return {refOf(*s_devices), refOf(*s_forwards)};   // index order == Key
+		return {refOf(*s_devices), refOf(*s_forwards), refOf(*s_didmap)};   // index order == Key
 #else
-		return {refOf(s_devices), refOf(s_forwards)};
+		return {refOf(s_devices), refOf(s_forwards), refOf(s_didmap)};
 #endif
 	}
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	constexpr const char* kTag = "nvs_writer";
 
+	// The pbxcfg string keys. Key::DidMap has none: it is not one string, and
+	// nvsSink() hands it to DidMapping before this is ever asked.
 	const char* nvsKeyName(Key k)
 	{
-		return (k == Key::Devices) ? "devices" : "forwards";
+		switch (k)
+		{
+		case Key::Devices:  return "devices";
+		case Key::Forwards: return "forwards";
+		case Key::DidMap:   break;
+		}
+		return "?";
 	}
 
 	// One zeroed slot from PSRAM, or internal heap if PSRAM is absent or full
@@ -74,8 +84,10 @@ namespace
 	{
 		psram::freePreferPsram(s_devices);
 		psram::freePreferPsram(s_forwards);
+		psram::freePreferPsram(s_didmap);
 		s_devices = nullptr;
 		s_forwards = nullptr;
+		s_didmap = nullptr;
 	}
 
 	// One length-1 FreeRTOS queue per key. A queue copies the whole item in under
@@ -140,6 +152,17 @@ namespace
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	bool nvsSink(Key k, const char* blob, size_t len)
 	{
+		if (k == Key::DidMap)
+		{
+			// Its own namespace and a per-slot sequence, in DidMapping where the
+			// keys live. `blob` is the writer's internal scratch, never the slot.
+			const bool ok = DidMapping::writeSnapshot(blob, len);
+			if (!ok)
+			{
+				ESP_LOGW(kTag, "DID table not saved (%u bytes)", static_cast<unsigned>(len));
+			}
+			return ok;
+		}
 		nvs_handle_t h = 0;
 		esp_err_t e = nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h);
 		if (e != ESP_OK)
@@ -201,9 +224,10 @@ void start()
 	// writer NotRunning, so a stage() can never reach a null slot.
 	s_devices = allocSlot<Slot<kDevicesCap>>();
 	s_forwards = allocSlot<Slot<kForwardsCap>>();
-	if (s_devices == nullptr || s_forwards == nullptr)
+	s_didmap = allocSlot<Slot<kDidMapCap>>();
+	if (s_devices == nullptr || s_forwards == nullptr || s_didmap == nullptr)
 	{
-		ESP_LOGE(kTag, "staging slot allocation failed -- device table and forwards will not persist");
+		ESP_LOGE(kTag, "staging slot allocation failed -- device table, forwards and DID table will not persist");
 		freeSlots();
 		started = false;
 		return;
@@ -226,7 +250,7 @@ void start()
 		}
 		if (t.q[i] == nullptr)
 		{
-			ESP_LOGE(kTag, "queue create failed -- device table and forwards will not persist");
+			ESP_LOGE(kTag, "queue create failed -- device table, forwards and DID table will not persist");
 			deleteQueues(t);
 			freeSlots();
 			started = false;
@@ -236,7 +260,7 @@ void start()
 	TaskHandle_t handle = nullptr;
 	if (xTaskCreatePinnedToCore(nvsWriterTask, "nvs_writer", 6144, nullptr, 1, &handle, 0) != pdPASS)
 	{
-		ESP_LOGE(kTag, "xTaskCreate nvs_writer failed -- device table and forwards will not persist");
+		ESP_LOGE(kTag, "xTaskCreate nvs_writer failed -- device table, forwards and DID table will not persist");
 		deleteQueues(t);
 		freeSlots();
 		started = false;

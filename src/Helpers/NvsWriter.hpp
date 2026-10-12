@@ -4,9 +4,12 @@
 // NvsWriterLogic.hpp; this is the sizes, the instance, and (board only) the
 // queues and the pinned task. First callers: Registrar::persistDevices() and
 // PbxFeatureConfig::persistForwards(), both under RequestsHandler::_mutex.
+// Slice 4 adds DidMapping::persist() (Key::DidMap), whose write is not one
+// nvs_set_str but DidMapping::writeSnapshot()'s per-slot sequence.
 
 #include <cstddef>
 
+#include "DidMapping.hpp"
 #include "FunctionRef.hpp"
 #include "NvsWriterLogic.hpp"
 #include "PoolConfig.hpp"
@@ -28,7 +31,13 @@ namespace nvswriter
 	// so there is no smaller bound than the NVS limit itself.
 	constexpr size_t kForwardsCap = kNvsStrMax;
 
-	constexpr size_t kScratchCap = (kDevicesCap > kForwardsCap) ? kDevicesCap : kForwardsCap;
+	// The DID table is a fixed-layout snapshot (DidMapping::kSnapshotLen bytes and
+	// the NUL), never a string handed to nvs_set_str, so the NVS limit does not
+	// apply to it; a field that does not fit its cell is refused at stage time.
+	constexpr size_t kDidMapCap = DidMapping::kSnapshotCap;
+
+	constexpr size_t maxOf(size_t a, size_t b) { return (a > b) ? a : b; }
+	constexpr size_t kScratchCap = maxOf(maxOf(kDevicesCap, kForwardsCap), kDidMapCap);
 
 	// Boot-time and idempotent (loadDevices / loadPbxConfig call it before any
 	// handler dispatches). Board: creates the queues and the task. Host: nothing.

@@ -806,12 +806,17 @@ public:
 	// getDidMappings() backs GET /api/did-mapping; setDidMapping()/
 	// removeDidMapping() back PUT/DELETE respectively ("" on success, else a
 	// short operator-facing error — removeDidMapping is idempotent, so it is
-	// always ""). clearAllDidMappings() backs /api/factory-reset (wipes the
-	// whole table) -- see DidMapping::clearAll().
+	// "" unless the new table could not be staged for the NVS writer, #986).
+	// clearAllDidMappings() backs /api/factory-reset (wipes the
+	// whole table, synchronously: the reset reports the result) -- see
+	// DidMapping::clearAll(). clearAllDidMappingsStaged() is the config import's
+	// clear (#986): the same wipe, staged for the NVS writer like setDidMapping()
+	// and removeDidMapping(), none of which write NVS under _mutex any more.
 	std::vector<DidMapping::Entry> getDidMappings();
 	std::string setDidMapping(const std::string& did, const std::string& extension);
 	std::string removeDidMapping(const std::string& did);
 	std::string clearAllDidMappings();
+	std::string clearAllDidMappingsStaged();
 
 	// Backs /api/factory-reset: wipes the CDR ring (caller/callee history is
 	// as sensitive as the credential tables above and lives in its own NVS

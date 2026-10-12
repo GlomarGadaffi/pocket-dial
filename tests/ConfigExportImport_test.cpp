@@ -23,6 +23,8 @@
 #include "TrunkConfigStore.hpp"   // #483
 #include "EmailConfigStore.hpp"   // #483
 #include "ResetGuard.hpp"     // #450: a reset leaves the guard up on host
+#include "NvsWriter.hpp"      // #986 slice 4: the DID table stages instead of committing
+#include "DidMapping.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -336,6 +338,54 @@ TEST_F(ConfigExportImportTest, Import_ReplaceNotMerge_DropsEntriesNotInTheBlob)
 	}
 	EXPECT_TRUE(has700);
 	EXPECT_FALSE(has701) << "an entry absent from the imported blob must be REMOVED, not left behind";
+}
+
+// #986 slice 4: the import's DID replace (a clear and one set per entry) used to
+// be 1 + N flash commits, each under _mutex (52.9 ms at the first). It stages
+// instead, so the NVS writer is left ONE snapshot, the final table -- and the
+// replace still works: the live table is right before the writer has run.
+TEST_F(ConfigExportImportTest, Import_StagesTheDidTableOnceInsteadOfCommittingPerEntry)
+{
+	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/did-mapping",
+		"did=%2B15550100099&extension=1099", "pd_session=" + _sysop.cookie, _sysop.csrf)), 200);
+
+	const std::string blob =
+		R"({"exportVer":1,"plaintext":{"extensions":[],"extensionSecrets":[],"ringGroups":[],)"
+		R"("forwards":[],"dnd":[],"pageZones":[],"dialPlan":[],)"
+		R"("didMappings":[{"did":"+15550100001","extension":"1001"},)"
+		R"({"did":"+15550100002","extension":"1002"},{"did":"+15550100003","extension":"1003"}],)"
+		R"("registrarMode":"open","telephonyConfig":[],"wifiSsid":"","wifiMode":0,)"
+		R"("apSecure":false,"parkTimeoutSec":90,"mdnsHostname":"pocketdial","schemaVer":1}})";
+
+	nvswriter::resetForTest();
+	const std::string importResp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(blob) + "&confirm=REPLACE", "pd_session=" + _sysop.cookie, _sysop.csrf);
+	ASSERT_EQ(statusOf(importResp), 200) << importResp;
+
+	// Replace, and already visible: the SIP path and the export read the live table.
+	const auto live = _handler->getDidMappings();
+	ASSERT_EQ(live.size(), 3u);
+	EXPECT_EQ(live[0].did, "+15550100001");
+	EXPECT_EQ(live[2].extension, "1003");
+
+	EXPECT_EQ(nvswriter::stats().staged, 4u) << "the clear and three entries";
+	EXPECT_EQ(nvswriter::stats().overwrites, 3u) << "each replaced the snapshot the writer had not taken";
+	unsigned writes = 0;
+	std::vector<std::string> keys;
+	nvswriter::drainForTest([&](nvswriter::Key k, const char* p, size_t n) {
+		if (k != nvswriter::Key::DidMap) return true;
+		++writes;
+		DidMapping::emitSnapshot(p, n, [&](const char* key, const char* val) {
+			if (*val != '\0') keys.push_back(std::string(key) + "=" + val);
+			return true;
+		});
+		return true;
+	});
+	EXPECT_EQ(writes, 1u) << "one write of the final table, not four";
+	const std::vector<std::string> want = {
+		"m0did=+15550100001", "m0ext=1001", "m1did=+15550100002", "m1ext=1002",
+		"m2did=+15550100003", "m2ext=1003"};
+	EXPECT_EQ(keys, want) << "the earlier table (the one DID set before the import) is gone";
 }
 
 // ── Password-gated (AES-256-GCM/PBKDF2-SHA256) round-trip ──────────────────

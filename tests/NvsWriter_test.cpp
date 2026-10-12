@@ -39,13 +39,14 @@ using nvswriter::StageResult;
 
 namespace
 {
-	// Two keys, tiny slots: Devices holds 15 payload bytes, Forwards 63.
+	// Three keys, tiny slots: Devices holds 15 payload bytes, Forwards and DidMap 63.
 	struct Rig
 	{
 		nvswriter::Slot<16> devices;
 		nvswriter::Slot<64> forwards;
+		nvswriter::Slot<64> didmap;
 		nvswriter::Slot<64> scratch;
-		std::array<nvswriter::SlotRef, nvswriter::kKeyCount> refs{{nvswriter::refOf(devices), nvswriter::refOf(forwards)}};
+		std::array<nvswriter::SlotRef, nvswriter::kKeyCount> refs{{nvswriter::refOf(devices), nvswriter::refOf(forwards), nvswriter::refOf(didmap)}};
 		nvswriter::DepthOneMailboxes mail{refs};
 		nvswriter::Stager<nvswriter::DepthOneMailboxes> st{mail, refs, &scratch};
 
@@ -131,7 +132,7 @@ TEST_F(NvsWriterLogic, TheStagedBlobEqualsTheSourceBytes)
 	const std::string src = std::string("aabbccddeeff\t201\t0\t0\t1\n") + "112233445566\t202\t1\t3\t4294967295\n";
 	nvswriter::Slot<128> big;
 	nvswriter::Slot<128> scratch;
-	std::array<nvswriter::SlotRef, nvswriter::kKeyCount> refs{{nvswriter::refOf(big), nvswriter::refOf(big)}};
+	std::array<nvswriter::SlotRef, nvswriter::kKeyCount> refs{{nvswriter::refOf(big), nvswriter::refOf(big), nvswriter::refOf(big)}};
 	nvswriter::DepthOneMailboxes mail(refs);
 	nvswriter::Stager<nvswriter::DepthOneMailboxes> st(mail, refs, &scratch);
 

@@ -309,8 +309,8 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/telephony-config/<slot>/test`](#post-apitelephony-configslottest) | `POST` | High | Gated (+ `X-CSRF`) | **Not read-only**. Places a real outbound call to the slot's own route DN and immediately drops it. Active slot only. Read the CAUTION in its section before calling it against anything live. |
 | [`/api/telephony-config/<slot>`](#delete-apitelephony-configslot) | `DELETE` | High | Gated (+ `X-CSRF`) | Clears one slot, including its stored secret, without a factory reset. |
 | [`/api/did-mapping`](#get-apidid-mapping) | `GET` | Medium | Gated | Lists the inbound DID→extension table. |
-| [`/api/did-mapping`](#put-apidid-mapping) | `PUT` | High | Gated (+ `X-CSRF`) | Creates or updates one DID→extension mapping. |
-| [`/api/did-mapping`](#delete-apidid-mapping) | `DELETE` | High | Gated (+ `X-CSRF`) | Removes one DID mapping. Idempotent. |
+| [`/api/did-mapping`](#put-apidid-mapping) | `PUT` | High | Gated (+ `X-CSRF`) | Creates or updates one DID→extension mapping. `200` means accepted and staged for the NVS writer, not yet on flash (#986). |
+| [`/api/did-mapping`](#delete-apidid-mapping) | `DELETE` | High | Gated (+ `X-CSRF`) | Removes one DID mapping. Idempotent. `200` means accepted and staged for the NVS writer, not yet on flash (#986). |
 | [`/api/wifi/scan`](#get-apiwifiscan) | `GET` | Low | None | Blocking scan of nearby Wi-Fi APs. Stubbed on `eth`/`lan8720`/desktop (§4.2). |
 | [`/api/wifi/connect`](#post-apiwificonnect) | `POST` | High | Gated (+ `X-CSRF`) | Saves Wi-Fi credentials to NVS and schedules a reboot into Station Mode. `501` on `eth`/`lan8720`/desktop (§4.2). |
 | [`/api/wifi/mode_ap`](#post-apiwifimode_ap) | `POST` | High | Gated (+ `X-CSRF`) | Sets the device to Standalone Access Point Mode and schedules a reboot. No confirmation parameter. `501` on `eth`/`lan8720`/desktop (§4.2). |
@@ -775,7 +775,7 @@ actions.
   * `confirm` (Required): must be the literal string `REPLACE`.
 * Response Content-Type: `application/json`
 * Response Status Codes:
-  * `200 OK`: `{"status":"ok","applied":[...],"skipped":[...]}`. For `forwards`, `applied` means accepted and staged for the NVS writer, not yet on flash (see the note under [`POST /api/forward`](#post-apiforward) for the power-fail window); the burst of per-trigger writes an import makes coalesces into one flash write, the last table. **Deviates from a bare `204`**; see the followup note above. This feature cannot restore everything a plaintext-capable export can carry, and a bare `204` would tell the operator "fully restored" when it was not.
+  * `200 OK`: `{"status":"ok","applied":[...],"skipped":[...]}`. For `forwards` and `didMappings`, `applied` means accepted and staged for the NVS writer, not yet on flash (see the notes under [`POST /api/forward`](#post-apiforward) and [`PUT /api/did-mapping`](#put-apidid-mapping) for the power-fail window); the burst of per-entry writes an import makes coalesces into one flash write, the last table, for as long as the writer has not yet taken the previous one (it runs at priority 1 and may wake between entries under light load, in which case an intermediate table is written first; the last table is always written last). The other settings an import applies (ring groups, voicemail, page zones, dial plan, registrar mode, telephony slots, E911, admin extension) are still written to flash before their setter returns. **Deviates from a bare `204`**; see the followup note above. This feature cannot restore everything a plaintext-capable export can carry, and a bare `204` would tell the operator "fully restored" when it was not.
   * `400 Bad Request`: `{"error":"import requires confirm=REPLACE"}` / `"missing blob parameter"` / `"malformed export blob"` / `"export blob is missing a plaintext object"` / `"unsupported exportVer"` / `"malformed secretsEnc block"`.
   * `422 Unprocessable Entity`: `{"error":"bad password or corrupted secrets block"}`. A wrong password and a tampered/corrupted `secretsEnc` block are **deliberately indistinguishable** (the GCM tag check fails identically either way). A `400`/`422` leaves the device completely untouched; the whole blob is validated (and decrypted, if a password was given) before the first setter runs.
   * `401`/`403`: gates 1-3 as in §0.1.
@@ -2367,6 +2367,20 @@ Creates or updates one mapping. Form-encoded.
   * `400 Bad Request`, with the literal body: `{"error":"missing did or extension parameter"}`; `{"error":"extension may contain only letters, digits, '#' and '*'"}`; `{"error":"cannot map a DID to a virtual/reserved extension"}` (`777`, `999`, `555`, `888` or `440`, none is a real endpoint a DID could usefully ring); or one of `DidMapping::setMapping`'s own strings, `{"error":"DID required"}`, `{"error":"Extension required"}`, `{"error":"Field too long"}` (over 32 characters), `{"error":"Field contains a control character"}`, `{"error":"DID mapping table full"}`. Updating an existing DID never consumes a slot, so it succeeds even on a full table.
   * `401`/`403`: gates 1-4 as in §0.1.
 
+> [!NOTE]
+> **`200` also means accepted and staged, not yet persisted** (#986). The whole table is
+> copied to the NVS writer task, which writes the eight slots to flash after the request
+> has been answered: a few milliseconds typically, longer if the write triggers a flash
+> page garbage collection or the writer is starved by media load. The mapping is live in
+> RAM at once and inbound routing and `GET`/export read it from there. A power cut, panic
+> or restart (OTA, reboot) inside that window brings the board back with the **previous**
+> persisted table; nothing is flushed before a planned restart. A table that could not be
+> staged is a `400` with `{"error":"DID table not persisted: ..."}` (a factory reset is
+> running, the writer is not running because its staging memory could not be reserved at
+> boot, or a field is longer than the writer's 33-byte cell, which only a hand-edited
+> store can produce); the in-RAM table has changed anyway. The on-flash form (the
+> `didmap` namespace, `m<N>did`/`m<N>ext`) is unchanged.
+
 Note the `PUT` verb. This is one of only three non-`GET`/`POST` routes in the API (the
 other two are `PUT`/`DELETE /api/telephony-config/<slot>`), and the body is still
 form-encoded, not JSON.
@@ -2384,7 +2398,10 @@ be decoded back into a space by `getFormParam()`'s `urlDecode`.
 ### `DELETE /api/did-mapping`
 
 Removes one mapping. Form-encoded, parameter `did`. **Idempotent**; removing a DID that
-was never mapped is still `200`, so there is nothing to branch on client-side.
+was never mapped is still `200`, so there is nothing to branch on client-side. Like `PUT`,
+`200` means the new table is accepted and staged for the NVS writer, not yet on flash
+(see the note under [`PUT /api/did-mapping`](#put-apidid-mapping)); this route reports
+nothing else, so a removal refused because a factory reset is running is also `200`.
 
 * Response Status Codes:
   * `200 OK`: `{"status":"ok","did":"8000"}`

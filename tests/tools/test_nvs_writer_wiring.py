@@ -124,8 +124,9 @@ class BoardWiring(unittest.TestCase):
 
 
 class StagingSlotsAndStackPlacement(unittest.TestCase):
-    """The board reserves the two staging slots in PSRAM at init; the scratch the flash write
-    reads and the task's stack stay internal (PsramTask.hpp, the #277 rule)."""
+    """The board reserves the three staging slots in PSRAM at init (the DID table's joined in
+    slice 4); the scratch the flash write reads and the task's stack stay internal
+    (PsramTask.hpp, the #277 rule)."""
 
     def setUp(self):
         self.src = code("Helpers/NvsWriter.cpp")
@@ -134,13 +135,14 @@ class StagingSlotsAndStackPlacement(unittest.TestCase):
     def test_the_staging_slots_come_from_psram_in_start_and_the_scratch_does_not(self):
         self.assertRegex(self.start, r"s_devices = allocSlot<Slot<kDevicesCap>>\(\);")
         self.assertRegex(self.start, r"s_forwards = allocSlot<Slot<kForwardsCap>>\(\);")
+        self.assertRegex(self.start, r"s_didmap = allocSlot<Slot<kDidMapCap>>\(\);")
         helper = indented_body("Helpers/NvsWriter.cpp", r"T\* allocSlot\(\)")
         self.assertIn("psram::allocPreferPsram(sizeof(T))", helper)
         self.assertEqual(self.src.count("allocPreferPsram("), 1, "the one allocation site is allocSlot()")
         self.assertRegex(self.src, r"(?m)^	Slot<kScratchCap> s_scratch;", "the scratch is a static: internal RAM")
         self.assertNotIn("allocSlot<Slot<kScratchCap>>", self.src)
         self.assertNotIn("s_scratch =", self.src)
-        self.assertRegex(self.src, r"#else\s+Slot<kDevicesCap> s_devices;\s+Slot<kForwardsCap> s_forwards;",
+        self.assertRegex(self.src, r"#else\s+Slot<kDevicesCap> s_devices;\s+Slot<kForwardsCap> s_forwards;\s+Slot<kDidMapCap> s_didmap;",
                          "the host keeps static slots")
 
     def test_the_writer_task_keeps_a_plain_internal_stack(self):
@@ -154,7 +156,8 @@ class StagingSlotsAndStackPlacement(unittest.TestCase):
 
     def test_a_failed_slot_allocation_leaves_the_writer_not_running(self):
         b = self.start
-        order = [b.index(m) for m in ("s_devices = allocSlot", "if (s_devices == nullptr || s_forwards == nullptr)",
+        order = [b.index(m) for m in ("s_devices = allocSlot",
+                                      "if (s_devices == nullptr || s_forwards == nullptr || s_didmap == nullptr)",
                                       "xQueueCreate", "xTaskCreatePinnedToCore(", "running().store(true")]
         self.assertEqual(order, sorted(order), "allocate, check, queues, task, and only then running")
         failed = b[order[1]:order[2]]

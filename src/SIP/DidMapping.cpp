@@ -1,6 +1,7 @@
 #include "DidMapping.hpp"
 
 #include "E164.hpp"
+#include "NvsWriter.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -23,7 +24,6 @@
 		#include <unistd.h>
 	#endif
 	#include <fstream>
-	#include <sstream>
 #endif
 
 namespace
@@ -35,6 +35,26 @@ namespace
 	void slotKey(char* out, size_t outLen, size_t idx, const char* field)
 	{
 		std::snprintf(out, outLen, "m%u%s", static_cast<unsigned>(idx), field);
+	}
+
+	// THE definition of the stored form, shared by the NVS writer (from a staged
+	// snapshot), the synchronous factory-reset write (from the table) and the host
+	// file: slot i is m<i>did, then m<i>ext, and an unused slot stores "".
+	// `valueAt(i, isExt)` supplies the value and `put(key, value)` stores it; the
+	// walk stops at the first put that fails, as the `ok && nvs_set_str(...)` chain
+	// it replaces did.
+	template <class ValueAt, class Put>
+	bool emitSlots(ValueAt&& valueAt, Put&& put)
+	{
+		char key[16];
+		for (size_t i = 0; i < DidMapping::kMaxMappings; ++i)
+		{
+			slotKey(key, sizeof(key), i, "did");
+			if (!put(key, valueAt(i, false))) return false;
+			slotKey(key, sizeof(key), i, "ext");
+			if (!put(key, valueAt(i, true))) return false;
+		}
+		return true;
 	}
 }
 
@@ -149,14 +169,92 @@ std::string DidMapping::removeMapping(const std::string& did)
 	return persist();
 }
 
+void DidMapping::clearEntries()
+{
+	_count = 0;
+	for (auto& e : _entries) { e = Entry{}; }
+}
+
 std::string DidMapping::clearAll()
 {
 	// Same reset-then-persist shape as load()'s in-memory reset, but persisted:
-	// an empty table written to the backing store, same as persist()'s own
+	// an empty table written to the backing store, same as persistNow()'s own
 	// "i >= _count" branch already does for every never-used slot.
-	_count = 0;
-	for (auto& e : _entries) { e = Entry{}; }
+	clearEntries();
+	return persistNow();
+}
+
+std::string DidMapping::clearAllStaged()
+{
+	clearEntries();
 	return persist();
+}
+
+// Fixed layout, built in the writer's staging slot: no heap, no stack buffer. A
+// value is taken as its C string (what nvs_set_str(value.c_str()) stored before),
+// then NUL-padded to its cell. A value longer than a cell is refused whole, never
+// cut short: the stage fails and the caller hears about it.
+void DidMapping::fillSnapshot(nvswriter::BlobWriter& w) const
+{
+	auto cell = [&w](const char* v) {
+		const size_t n = std::strlen(v);
+		if (n > kMaxFieldLen)
+		{
+			w.fail();
+			return;
+		}
+		w.str(std::string_view(v, n));
+		for (size_t pad = n; pad < kSlotCellLen; ++pad) w.ch('\0');
+	};
+	for (size_t i = 0; i < kMaxMappings; ++i)
+	{
+		const bool live = i < _count;
+		cell(live ? _entries[i].did.c_str() : "");
+		cell(live ? _entries[i].extension.c_str() : "");
+	}
+}
+
+bool DidMapping::emitSnapshot(const char* blob, size_t len,
+	FunctionRef<bool(const char* key, const char* value)> put)
+{
+	// Whole or not at all: the length is exact and every cell ends in a NUL, so no
+	// cell is read past its end and a payload that is not ours stores no slot.
+	if (blob == nullptr || len != kSnapshotLen) return false;
+	for (size_t cell = 0; cell < 2 * kMaxMappings; ++cell)
+	{
+		if (blob[cell * kSlotCellLen + kMaxFieldLen] != '\0') return false;
+	}
+	return emitSlots(
+		[blob](size_t i, bool ext) { return blob + (2 * i + (ext ? 1 : 0)) * kSlotCellLen; },
+		put);
+}
+
+std::string DidMapping::persist()
+{
+	// #986 slice 4: stage, do not write. The snapshot is copied into the NVS
+	// writer's slot under the caller's _mutex and nvs_set_str + nvs_commit run on
+	// the nvs_writer task. A stage that was refused is an error the HTTP setter can
+	// report; the in-memory table has changed either way.
+	const nvswriter::StageResult r = nvswriter::stage(nvswriter::Key::DidMap,
+		[this](nvswriter::BlobWriter& w) { fillSnapshot(w); });
+	switch (r)
+	{
+	case nvswriter::StageResult::Ok:
+		break;
+	case nvswriter::StageResult::Reset:
+		return "DID table not persisted: a factory reset is running";
+	case nvswriter::StageResult::TooBig:
+		return "DID table not persisted: a field is longer than the writer's cell";
+	case nvswriter::StageResult::NotRunning:
+		return "DID table not persisted: the NVS writer is not running";
+	}
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+	// Host: no writer task. The file is the store, so it is written from the table
+	// as before, only once the stage was accepted (a refusal means no write at all).
+	return persistNow();
+#else
+	return "";
+#endif
 }
 
 std::vector<DidMapping::Entry> DidMapping::list() const
@@ -180,6 +278,7 @@ std::string DidMapping::extensionForDid(const std::string& did) const
 
 void DidMapping::load()
 {
+	nvswriter::start();   // #986: up before the first persist(); idempotent, host no-op
 	_count = 0;
 	for (auto& e : _entries) { e = Entry{}; }
 
@@ -221,23 +320,41 @@ void DidMapping::load()
 	nvs_close(h);
 }
 
-std::string DidMapping::persist()
+// The nvs_writer task's half of persist(): every slot's two nvs_set_str, then one
+// commit, and only if every set worked. `blob` is the writer's internal scratch
+// (the flash write must not read PSRAM, #315), never the staging slot.
+bool DidMapping::writeSnapshot(const char* blob, size_t len)
+{
+	nvs_handle_t h;
+	if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+	{
+		return false;
+	}
+	bool ok = emitSnapshot(blob, len, [&h](const char* key, const char* value) {
+		return nvs_set_str(h, key, value) == ESP_OK;
+	});
+	ok = ok && nvs_commit(h) == ESP_OK;
+	nvs_close(h);
+	return ok;
+}
+
+// The factory reset's erase: written here, now, because it runs inside
+// resetguard::begin() (a staged write is refused there) and its caller reports
+// whether the table is really gone.
+std::string DidMapping::persistNow()
 {
 	nvs_handle_t h;
 	if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
 	{
 		return "NVS open failed";
 	}
-	bool ok = true;
-	char key[16];
-	for (size_t i = 0; i < kMaxMappings && ok; ++i)
-	{
-		const bool live = i < _count;
-		slotKey(key, sizeof(key), i, "did");
-		ok = ok && nvs_set_str(h, key, live ? _entries[i].did.c_str() : "") == ESP_OK;
-		slotKey(key, sizeof(key), i, "ext");
-		ok = ok && nvs_set_str(h, key, live ? _entries[i].extension.c_str() : "") == ESP_OK;
-	}
+	bool ok = emitSlots(
+		[this](size_t i, bool ext) {
+			return (i < _count) ? (ext ? _entries[i].extension.c_str() : _entries[i].did.c_str()) : "";
+		},
+		[&h](const char* key, const char* value) {
+			return nvs_set_str(h, key, value) == ESP_OK;
+		});
 	ok = ok && nvs_commit(h) == ESP_OK;
 	nvs_close(h);
 	return ok ? "" : "NVS write failed";
@@ -247,6 +364,7 @@ std::string DidMapping::persist()
 
 void DidMapping::load()
 {
+	nvswriter::start();   // #986: up before the first persist(); idempotent, host no-op
 	_count = 0;
 	for (auto& e : _entries) { e = Entry{}; }
 
@@ -299,7 +417,7 @@ void DidMapping::load()
 	}
 }
 
-std::string DidMapping::persist()
+std::string DidMapping::persistNow()
 {
 #if defined(_WIN32)
 	// No POSIX permission model; honest in-memory only (the file would be
@@ -315,14 +433,18 @@ std::string DidMapping::persist()
 	}
 	(void)::fchmod(fd, 0600);  // in case the file pre-existed with looser bits
 
-	std::ostringstream out;
-	for (size_t i = 0; i < kMaxMappings; ++i)
-	{
-		const bool live = i < _count;
-		out << 'm' << i << "did=" << (live ? _entries[i].did : std::string()) << '\n'
-		    << 'm' << i << "ext=" << (live ? _entries[i].extension : std::string()) << '\n';
-	}
-	const std::string data = out.str();
+	std::string data;
+	emitSlots(
+		[this](size_t i, bool ext) {
+			return (i < _count) ? (ext ? _entries[i].extension.c_str() : _entries[i].did.c_str()) : "";
+		},
+		[&data](const char* key, const char* value) {
+			data += key;
+			data += '=';
+			data += value;
+			data += '\n';
+			return true;
+		});
 	const bool ok = ::write(fd, data.data(), data.size()) ==
 	                static_cast<ssize_t>(data.size());
 	::close(fd);
