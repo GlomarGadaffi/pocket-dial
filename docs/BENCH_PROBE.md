@@ -163,23 +163,28 @@ blocks (4 KB, halving on fragmentation down to 64 B, at most 256 blocks) until
 
 ### `x370_pressure_rebuild` (#370)
 
-Part of #370, harness only. One ring with the ballast held at the 8192 floor, so the rx task's rebuild of the GET
-handle after a transport failure (`recreateGetClient()`, `TelephonyAnchorClient.cpp:3755`, called at `:3895`), and
-the TLS handshake after it, run under pressure. The scenario arms `get_status=404`, `get_max_attempts=8`, holds
-`ballast=8192&deadman=35`, places **one** call to the designated far end, CANCELs it 2 s after the first GET
-transport failure (or at 10 s if there is none), and releases the ballast the moment the call returns.
+This is part of #370 and harness only. It runs one ring with the ballast held at the 8192 floor, so the rx task's
+rebuild of the GET handle after a transport failure (`recreateGetClient()`, `TelephonyAnchorClient.cpp:4137`, called
+at `:4277`), and the TLS handshake after it, run under pressure. The scenario arms `get_status=404`,
+`get_max_attempts=8`, holds `ballast=8192&deadman=35`, places **one** call to the designated far end, CANCELs it 2 s
+after the first GET transport failure (or at 10 s if there is none), and releases the ballast the moment the call
+returns.
+
+The line numbers in this section are from commit `87d2874` (`src/SIP/TelephonyAnchorClient.cpp`). `grep -n` on a
+quoted log line finds its current location.
 
 - **No fault forces the rebuild.** `get_status` rewrites only a parsed HTTP answer, and a parsed answer keeps the
-  handle (`:3815-3862`); `overrideGetStatus()` leaves a transport failure (status <= 0) real. The rebuild runs only
-  after a real `GET stream transport failure` (`:3871`) or `GET stream open failed` (`:3882`) line, and only the
-  ballast can cause one, by chance. In a call that is not answered every GET answer is a 404 on a kept connection,
-  so the one handshake under pressure is the first open (`startRxIfNeeded()` in `makeCall()`, `:576`, before
-  `Successfully initiated call`). That is why the ballast is held **before the INVITE**. `get_status=404` and the
+  handle (`:4197-4245`); `overrideGetStatus()` (`src/SIP/BenchProbeLogic.hpp`) leaves a transport failure (status
+  <= 0) real. The rebuild runs only after a real `GET stream transport failure` (`:4253`) or `GET stream open failed`
+  (`:4264`) line, and only the ballast can cause one, by chance. In a call that is not answered every GET answer is a
+  404 on a kept connection, so the one handshake under pressure is the first open (`startRxIfNeeded()` in
+  `makeCall()`, `:603` and its retry at `:614`, before `Successfully initiated call` at `:685`). That is why the
+  ballast is held **before the INVITE**. `get_status=404` and the
   small `get_max_attempts` only keep the loop in its "not ready" retries for a short call; a 403 would trip the
   #902 fail-fast and end it with a 503.
-- **The witness is derived; the rebuild has no success line.** `:3895-3899` log only a failure (`:3897`, "could not
-  rebuild client"). Every loop iteration that does not end it logs exactly one attempt line (`:3820`, `:3871`,
-  `:3882`) and cannot `continue` past one, and the only way from a failure at attempt k to the next iteration is
+- **The witness is derived; the rebuild has no success line.** `:4277-4281` log only a failure (`:4279`, "could not
+  rebuild client"). Every loop iteration that does not end it logs exactly one attempt line (`:4202`, `:4253`,
+  `:4264`) and cannot `continue` past one, and the only way from a failure at attempt k to the next iteration is
   for `recreateGetClient()` to have returned true. So the scenario counts, from the syslog:
 
   | Witness | Lines |
@@ -187,14 +192,14 @@ transport failure (or at 10 s if there is none), and releases the ballast the mo
   | transport failure (the path counter `get_transport_fail`; 0 is `INVALID`) | `GET stream transport failure (no HTTP response, status=-1), attempt k/N` or `GET stream open failed (...), attempt k/N` |
   | rebuilt | such a line at k, then any attempt line at k+1 of the same N |
   | fresh handshake answered | the k+1 line is `GET stream not ready (HTTP ...), attempt k+1/N`, a parsed answer |
-  | `recreateGetClient()` returned false | `GET stream: could not rebuild client after transport failure`: a handle that would not init, or a teardown racing the loop (`:3764`); the log cannot tell which, and no handshake ran, so it is not a witness |
-  | third in a row | `GET stream: 3 consecutive transport failures`: gives up without a rebuild (`:3888-3894`) |
+  | `recreateGetClient()` returned false | `GET stream: could not rebuild client after transport failure`: a handle that would not init, or a teardown racing the loop (`:4146`); the log cannot tell which, and no handshake ran, so it is not a witness |
+  | third in a row | `GET stream: 3 consecutive transport failures`: gives up without a rebuild (`:4270-4276`) |
 
   A failure with no next attempt (a lost UDP line, or the CANCEL came first) and a "could not rebuild" line with
   no rebuild beside it are `INVALID`, never `PASS`; the counts stay in the summary. `test_anchor_x370_pressure_rebuild.py`
   pins every one of these lines, the `3`, and the absence of a `continue` in the loop to the source, and fails if a
   success line is added, so the witness can then be made direct. The line would go right after the
-  `if (!recreateGetClient()) {... break;}` block at `:3895-3899` (no `else`: the `if` breaks).
+  `if (!recreateGetClient()) {... break;}` block at `:4277-4281` (no `else`: the `if` breaks).
 - **Verdicts.** `PASS`: both faults fired, exactly one anchored leg, a rebuild witness (a failure followed by the next attempt),
   the board answered `/api/status` after the release with a later uptime and the same reset reason, no panic line,
   no coredump, no `ORPHANED` line, one drop. `FAIL`: any of the last five, a hang or reboot after the release, a
