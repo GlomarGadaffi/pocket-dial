@@ -10160,6 +10160,12 @@ std::string RequestsHandler::clearAllDidMappings()
 	return _didMapping.clearAll();
 }
 
+std::string RequestsHandler::clearAllDidMappingsStaged()
+{
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
+	return _didMapping.clearAllStaged();
+}
+
 void RequestsHandler::clearAllCallHistory()
 {
 	std::lock_guard<pd::TimedMutex> lock(_mutex);

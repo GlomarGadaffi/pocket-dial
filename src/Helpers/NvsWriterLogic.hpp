@@ -28,6 +28,13 @@
 // device-table blob; within a key the newest complete snapshot replaces an
 // unwritten older one (last write wins, which is right for state blobs).
 //
+// Slice 4 (#986) adds the DID table as the third key. Its blob is not one NVS
+// string but a fixed-layout snapshot that DidMapping::writeSnapshot() applies
+// slot by slot; the policy here is the same, and what that buys is the config
+// import: a clear and N sets of the table leave the writer one snapshot (the
+// last) when it has not yet taken the earlier ones, instead of N+1 commits under
+// RequestsHandler::_mutex.
+//
 // Power-fail window: from stage() until the writer's nvs_commit returns. In
 // RAM the table is already right; on flash the previous snapshot stays valid
 // (an NVS commit is atomic per item) until the new one lands. The window is the
@@ -50,8 +57,11 @@
 
 namespace nvswriter
 {
-	enum class Key : uint8_t { Devices = 0, Forwards = 1 };
-	constexpr size_t kKeyCount = 2;
+	// DidMap is not one NVS string like the other two: its blob is a fixed-layout
+	// snapshot of the DID table that DidMapping::writeSnapshot() applies slot by
+	// slot in the "didmap" namespace (#986 slice 4).
+	enum class Key : uint8_t { Devices = 0, Forwards = 1, DidMap = 2 };
+	constexpr size_t kKeyCount = 3;
 	constexpr size_t indexOf(Key k) { return static_cast<size_t>(k); }
 	constexpr Key keyAt(size_t i) { return static_cast<Key>(i); }
 
@@ -98,6 +108,9 @@ namespace nvswriter
 			_len += s.size();
 		}
 		void ch(char c) { str(std::string_view(&c, 1)); }
+		// For a value that cannot be represented in the layout (a DID field longer
+		// than its cell): refused like an overflow, never cut short.
+		void fail() { _over = true; }
 		void uint(uint32_t v)
 		{
 			char rev[10] = {};

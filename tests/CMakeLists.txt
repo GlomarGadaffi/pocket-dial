@@ -627,6 +627,9 @@ add_executable(sip_parser_tests
     # depth-1 mailboxes) and the two callers that now stage instead of committing.
     ../src/Helpers/NvsWriter.cpp
     NvsWriter_test.cpp
+    # Issue #986 slice 4: the DID table stages its snapshot for that writer (set,
+    # remove and the import clear) instead of committing 16 keys under _mutex.
+    DidMapStaging_test.cpp
     # Issue #363: the secrets a factory reset must erase.
     ../src/Helpers/FactoryReset.cpp
     # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2

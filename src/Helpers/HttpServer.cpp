@@ -6413,10 +6413,14 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		}
 		applied.push_back("dialPlan");
 
-		// DID mappings: RequestsHandler exposes a genuine bulk clear (the same
-		// one /api/factory-reset uses), unlike the four tables above -- use it
-		// for a real replace instead of hand-rolling a diff.
-		handler->clearAllDidMappings();
+		// DID mappings: RequestsHandler exposes a genuine bulk clear, unlike the
+		// four tables above -- use it for a real replace instead of hand-rolling a
+		// diff. The STAGED clear, not the one /api/factory-reset uses (#986): each of
+		// these calls only copies the table into the NVS writer's slot under
+		// _mutex, so the clear and the N sets leave the writer one snapshot, the
+		// last, instead of N+1 flash commits under the lock. A "" here means staged,
+		// not yet persisted.
+		handler->clearAllDidMappingsStaged();
 		for (const auto& m : pt->arrayOr("didMappings"))
 		{
 			handler->setDidMapping(m.stringOr("did"), m.stringOr("extension"));

@@ -50,17 +50,35 @@
 //     removed. E.164 equivalence is added on top of the old behaviour, never
 //     in place of it.
 //
+// ── Staged persistence (#986 slice 4) ────────────────────────────────────────
+// setMapping()/removeMapping()/clearAllStaged() no longer write NVS under the
+// caller's lock (a table write is 2 * kMaxMappings nvs_set_str plus a commit,
+// measured at 52.9 ms under RequestsHandler::_mutex during a config import).
+// They copy a snapshot of the table into the NVS writer's staging slot
+// (nvswriter::Key::DidMap) and return; the nvs_writer task applies it with
+// writeSnapshot(), slot by slot, with the same keys persist() always used, so
+// the on-flash form is unchanged and load() reads it as before. The in-memory
+// table is already right when the call returns -- only the flash copy lags -- so
+// a "" return means accepted and staged, not yet persisted. A restart or power
+// loss before the writer's commit loses the change.
+//
+// clearAll() stays synchronous: /api/factory-reset calls it after
+// resetguard::begin(), when staging is refused by design, and it must leave the
+// PII table erased before it answers.
+//
+// The staging slot has ONE producer: every caller of setMapping/removeMapping/
+// clearAll*/persist holds RequestsHandler::_mutex.
+//
 // Thread-safety: this class is NOT internally locked, same caller-holds-lock
 // convention as TelephonyApiConfig — RequestsHandler owns the instance
 // (alongside TelephonyApiConfig) and serializes access under its own _mutex.
-// persist() does blocking NVS/file I/O, so mutating calls (setMapping/
-// removeMapping) belong on the config plane only — never under the
-// packet-hot-path lock, and never as a step inside a real inbound call's
-// handling. extensionForDid() itself is a bounded linear scan over at most
+// clearAll() does blocking NVS/file I/O, so it belongs on the factory-reset path
+// only. extensionForDid() itself is a bounded linear scan over at most
 // POCKETDIAL_MAX_DID_MAPPINGS entries with no I/O, so it is safe to call from
 // routeInboundAnchorCall() under a lock, the same as any other small
 // in-memory lookup on this codebase's dashboard/config tables.
 
+#include "FunctionRef.hpp"
 #include "PoolConfig.hpp"
 
 #include <cstddef>
@@ -68,11 +86,21 @@
 #include <string_view>
 #include <vector>
 
+namespace nvswriter { class BlobWriter; }
+
 class DidMapping
 {
 public:
 	static constexpr size_t kMaxMappings = POCKETDIAL_MAX_DID_MAPPINGS; // hard table bound
 	static constexpr size_t kMaxFieldLen = 32;                          // did / extension field cap
+
+	// The staged snapshot: for each of the kMaxMappings slots, the did and then
+	// the extension, each in one cell of kSlotCellLen bytes (the value, then
+	// NULs; a cell's last byte is always NUL). kSnapshotCap adds the NUL every
+	// staging slot keeps after its payload.
+	static constexpr size_t kSlotCellLen = kMaxFieldLen + 1;
+	static constexpr size_t kSnapshotLen = 2 * kMaxMappings * kSlotCellLen;
+	static constexpr size_t kSnapshotCap = kSnapshotLen + 1;
 
 	struct Entry
 	{
@@ -98,22 +126,34 @@ public:
 	// "DID required", "Extension required", "Field too long", "Field
 	// contains a control character", or "DID mapping table full" (only for a
 	// genuinely NEW did once all kMaxMappings slots are taken by other
-	// DIDs). Persists on success.
+	// DIDs). Stages the new table for the NVS writer on success ("" then means
+	// accepted and staged, not yet on flash); a table that could not be staged
+	// ("DID table not persisted: ...": a factory reset is running, a field does
+	// not fit its cell, the writer is not running) is an error, and the in-memory
+	// table has changed all the same, as it always did when a write failed.
 	std::string setMapping(const std::string& did, const std::string& extension);
 
 	// Remove the mapping for `did`, compacting the table so list() never has
 	// gaps. "" on success, INCLUDING when no mapping existed (idempotent) —
-	// the caller doesn't need to check existence first. Persists only when a
-	// mapping actually changed (a no-op remove skips the blocking write).
+	// the caller doesn't need to check existence first. Stages only when a
+	// mapping actually changed (a no-op remove stages nothing).
 	std::string removeMapping(const std::string& did);
 
-	// Remove EVERY mapping and persist the now-empty table. Used by
+	// Remove EVERY mapping and persist the now-empty table SYNCHRONOUSLY. Used by
 	// /api/factory-reset so a reset never leaves the DID -> extension table
-	// sitting in flash under this class's own "didmap" namespace/file. ""
-	// on success, else a short operator-facing error (same persist() failure
-	// modes as setMapping/removeMapping) -- the in-memory table is cleared
-	// either way.
+	// sitting in flash under this class's own "didmap" namespace/file, and so the
+	// reset can report whether it did. Its one caller runs after
+	// resetguard::begin(), when a staged write would be refused, which is why this
+	// is not staged. "" on success, else a short operator-facing error ("NVS open
+	// failed", "NVS write failed"; the host's file errors) -- the in-memory table
+	// is cleared either way.
 	std::string clearAll();
+
+	// clearAll() for the config import, which replaces the table and must not hold
+	// the engine lock across a flash write: the empty table is staged like any
+	// other change, so the import's clear plus N setMapping() calls leave one
+	// snapshot for the writer, the last. Same return contract as setMapping().
+	std::string clearAllStaged();
 
 	// All configured mappings, in table order (oldest add first; updates keep
 	// their original position).
@@ -142,8 +182,28 @@ public:
 	// file). Default: "pocketdial_didmap.cfg" in the working directory.
 	void setStorePath(const std::string& path) { _storePath = path; }
 
+	// The nvs_writer's half (see "Staged persistence" above). emitSnapshot()
+	// walks a staged snapshot in the exact order and with the exact keys the
+	// whole-table write always used: put("m0did", ...), put("m0ext", ...),
+	// put("m1did", ...) ... for every slot, "" for an unused one. It checks that
+	// `blob` is exactly a snapshot BEFORE the first put and returns false without
+	// one if it is not; it stops at the first put that returns false. Pure: the
+	// host suite runs the same walk the board does.
+	static bool emitSnapshot(const char* blob, size_t len,
+		FunctionRef<bool(const char* key, const char* value)> put);
+
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// Applies a staged snapshot to NVS ("didmap" namespace): every slot's two
+	// nvs_set_str, then one nvs_commit. Called by the nvs_writer task, never under
+	// _mutex. False if the snapshot is malformed or any step failed.
+	static bool writeSnapshot(const char* blob, size_t len);
+#endif
+
 private:
-	std::string persist();  // write the whole table; "" on success
+	std::string persist();     // stage the whole table for the writer; "" when staged
+	std::string persistNow();  // write the whole table here, now; "" on success
+	void fillSnapshot(nvswriter::BlobWriter& w) const;   // the staged form, built in the writer's slot
+	void clearEntries();
 	// Index of the live entry for `did`, or kMaxMappings if none. Linear scan
 	// over _count entries — no heap, no I/O.
 	size_t findIndex(const std::string& did) const;
