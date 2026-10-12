@@ -1,15 +1,28 @@
 # Browser flasher
 
-`index.html` is a single, dependency-free page that installs pocket-dial onto
-an ESP32-S3 board over USB, using the [Web Serial API][webserial] to drive
-[esptool-js][esptool-js] entirely inside the browser. It is served from GitHub
-Pages at:
+`index.html` installs pocket-dial onto an ESP32-S3 board over USB, entirely inside the browser, with no build step.
+
+## Hosting and data flow
+
+The page is served from GitHub Pages at:
 
 **<https://glomargadaffi.github.io/pocket-dial/flasher/>**
 
-Nothing is uploaded anywhere. The page fetches firmware images from this
-repository's GitHub Releases and writes them to the board from the user's own
-machine.
+It uses the [Web Serial API][webserial] to drive [esptool-js][esptool-js]. The
+esptool-js bundle is the only external script the page loads. It comes from
+jsDelivr at a pinned version.
+
+Nothing is uploaded anywhere. The page fetches firmware images from the same
+GitHub Pages site, under `docs/firmware/<tag>/`, and writes them to the board
+from the user's own machine. The `release.yml` workflow copies those images
+from this repository's GitHub Releases.
+
+```mermaid
+flowchart LR
+    R["GitHub Release"] -->|"release.yml copies images"| P["Pages: docs/firmware/tag"]
+    P -->|"same-origin fetch"| B["Browser page"]
+    B -->|"Web Serial"| D["ESP32-S3 board"]
+```
 
 ## Requirements
 
@@ -44,24 +57,22 @@ machine.
    selected by default. An empty list and network errors are explained states
    that steer the user to the local-file panel.
 
-   > **Why not the API?** It used to be `api.github.com/.../releases`, with each
-   > image fetched from its asset's `browser_download_url`. **A browser cannot do
-   > that.** Those URLs 302 to `release-assets.githubusercontent.com`, and
-   > neither the redirect nor the final response sets
-   > `Access-Control-Allow-Origin`, so every download fails CORS. The API itself
-   > *is* CORS-enabled, so listing releases worked and only the downloads failed;
-   > the page looked healthy right up until someone pressed **Flash** (#138).
-   >
-   > `release.yml` now copies each release's images into `docs/firmware/<tag>/`
-   > and regenerates `docs/firmware/index.json`, so everything the page fetches
-   > is same-origin and CORS never applies. Nothing on the flash path touches
-   > github.com; the only API-shaped thing left is the "view release" link,
-   > which is constructed from the tag and is cosmetic.
-   >
-   > The GitHub Release is still the source of truth and still carries every
-   > asset, including the host binary, `partitions.csv` and `SHA256SUMS`. Pages
-   > holds only the subset the page downloads. See
-   > [`docs/firmware/README.md`](../firmware/README.md).
+   The page does not call the GitHub API (`api.github.com/.../releases`) or
+   download assets from their `browser_download_url`. Those URLs redirect to
+   `release-assets.githubusercontent.com`, and neither the redirect nor the
+   final response sets `Access-Control-Allow-Origin`, so the browser blocks
+   every download (#138).
+
+   `release.yml` copies each release's images into `docs/firmware/<tag>/` and
+   regenerates `docs/firmware/index.json`. Everything the page fetches is
+   same-origin, so CORS never applies. Nothing on the flash path touches
+   github.com. The one GitHub URL the page builds is the "view release" link,
+   which comes from the tag and is for display only.
+
+   The GitHub Release is still the source of truth and still carries every
+   asset, including the host binary, `partitions.csv` and `SHA256SUMS`. Pages
+   holds only the subset the page downloads. See
+   [`docs/firmware/README.md`](../firmware/README.md).
 
 4. **Resolve the images.** Two release layouts are understood:
 
@@ -146,42 +157,47 @@ It exists mainly for the headless `esp32s3-eth` and `esp32s3-wifi` builds: they
 have no screen, so this page is the only place a human ever sees a generated AP
 passphrase.
 
-**Opt-in, and off by default.** The panel is governed by *Apply these settings
-to the board*, unchecked on load. While it is unchecked the flasher writes
-**nothing** to `cfgseed` (the partition is not in the flash plan at all), so
-reflashing a board you already configured never clobbers its passphrase, Wi-Fi
-mode, or upstream credentials. The panel says so; so does this paragraph,
-because it is the property most worth not breaking.
+### Opt-in
 
-**Every control has a "Leave as is" position**, and only controls moved off it
-set their `has-*` flag in the record. This is not politeness: a plain on/off
-checkbox for AP security would mean someone opting in purely to set STATION
-mode also writes `has-ap-secure` with the value `0`, silently reopening a board
-that had WPA2 on, and with a fresh `gen`, so the firmware would really apply
-it.
+The settings are off by default. They are governed by *Apply these settings
+to the board*, which is unchecked on load. While it is unchecked the flasher
+writes **nothing** to `cfgseed`, because the partition is not in the flash plan
+at all. Reflashing a board you already configured therefore never clobbers its
+passphrase, Wi-Fi mode, or upstream credentials. This is the property most worth
+keeping.
 
-**Turning WPA2 on is a breaking change**, called out in a warning next to the
-toggle: every phone, ATA, and laptop already associated with the open access
-point has to be re-paired with the new passphrase. *Generate* produces 20
-characters from `23456789ABCDEFGHJKMNPQRSTVWXYZ` (no `0`/`O`, `1`/`I`/`L`, `U`)
-by rejection-sampled `crypto.getRandomValues`, matching
-`DeviceConfig::kPskAlphabet`. Passphrases are validated to 8–63 printable ASCII
-characters, the WPA2 bounds the firmware enforces. Selecting *WPA2* with an
-empty box generates one rather than letting the firmware pick a value that only
-ever reaches the serial log. After a successful flash the passphrase is shown
-in the result notice with a **Copy** button and echoed into the log.
+### Leave as is
 
-**SIP registrar mode** is the one setting here that is not about Wi-Fi, and it
-is in this panel because there is nowhere else to put it: digest auth is fully
-implemented in the firmware, but nothing outside the unit tests has ever
-written the `reg_mode` NVS key (no HTTP endpoint, no dashboard control), so a
-device comes up in the compiled-in default and stays there. A dashboard control
-is being added in parallel; until it ships, this page is the only way to set
-the mode on a headless board before first boot. The compiled-in default is
-`open`, so on a never-configured board *Leave as is* means open.
+Every control has a "Leave as is" position, and only controls moved off it set
+their `has-*` flag in the record. The reason is a plain on/off checkbox for AP
+security. Someone who opts in only to set STATION mode would also write
+`has-ap-secure` with the value `0`. That silently reopens a board that had WPA2
+on, and the fresh `gen` makes the firmware apply it.
 
-- open (byte `0`): any endpoint on the network registers as any extension,
-  no credential. Fine for a bench, lab, or classroom; not for a shared link.
+### Wi-Fi and AP security
+
+**Warning:** turning WPA2 on breaks existing clients. Every phone, ATA, and
+laptop already associated with the open access point has to be re-paired with
+the new passphrase. The page shows this warning next to the toggle.
+
+*Generate* produces 20 characters from `23456789ABCDEFGHJKMNPQRSTVWXYZ` (no
+`0`/`O`, `1`/`I`/`L`, `U`) by rejection-sampled `crypto.getRandomValues`,
+matching `DeviceConfig::kPskAlphabet`. Passphrases are validated to 8–63
+printable ASCII characters, the bounds the firmware enforces for WPA2. Selecting
+*WPA2* with an empty box generates one rather than letting the firmware pick a
+value that only ever reaches the serial log. After a successful flash the
+passphrase is shown in the result notice with a **Copy** button and echoed into
+the log.
+
+### SIP registrar mode
+
+**SIP registrar mode** is the one setting here that is not about Wi-Fi. It is in
+this panel because a headless board has no screen and no dashboard until it
+joins a network. Digest auth is implemented in the firmware. The mode is stored
+in NVS as `reg_mode`. The dashboard sets it through `POST /api/registrar`, and
+this panel sets it before the board first boots. A board that has never been
+configured runs in learn, so *Leave as is* means learn.
+
 - learn (`1`): trust-on-first-use. Unknown devices are adopted and locked
   to their extension by MAC, while already-secured ones are digest-enforced. A
   deliberate, *temporary* weakening for adopting an existing phone fleet: it
@@ -193,22 +209,39 @@ the mode on a headless board before first boot. The compiled-in default is
   stored secret is rejected outright with *Extension Not Provisioned*
   (`Registrar::admitSecure`), so provision before switching a live system over.
 
-**The record's version was deliberately not bumped** when `regMode` was added
-at byte 13 behind `kSeedHasRegMode` (bit 5). Each field is gated by its own
-flag and every reader ignores flags it does not recognise, so old firmware
-skips bit 5 and applies the rest, and new firmware reading an older record
-leaves `reg_mode` alone. Bumping the version would have made older firmware
-reject the whole record. Future fields go in the reserved space behind a new
-flag bit, the same way.
+Open is retired (#500). The page offers only learn and secure, and a seed that
+still carries byte `0` installs learn.
 
-**Older boards.** A board flashed from a release whose partition table predates
-`cfgseed` has no such partition; the firmware skips the seed silently, which is
-the designed behaviour and not an error. A **Full flash** self-heals it in one
-go: the new partition table and the seed are written in the same operation, so
-the board comes up already knowing about `cfgseed` and reads the seed on that
-first boot. *App only* does not rewrite the partition table, so a seed written
-in that mode lands on a layout that does not declare the partition and is
-ignored until a full flash. The panel says this too.
+### Record version
+
+The record version is deliberately not bumped to add a field. `regMode` sits at
+byte 13 behind `kSeedHasRegMode` (bit 5). Each field is gated by its own flag,
+and every reader ignores flags it does not recognise. Old firmware skips bit 5
+and applies the rest. New firmware reading an older record leaves `reg_mode`
+alone. Bumping the version would make older firmware reject the whole record.
+Future fields go in the reserved space behind a new flag bit, the same way.
+
+### Older boards
+
+A board flashed from a release whose partition table predates `cfgseed` has no
+such partition; the firmware skips the seed silently, which is the designed
+behaviour and not an error. A **Full flash** self-heals it in one go: the new
+partition table and the seed are written in the same operation, so the board
+comes up already knowing about `cfgseed` and reads the seed on that first boot.
+*App only* does not rewrite the partition table, so a seed written in that mode
+lands on a layout that does not declare the partition and is ignored until a
+full flash. The panel says this too.
+
+```mermaid
+flowchart TD
+    A{"Apply these settings to the board checked?"} -->|No| B["cfgseed is not in the flash plan, nothing is written"]
+    A -->|Yes| C{"Flash mode"}
+    C -->|Full flash| D["Partition table and seed written together"]
+    D --> E["Board reads the seed on first boot"]
+    C -->|App only| F{"Board partition table declares cfgseed?"}
+    F -->|No| G["Seed ignored until a full flash"]
+    F -->|Yes| H["Seed read at boot"]
+```
 
 ## Local development
 

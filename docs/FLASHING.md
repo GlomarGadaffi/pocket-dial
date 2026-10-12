@@ -1,48 +1,33 @@
 # Flashing pocket-dial Firmware
 
-This guide covers building and flashing pocket-dial firmware onto an ESP32-S3
-board, and updating it afterward over-the-air (OTA).
-
-> **First flash must be over USB.** The dual-OTA partition layout (see
-> [OTA.md](OTA.md)) differs from any single-`factory` image, so the very first
-> install of an OTA-capable build has to go on over the USB/serial port. After
-> that, you can update wirelessly from the dashboard.
+This guide covers building and flashing pocket-dial firmware onto an ESP32-S3 board (or a classic ESP32 for the `lan8720` build), and updating it afterward over the air (OTA).
 
 ## 1. Which firmware for which board
 
-All targets build for **ESP32-S3**. Pick the transport with
-`-D SIP_TRANSPORT=<transport>`:
+Pick the transport with `-D SIP_TRANSPORT=<transport>`:
 
-| Board | `SIP_TRANSPORT` | Verified app size |
-|-------|-----------------|-------------------|
-| Guition JC3248W535 (3.5" touch display) | `display` | ~1.50 MB (1,571,568 B) |
-| Generic ESP32-S3 / SoftAP | `wifi` | ~1.29 MB (1,288,464 B) |
-| Waveshare ESP32-S3-ETH / LilyGO T-ETH (W5500) | `eth` | ~0.95 MB (949,984 B) |
+| Board | `SIP_TRANSPORT` | Chip target |
+|-------|-----------------|-------------|
+| Guition JC3248W535 (3.5" touch display) | `display` | `esp32s3` |
+| Generic ESP32-S3 / SoftAP | `wifi` | `esp32s3` |
+| Waveshare ESP32-S3-ETH / LilyGO T-ETH (W5500) | `eth` | `esp32s3` |
+| LilyGO T-Internet-COM (internal-EMAC LAN8720) | `lan8720` | `esp32` (classic) |
 
-Every image fits comfortably in the 6 MB `ota_0` / `ota_1` slots.
+The browser flasher offers the `display`, `wifi` and `eth` builds only. Build `lan8720` from source, as described in §2.
 
-> [!IMPORTANT]
-> **ESP-IDF v6.0 or later is required.** `main/CMakeLists.txt` enforces it at
-> configure time, so an older toolchain stops immediately with a clear message
-> instead of failing ~1400 objects in with `component esp_driver_ledc could not
-> be found`. LEDC, GPIO, SPI and I2C were split out of the monolithic `driver`
-> component after v5.2, and this project requires them by their split names.
-> Both `.github/workflows/ci.yml` and `.github/workflows/release.yml` build on
-> **v6.0.1**.
->
-> This used to be inconsistent: the release workflow stayed pinned to v5.2.1
-> long after v5 stopped building, which is why the `v1.3.0-pre-alpha` release
-> run failed on every leg. If you are reproducing a release artifact older than
-> that, you need the toolchain that shipped it, but nothing on `main` builds
-> under v5 any more.
+Published image sizes are listed in `docs/firmware/index.json`. Every published image fits comfortably in the 6 MB `ota_0` / `ota_1` slots.
 
 ## 2. Build
+
+**ESP-IDF v6.0 or later is required.** `main/CMakeLists.txt` enforces it at configure time, so an older toolchain stops immediately with a clear message instead of failing ~1400 objects in with `component esp_driver_ledc could not be found`. LEDC, GPIO, SPI and I2C were split out of the monolithic `driver` component after v5.2, and this project requires them by their split names. Both `.github/workflows/ci.yml` and `.github/workflows/release.yml` build on v6.0.1. To reproduce an older release artifact, use the toolchain that shipped it. Nothing on `main` builds under v5.
 
 ```bash
 . $IDF_PATH/export.sh            # set up the ESP-IDF environment (see the note above)
 idf.py set-target esp32s3
 idf.py -D SIP_TRANSPORT=display build     # or wifi / eth
 ```
+
+For the `lan8720` build, set the classic ESP32 target instead: `idf.py set-target esp32`, then `idf.py -D SIP_TRANSPORT=lan8720 build`. The configure step stops for any other target.
 
 The build produces, under `build/`:
 
@@ -53,39 +38,21 @@ The build produces, under `build/`:
 
 ## 3. First-time flash (USB)
 
-### Option 0: from the browser, no toolchain
-
-Open **<https://glomargadaffi.github.io/pocket-dial/flasher/>** in Chrome, Edge, or
-Opera on a desktop, plug the board in over USB, pick the variant (Ethernet /
-display / Wi-Fi) and click **Flash board**. It pulls the images from the **GitHub Pages
-mirror** under `docs/firmware/<tag>/`, not from the Release assets; release-asset URLs
-send no CORS header, so a browser page cannot `fetch()` them ([#138]; the page reads
-`../firmware/index.json` same-origin, `docs/flasher/index.html:540-551`, and
-`release.yml:278` publishes the mirror). It writes them from your machine; nothing is
-uploaded.
-
-> [!IMPORTANT]
-> **There is no Waveshare variant in any release.** The flasher's `esp32s3-eth` image is
-> the **LilyGO T-ETH-Elite**, and `PD_ETH_BOARD` defaults to `elite`
-> (`main/CMakeLists.txt:37-39`). Flashing it to a Waveshare ESP32-S3-ETH writes the wrong
-> W5500 pin map, which aborts boot and leaves the board in a reset loop (see
-> [HARDWARE.md §3](HARDWARE.md)). That board must be built from source with
-> `idf.py -D SIP_TRANSPORT=eth -D PD_ETH_BOARD=waveshare build`. It
-also takes locally built `.bin` files under *Flash your own build*. Details in
-[flasher/README.md](flasher/README.md).
-
-It can additionally write the device's configuration at flash time (Wi-Fi mode,
-SoftAP security and passphrase, upstream STA credentials, and the SIP registrar
-mode) through the collapsed *Set Wi-Fi, AP security and SIP registrar mode
-while flashing* panel. That panel is opt-in and off by default: leave it
-alone and the flasher touches no configuration at all. It is the only way to
-configure a headless `eth` or `wifi` board before its first boot. See §5.
+The very first install of an OTA-capable build has to go on over the USB/serial port. The dual-OTA partition layout (see [OTA.md](OTA.md)) differs from any single-`factory` image. After that first flash, you can update wirelessly from the dashboard.
 
 Connect the board over USB and identify the serial port:
 
 - Linux: `/dev/ttyUSB0` or `/dev/ttyACM0`
 - macOS: `/dev/cu.usbserial-*` or `/dev/cu.usbmodem-*`
 - Windows: `COM3` (check Device Manager → Ports)
+
+### Option 0: from the browser, no toolchain
+
+Open **<https://glomargadaffi.github.io/pocket-dial/flasher/>** in Chrome, Edge, or Opera on a desktop, plug the board in over USB, pick the variant (Ethernet / display / Wi-Fi) and click **Flash board**. The page pulls the images from the **GitHub Pages mirror** under `docs/firmware/<tag>/`, not from the Release assets. Release-asset URLs send no CORS header, so a browser page cannot `fetch()` them (issue [#138](https://github.com/GlomarGadaffi/pocket-dial/issues/138)). The page reads `../firmware/index.json` same-origin (`FIRMWARE_INDEX` in `docs/flasher/index.html`), and the `Publish firmware to Pages` step in `.github/workflows/release.yml` publishes the mirror. It writes the images from your machine; nothing is uploaded.
+
+**Warning:** There is no Waveshare variant in any release. The flasher's `esp32s3-eth` image is the **LilyGO T-ETH-Elite**, and `PD_ETH_BOARD` defaults to `elite` (see `main/CMakeLists.txt`). Flashing it to a Waveshare ESP32-S3-ETH writes the wrong W5500 pin map, which aborts boot and leaves the board in a reset loop (see [HARDWARE.md §3](HARDWARE.md)). That board must be built from source with `idf.py -D SIP_TRANSPORT=eth -D PD_ETH_BOARD=waveshare build`. The flasher also takes locally built `.bin` files under *Flash your own build instead*. Details in [flasher/README.md](flasher/README.md).
+
+The flasher can also write the device's configuration at flash time (Wi-Fi mode, SoftAP security and passphrase, upstream STA credentials, and the SIP registrar mode) through the collapsed *Set Wi-Fi, AP security and SIP registrar mode while flashing* panel. That panel is opt-in and off by default: leave it alone and the flasher touches no configuration at all. It is the only way to configure a headless `eth` or `wifi` board before its first boot. See §5.
 
 ### Option A: `idf.py` (recommended)
 
@@ -107,42 +74,50 @@ esptool.py -p COM3 -b 460800 --chip esp32s3 write_flash \
   0x20000  build/SipServer.bin
 ```
 
-> The `ota_data_initial.bin` at `0xf000` points the bootloader at `ota_0`
-> (offset `0x20000`) for the first boot. `idf.py flash` handles this for you.
+The `ota_data_initial.bin` at `0xf000` points the bootloader at `ota_0` (offset `0x20000`) for the first boot. `idf.py flash` handles this for you.
 
-Those four offsets are still correct after the `cfgseed` partition was added:
-`nvs`, `otadata`, `phy_init`, `ota_0` and `ota_1` all keep their exact offsets
-and sizes (that is a stated contract in `partitions.csv`'s own header). Neither
-`idf.py flash` nor the `esptool` command above writes `cfgseed`; it is left
-erased (`0xFF`), which the firmware treats as "no seed" and ignores. See §5.
+The offsets in the `esptool` command match the current partition table. `nvs`, `otadata`, `phy_init`, `ota_0` and `ota_1` all keep their exact offsets and sizes, and `partitions.csv` states this as a contract in its header. Neither `idf.py flash` nor the `esptool` command above writes `cfgseed`. It is left erased (`0xFF`), which the firmware treats as "no seed" and ignores. See §5.
 
 ### First boot: what you will actually see
 
 Nothing about the dashboard is hidden, gated at the transport, or delayed. As soon
 as the board is up:
 
-* **The HTTP dashboard answers on its port immediately**, in every state,
+- **The HTTP dashboard answers on its port immediately**, in every state,
   provisioned or not. The listener opens when `HttpServer` is constructed and stays
-  open for the life of the process. Firmware built before commit `de1a36e` went
-  **dark** once a PIN was set and was reopened by dialling `*4887` from the admin
-  extension; that entire mechanism was removed: `grep -rn 4887 src/` returns
-  nothing. A **connection refused is therefore always a genuine fault** (wrong
-  address, wrong network, board still booting), never an expected gate to open.
-* The login is `admin` / `admin`: a username and a password, not a PIN. It
-  ships well-known on purpose, so first contact needs no out-of-band secret.
-* **You must replace it before anything else works.** While the default credential
-  stands, every admin-gated route (read-only `GET`s included) returns
-  `403 {"error":"setup_required"}`. The single exception is
-  `POST /api/admin/set-credential`. That covers OTA, factory reset, Wi-Fi changes,
-  registrar mode and AP security.
-* **On the `wifi`, `eth` and `lan8720` builds the SIP registrar does not start at
+  open for the life of the process. There is no star-code and no admin-open window:
+  `grep -rn 4887 src/` returns nothing. A **connection refused is therefore always a
+  genuine fault** (wrong address, wrong network, board still booting), never a gate
+  to open.
+- The login is `admin` / `admin`: a username and a password, not a PIN. It ships
+  well-known on purpose, so first contact needs no out-of-band secret.
+- **You must replace it before anything else works.** While the default credential
+  stands, a logged-in session gets `403 {"error":"setup_required"}` from every
+  admin-gated route, read-only `GET`s included. Without a session the response is
+  `401 {"error":"authentication required"}`. The single exception is
+  `POST /api/admin/set-credential`. OTA, factory reset, Wi-Fi changes, registrar mode
+  and AP security all wait on it.
+- **On the `wifi`, `eth` and `lan8720` builds the SIP registrar does not start at
   all until a credential is committed.** The boot task logs
   `[boot] device unprovisioned — SIP stack held dark until credential committed`
   and polls every 2 s; no phone can register until you finish setup. If nothing is
-  committed within 30 minutes the board reboots and begins the wait again; a board
+  committed within 30 minutes, the board reboots and begins the wait again. A board
   that restarts on you mid-setup is behaving as designed, not crashing. The
   `display` build is **not** gated this way: it boots into its normal network role
   and brings SIP up regardless.
+
+```mermaid
+flowchart TD
+    boot[Board boots] --> http[HTTP dashboard starts in every state]
+    http --> build{Build}
+    build -->|display| sip[SIP registrar starts]
+    build -->|wifi, eth or lan8720| committed{Credential committed?}
+    committed -->|yes| sip
+    committed -->|no, under 30 minutes| poll[Wait 2 s and check again]
+    poll --> committed
+    committed -->|no, 30 minutes passed| reboot[Board reboots and waits again]
+    reboot --> boot
+```
 
 The exact `curl` calls are in
 [SETUP_GUIDE.md §3](SETUP_GUIDE.md#3-log-in-and-complete-setup-first).
@@ -159,46 +134,54 @@ action until you replace it. The *separate* DTMF admin PIN (the phone-keypad
 `*PIN#code` menu secret, unrelated to the web login) is erased with it, and has no
 default, so that menu is disabled until you set one again.
 
-### Migration note (adding `cfgseed`)
+### Boards flashed before `coredump` and `cfgseed`
 
-The current partition table adds one 4 KB data partition, `cfgseed`
-(`data, 0x41, 0xFFF000, 0x1000`), at the very top of the 16 MB device. The space
-came out of `prompts`, which shrank from `0x3E0000` to `0x3DF000`; everything
-below it is byte-identical, so the change is OTA-compatible in both directions.
+The current `partitions.csv` declares two data partitions that older layouts lack.
+`coredump` holds the panic coredump (issue #382). `cfgseed`
+(`data, 0x41, 0xFFF000, 0x1000`) is a 4 KB partition at the very top of the 16 MB
+flash, used for flash-time configuration (§5). Both are carved out of the space that
+`prompts` occupies. `nvs`, `otadata`, `phy_init`, `ota_0` and `ota_1` keep their exact
+offsets and sizes.
 
-Because an OTA update ships an app image and **never rewrites the partition
-table**, a board flashed before `cfgseed` existed will not have it, and current
-firmware runs on it perfectly well. So does the 4 MB
-`sdkconfig.defaults.esp32_constrained` layout (`partitions_4mb.csv`), which has
-no room for `cfgseed` at all. **A missing `cfgseed` partition is the normal case,
-not an error**: the firmware reads it, finds nothing, and keeps its NVS-stored
-configuration. The only way to add the partition to an existing board is a full
-USB flash of the new partition table (bootloader + partition table + app), which
-the browser flasher's *Full flash* mode does in one operation.
+An OTA update ships an app image and **never rewrites the partition table**. A
+board flashed before these partitions existed therefore does not have them, and
+current firmware runs on it normally. A missing `cfgseed` partition is the normal
+case, not an error: the firmware finds nothing and keeps its NVS-stored
+configuration. A missing `coredump` partition means coredumps are unavailable, which
+is not an error either. The 4 MB `sdkconfig.defaults.esp32_constrained` layout
+(`partitions_4mb.csv`) has no room for `cfgseed` at all.
+
+The only way to add these partitions to an existing board is a full USB flash of
+the new partition table, with the bootloader and the app. `idf.py flash`, the
+`esptool` command in §3, and the browser flasher's *Full flash* mode each do this in
+one operation.
 
 ## 4. Updating over-the-air (after the first USB flash)
 
-Once a device is running an OTA-capable build, push new firmware without a
-cable. OTA upload always needs **two** things from the admin session: there is no
-unauthenticated path in any provisioning state: the `pd_session` cookie *and* the
-session's `X-CSRF` token, which `POST /api/admin/login` returns in its JSON
-response.
+Once a device runs an OTA-capable build, you can push new firmware without a
+cable. An upload needs these things from the admin session:
 
-> [!IMPORTANT]
-> **Finish first-use setup before attempting an OTA.** While the board is still on
-> the shipped `admin`/`admin` credential, `POST /api/ota/upload` and
-> `POST /api/ota/reboot` return `403 {"error":"setup_required"}` like every other
-> admin-gated route, only `POST /api/admin/set-credential` is exempt. See
-> [SETUP_GUIDE.md §3](SETUP_GUIDE.md#3-log-in-and-complete-setup-first).
->
-> **The port itself is not a gate.** The HTTP listener is open from boot in every
-> state. Earlier firmware went dark once a PIN was set, was reopened by dialling
-> `*4887` from the registered admin extension, and had a
-> `POST /api/admin/keepalive` route to extend that window. **All of it was
-> removed**: there is no star-code, no bounded admin-open window, and no
-> `keepalive` route in `src/` any more. If a connection is refused, the fault is
-> real; do not go looking for a window to open. See
-> [API.md §0](API.md#0-reachability--admin-session-layer-read-this-first).
+- The `pd_session` cookie, set by `POST /api/admin/login`.
+- The session's `X-CSRF` token, which `POST /api/admin/login` returns in its JSON
+  response.
+- An owner-role session, once an owner account exists. Until then a sysop login is
+  enough. Once one exists, a sysop session gets
+  `403 {"error":"owner privilege required"}` on upload. See [OTA.md §3](OTA.md) for
+  how the owner role is set up.
+
+There is no unauthenticated upload path in any provisioning state. The reboot step
+needs a sysop session and the CSRF token; it does not need the owner role.
+
+**Finish first-use setup before attempting an OTA.** While the board is still on the
+shipped `admin`/`admin` credential, `POST /api/ota/upload` and `POST /api/ota/reboot`
+return `403 {"error":"setup_required"}` like every other admin-gated route. Only
+`POST /api/admin/set-credential` is exempt. See
+[SETUP_GUIDE.md §3](SETUP_GUIDE.md#3-log-in-and-complete-setup-first).
+
+The port itself is not a gate. The HTTP listener is open from boot in every state,
+and there is no star-code, no bounded admin-open window, and no `keepalive` route in
+`src/`. If a connection is refused, the fault is real, so do not look for a window to
+open. See [API.md §0](API.md#0-reachability--admin-session-layer-read-this-first).
 
 ```bash
 DEVICE=http://192.168.4.1
@@ -232,25 +215,30 @@ curl -s -b "$JAR" \
      -X POST "$DEVICE/api/ota/reboot"
 ```
 
-> A script written against earlier firmware sends the cookie but no token, and
-> now gets `403 {"error":"missing or invalid CSRF token"}` on the upload and
-> reboot steps. A script that skips step 1 altogether (which older firmware
-> tolerated on an unprovisioned device) now gets
-> `401 {"error":"authentication required"}`. **There is no ungated OTA endpoint any
-> more, in any state**, so the old advice to "set a PIN in production before
-> exposing OTA" no longer describes a choice you have. Full walk-through and
-> response codes: [OTA.md §3](OTA.md).
+A script that sends the cookie but no `X-CSRF` header gets
+`403 {"error":"missing or invalid CSRF token"}` on the upload and reboot steps. A
+script that skips step 1 gets `401 {"error":"authentication required"}`. **There is
+no ungated OTA endpoint in any state.** Full walk-through and response codes:
+[OTA.md §3](OTA.md).
 
 The bootloader brings the new image up in a *pending-verify* state. The firmware
-confirms it automatically a few seconds after the SIP and HTTP servers come up
-(see [OTA.md](OTA.md) §4); if the new image crashes on boot, the bootloader rolls
-back to the previous slot, no bricking.
+confirms it automatically a few seconds after the SIP and HTTP servers come up (see
+[OTA.md](OTA.md) §4). If the new image crashes on boot, the bootloader rolls back to
+the previous slot, so the board is not bricked.
 
-> [!NOTE]
-> The dual-slot layout, the pending-verify confirmation and the rollback path are
-> all implemented, but the **full OTA cycle has never been run end to end on
-> hardware**. Treat your first wireless update as the test of it, and
-> keep a USB cable within reach.
+```mermaid
+flowchart LR
+    login[Log in: pd_session cookie and X-CSRF token] --> upload[Upload image to inactive slot]
+    upload --> reboot[Reboot into the new image]
+    reboot --> pending[Pending-verify state]
+    pending -->|SIP and HTTP servers up| confirm[Firmware confirms the image a few seconds later]
+    pending -->|Crashes on boot| rollback[Bootloader rolls back to the previous slot]
+```
+
+**Warning:** The dual-slot layout, the pending-verify confirmation and the rollback
+path are all implemented, but the **full OTA cycle has never been run end to end on
+hardware**. Treat your first wireless update as the test of it, and keep a USB cable
+within reach.
 
 Check status any time:
 
@@ -266,11 +254,11 @@ generated SoftAP passphrase and no dashboard to reach before it is on a network.
 record** into the `cfgseed` partition at `0xFFF000`, and the firmware reads it
 **once** on first boot and copies the flagged fields into NVS.
 
-| | |
+| Topic | Detail |
 |---|---|
 | What can be seeded | Wi-Fi mode (captive-portal default / STATION / AP), SoftAP WPA2 on-off, SoftAP passphrase, upstream STA SSID + password, SIP registrar mode |
 | Who writes it | The browser flasher, over USB, before first boot, **only**. There is no CLI tool for this. |
-| Who reads it | `DeviceConfig::applyFlashSeed()`, called at boot right after `nvs_flash_init()` |
+| Who reads it | `DeviceConfig::applyFlashSeed()`, called at boot after `nvs_flash_init()` and the NVS schema-version check |
 | Applied how often | Once per record. Each write carries a `gen` counter; the firmware stores it as `cfgseed_gen` and ignores the partition until a *newer* `gen` appears, so a plain reboot never re-clobbers settings you changed since. |
 | Wire format | `src/Helpers/DeviceConfig.hpp` is authoritative (magic `PDCS`, version, per-field `has-*` flag bits, CRC-32 over bytes `[0,252)`). |
 
@@ -309,22 +297,22 @@ access and stores it in NVS: 20 characters from `23456789ABCDEFGHJKMNPQRSTVWXYZ`
 (no `0`/`O`, `1`/`I`/`L`, `U`), because it gets read off a small LCD or a serial
 log and retyped into a desk phone. You can see it in four places:
 
-* on the LVGL onboarding screen, on the `display` build;
-* on the serial console at AP bringup, as
+- on the LVGL onboarding screen, on the `display` build;
+- on the serial console at AP bringup, as
   `INFRA: SoftAP passphrase (WPA2): <psk>`, the headless build's only local
   channel, and yes, that is in the clear: anyone with a serial cable is already
   inside the physical trust boundary;
-* in the dashboard, and over `GET /api/ap-security` (see [API.md](API.md));
-* in the browser flasher's result notice, with a **Copy** button, when the
+- in the dashboard, and over `GET /api/ap-security` (see [API.md](API.md));
+- in the browser flasher's result notice, with a **Copy** button, when the
   passphrase was set at flash time.
 
 Enabling WPA2 from the dashboard does **not** restart the radio; that would drop
 the client that just asked for the passphrase. The change lands at the next AP
 bringup, so power-cycle the board to see it take effect.
 
-> The shipped defaults remain an **open** SoftAP, a **`learn`** SIP registrar
-> (trust-on-first-use; `open` is retired, #502), plain HTTP, and unsigned OTA.
-> Everything in this section is something an operator turns on deliberately.
+The shipped defaults remain an **open** SoftAP, a **`learn`** SIP registrar
+(trust-on-first-use; `open` is retired, #502), plain HTTP, and unsigned OTA.
+Everything in this section is something an operator turns on deliberately.
 
 ## 6. Troubleshooting
 
@@ -335,8 +323,8 @@ bringup, so power-cycle the board to see it take effect.
 | Boots to old firmware after OTA | The new image failed verification and rolled back; check the serial log, rebuild and retry. |
 | Colors look wrong on the display | Confirm the `display` transport build (`CONFIG_LV_COLOR_16_SWAP=y` is set in `sdkconfig.defaults`). |
 | Wi-Fi creds / admin credential lost after flashing | Expected after a full `erase_flash` or layout migration. The board is back on `admin`/`admin` and demands first-use setup again; the separate DTMF admin PIN is gone too. On `wifi`/`eth`/`lan8720` the SIP registrar stays down until you complete setup, see *First boot* in §3. |
-| Connection refused on port 80 | Always a genuine fault: wrong address, wrong network, or the board has not finished booting. The listener opens at construction and stays open in every provisioning state. The dark-by-default plane and the `*4887` reopen star-code were **removed**; there is nothing to "open" first. See [API.md §0](API.md#0-reachability--admin-session-layer-read-this-first). |
-| `403 {"error":"setup_required"}` from any admin route | The board is still on the default `admin`/`admin` login. Until you replace it via `POST /api/admin/set-credential`, every other admin-gated route (`GET`s included) refuses. See [SETUP_GUIDE.md §3](SETUP_GUIDE.md#3-log-in-and-complete-setup-first). |
+| Connection refused on port 80 | Always a genuine fault: wrong address, wrong network, or the board has not finished booting. The listener opens at construction and stays open in every provisioning state. There is no `*4887` star-code or admin-open window to trigger first. See [API.md §0](API.md#0-reachability--admin-session-layer-read-this-first). |
+| `403 {"error":"setup_required"}` from any admin route | The board is still on the default `admin`/`admin` login. Until you replace it via `POST /api/admin/set-credential`, every other admin-gated route (`GET`s included) refuses a logged-in session. Without a session the response is `401`. See [SETUP_GUIDE.md §3](SETUP_GUIDE.md#3-log-in-and-complete-setup-first). |
 | `429 {"error":"too many failed attempts..."}` on login | The brute-force lockout is engaged: 5 consecutive wrong username/password attempts → 60 s, doubling on each repeat lockout to a 16-minute cap. It is keyed per client address, and a correct login clears that client's counter. The counters are RAM-only; power-cycling clears them without touching the stored credential. |
 | `403 {"error":"missing or invalid CSRF token"}` from a script | The script sends the session cookie but no `X-CSRF` header. Capture the token from the login response, §4. |
 | Flash-time settings had no effect | Either the panel's *Apply these settings to the board* box was left unchecked (the default), or the seed was written in *App only* mode onto a partition table that predates `cfgseed`. Redo it as a **Full flash**, §5. |

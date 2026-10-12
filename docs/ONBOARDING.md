@@ -1,24 +1,22 @@
 # Pocket-Dial Firmware Onboarding Guide
-### Zero-to-Flashing in Under 30 Minutes
 
-Welcome to the pocket-dial ESP32 firmware project! This guide will take you from a clean machine to a fully compiled and flashed firmware, with a functioning HTTP dashboard running on your target development board.
+This guide takes you from a clean machine to a compiled and flashed pocket-dial firmware, with the HTTP dashboard running on your development board.
 
 ## Prerequisites & Tools
 
-Before you begin, install the required toolchain and platform dependencies based on your operating system:
+Install the toolchain and platform dependencies for your operating system before you begin.
 
 ### 1. Hardware Drivers
-Ensure you have installed the correct USB-to-UART bridge drivers for your target board:
-* Silicon Labs CP210x: [Download CP210x VCP Drivers](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers) (Common on standard ESP32 DevKits)
-* WCH CH340 / CH341: [Download CH340 Drivers](http://www.wch-ic.com/downloads/CH341SER_EXE.html) (Common on low-cost S3 boards, displays, and clone devkits)
+
+Install the correct USB-to-UART bridge driver for your target board:
+
+* Silicon Labs CP210x: [Download CP210x VCP Drivers](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers) (common on standard ESP32 DevKits)
+* WCH CH340 / CH341: [Download CH340 Drivers](http://www.wch-ic.com/downloads/CH341SER_EXE.html) (common on low-cost S3 boards, displays, and clone devkits)
 
 ### 2. ESP-IDF Toolchain (v6.0 or later; v5.x will not configure)
-The firmware requires **ESP-IDF v6.0+**. This is a hard floor, not a recommendation:
-`main/CMakeLists.txt:19-24` raises a CMake `FATAL_ERROR` on anything below v6.0, so a v5.x
-toolchain fails at configure time before a single file is compiled. Both
-`.github/workflows/ci.yml` and `release.yml` build on **v6.0.1**.
-*(Earlier revisions of this page said v5.1.2 / v5.2.1 were "fully certified". They are not
-usable at all. A v5.2.1 pin is what silently broke the v1.3.0-pre-alpha release run.)*
+
+The firmware requires **ESP-IDF v6.0+**. This is a hard floor, not a recommendation. `main/CMakeLists.txt:19-24` raises a CMake `FATAL_ERROR` on anything below v6.0, so a v5.x toolchain fails at configure time, before a single file is compiled. Both `.github/workflows/ci.yml` and `release.yml` build on **v6.0.1**. v5.1.2 and v5.2.1 are not usable, and CI no longer builds them.
+
 * Windows installation: Download and run the [ESP-IDF Offline Installer](https://dl.espressif.com/dl/esp-idf/) (select version `6.0.1`).
 * Linux/macOS installation: Follow the [Espressif Standard Shell Setup Guide](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/linux-macos-setup.html).
 
@@ -38,9 +36,7 @@ To load the correct compilers (`xtensa-esp32-elf-gcc`, `xtensa-esp32s3-elf-g++`)
 . $HOME/esp/esp-idf/export.sh
 ```
 
-> [!TIP]
-> If activation is successful, running `idf.py --version` should output `ESP-IDF v6.0.x`.
-> Anything below v6.0 will stop with the `FATAL_ERROR` from `main/CMakeLists.txt`.
+If activation succeeds, running `idf.py --version` prints `ESP-IDF v6.0.x`. Anything below v6.0 stops with the `FATAL_ERROR` from `main/CMakeLists.txt`.
 
 ## Step 2: Clone & Configure
 
@@ -63,22 +59,14 @@ To load the correct compilers (`xtensa-esp32-elf-gcc`, `xtensa-esp32s3-elf-g++`)
 
 ## Step 3: Select Your Hardware Transport Layer
 
-The firmware is designed with a highly modular physical layer. Define your transport configuration at compile-time by passing the `-D SIP_TRANSPORT` parameter to `idf.py`:
+The firmware has a modular physical layer. Pick a transport at compile time by passing `-D SIP_TRANSPORT` to `idf.py`. Each transport maps to one entrypoint file, listed in the table below.
 
-```
-                           ┌───────────────────────────┐
-                           │      Build Entrypoint     │
-                           └─────────────┬─────────────┘
-                                         │
-                 ┌───────────────────────┼───────────────────────┐
-                 ▼                       ▼                       ▼
-      -D SIP_TRANSPORT=wifi    -D SIP_TRANSPORT=eth    -D SIP_TRANSPORT=display
-                 │                       │                       │
-                 ▼                       ▼                       ▼
-    ┌─────────────────────────┐  ┌─────────────────────────┐  ┌─────────────────────────┐
-    │     Wi-Fi SoftAP Mode   │  │   W5500 PoE Ethernet    │  │   AXS15231B Touch screen │
-    │     (esp_main.cpp)      │  │   (esp_main_eth.cpp)    │  │ (esp_main_display.cpp)  │
-    └─────────────────────────┘  └─────────────────────────┘  └─────────────────────────┘
+```mermaid
+flowchart TD
+    build["Build with -D SIP_TRANSPORT"] --> wifi["wifi: Wi-Fi SoftAP<br/>main/esp_main.cpp"]
+    build --> eth["eth (default): W5500 PoE Ethernet<br/>main/esp_main_eth.cpp"]
+    build --> lan["lan8720: LAN8720 RMII PHY, classic ESP32 only<br/>main/esp_main_eth_lan8720.cpp"]
+    build --> display["display: Guition AXS15231B touch display<br/>main/esp_main_display.cpp"]
 ```
 
 | Transport Parameter | Target Board Description | Primary Entrypoint File |
@@ -88,7 +76,7 @@ The firmware is designed with a highly modular physical layer. Define your trans
 | `lan8720` | **A separate transport, not part of `eth`.** Classic ESP32 + LAN8720 RMII PHY; hard-errors unless `IDF_TARGET == esp32` | `main/esp_main_eth_lan8720.cpp` |
 | `display` | Guition AXS15231B **3.5" 320x480** LCD, pins graphics to Core 1 and SIP on Core 0 | `main/esp_main_display.cpp` |
 
-Choose **ONE** of the following compilation commands matching your physical hardware setup:
+Choose one of the following build commands to match your hardware:
 
 ```bash
 # Option A: Build for Standalone Wi-Fi (Any standard ESP32 or S3 Board)
@@ -103,43 +91,37 @@ idf.py -D SIP_TRANSPORT=display build
 
 ## Step 4: Security Customizations (Issues #54-#59)
 
-Before compiling, configure security settings according to your environment's posture:
+Before you compile, set the security options for your environment.
 
 ### 1. Learn vs. Secure Mode Authentication (Issue #56)
-By default, the SIP engine starts in **Learn** mode (trust-on-first-use; Open Mode is retired, #502). If you are deploying the firmware in a production or shared corporate network environment, you must switch the system to **Secure** mode to block unauthorized traffic.
-> [!CAUTION]
-> **This is not a build knob and editing that `#define` does nothing.** Earlier revisions
-> told you to comment out `POCKETDIAL_OPEN_REGISTRAR` in `src/SIP/RequestsHandler.hpp`. That
-> macro is **gone** (#500); see the header's comment at `RequestsHandler.hpp:4-11`.
 
-* To enable Secure mode: the registrar admission mode is a **runtime** setting,
-  persisted in NVS as `reg_mode` in the `pbxcfg` namespace. Change it with
-  `POST /api/registrar` (`mode=learn` or `mode=secure`) from a logged-in dashboard session,
-  or seed it at flash time through the `cfgseed` record. See
-  [LEARN_MODE.md](LEARN_MODE.md) for the cutover procedure.
-* Effect: in `learn`, an unknown MAC is adopted trust-on-first-use, and its extension is
-  locked to that MAC only once an admin secures it; in `secure`, every `REGISTER` **and** `INVITE` is digest-challenged.
-* Before you plan on `secure`: read [LEARN_MODE.md](LEARN_MODE.md) Step 4 first. There
-  is currently no way to set a per-extension SIP secret, so `secure` rejects every phone
-  rather than protecting them, and `POST /api/registrar mode=secure` refuses with `409`
-  unless you override it. `learn` is the strongest mode that can actually be deployed today.
+By default, the SIP engine starts in **Learn** mode, which is trust-on-first-use. Open Mode is retired (#502). **Secure** mode is the one that blocks unauthorized traffic, but every phone needs a per-extension secret first. Read the warning below before you choose it.
 
-### 2. Address of Record (AOR) Sanitization Safeguard (Issue #55)
-The engine whitelists and sanitizes SIP Address of Record (AOR) segments during inbound packet parsing. 
-* Only alphanumeric characters and the characters `.`, `-`, `_`, `+`, **`*` and `#`** are
-  allowed (`RequestsHandler.cpp:5968-5977`). The last two matter: without them the star and
-  pound feature codes (`*8` group pickup, `**<ext>` directed pickup, the `*PIN#` admin menu)
-  would not be dialable.
-* Malformed injection strings or script probes are instantly intercepted and rejected with a `400 Bad Request` packet, preventing potential parsing or configuration hijacking attempts.
+**Warning:** Editing a `#define` does nothing for this setting. The old `POCKETDIAL_OPEN_REGISTRAR` macro was removed (#500). The header comment at `src/SIP/RequestsHandler.hpp:4-11` describes the runtime setting.
+
+* To enable Secure mode: the registrar admission mode is a **runtime** setting, persisted in NVS as `reg_mode` in the `pbxcfg` namespace. Change it with `POST /api/registrar` (`mode=learn` or `mode=secure`) from a logged-in dashboard session, or seed it at flash time through the `cfgseed` record. See [LEARN_MODE.md](LEARN_MODE.md) for the cutover procedure.
+* Effect: in `learn`, an unknown MAC is adopted on a trust-on-first-use basis. If the same MAC registers again for the same extension at least 30 seconds after its first sighting, the extension locks to that MAC automatically. The lock does not happen if an earlier-adopted device already holds the extension. Promoting a device to Secured is a separate admin step; a Secured device stays locked to its MAC and is digest-checked. In `secure`, every `REGISTER` **and** `INVITE` is digest-challenged.
+
+**Warning:** There is currently no way to create or rotate a per-extension SIP secret. The only path that brings one back is restoring an encrypted configuration backup that already holds it (`POST /api/config/import`). Without secrets, `secure` rejects every phone rather than protecting them. `POST /api/registrar mode=secure` refuses with `409` unless you override it. Read [LEARN_MODE.md](LEARN_MODE.md) Step 4 before you plan on `secure`. `learn` is the strongest mode that can actually be deployed today.
+
+### 2. Address of Record (AOR) Validation (Issue #55)
+
+The engine checks SIP Address of Record (AOR) values during inbound packet parsing. The check is `RequestsHandler::isValidAor()` in `src/SIP/RequestsHandler.cpp`.
+
+* Only alphanumeric characters and the characters `.`, `-`, `_`, `+`, **`*` and `#`** are allowed, and a value must be 1 to 64 characters long. The last two matter: without them, the star and pound feature codes (`*8` group pickup, `**<ext>` directed pickup, the `*PIN#` admin menu) would not be dialable.
+* Malformed values, such as injection strings or script probes, are rejected with a `400 Bad Request` SIP response. This blocks potential parsing and configuration hijacking attempts.
 
 ### 3. Distributed Scanner Denial-of-Service Defense (Issue #58)
-The system prevents flash/memory exhaustion exploits by network scanners via two mechanisms:
-* Old rate-limit tracking buckets (inactive for >60 seconds) are automatically swept from memory during the tick process.
-* The number of concurrent tracking source IPs is restricted to a hard cap of `MAX_BUCKETS = 256`. Scanning packets exceeding this limit are silently dropped to safeguard device stability.
+
+The system prevents memory exhaustion by network scanners in two ways:
+
+* Rate-limit tracking buckets that have been inactive for more than 60 seconds are swept from memory in `RequestsHandler::tick()`.
+* The rate-limit map holds at most 256 source IPs. The cap is a literal in `RequestsHandler::allowPacket()`. When the map is full, a packet from a new source IP is dropped without a reply. Sources that already have a bucket are not affected by the cap.
 
 ## Step 5: Flash the Board
 
-Connect your development board using a high-quality USB-C/micro-USB cable. Identify the serial port assigned to your device:
+Connect your development board with a USB-C or micro-USB cable that carries data. Identify the serial port assigned to your device:
+
 * Windows: Open Device Manager and check `Ports (COM & LPT)` (e.g., `COM3`, `COM12`).
 * Linux: Run `ls /dev/ttyUSB*` or `ls /dev/ttyACM*` (e.g., `/dev/ttyUSB0`).
 * macOS: Run `ls /dev/cu.usbserial*` or `ls /dev/cu.usbmodem*`.
@@ -151,23 +133,21 @@ Flash the compiled firmware binaries and partition tables directly to the flash 
 idf.py -p COM3 flash monitor
 ```
 
-> [!IMPORTANT]
-> If the flashing utility times out while trying to connect, hold down the physical **BOOT / FLASH** button on the development board, press and release the **EN / RST** button, then release the BOOT button to force the chip into ROM bootloader mode before running the command.
+If the flashing utility times out while it connects, hold down the physical **BOOT / FLASH** button on the board, press and release the **EN / RST** button, then release the BOOT button. This forces the chip into ROM bootloader mode. Then run the command again.
 
 ## Step 6: Manual HTTP API Verification
 
-Once flashing completes, the device boots and the serial monitor will show logging status. If running in **Wi-Fi SoftAP** or **Display** mode:
+After flashing, the device boots and the serial monitor shows its logs. If the board runs in **Wi-Fi SoftAP** or **Display** mode:
 
-1. Connect to the Network: On your laptop or phone, connect to the Wi-Fi network named
-   **`esp32-sipserver`**. It is **open by default** (no password). If access-point security
-   has been enabled (from the dashboard, or at flash time via the browser flasher), you will
-   need the device's own generated WPA2 passphrase instead; see
-   [SETUP_GUIDE.md](SETUP_GUIDE.md#turning-on-access-point-security-wpa2) for where to read it.
-2. Retrieve Server IP: The SoftAP gateway IP defaults to **`192.168.4.1`**.
+1. Connect to the network. On your laptop or phone, join the Wi-Fi network named **`esp32-sipserver`**. It is **open by default** (no password). If access-point security has been enabled, from the dashboard or at flash time through the browser flasher, you need the device's own generated WPA2 passphrase instead. See [SETUP_GUIDE.md](SETUP_GUIDE.md#turning-on-access-point-security-wpa2) for where to read it. On a display build that is still in captive-portal onboarding, the setup AP is **`My-Ap`** instead. It is a WPA2 network, and its passphrase is shown on the onboarding screen. See [SETUP_GUIDE.md](SETUP_GUIDE.md#variant-captive-portal-onboarding-touch-display-build).
+2. Retrieve the server IP. The SoftAP gateway IP defaults to **`192.168.4.1`**.
 
-You can now manually query and control the firmware using standard terminal commands or by navigating your browser to `http://192.168.4.1/`.
+You can now query and control the firmware with standard terminal commands, or by opening `http://192.168.4.1/` in your browser.
+
+Sections 3 and 4 call admin routes. After you log in, every admin-gated route except `POST /api/admin/set-credential` returns `403` with `setup_required` while the board still has its shipped login (`admin`/`admin`). Change the login first, as described in [SETUP_GUIDE.md section 3](SETUP_GUIDE.md#3-log-in-and-complete-setup-first). The gate order is described in [API.md §0.1](API.md#01-the-gates-in-the-order-requireadmin-applies-them).
 
 ### 1. Get Live System Status (Uptime, Registered Clients, and Sessions)
+
 Retrieves system metrics and registered SIP extensions.
 
 #### Command
@@ -195,6 +175,7 @@ curl -s http://192.168.4.1/api/status
 ```
 
 ### 2. Scan Local Wi-Fi Networks
+
 Triggers an active network scan and returns reachable SSID lists, their signal strength, and encryption types.
 
 #### Command
@@ -221,15 +202,10 @@ curl -s http://192.168.4.1/api/wifi/scan
 ```
 
 ### 3. Connect Device to a Client Wi-Fi Network
+
 Saves credentials into the `"storage"` NVS namespace, changes operating mode to station, and initiates an automatic system restart.
 
-> [!IMPORTANT]
-> **This route is admin-gated. An unauthenticated call returns `401`.**
-> `POST /api/wifi/connect` goes through `requireAdmin(..., needCsrf=true)`
-> (`HttpServer.cpp:642-648`), so it needs a `pd_session` cookie **and** a matching
-> `X-CSRF` header. Earlier revisions of this page showed the bare call below without
-> either. Log in first, keep the cookie, and echo the CSRF token the login returns.
-> See [API.md §0.1](API.md).
+This route is admin-gated. An unauthenticated call returns `401`. The call needs a `pd_session` cookie and a matching `X-CSRF` header, because `POST /api/wifi/connect` runs `requireAdmin()` with CSRF checking on (`needCsrf=true`). Log in first, keep the cookie, and echo the CSRF token that the login returns. See [API.md §0.1](API.md#01-the-gates-in-the-order-requireadmin-applies-them).
 
 #### Command
 ```bash
@@ -257,15 +233,10 @@ curl -b jar.txt -X POST \
 ```
 
 ### 4. Force Disconnect an Active Call Extension (admin session + CSRF)
+
 Sends a disconnect command to terminate the session of a rogue or deadlocked extension.
 
-> [!IMPORTANT]
-> **Matching `Origin`/`Host` headers are not sufficient.** Earlier revisions described
-> this route as protected by "Same-Origin protection" alone, and showed a `curl` with
-> only those two headers. It runs the full `requireAdmin(..., needCsrf=true)` chain
-> (`HttpServer.cpp:482-488`, gate body at `:2079-2127`): same-origin, **then** a valid
-> `pd_session` cookie, **then** a matching `X-CSRF` token, **then** the forced-setup
-> check. Without a session it returns `401 {"error":"authentication required"}`.
+Matching `Origin`/`Host` headers are not enough. This route runs the full `requireAdmin(..., needCsrf=true)` chain in `src/Helpers/HttpServer.cpp`: a same-origin check, then a valid `pd_session` cookie, then a matching `X-CSRF` token, then the forced-setup check. Without a session it returns `401 {"error":"authentication required"}`.
 
 #### Command
 ```bash

@@ -3,16 +3,15 @@
 How to size the **pocket-dial** SIP registrar for a given board, what it costs in
 RAM, and what breaks if you push it too far.
 
-> TL;DR: capacity is set at **compile time** via three macros in
-> [`src/SIP/PoolConfig.hpp`](../src/SIP/PoolConfig.hpp). The defaults
-> (`32` clients / `8` sessions / **`52`** messages) target a generic Wi-Fi ESP32.
-> The message pool is derived, not a literal: `POCKETDIAL_MSG_POOL` defaults to
-> `MAX_CLIENTS + MAX_SUBSCRIPTIONS + 4` = 32 + 16 + 4 = **52**
-> (`PoolConfig.hpp:69-71`), sized so a `999` all-page fan-out and a BLF `NOTIFY`
-> burst in the same locked section cannot spill to the heap. Override it and you
-> break that sizing; see §3.
-> Bump them with `-D` flags for an S3-with-PSRAM build. See the tier table below
-> for ready-to-paste build commands.
+Capacity is set at **compile time** by three macros in
+[`src/SIP/PoolConfig.hpp`](../src/SIP/PoolConfig.hpp). The defaults (`32`
+clients, `8` sessions, `52` messages) target a generic Wi-Fi ESP32. The message
+pool is derived, not a literal: `POCKETDIAL_MSG_POOL` defaults to
+`MAX_CLIENTS + MAX_SUBSCRIPTIONS + 4` = 32 + 16 + 4 = **52**
+(`PoolConfig.hpp:80-81`). That sizing keeps a `999` all-page fan-out and a BLF
+`NOTIFY` burst in the same locked section from spilling to the heap. Overriding
+it breaks that sizing; see §3. To raise the caps on an S3 build with PSRAM, pass
+`-D` flags. The tier table in §3 has ready-to-paste build commands.
 
 ## 1. Why RAM is the binding constraint (not CPU or bandwidth)
 
@@ -23,9 +22,9 @@ the audio for an ordinary call:
 * **RTP media is peer-to-peer.** Once two phones complete the SDP offer/answer,
   they stream G.711 audio *directly to each other's IP:port*. The ESP32 never
   sees an RTP packet, never transcodes, never mixes. A connected call costs the
-  server **zero** ongoing CPU and **zero** media bandwidth. Only the few hundred
-  bytes of `Session` bookkeeping that remember who is talking to whom. (The
-  capacity model below is about THIS path. `AnchorClient`/`MediaBridge`/`MixBus`
+  server **zero** ongoing CPU and **zero** media bandwidth. It keeps only the few
+  hundred bytes of `Session` bookkeeping that record who is talking to whom. (The
+  capacity model below is about this path. `AnchorClient`/`MediaBridge`/`MixBus`
   are an opt-in exception that puts the board in the media path when a fork wires
   them in; see [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) Non-Goals; they carry their own,
   separate CPU/RAM budget, not accounted for here.)
@@ -45,7 +44,7 @@ allocation**. This is deliberate: the ESP32 heap has no MMU and no compaction, s
 a long-running server that mallocs/frees per packet will eventually fragment and
 fail an allocation at the worst possible moment. Pre-allocation trades a fixed,
 known, up-front RAM cost for **deterministic, fragmentation-free** runtime. The
-corollary is that **the pool sizes ARE the device's hard concurrency limits**, and
+corollary is that **the pool sizes are the device's hard concurrency limits**, and
 they are paid for whether the box ever handles one call or its ceiling.
 
 ## 2. Per-object RAM cost (the inputs to the budget)
@@ -79,13 +78,7 @@ transactions:  56 × ~1.75KB ≈  97.6 KB   <-- dominant term
 TOTAL                       ≈ ~156 KB static SRAM
 ```
 
-> **Corrected twice.** An early revision used 32 messages and reported ~37 KB;
-> that was fixed to ~58 KB when the derived 52-message default was accounted for
-> (`PoolConfig.hpp`). The figure above adds the transaction pools, which did not
-> exist at either earlier revision in anything like their current size. If you
-> sized a board against **either** older number, re-check it.
-
-**The transaction pools are now the dominant term, ahead of the message pool.**
+The transaction pools are the dominant term, ahead of the message pool.
 `sizeof(TransactionLayer)` is **99,912 B** at the defaults, measured, not
 estimated; `TxLifecycle.TheLayerStaticFootprintIsVisibleHere` in
 `tests/TransactionLayerRfc17_test.cpp` asserts a ceiling on it so the number
@@ -99,15 +92,27 @@ That inline buffer is the whole cost and it is deliberate: a transaction must be
 able to retransmit after the pooled `SipMessage` it came from has been recycled
 into a different call, so it cannot hold a reference. It has to own the bytes.
 
+The budget above does not include the kept header-line buffers. Between uses,
+each pooled message keeps up to `POCKETDIAL_KEPT_LINE_BYTES` (8192 by default)
+of header-line buffer, and the two string arrays behind those lines add about
+4.5 KB more. One slot can therefore hold about 12.5 KB at most. Pool-wide that is
+`POCKETDIAL_MSG_POOL` × 12.5 KB, about 650 KB at the 52-slot default if every
+slot were full at once (`src/SIP/PoolConfig.hpp:84-97`). These buffers are heap
+allocations under 16 KB, so on the S3 they go to internal DRAM first. The 8 KB
+limit is four 2 KB datagrams' worth, so legitimate traffic is never trimmed. The
+constrained build sets the limit to 4 KB (`main/CMakeLists.txt`).
+
 **On a no-PSRAM board this is internal DRAM and it matters.** The default S3R8
 profile has `CONFIG_SPIRAM_USE_MALLOC=y`, and `RequestsHandler` is far larger
-than the 16 KB always-internal threshold, so the whole engine, these pools
-included, lands in PSRAM. `sdkconfig.defaults.esp32_constrained` sets
+than the 16 KB always-internal threshold, so the whole engine, including the
+transaction pools, lands in PSRAM. `sdkconfig.defaults.esp32_constrained` sets
 `CONFIG_SPIRAM=n`, and on that tier ~156 KB against ~290–320 KB of usable
 internal DRAM is no longer a comfortable margin. Note that the `POCKETDIAL_*`
 knobs are `-D` compiler flags, **not** Kconfig options, so switching to the
 constrained sdkconfig does **not** scale them down on its own; the build has to
-pass them. For that tier, start with:
+pass them. The `SIP_CONSTRAINED` build switch (`main/CMakeLists.txt`) passes its
+own, smaller set of caps; the flags below are the manual route. For that tier,
+start with:
 
 ```
 -DPOCKETDIAL_MAX_TRANSACTIONS=16 \
@@ -128,20 +133,26 @@ logs on a constrained build before trusting the number.
 
 ## 3. Hardware tiers
 
-Pick the row that matches your board, paste the build command, done. All three
+Pick the row that matches your board and paste its build command. All three
 build the same firmware; only the pool caps differ.
 
 | Tier | Board | `MAX_CLIENTS` | `MAX_SESSIONS` | Msg pool | Static pool RAM | Realistic concurrent calls |
 | :--- | :--- | ---: | ---: | ---: | ---: | :--- |
-| **Pocket** | Generic ESP32 (Wi-Fi SoftAP) | **32** (default) | **8** (default) | 52 (derived) | **~58 KB** | 6–8 simultaneous calls, ~16 phones (SoftAP-limited) |
-| **Office** | ESP32-S3 + 8 MB PSRAM (Guition JC3248W535) | **64** | **24** | 64 | **~90 KB** | ~24 calls, 50+ phones |
-| **Rack** | ESP32-S3 + W5500 PoE (wired Ethernet) | **128** | **48** | 128 | **~180 KB** | ~48 calls, 100+ phones |
+| **Pocket** | Generic ESP32 (Wi-Fi SoftAP) | **32** (default) | **8** (default) | 52 (derived) | **~156 KB** | Up to 5 phone-to-phone calls, ~10 phones (SoftAP-limited) |
+| **Office** | ESP32-S3 + 8 MB PSRAM (Guition JC3248W535) | **64** | **24** | 84 (derived) | **~280 KB** | ~24 calls, 50+ phones |
+| **Rack** | ESP32-S3 + W5500 PoE (wired Ethernet) | **128** | **48** | 148 (derived) | **~480 KB** | ~48 calls, 100+ phones |
 
-> The "concurrent calls" column is a *practical* expectation, not just
-> `MAX_SESSIONS`: it folds in the network-layer ceilings discussed in §5
-> (SoftAP association cap, socket/FD limits). On a wired Rack node the session
-> pool, not the network, is the limit; on a Pocket SoftAP node the **16-client
-> Wi-Fi association cap** bites long before the 32-client pool does.
+The concurrent-calls column is a practical expectation, not just `MAX_SESSIONS`.
+It folds in the network-layer ceilings discussed in §5 (SoftAP association cap,
+socket and FD limits). On a wired Rack node the session pool, not the network,
+is the limit. On a Pocket SoftAP node the **10-station Wi-Fi association cap**
+(`max_connection`, see §5) bites long before the 32-client pool does.
+
+The static pool RAM column is the §2 total for each tier: clients, sessions,
+messages and transaction pools. It excludes the kept header-line buffers, which
+can add up to about 12.5 KB per message slot on top (§2). These figures are
+arithmetic on the macros in `src/SIP/PoolConfig.hpp`, so re-derive them when those
+macros change.
 
 ### Build commands
 
@@ -167,12 +178,11 @@ cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
 idf.py build -DCMAKE_CXX_FLAGS="-DPOCKETDIAL_MAX_CLIENTS=64 -DPOCKETDIAL_MAX_SESSIONS=24"
 ```
 
-> **Do not pass `-DPOCKETDIAL_MSG_POOL` here.** Earlier revisions of this block
-> added `-DPOCKETDIAL_MSG_POOL=64`, which is *smaller* than the value the default
-> derivation produces for `MAX_CLIENTS=64` (64 + 16 + 4 = **84**). Setting it to 64
-> silently shrank the pool below the all-page + `NOTIFY` fan-out it is sized for
-> (`PoolConfig.hpp:58-71`), the opposite of what the flag looked like it was doing.
-> Leave it unset and it tracks `MAX_CLIENTS` automatically.
+**Warning:** do not pass `-DPOCKETDIAL_MSG_POOL` on this tier. The default
+derivation gives 64 + 16 + 4 = **84** for `MAX_CLIENTS=64`. A smaller value
+shrinks the pool below the all-page and `NOTIFY` fan-out it is sized for
+(`src/SIP/PoolConfig.hpp:80-81`), so SIP packets are refused under load (§4).
+Leave it unset and it tracks `MAX_CLIENTS` automatically.
 
 #### Rack (ESP32-S3 + W5500/PoE wired Ethernet)
 
@@ -185,16 +195,18 @@ cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
 idf.py build -DCMAKE_CXX_FLAGS="-DPOCKETDIAL_MAX_CLIENTS=128 -DPOCKETDIAL_MAX_SESSIONS=48"
 ```
 
-> Same note as Office: leave `POCKETDIAL_MSG_POOL` unset. The derivation gives
-> 128 + 16 + 4 = **148**, and the `=128` this block used to pass was a reduction.
+As with Office, leave `POCKETDIAL_MSG_POOL` unset. The derivation gives
+128 + 16 + 4 = **148**.
 
-> PSRAM note (Office/Rack): the ~90–180 KB pool budget fits in *internal*
-> SRAM on the S3, so no PSRAM is strictly required for these tiers. PSRAM on the
-> Guition board is reserved for the LVGL frame buffers (≈307 KB each, see
-> [HARDWARE.md](HARDWARE.md) §2), not for these pools. Keeping SIP state in fast
-> internal SRAM avoids PSRAM access latency on the signalling path. If you push
-> the message pool into the hundreds you can move *that* pool to PSRAM, but the
-> defaults above intentionally stay in internal SRAM.
+**PSRAM (Office and Rack).** The message pool stays in internal SRAM, which avoids
+PSRAM access latency on the signalling path. Each slot is a separate allocation
+under 16 KB, which the allocator places in internal DRAM first. The transaction
+pools are the larger part of these totals, about 180 KB on Office and about 310 KB
+on Rack, against 512 KB of internal SRAM on the ESP32-S3. On the default S3R8
+profile, §2 places them in PSRAM with `RequestsHandler`. The LVGL frame buffers on
+the Guition board (≈307 KB each, see [HARDWARE.md](HARDWARE.md) §2) also use PSRAM.
+If you push the message pool into the hundreds, you can move that pool to PSRAM as
+well.
 
 ## 4. Graceful degradation when a pool is exhausted
 
@@ -202,11 +214,12 @@ Running out of a pool is a **defined, recoverable** condition, never a crash or
 an out-of-memory abort. Each pool degrades in its own well-behaved way:
 
 * **Client pool full (REGISTER).** `allocateClient()` first tries to reuse an
-  existing binding, then a free slot, then **evicts the oldest already-expired
-  client**. Only if every slot holds a live registration does it fail, and then
-  the registrar replies **`503 Service Unavailable`**. The phone's SIP stack
-  retries on its normal REGISTER refresh timer, so a client that arrives after a
-  slot frees up simply registers on its next attempt.
+  existing binding, then a free slot, then **evicts an already-expired client**
+  (the first one it finds in pool order, not necessarily the oldest). Only if
+  every slot holds a live registration does it fail, and then the registrar
+  replies **`503 Service Unavailable`**. The phone's SIP stack retries on its
+  normal REGISTER refresh timer, so a client that arrives after a slot frees up
+  simply registers on its next attempt.
 * **Session pool full (INVITE / 999 broadcast).** `allocateSession()` returns
   `nullptr` when no slot is free, and every INVITE path answers
   **`503 Service Unavailable`** (see `onInvite()` and the broadcast handler in
@@ -217,54 +230,74 @@ an out-of-memory abort. Each pool degrades in its own well-behaved way:
   `"[WARNING] SIP Message pool exhausted (N total)! Refusing (no heap fallback, #409)."`
   (rate-limited to 1-in-100), and counts it in `/api/status` `msgPoolRefusals`.
   The call sites in `RequestsHandler.cpp` that check it drop the packet and rely on
-  the peer's RFC 3261 §17 retransmit. The #101A bounded heap fallback (8 messages)
-  is gone: it allocated internal DRAM on the SIP task exactly when it was scarcest.
-  Shedding load is the intended behaviour at that depth, but it *does* refuse work. It matters most during a 999 all-page, which transiently needs one message
-  per paged target; see §6.
+  the peer's RFC 3261 §17 retransmit. There is no heap fallback because an
+  allocation at that point would take internal DRAM on the SIP task exactly when
+  it is scarcest. Shedding load is the intended behaviour at that depth, but it
+  does refuse work. It matters most during a 999 all-page, which transiently needs
+  one message per paged target. The sizing rationale is in
+  `src/SIP/PoolConfig.hpp:69-79`.
+
+The REGISTER path through `allocateClient()`, in order:
+
+```mermaid
+flowchart TD
+    A[REGISTER arrives] --> B{Existing binding for this number?}
+    B -->|yes| C[Reuse the existing binding]
+    B -->|no| D{Free slot?}
+    D -->|yes| E[Take the free slot]
+    D -->|no| F{Expired client in pool?}
+    F -->|yes| G[Evict the first expired client]
+    F -->|no| H[503 Service Unavailable]
+```
 
 All three counters surface on the dashboard (`getClientCount()`,
 `getSessionCount()`, processed/dropped packet counters), so operators can watch
 headroom and bump the tier before exhaustion becomes routine.
 
-> Measured (Issue #79): driving registrations from 40 distinct source IPs
-> (bypassing the Issue #38 per-IP limiter) against a default-tier host build
-> confirmed the client-pool ceiling
-> lands exactly at 32, with a clean `503` on the overflow and no crash. The
-> session-pool ceiling (8) is real server-side (confirmed via server logs) and
-> the ordinary call-setup path 503s cleanly at it, but the `777` echo/diagnostic
-> extension does **not** currently surface that 503 to the caller; see Issue
-> #115. This was a single-host, host-build measurement (loopback-range source
-> IPs, not real distinct hosts), not a real multi-host run against firmware.
+None of the measurements in this section can be checked from this tree. Their
+run records were kept in `tests/load/STRESS_FINDINGS.md`, which commit `327f180`
+stopped tracking. Treat them as reported results, not reproduced ones.
+[BENCHMARKS.md](BENCHMARKS.md) describes the same gap.
 
-> Measured on firmware, multi-host (Issue #79, 2026-09-06): the run above has
-> now been repeated against a real board, a LilyGO T-ETH-Elite S3 (W5500,
-> `SIP_TRANSPORT=eth`, default 32/8 tier), driven concurrently from **two
-> genuinely distinct physical hosts** on the same LAN, so the Issue #38 per-IP
-> token bucket is bypassed by having separate buckets rather than by loopback
-> aliases:
->
-> | source host | attempts | `200` | `503` | p50 latency |
-> |---|--:|--:|--:|--:|
-> | `192.168.12.110` | 25 | **25** | 0 | 7.3 ms |
-> | `192.168.12.161` | 25 | **7** | 18 | 11.8 ms |
-> | **total** | 50 | **32** | 18 | — |
->
-> The client-pool ceiling lands at **exactly 32** across the two hosts, matching
-> `POCKETDIAL_MAX_CLIENTS`, confirming the pool is global, not per-source. Every
-> rejection was a clean `503 Service Unavailable`; `packetsDropped` stayed 0, and
-> the serial console showed no watchdog, panic, abort or reboot. The board kept
-> answering REGISTERs afterwards. A separate single-host run (45 attempts, paced
-> under the per-IP limit) reproduced the same 32/13 split with p50 4.6 ms.
->
-> Two caveats worth recording. First, the **session** ceiling (8) was *not*
-> cleanly demonstrated on firmware: 14 concurrent `777` echo calls returned 11 ×
-> `200` and 3 × *no response at all* rather than `503`, the Issue #115 behaviour,
-> now confirmed on hardware. Second, sustained registration load makes the
-> register-beep INVITE flood the static message pool
-> (`[tx] pool exhausted — INVITE sent without retransmit tracking`), which is
-> Issue #148; a starved pool silently drops unrelated signalling, so the latency
-> figures above should be read as "healthy tier, known beep bug", not as a clean
-> bill of health.
+**Measured (Issue #79):** driving registrations from 40 distinct source IPs
+(bypassing the Issue #38 per-IP limiter) against a default-tier host build
+confirmed the client-pool ceiling lands exactly at 32, with a clean `503` on the
+overflow and no crash. The session-pool ceiling (8) is real server-side
+(confirmed via server logs) and the ordinary call-setup path 503s cleanly at it,
+but the `777` echo/diagnostic extension does **not** currently surface that 503
+to the caller; see Issue #115. This was a single-host, host-build measurement
+(loopback-range source IPs, not real distinct hosts), not a real multi-host run
+against firmware.
+
+**Measured on firmware, multi-host (Issue #79, 2026-09-06).** The host-build run
+above was repeated against a real board, a LilyGO T-ETH-Elite S3 (W5500,
+`SIP_TRANSPORT=eth`, default 32/8 tier). It was driven concurrently from **two
+genuinely distinct physical hosts** on the same LAN, so the Issue #38 per-IP
+token bucket is bypassed by having separate buckets rather than by loopback
+aliases:
+
+| source host | attempts | `200` | `503` | p50 latency |
+|---|--:|--:|--:|--:|
+| `192.168.12.110` | 25 | **25** | 0 | 7.3 ms |
+| `192.168.12.161` | 25 | **7** | 18 | 11.8 ms |
+| **total** | 50 | **32** | 18 | — |
+
+The client-pool ceiling lands at **exactly 32** across the two hosts, matching
+`POCKETDIAL_MAX_CLIENTS`, confirming the pool is global, not per-source. Every
+rejection was a clean `503 Service Unavailable`; `packetsDropped` stayed 0, and
+the serial console showed no watchdog, panic, abort or reboot. The board kept
+answering REGISTERs afterwards. A separate single-host run (45 attempts, paced
+under the per-IP limit) reproduced the same 32/13 split with p50 4.6 ms.
+
+Two caveats apply. First, the **session** ceiling (8) was *not* cleanly
+demonstrated on firmware: 14 concurrent `777` echo calls returned 11 × `200` and
+3 × *no response at all* rather than `503`, the Issue #115 behaviour, confirmed
+on hardware. Second, sustained registration load makes the register-beep INVITE
+flood the transaction client pool
+(`[tx] client pool exhausted — INVITE sent without retransmit tracking`), which
+is Issue #148. A starved pool also drops unrelated signalling, so the latency
+figures above should be read as "healthy tier, known beep bug", not as a clean
+bill of health.
 
 ## 5. Why the defaults are 32 / 8, and what breaks if you 10× them
 
@@ -272,25 +305,32 @@ headroom and bump the tier before exhaustion becomes routine.
 Wi-Fi **SoftAP** (a small office, a classroom, a pop-up intercom). In that
 deployment:
 
-* The ESP-IDF SoftAP **caps associated stations at ~10–16** (`max_connection`,
-  hard-limited by the Wi-Fi driver). 32 client slots is already *2×* that ceiling,
-  giving comfortable room for stale-binding churn without ever being the limit.
-* 8 sessions means up to 8 simultaneous 1:1 calls, well beyond what ~16 phones
-  realistically place at once, and an `8 × ~200 B` rounding error in the budget.
-* The whole thing fits in **~58 KB** (see §2; the message pool defaults to the derived
-  52, not 32), leaving most of internal SRAM for Wi-Fi buffers, the HTTP dashboard, the
-  captive-portal DNS, and LVGL.
+* The firmware sets the SoftAP's association cap to **10 stations** (`max_connection`,
+  set in `main/esp_main.cpp` at lines 38 and 121, and in `main/esp_main_display.cpp`
+  at line 370). The Wi-Fi driver's own limit is not verified in this tree. 32
+  client slots is more than three times that cap, which leaves room for
+  stale-binding churn without ever being the limit.
+* 8 sessions means up to 8 simultaneous calls. A phone-to-phone call needs two
+  registered phones, so a 10-station SoftAP allows at most five phone-to-phone
+  calls at once.
+  The session pool itself is an `8 × ~200 B` rounding error in the budget.
+* The whole thing is about **~156 KB** (see §2, which includes the transaction
+  pools). That is about half of the ~290–320 KB of usable internal DRAM on a plain
+  ESP32, so the rest has to cover the Wi-Fi buffers, the HTTP dashboard, the
+  captive-portal DNS and LVGL.
 
-In short: 32/8 is sized to be *one notch above* the network layer's own ceiling on
-the cheapest supported board, so RAM is never wasted and the pool is never the
-thing that fails first.
+In short: 32 clients and 8 sessions sit above the SoftAP's station cap on the
+cheapest supported board, so the pool is never the thing that fails first. The
+22 client slots that the cap cannot fill cost about 2 KB.
 
 What breaks if you naively 10× to 320 / 80 / 320:
 
-* **Static SRAM exhaustion.** ~370 KB of pools would *exceed the entire usable
-  internal DRAM* of a plain ESP32 (~290–320 KB). The firmware would fail to boot
-  or starve the Wi-Fi stack. The S3 has more headroom but the message pool still
-  dominates. Move it to PSRAM before going this large.
+* **Static SRAM exhaustion.** The pools would total about 845 KB: about 370 KB of
+  clients, sessions and messages, plus about 475 KB of transaction slots (272 slots
+  at 1.75 KB). That exceeds the *entire usable internal DRAM* of a plain ESP32
+  (~290–320 KB) and the 512 KB of internal SRAM on the S3. The firmware would fail
+  to boot or starve the Wi-Fi stack. The transaction layer is the larger share, so
+  move the pools to PSRAM before going this large.
 * **Heap fragmentation at boot.** 320 message objects each own a packet buffer;
   allocating them all at startup on a fragmented heap can fail even when *total*
   free bytes look sufficient, because there's no single contiguous run. (The
@@ -303,10 +343,10 @@ What breaks if you naively 10× to 320 / 80 / 320:
   (`CONFIG_LWIP_MAX_SOCKETS`, often 10–16). Hundreds of *registered* clients is
   fine (they share one UDP listener), but anything that opens per-peer sockets, or
   the HTTP dashboard under load, hits the FD cap long before 320 clients matters.
-* **SoftAP association cap (Pocket tier).** Even with 320 client slots, a Wi-Fi
-  SoftAP still won't associate more than ~16 stations. The extra slots are pure
-  wasted RAM unless you're on **wired Ethernet** (the Rack tier), which is exactly
-  why high client counts belong on the W5500/PoE board, not a SoftAP node.
+* **SoftAP association cap (Pocket tier).** Even with 320 client slots, the SoftAP
+  is configured for 10 stations. The extra slots are pure wasted RAM unless you're
+  on **wired Ethernet** (the Rack tier), which is exactly why high client counts
+  belong on the W5500/PoE board, not a SoftAP node.
 
 Rule of thumb: scale clients/sessions to match your *network tier* (SoftAP →
 stay near defaults; wired Ethernet → scale up), keep the message pool ≈ the client

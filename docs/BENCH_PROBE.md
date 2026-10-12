@@ -1,13 +1,13 @@
 # Bench probe image (`POCKETDIAL_ANCHOR_BENCH_PROBE`)
 
-Issue #384, harness hook H1. A bench-only firmware image that injects one-shot
-faults into the 3CX anchor client and holds a controlled amount of internal DRAM,
-so a rig scenario can drive the paths behind #349, #279, #336, #518, #379 and the
-pressure runs for #350/#370 on purpose instead of waiting for them.
+This is issue #384, harness hook H1: a bench-only firmware image that injects one-shot
+faults into the 3CX anchor client and holds a controlled amount of internal DRAM. A rig
+scenario uses it to drive the paths behind #349, #279, #336, #518, #379 and the pressure
+runs for #350/#370 on purpose, instead of waiting for them.
 
-**Never ship it. Never leave it on a rig.** Every run that flashes it ends by
-putting a release image back, and CHECK-IN (#428) verifies the board reports a
-release stamp again. That check is the operator's job.
+**Warning:** never ship the probe image, and never leave it on a rig. Every run that
+flashes it ends by putting a release image back. CHECK-IN (#428) verifies that the board
+reports a release stamp again, but that check is the operator's job.
 
 A second, unrelated bench option, `POCKETDIAL_HTTP_DRAM_ACCOUNT` (#410, #328), is described
 at the end: [HTTP DRAM accounting](#http-dram-accounting-pocketdial_http_dram_account).
@@ -63,7 +63,7 @@ dead-man timer cannot be created.
 
 Each is **one-shot**: arming it once makes it fire once, and each firing logs one
 line `BENCHFAULT <name> fired` and bumps its `fired` counter. `fired` is the
-scenario's "path exercised" counter: a run whose fault shows `fired: 0` is INVALID.
+scenario's "path exercised" counter: a run whose fault shows `fired: 0` is `INVALID`.
 
 | Name | Value | Where it fires | Effect | Serves |
 |---|---|---|---|---|
@@ -92,8 +92,8 @@ Notes:
   end the client, cannot run from its event handler, and expose no socket. Variant A
   of `x336_ws_reauth` needs another way to cut the WS (for example, at the network).
 
-**Validity:** app-level faults are **not** evidence for #350. That bug lives in
-mbedTLS's failed-read state, and only ballast or a real network fault reaches it.
+App-level faults are **not** evidence for #350. That bug lives in mbedTLS's failed-read
+state, and only ballast or a real network fault reaches it.
 
 ### `ws_upsert` (#888)
 
@@ -103,7 +103,7 @@ builds the frame `{"event":{"event_type":0,"entity":"/callcontrol/<dn>/participa
 with `<dn>` the anchor's source DN, and hands it to `handleWsEvent()` as a text frame. The JSON parse, the DN
 check, `parseParticipantEntity()` and the classification are the real ones, not a copy. The participant id is
 the probe's own, `pdb-u<case>-<n>` (`n` counts injections since boot), so a witness line says which upsert made
-it (`part=pdb-u2-3`) and is the first sighting of its id, which is the one that logs.
+it (`part=pdb-u2-3`). The witness line is the first sighting of that id, so it is the line that gets logged.
 
 | Case | Waits for | The upsert | Branch it reaches | Witness line it makes |
 |---|---|---|---|---|
@@ -113,14 +113,14 @@ it (`part=pdb-u2-3`) and is the first sighting of its id, which is the one that 
 
 - **A case that cannot happen yet waits, still armed.** It is never forced: a case 2 armed with no call in
   flight fires when a call is, and a case 1 or 3 armed during an outbound call fires after it. `fired` counts
-  injections, so a case that never became possible shows `fired` unchanged and the scenario calls it INVALID.
+  injections, so a case that never became possible shows `fired` unchanged and the scenario calls it `INVALID`.
 - **Case 1 and the enqueue.** The work queue has no failure a probe can drive without also starving the
   workers (they drain it at once). So `enqueueWsWork()` refuses a work item whose participant is a `pdb-u` id
   and whose control leg is that participant itself, which is what an unknown participant with no call maps
   to, and answers false after freeing the item: the same `delete item; return false` a full queue takes. The
   `xQueueSend` failure itself is not exercised. The same rule means a synthetic participant is never queued as
   an inbound call, the one thing that would ring the route DN's phones, even if the call in case 2 ends between
-  the tick's check and the classification (the upsert then reads "not queued" and the case is INVALID, not a
+  the tick's check and the classification (the upsert then reads "not queued" and the case is `INVALID`, not a
   ring). Case 2's item is queued, mapped to the in-flight leg: the worker runs its status check on that leg
   (one extra participant-list GET on the real call), as it does for any upsert.
 - **Case 3 and the own-leg table.** The id is noted in `_ownLegs` (#379) before the injection and released
@@ -130,7 +130,7 @@ it (`part=pdb-u2-3`) and is the first sighting of its id, which is the one that 
   `emergencyDisarms`, as for every fault. Logs: `BENCHFAULT ws_upsert armed (value <case>)`, then on the tick
   `BENCHFAULT ws_upsert fired` and `BENCHFAULT ws_upsert case <case>: injecting part=<id>`, then the witness
   line. If the 256-line per-boot witness cap was already reached there is no witness line (`witness cap
-  reached`), and the case reads INVALID.
+  reached`), and the case reads `INVALID`.
 - **Refusal (rule 5, the same policy as every fault).** Arming while an emergency is live is answered `409`,
   counted in `refusedArms` and logged `BENCHFAULT ws_upsert arm refused: emergency call live`. A fire site
   reached while an emergency is live, or for an emergency destination, injects nothing, disarms every fault,
@@ -142,7 +142,7 @@ it (`part=pdb-u2-3`) and is the first sighting of its id, which is the one that 
   before the INVITE, and CANCELs 0.5 s after the `BENCHFAULT ws_upsert fired` line (or at 10 s if it never
   comes), so the far end rings once and briefly. Its call cap is 1. Cases 1 and 3 place no call. It counts
   the witness line of each case by the exact text above and the case's part id; a case with 0 lines is
-  INVALID, never PASS. Far end only: no owner extension, no test UA, no service number.
+  `INVALID`, never `PASS`. Far end only: no owner extension, no test UA, no service number.
 
 ## Ballast
 
@@ -163,45 +163,50 @@ blocks (4 KB, halving on fragmentation down to 64 B, at most 256 blocks) until
 
 ### `x370_pressure_rebuild` (#370)
 
-Part of #370, harness only. One ring with the ballast held at the 8192 floor, so the rx task's rebuild of the GET
-handle after a transport failure (`recreateGetClient()`, `TelephonyAnchorClient.cpp:3755`, called at `:3895`), and
-the TLS handshake after it, run under pressure. The scenario arms `get_status=404`, `get_max_attempts=8`, holds
-`ballast=8192&deadman=35`, places **one** call to the designated far end, CANCELs it 2 s after the first GET
-transport failure (or at 10 s if there is none), and releases the ballast the moment the call returns.
+This is part of #370 and harness only. It runs one ring with the ballast held at the 8192 floor, so the rx task's
+rebuild of the GET handle after a transport failure (`recreateGetClient()`, `TelephonyAnchorClient.cpp:4137`, called
+at `:4277`), and the TLS handshake after it, run under pressure. The scenario arms `get_status=404`,
+`get_max_attempts=8`, holds `ballast=8192&deadman=35`, places **one** call to the designated far end, CANCELs it 2 s
+after the first GET transport failure (or at 10 s if there is none), and releases the ballast the moment the call
+returns.
+
+The line numbers in this section are from commit `87d2874` (`src/SIP/TelephonyAnchorClient.cpp`). `grep -n` on a
+quoted log line finds its current location.
 
 - **No fault forces the rebuild.** `get_status` rewrites only a parsed HTTP answer, and a parsed answer keeps the
-  handle (`:3815-3862`); `overrideGetStatus()` leaves a transport failure (status <= 0) real. The rebuild runs only
-  after a real `GET stream transport failure` (`:3871`) or `GET stream open failed` (`:3882`) line, and only the
-  ballast can cause one, by chance. In a call that is not answered every GET answer is a 404 on a kept connection,
-  so the one handshake under pressure is the first open (`startRxIfNeeded()` in `makeCall()`, `:576`, before
-  `Successfully initiated call`). That is why the ballast is held **before the INVITE**. `get_status=404` and the
-  small `get_max_attempts` only keep the loop in its "not ready" retries for a short call; a 403 would trip the
-  #902 fail-fast and end it with a 503.
-- **The witness is derived; the rebuild has no success line.** `:3895-3899` log only a failure (`:3897`, "could not
-  rebuild client"). Every loop iteration that does not end it logs exactly one attempt line (`:3820`, `:3871`,
-  `:3882`) and cannot `continue` past one, and the only way from a failure at attempt k to the next iteration is
+  handle (`:4197-4245`); `overrideGetStatus()` (`src/SIP/BenchProbeLogic.hpp`) leaves a transport failure (status
+  <= 0) real. The rebuild runs only after a real `GET stream transport failure` (`:4253`) or `GET stream open failed`
+  (`:4264`) line, and only the ballast can cause one, by chance. In a call that is not answered every GET answer is a
+  404 on a kept connection, so the one handshake under pressure is the first open (`startRxIfNeeded()` in
+  `makeCall()`, `:603` and its retry at `:614`, before `Successfully initiated call` at `:685`). That is why the
+  ballast is held **before the INVITE**. `get_status=404` and the small `get_max_attempts` only keep the loop in
+  its "not ready" retries for a short call; a 403 would trip the #902 fail-fast and end it with a 503.
+- **The witness is derived; the rebuild has no success line.** `:4277-4281` log only a failure (`:4279`, "could not
+  rebuild client"). Every loop iteration that does not end it logs exactly one attempt line (`:4202`, `:4253`,
+  `:4264`) and cannot `continue` past one, and the only way from a failure at attempt k to the next iteration is
   for `recreateGetClient()` to have returned true. So the scenario counts, from the syslog:
 
   | Witness | Lines |
   |---|---|
-  | transport failure (the path counter `get_transport_fail`; 0 is INVALID) | `GET stream transport failure (no HTTP response, status=-1), attempt k/N` or `GET stream open failed (...), attempt k/N` |
+  | transport failure (the path counter `get_transport_fail`; 0 is `INVALID`) | `GET stream transport failure (no HTTP response, status=-1), attempt k/N` or `GET stream open failed (...), attempt k/N` |
   | rebuilt | such a line at k, then any attempt line at k+1 of the same N |
   | fresh handshake answered | the k+1 line is `GET stream not ready (HTTP ...), attempt k+1/N`, a parsed answer |
-  | `recreateGetClient()` returned false | `GET stream: could not rebuild client after transport failure`: a handle that would not init, or a teardown racing the loop (`:3764`); the log cannot tell which, and no handshake ran, so it is not a witness |
-  | third in a row | `GET stream: 3 consecutive transport failures`: gives up without a rebuild (`:3888-3894`) |
+  | `recreateGetClient()` returned false | `GET stream: could not rebuild client after transport failure`: a handle that would not init, or a teardown racing the loop (`:4146`); the log cannot tell which, and no handshake ran, so it is not a witness |
+  | third in a row | `GET stream: 3 consecutive transport failures`: gives up without a rebuild (`:4270-4276`) |
 
   A failure with no next attempt (a lost UDP line, or the CANCEL came first) and a "could not rebuild" line with
-  no rebuild beside it are INVALID, never PASS; the counts stay in the summary. `test_anchor_x370_pressure_rebuild.py`
+  no rebuild beside it are `INVALID`, never `PASS`; the counts stay in the summary. `test_anchor_x370_pressure_rebuild.py`
   pins every one of these lines, the `3`, and the absence of a `continue` in the loop to the source, and fails if a
   success line is added, so the witness can then be made direct. The line would go right after the
-  `if (!recreateGetClient()) {... break;}` block at `:3895-3899` (no `else`: the `if` breaks).
-- **Verdicts.** PASS: both faults fired, exactly one anchored leg, a rebuild witness (a failure followed by the next attempt),
-  the board answered `/api/status` after the release with a later uptime and the same reset reason, no panic line,
-  no coredump, no `ORPHANED` line, one drop. FAIL: any of the last five, a hang or reboot after the release, a
-  second rx task on the leg (#370's shape), a CANCEL not answered 200. INVALID: no transport failure (the
-  ballast did not bite), a failure with no next attempt, a lone "could not rebuild", no leg (the far end never rang; with the ballast held
-  across `makeCall()`'s POST that can be the pressure itself), the ballast not taking (`held` false), a `409`, the
-  dead-man releasing it first.
+  `if (!recreateGetClient()) {... break;}` block at `:4277-4281` (no `else`: the `if` breaks).
+- **Verdicts.** The run is `PASS` when both faults fired, there is exactly one anchored leg, a rebuild witness shows
+  (a failure followed by the next attempt), the board answers `/api/status` after the release with a later uptime and
+  the same reset reason, and there is no panic line, no coredump, no `ORPHANED` line and one drop. It is `FAIL` when
+  any of the last five checks in that list fails, on a second rx task on the leg (#370's shape), or on a CANCEL not
+  answered 200. It is `INVALID` for no transport failure (the ballast did not bite), a failure with no next attempt,
+  a lone "could not rebuild" line, no leg (the far end never rang; with the ballast held across `makeCall()`'s POST
+  that can be the pressure itself), the ballast not taking (`held` false), a `409`, or the dead-man releasing it
+  first.
 - **Pressure rules.** The board's HTTP may not answer while the ballast is held. The run makes no HTTP request
   between the hold and the release (`CANCEL` timing reads the syslog), starts no status logger (a second poller
   is load on the thing measured), releases first thing after the call and again in a `finally`
@@ -212,8 +217,19 @@ transport failure (or at 10 s if there is none), and releases the ballast the mo
   cap 30 s.
 - **Needs an OK.** Holding the ballast across `makeCall()` puts its POST and the reconcile list read under
   pressure: the #349 ORPHAN variant (a live billable leg on 3CX) is possible, which the approval excludes (see
-  `makecall_read_fail` above). An `ORPHANED` line is a FAIL with a note to check the route point. If the ballast
-  makes the POST fail instead, the run is INVALID (no leg); raise `ballast_bytes` to ease it.
+  `makecall_read_fail` above). An `ORPHANED` line is a `FAIL` with a note to check the route point. If the ballast
+  makes the POST fail instead, the run is `INVALID` (no leg); raise `ballast_bytes` to ease it.
+
+The failure path of the GET loop, as the witness rows read it:
+
+```mermaid
+flowchart TD
+    A["GET attempt k fails: transport failure or open failed"] --> B{"Third transport failure in a row?"}
+    B -->|yes| C["Give up: consecutive transport failures"]
+    B -->|no| D{"recreateGetClient() returns true?"}
+    D -->|no| E["Give up: could not rebuild client"]
+    D -->|yes| F["Attempt k+1 on the rebuilt handle"]
+```
 
 ## Rule 5: 911 and 933 come first
 
@@ -234,6 +250,15 @@ transport failure (or at 10 s if there is none), and releases the ballast the mo
   Undoing it keeps `ensureToken()` from refetching ahead of the 911.
 - **A fill in progress gives way.** A ballast fill checks the emergency gate before
   every block, and gives everything back if an emergency appears mid-fill.
+
+The fire decision for a fault site:
+
+```mermaid
+flowchart TD
+    A["A fault site is reached"] --> B{"Destination marked emergency, or an emergency session live?"}
+    B -->|no| C["The fault fires"]
+    B -->|yes| D["Disarm every fault and count emergencySkips for that fault"]
+```
 
 None of this has been exercised with a real emergency call, and it must not be.
 The host tests pin the decisions (`tests/BenchProbeLogic_test.cpp`).
@@ -256,7 +281,7 @@ Written and host-tested without a board: no rig, no 3CX, no phone. The ESP glue
 (`src/SIP/BenchProbe.cpp` and the `#if` blocks) has only been compiled. Every
 scenario's first run is also the first run of the probe on hardware.
 
-`ws_upsert` and `x888_ws_upsert` (#888) are newer still: the probe arm (`benchWsUpsert()`, the `enqueueWsWork()`
+`ws_upsert` and `x888_ws_upsert` (#888) are the least tested: the probe arm (`benchWsUpsert()`, the `enqueueWsWork()`
 refusal, the `tick()` call) was syntax-checked with the release build's compile flags plus
 `-DPOCKETDIAL_ANCHOR_BENCH_PROBE=1`, never linked into a probe image, and its stack use on the SIP task is
 unmeasured. The scenario has run only against the fake board in `tests/tools/test_anchor_scenarios.py`
@@ -270,8 +295,8 @@ log, not read from a line of its own.
 
 ## HTTP DRAM accounting (`POCKETDIAL_HTTP_DRAM_ACCOUNT`)
 
-Issues #410 and #328. A bench-only reading, not a fix. Under HTTP load alone `.244`'s
-`minFreeHeapInternal` fell from 31567 B to 475 B (#947), and nothing said which part of the
+This is a bench-only reading, not a fix (issues #410 and #328). Under HTTP load alone,
+`.244`'s `minFreeHeapInternal` fell from 31567 B to 475 B (#947), and nothing said which part of the
 HTTP path held the bytes. This build option adds one field to `GET /api/status`,
 `httpDramAccount`, that does. Release behaviour is unchanged: the option defaults to `0`
 (`src/SIP/PoolConfig.hpp`), every line it adds sits under `#if POCKETDIAL_HTTP_DRAM_ACCOUNT`
@@ -330,7 +355,7 @@ the moment the **total** last set a new high. Everything is bytes except `conns`
 | `total` | Every row above added up, as `now` and as `hwm`. **`total.hwm` is the most the HTTP path ever held at once.** The rows' own `hwm` values peak at different instants and do not add up to it. |
 | `respBodyMax` | The largest single body counted in `respBody`. |
 | `conns` | Connection threads: `now` and the most ever alive at once. The board does not report this anywhere else (#947). |
-| `spawnFailures` | `connection thread spawn failed` events (stderr only until now). Non-zero means the heap floor was reached. |
+| `spawnFailures` | `connection thread spawn failed` events, which are otherwise written only to stderr. Non-zero means the heap floor was reached. |
 
 Counts are blocks the code asked for, by capacity; allocator overhead per block is not in them.
 A body, string or buffer is counted only if it is in internal RAM at the moment of counting
@@ -391,7 +416,8 @@ instants:
 
 1. Reboot, wait for the phones to register, and let the board go idle. Read `/api/status` once
    and write down `freeHeapInternal` (`F0`), `minFreeHeapInternal` (`M0`) and `httpDramAccount`.
-   The request that reads it is itself in flight, so `conns.now` is at least 1 (and `reqBuf.now` is 4096 only if its read buffer is in internal RAM, see the `reqBuf` row).
+   The request that reads it is itself in flight, so `conns.now` is at least 1. `reqBuf.now` is 4096 only if its
+   read buffer is in internal RAM (see the `reqBuf` row).
 2. Run the #961/#947 harness (idle, then dashboard), or `for i in $(seq 4); do curl ... & done`.
 3. Read `/api/status` again: `minFreeHeapInternal` (`M1`) and `httpDramAccount`.
 4. If `M1 < M0` the run set a new low-water mark, and `F0 - M1` is how far internal DRAM fell
@@ -402,40 +428,42 @@ instants:
      the floor was hit.
 5. Per consumer: `taskStack.hwm / 4096` is the peak connection threads, and each live connection
    costs at least `4096` (the stack), plus `4096` for a read buffer that is in internal RAM
-   (`reqBuf` row), before any request text. Before #410 moved the read buffer to PSRAM, with
-   `kMaxConcurrentConnections` at 4 that was `4096 + 4096` each, 32768 B, more than the 31567 B
-   low-water mark at the first read in #947. That is arithmetic from the code, a candidate to
-   confirm or reject with the reading, not a finding.
+   (`reqBuf` row), before any request text. With read buffers in internal RAM and the old cap of 4
+   (before #981), that was 4 x `4096 + 4096` = 32768 B, more than the 31567 B low-water mark at the
+   first read in #947. At the cap of 3 it is 3 x 8192 = 24576 B. That is arithmetic from the code, a
+   candidate to confirm or reject with the reading, not a finding.
 
 ### The lwIP share, and choosing a fix
 
-After #974 moved the read buffer to PSRAM the `.244` bench read `reqBuf` 0 and an accounted peak
-of 16930 B, but the drop under load was 38.4 KB: about 21.5 KB unaccounted (it was 5.4 KB). The
-probes above exist to name that share. This section is the **candidate** and what to read to
-confirm it; the numbers are arithmetic from the code and the config, not readings.
+With the read buffer in PSRAM (#974), the `.244` bench read `reqBuf` 0 and an accounted peak of 16930 B.
+The drop under load was 38.4 KB, so about 21.5 KB was unaccounted. The readings in this section predate #981,
+which lowered the connection cap from 4 to 3. The probes above exist to name that share. This section is the
+**candidate** and what to read to confirm it. The candidate figures below are arithmetic from the code and the
+config, not readings.
 
 **Candidate.** A socket send copies the response into heap pbufs and holds them until the peer
 acknowledges (`tcp_write` with `TCP_WRITE_FLAG_COPY`). Each connection can queue up to
 `CONFIG_LWIP_TCP_SND_BUF_DEFAULT` = 5760 B, four 1440 B segments, each with about 80 B of pbuf,
 header room and `tcp_seg` around it: about 1.06 B of heap per queued byte, 6.1 KB for a full queue.
 The dashboard document is sent in place from flash but still goes through that queue at the pace
-the peer acknowledges, so four browsers loading it hold four full queues for the whole load:
-4 x 6.1 = about 24 KB at the peak, the size of the unaccounted share. Each connection also costs
-what `connCreate` reads beyond its 4096 B stack (the TCB and pthread state) and about 0.7 KB of
+the peer acknowledges, so the dashboard load can hold three full queues at once for the whole load:
+3 x 6.1 = about 18 KB at the peak. At the old cap of 4 the same arithmetic gave 4 x 6.1 = about 24 KB,
+close to the unaccounted share. Each connection also costs what `connCreate` reads beyond its 4096 B stack
+(the TCB and pthread state) and about 0.7 KB of
 `tcp_pcb`, `netconn`, mailbox and semaphore (the `memp` rows size the pools).
 
 **Read after the harness run**, in one `/api/status`: `tcp.httpQueuedBytes.max`, `tcp.queuedBufs.max`,
 `memp` (`TCP_SEG`, `PBUF_REF/ROM`, `NETCONN`, `TCP_PCB` `bytesMax`), `connCreate.min`, `heap.largest.min`,
 `conns.hwm`, `httpPerSourceRefusals` and the busy refusals in the log.
 
-**Proposals** (none applied: no default changes in this change):
+**Proposals.** None is applied, and the defaults are unchanged. The connection cap is already 3, with 2
+connections per source address (`kMaxConcurrentConnections` and `kMaxConnectionsPerSource` in
+`src/Helpers/HttpServer.hpp`, #981). A fourth concurrent request gets a 503. Only the send buffer is still open:
 
-| Option | Expected saving at the four-connection peak | Costs | Pick it when the bench shows |
+| Option | Expected saving at the three-connection peak | Costs | Pick it when the bench shows |
 |---|---|---|---|
-| Smaller send buffer: `CONFIG_LWIP_TCP_SND_BUF_DEFAULT` 5760 to 2880 (the constrained profile's value), with `CONFIG_LWIP_TCP_WND_DEFAULT` left alone | Up to 4 x (5760 - 2880) x 1.06 = 12.2 KB, but only what was queued: about 1.06 x (`httpQueuedBytes.max` - min(`httpQueuedBytes.max`, 11520)) | Throughput of large downloads (two segments in flight; the document and `/api/coredump`, not the polled JSON); no concurrency lost | `tcp.httpQueuedBytes.max` near 4 x 5760 = 23040 (say 17 KB or more): the queues are the eater |
-| Connection cap 4 to 3 (`kMaxConcurrentConnections`) | One connection's whole cost: `connCreate.min` (about 4.7 KB if it reads the TCB at about 600 B) + a full queue 6.1 KB + 0.7 KB = about 11.5 KB | The fourth concurrent request is refused 503, and `kMaxConnectionsPerSource` falls from 3 to 2: a browser's third parallel connection is refused | `conns.hwm` is 4 only briefly, `httpPerSourceRefusals` reads 0 under the real dashboard load at cap 4, and the busy-refusal log is empty |
-| Both | 4 x (4.7 + 6.1 + 0.7) = 46 KB to 3 x (4.7 + 3.1 + 0.7) = 25.4 KB, about 20.6 KB | The two costs above | The first row's condition holds and the second row's saving alone is not enough |
-| Neither | none | | `tcp.httpQueuedBytes.max` is small (under about 8 KB) while the unaccounted share is still large: the queues are not it. Read `heap.largest.min` and `tasks` next and look at the response builders' transients (`std::ostringstream` plus `str()`, see below); do not change either knob on this evidence |
+| Smaller send buffer: `CONFIG_LWIP_TCP_SND_BUF_DEFAULT` 5760 to 2880 (the constrained profile's value), with `CONFIG_LWIP_TCP_WND_DEFAULT` left alone | Up to 3 x (5760 - 2880) x 1.06 = 9.2 KB, but only what was queued: about 1.06 x (`httpQueuedBytes.max` - min(`httpQueuedBytes.max`, 8640)) | Throughput of large downloads (two segments in flight; the document and `/api/coredump`, not the polled JSON); no concurrency lost | `tcp.httpQueuedBytes.max` near 3 x 5760 = 17280, which is all three queues full: the queues are the eater |
+| Neither | none | | `tcp.httpQueuedBytes.max` is small (under about 8 KB) while the unaccounted share is still large: the queues are not it. Read `heap.largest.min` and `tasks` next and look at the response builders' transients (`std::ostringstream` plus `str()`, see below); do not change the send buffer on this evidence |
 
 ### What it cannot see
 
@@ -466,8 +494,7 @@ Host-tested (`HttpDramAccount_test.cpp`, built with the option on and off), and
 `HttpServer.cpp` was compiled on its own with the ESP32-S3 toolchain (esp-15.2.0, flags of an
 existing `eth` build tree): with the option off the object is byte-identical to `origin/main`'s;
 with it on, code grows by 2653 B and `.bss` by 84 B, and `-fstack-usage` gives `handleClient()`
-448 -> 496 B and `sendResponseWithHeader()` 240 -> 256 B. Not done: a link or a full image
-(so no app-slot margin for the option-on image), the classic-ESP32 / `lan8720` and
+448 -> 496 B and `sendResponseWithHeader()` 240 -> 256 B. Not done: the classic-ESP32 / `lan8720` and
 `SIP_CONSTRAINED` profiles, any run on a board, and the first reading on `.244`.
 
 The probes (this section's second half) add to that:
@@ -485,7 +512,7 @@ The probes (this section's second half) add to that:
   `MEMP_STATS=1` under `MEMP_MEM_MALLOC`, and fail with `'MEMP_STATS' redefined` if it is set
   without `LWIP_STATS`, which is why the CMake sets it only when `CONFIG_LWIP_STATS` is on.
 - A full option-on ESP32-S3 `eth` image builds and links (`SipServer.bin` 2302448 B in a 6 MB app
-  slot, 63% free; the option-on image of #973 was 2297136 B).
+  slot, 63% free).
 - Not done: any run on a board, so no `memp`, `tcp` or `connCreate` value has been read; every number
   in the fix table above is arithmetic. The accept loop's 20 ms `select()` and the `tcpip_api_call`
   every 20 ms have not been timed.

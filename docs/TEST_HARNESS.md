@@ -1,29 +1,26 @@
-# pocket-dial Test Harness — Specification
+# Test harness
 
-Status: DRAFT for crew review (2026-09-20).
-Scope: one entrypoint that runs every existing verification layer against either the
-**host** build or a **board**, plus a hardware-in-the-loop (HIL) job on the glolab runner.
-Nothing here replaces a script that already works.
+One entrypoint, `tests/run.py`, runs every existing verification layer against either a host build or a board, plus a hardware-in-the-loop (HIL) job on the glolab runner. Nothing here replaces a script that already works.
 
-## 0. What exists today (measured on `d92fd2d`, not copied from docs)
+Draft for crew review, dated 2026-09-20. Section 9 records what is built.
+
+## 0. What exists today
+
+Checked against the workflows and tests in this tree. Counts are left out because they drift. `tests/tools/check_test_count.py` reads the number of GoogleTest cases that ran from the JSON reports, and `tests/EXPECTED_MIN_TESTS` with `tests/min_tests.d/` holds the floor.
 
 | Layer | Where | Runs in CI? | Target |
 |---|---|---|---|
-| GoogleTest suite, 96 files / 1191 cases, one ctest target `sip_parser_tests` | `tests/` | yes (ci.yml, ci-glolab.yml) | host |
-| HTTP API smoke, 30 TC ids | `tests/http/test_api.sh` | yes (host); manual on board | both |
-| pjsua/baresip interop, 11 scenarios | `tests/interop/interop.py` | **no** | host only (spawns `SipServer`) |
-| SIPp, 7 XML scenarios | `tests/sipp/run_sipp.sh` | **no** | host only (spawns `SipServer`) |
+| GoogleTest suite, one ctest target `sip_parser_tests` | `tests/` | yes (`ci.yml`; `ci-glolab.yml` nightly) | host |
+| HTTP API smoke | `tests/http/test_api.sh` | yes (`ci.yml`; `ci-glolab.yml` nightly); on a board through `board-smoke` | both |
+| pjsua/baresip interop | `tests/interop/interop.py` | yes (`interop.yml`, on pull requests) | host only (spawns `SipServer`) |
+| SIPp, XML scenarios | `tests/sipp/run_sipp.sh` | **no** | host only (spawns `SipServer`) |
 | Load / pool ceilings | `tests/load/sip_stress.py` | **no** | either (takes an IP) |
-| Call-graph / VLA guard (THREAT_MODEL T-7) | `tests/tools/check_parser_callgraph.py` | **no** | source |
-| Office smoke, 10 scenarios, real RTP | `.smoke/office_smoke.py <ip>` | **no** | board |
+| Call-graph / VLA guard (THREAT_MODEL T-7) | `tests/tools/check_parser_callgraph.py` | yes (`ci.yml`; `ci-glolab.yml` nightly) | source |
+| Office smoke, real RTP | `.smoke/office_smoke.py <ip>` | **no** | board |
 | Serial capture, SIP liveness, NVS provisioning | `.smoke/capture.py`, `sip_probe.py`, `gen_provision_nvs.py` | **no** | board |
-| Firmware build matrix (5 legs) + heap_debug + heap_trace + waveshare | `ci.yml` | yes | compile only |
+| Firmware build matrix, heap_debug, heap_trace and waveshare builds | `ci.yml` | yes | compile only |
 
-Gaps the harness closes: there is no runner script at all; nothing beyond gtest and
-`test_api.sh` is automated; the glolab self-hosted runner never touches a board;
-interop and SIPp cannot address a remote PBX; there is no sanitizer build and no soak;
-`ci.yml` uploads no firmware artifacts (only `release.yml` does); the host binary has no
-graceful shutdown, so every driver kills it.
+Gaps still open: interop and SIPp cannot address a remote PBX; there is no sanitizer build and no soak verdict; the host binary has no graceful shutdown, so every driver kills it.
 
 ## 1. Design principles
 
@@ -48,19 +45,19 @@ tests/run.py <suite> [--target host|board=<ip>] [--profile default|heap_trace|he
 
 | Suite | Wraps | host | board | Notes |
 |---|---|---|---|---|
-| `unit` | cmake + ctest | ✔ | – | `--gtest_filter` passthrough, sharding (§6) |
-| `api` | `tests/http/test_api.sh` | ✔ | ✔ | see §5.4 step 3 for board safety |
-| `interop` | `tests/interop/interop.py` | ✔ | after P1 | needs the remote-target change (§4) |
-| `sipp` | `tests/sipp/run_sipp.sh` | ✔ | after P1 | same |
-| `load` | `tests/load/sip_stress.py` | ✔ | ✔ | already takes an IP |
-| `callgraph` | `tests/tools/check_parser_callgraph.py` | source | – | free to add to CI today |
-| `sanitize` | cmake `-fsanitize=address,undefined` + ctest | ✔ | – | new job (§6) |
-| `board-flash` | esptool over glolab SSH | – | ✔ | §5.2 |
-| `board-provenance` | `/api/status` + boot banner vs build stamp | – | ✔ | §5.3, runs before every board suite |
-| `board-smoke` | `capture.py` + `sip_probe.py` + `test_api.sh` + `office_smoke.py` | – | ✔ | §5.4 |
-| `board-soak` | `/api/status` heap sampler | – | ✔ | §5.5 |
-| `anchor` | 3CX Call Control tier | – | bench only | §5.6, credentials-gated |
-| `all` | every suite the target supports | ✔ | ✔ | |
+| `unit` | cmake + ctest | yes | no | `--gtest_filter` passthrough; sharding is planned (§6) |
+| `api` | `tests/http/test_api.sh` | yes | yes | see §5.4 step 3 for board safety |
+| `interop` | `tests/interop/interop.py` | yes | after P1 | needs the remote-target change (§4) |
+| `sipp` | `tests/sipp/run_sipp.sh` | yes | after P1 | same |
+| `load` | `tests/load/sip_stress.py` | yes | yes | already takes an IP |
+| `callgraph` | `tests/tools/check_parser_callgraph.py` | source | no | runs in CI (§3) |
+| `sanitize` | cmake `-fsanitize=address,undefined` + ctest | yes | no | planned job (§6) |
+| `board-flash` | esptool over glolab SSH | no | yes | §5.2 |
+| `board-provenance` | `/api/status` + boot banner vs build stamp | no | yes | §5.3, runs before every board suite |
+| `board-smoke` | `capture.py` + `sip_probe.py` + `test_api.sh` + `office_smoke.py` | no | yes | §5.4 |
+| `board-soak` | `/api/status` heap sampler | no | yes | §5.5 |
+| `anchor` | 3CX Call Control tier | no | bench only | §5.6, credentials-gated |
+| `all` | every suite the target supports | yes | yes | |
 
 Exit code: 0 all pass, 1 any FAIL, 2 harness error (target unreachable, provenance
 mismatch, lock held). SKIP never fails the run but is always listed.
@@ -74,31 +71,34 @@ serial.log         board runs: full capture, see §5.1
 status-*.json      every /api/status the harness read, timestamped
 ```
 
-`--json` prints `manifest.json` to stdout for CI step summaries.
+`serial.log` is planned; serial capture is not built yet (§9).
+
+`--json` prints `manifest.json` to stdout, where the CI logs capture it.
 
 ## 3. Host tier
 
 Runs on ubuntu-latest, on the glolab runner, and under WSL on a dev box.
 
-- `unit`: the unchanged three commands (`unset IDF_PATH; cmake -B; cmake --build; ctest`).
+- `unit`: the unchanged build and test commands (`unset IDF_PATH; cmake -B; cmake --build; ctest`).
   The harness takes a **per-host lock** (`flock` on `/tmp/pd-host-tests.lock`) because the
-  HTTP suites bind fixed port blocks 18080–19399 (CONTRIBUTING_FIRMWARE §5) and two
-  concurrent runs collide. Plumbing a port base through the 13 HTTP test files removes
-  the lock; that is P2.
+  HTTP suites bind fixed TCP port blocks from 18080 upward (the port table in
+  [CONTRIBUTING_FIRMWARE.md](../CONTRIBUTING_FIRMWARE.md), section 5), and two concurrent
+  runs collide. Plumbing a port base through the HTTP test files removes the lock; that is
+  P2. The files are the ones listed in that table.
 - `api`: identical to the CI step today; the harness owns spawn, poll and `kill -9` of
   `SipServer`.
 - `interop`, `sipp`: unchanged on host. Both need pjsua and sipp provisioned on glolab
   without sudo (`apt-get download` + `dpkg -x`; pjsua from source with
   `PJMEDIA_HAS_VIDEO 1`, or attended transfer can never send its REFER).
-- `callgraph`: add to `ci.yml` and `ci-glolab.yml` as a blocking step. Exit 1 = cycle or
-  dynamic frame, exit 2 = TU failed to compile.
-- `sanitize`: new `ci.yml` job, ASan + UBSan, warn-only for two weeks to establish a
-  baseline, then blocking.
+- `callgraph`: a blocking step in `ci.yml` (job `callgraph-guard`) and in `ci-glolab.yml`.
+  Exit 1 = cycle or dynamic frame, exit 2 = TU failed to compile.
+- `sanitize`: planned as a new `ci.yml` job, ASan + UBSan, warn-only for two weeks to
+  establish a baseline, then blocking.
 
 ## 4. Remote-target change for interop and SIPp (P1)
 
-Both harnesses launch `SipServer --ip 127.0.0.1` as a subprocess and bind each UA to its
-own `127.0.0.x`. For `--target board=<ip>`:
+Not built yet (§9). Both harnesses launch `SipServer --ip 127.0.0.1` as a subprocess and bind
+each UA to its own `127.0.0.x`. For `--target board=<ip>`:
 
 - Skip the spawn. Registrar = `<ip>:5060`, web = `<ip>:80`.
 - UAs bind to the runner's LAN address (glolab is on the same 192.168.12.x as `.244`) on
@@ -136,36 +136,42 @@ own `127.0.0.x`. For `--target board=<ip>`:
 
 ### 5.2 `board-flash`
 
-Input: a firmware bundle from a `build-esp-idf` CI artifact (esp32s3/eth, chosen
-profile), never built on the runner. Steps:
+`tests/run.py board-flash` writes the app image only, and it requires `--allow-destructive`.
+It is not part of the `hil-244` job (§5.8).
+
+Input: a firmware bundle from a `build-esp-idf` CI artifact (esp32s3/eth, chosen profile), never
+built on the runner. Steps:
 
 1. Acquire the board lock (§5.7).
 2. scp the bundle to glolab `/tmp/pd244_flash/<sha>/`, verify `SHA256SUMS`.
 3. Pre-flash: read `/api/status`, record the current version stamp, save
    `POST /api/config/export` to the results dir.
 4. `esptool --chip esp32s3 --port <by-id> --no-stub --after no_reset write_flash 0x20000 app.bin`.
-   App-only by default; `--full` writes bootloader + partitions + app; `--nvs <img>`
-   writes a `gen_provision_nvs.py` image at 0x9000. glolab's working esptool is 5.4.0
-   (the venv at `~claude-agent/esptool-venv`, which ran the 2026-09-27 recovery in #338),
-   not 4.7.0. The underscore spellings and `--no-stub` above are what `tests/run.py`
-   sends; they date from Debian's packaged 4.7.0, which has no S3 stub JSON.
-   **`--after no_reset` is mandatory.** Issue #338 (open) shows that esptool's hard,
-   watchdog and RTS resets can park this board in ROM download mode until someone
-   presses RST or power-cycles it. Switching power cannot do that remotely: `.244` is
-   PoE-fed, so a USB VBUS cycle leaves it running (tested 2026-09-24, uptime kept
-   climbing), and its PoE switch is unmanaged. The reset after a flash must come from a
-   GPIO relay or open-drain MOSFET from glolab on `.244`'s EN (reset) line, which is a
-   P0 hardware dependency (§8). Until it exists, `board-flash` is dispatch-only with a
-   human at the bench, and the physical RST button is the only guaranteed recovery.
+   Only the app is written today. `--full` (bootloader, partitions and app) and `--nvs <img>`
+   (a `gen_provision_nvs.py` image at 0x9000) are planned, and `tests/run.py` does not accept
+   them yet (§9). glolab's working esptool is 5.4.0 (the venv at `~claude-agent/esptool-venv`,
+   which ran the 2026-09-27 recovery in #338). The underscore spellings and `--no-stub` above
+   are what `tests/run.py` sends; they date from Debian's packaged 4.7.0, which has no S3 stub JSON.
+
+   **Warning:** `--after no_reset` is mandatory. Issue #338 (open) shows that esptool's hard,
+   watchdog and RTS resets can park this board in ROM download mode until someone presses RST
+   or power-cycles it. A remote power cycle does not help: `.244` is PoE-fed, so a USB VBUS
+   cycle leaves it running (tested 2026-09-24, uptime kept climbing), and its PoE switch is
+   unmanaged. The reset after a flash must come from a GPIO relay or open-drain MOSFET from
+   glolab on `.244`'s EN (reset) line, which is a P0 hardware dependency (§8). Until it exists,
+   `board-flash` runs only with a human at the bench, and the physical RST button is the only
+   guaranteed recovery.
+
    **Safe reboot until then:** hold DTR false so GPIO0 stays high, then pulse RTS; the
    ROM boots from flash instead of the download loader. `.smoke/capture.py` does exactly
    this; the bench's `pd_serial.py --reset` on glolab holds DTR false the same way (#384).
    One data point, not proof: on 2026-09-27 esptool 5.4.0
    `--before no-reset --after hard-reset`, with DTR false, took `.244` out of the ROM
    loader into the app (#338).
-5. Reset (EN low), start capture, poll `/api/status` up to 60 s.
-6. Run `board-provenance`. Mismatch = exit 2, board left as-is, lock released with a
-   CHECK-IN stating what is on it.
+5. Reset (EN low), start capture, poll `/api/status` up to 60 s. Neither the EN-low reset nor
+   the capture is built yet (§9).
+6. Run `board-provenance`. Mismatch = exit 2, board left as-is, lock released with a CHECK-IN
+   stating what is on it. Today a mismatch is recorded as WARN (§9).
 
 ### 5.3 `board-provenance`
 
@@ -179,39 +185,42 @@ on the stamp from `git describe --tags --always` of the built commit:
 It also records `resetReason` from the first Heartbeat; a Heartbeat line without
 `ResetReason` is a pre-#340 build and fails provenance outright.
 
+Built today: the `/api/status` version and `resetReason` checks, with a version mismatch
+recorded as WARN. The boot-banner and binary checks, and the FAIL verdict, are not built yet (§9).
+
 ### 5.4 `board-smoke`
 
-Ordered, each step a verdict:
+Ordered, each step a verdict. Steps 1 and 4, and the serial checks in them, are not built yet (§9).
 
-1. Boot capture. **The reboot counts as destructive**: the Yealink on 1001 is a real
+1. Boot capture. **Warning:** the reboot is destructive. The Yealink on 1001 is a real
    handset in use, so without `--allow-destructive` this step attaches to the running
    board and asserts only from that point. Checks: link up, IP acquired, SD mounted, zero
    `ERROR`/panic lines across the whole file.
 2. `sip_probe.py <ip>` → `RESULT: ALIVE`.
-3. `test_api.sh <ip>`. **As written the script is not board-safe**: it assumes the
-   shipped `admin`/`admin`, and its final auth block logs out and deliberately trips
-   brute-force lockout, which `SERVER_PID` does not gate (it only gates TC-OTA-07 and
-   TC-FR-01..03). Board mode needs a credential source from the runner environment
-   (`PD_BOARD_ADMIN_PIN`) and the lockout, factory-reset and OTA-reboot cases moved
-   behind `--allow-destructive`, with config export before and import after.
+3. `test_api.sh <ip>`. The script reads the admin PIN from `PD_BOARD_ADMIN_PIN`. If that
+   variable is unset, it falls back to `admin`. The brute-force lockout case (TC-AUTH-11)
+   runs only with `--allow-destructive`. The OTA upload case (TC-OTA-03) is gated the same
+   way. The factory-reset cases (TC-FR-01..03) run only when `SERVER_PID` is set, that is,
+   against a host process. Planned: a config export before the run and an import after it.
 4. Yealink 1001 registered in `/api/status` within 90 s of boot; no `Timer B expired`,
    no `pool exhausted` anywhere in the capture.
-5. `office_smoke.py <ip>`, all 10 scenarios as sub-verdicts.
+5. `office_smoke.py <ip>`, every scenario in the script as a sub-verdict.
 6. `interop --target board` (after P1).
 7. Final `/api/status` snapshot; internal-heap `largest` must be ≥ 50% of its post-boot
    value. Placeholder threshold until `board-soak` gives a baseline.
 
 ### 5.5 `board-soak`
 
-`tests/run.py board-soak --target board=<ip> --minutes N --interval 30 [--calls every M]`
-samples the 8 heap fields + 5 `stackHwm_*` fields from `/api/status`, optionally places
-a test-dial call every M minutes, and writes a CSV. Verdict is a slope test on internal
-`free` and `largest` against an idle baseline. The #328 confirmation (largest
-27628 → 1132 in 13 idle minutes) was this by hand; it becomes a number the crew can
-quote. Profiles matter: `heap_trace` builds are for the #331 periodic dump (but no boot
-of that build has reached t=360 s yet, #374, so its 360/900 s and periodic dumps are
-unreachable today), and only a `default` build is a valid target for the #328/#330
-zero-alloc proof.
+Planned invocation: `tests/run.py board-soak --target board=<ip> --minutes N --interval 30 [--calls every M]`.
+The sampler that exists today writes a fixed CSV with no slope verdict (§9). The planned version
+samples the heap and `stackHwm_*` fields that `/api/status` reports, optionally places a
+test-dial call every M minutes, and writes a CSV. Its verdict will be a slope test on internal
+`free` and `largest` against an idle baseline. The #328 leak was confirmed by hand (largest
+27628 → 1132 in 13 idle minutes); this section turns that into a number the crew can quote.
+
+Profiles matter: `heap_trace` builds are for the #331 periodic dump (but no boot of that build
+has reached t=360 s yet, #374, so its 360/900 s and periodic dumps are unreachable today), and
+only a `default` build is a valid target for the #328/#330 zero-alloc proof.
 
 ### 5.6 `anchor` (3CX Call Control, bench only)
 
@@ -233,40 +242,55 @@ joins it rather than replacing it:
   printing the holder's manifest (who, sha, started, expiry).
 - A human hold is a `/var/lock/pd244.hold` file the harness never overrides.
 - The CI job uses `concurrency: glolab-board-244` (not per-SHA) so two pushes queue.
-- Posts a CHECK-OUT comment on the night's Discussion thread before touching the board
-  ("harness run <sha>, expiry <start+45 min>") and a CHECK-IN after, stating the
-  firmware left on the board.
+- Not built yet (§9): posting a CHECK-OUT comment on the night's Discussion thread before
+  touching the board ("harness run <sha>, expiry <start+45 min>") and a CHECK-IN after,
+  stating the firmware left on the board.
 
 ### 5.8 CI wiring
 
-Today `ci.yml` uploads no firmware artifacts, and `ci-glolab.yml` fires on the same push,
-so a cross-workflow download would race the IDF matrix. Two P0 changes:
+The `hil-244` job lives in `ci.yml`, so it can `needs:` the build jobs in the same workflow.
+It runs on the glolab self-hosted runner (`runs-on: [self-hosted, glolab]`) and only on
+`workflow_dispatch`, so pull requests and pushes never reach it. It runs `board-smoke`
+against the board and does not flash it.
 
-- The esp32s3/eth leg plus the `build-heap-trace` and `build-heap-debug` jobs gain an
-  `upload-artifact` step for their flash bundles.
-- A new job `hil-244` lives in `ci.yml` itself: `needs: build-esp-idf`,
-  `runs-on: [self-hosted, glolab]`, `if: github.ref == 'refs/heads/main'`, plus
-  `workflow_dispatch` inputs `profile` and `allow_destructive`. The existing
-  `build-and-test-host-glolab` job in `ci-glolab.yml` is untouched.
+```mermaid
+flowchart LR
+    A["build-esp-idf<br/>esp32s3/eth leg uploads firmware-esp32s3-eth"] --> H["hil-244<br/>workflow_dispatch only"]
+    B["build-heap-trace<br/>uploads firmware-heap-trace"] --> H
+    H --> S["tests/run.py board-smoke<br/>on 192.168.12.244"]
+    S --> R["uploads hil-244-results-SHA"]
+```
 
-Steps:
+Firmware bundles:
 
-1. `actions/download-artifact` the esp32s3/eth bundle for the profile from this run.
-2. `tests/run.py board-flash --target board=192.168.12.244 --profile <p>`
-3. `tests/run.py board-smoke --target board=192.168.12.244`
-4. Upload the results dir as an artifact; `manifest.json` becomes the step summary. On
-   failure the serial capture is the first thing linked.
+- `build-esp-idf`, esp32s3/eth leg: uploads `firmware-esp32s3-eth`. Done.
+- `build-heap-trace`: uploads `firmware-heap-trace`. Done.
+- `build-heap-poisoning` builds the heap_debug profile and uploads nothing. Not done.
 
-Fork PRs never reach this job because of the `main`-only condition; the self-hosted
-runner still never checks out PR code.
+The `hil-244` job:
+
+1. Downloads the bundle for the profile from this run with `actions/download-artifact`. A
+   `profile` input of `heap_trace` selects `firmware-heap-trace`; any other value selects
+   `firmware-esp32s3-eth`. The heap_debug and constrained profiles have no bundle yet, so they
+   run the eth image.
+2. Runs `tests/run.py board-smoke --target board=192.168.12.244 --profile <profile> --json`,
+   with `--allow-destructive` added when the `allow_destructive` input is true. The
+   `PD_BOARD_ADMIN_PIN` repo secret is passed in the environment.
+3. Uploads `tests/.results/` with `actions/upload-artifact` as `hil-244-results-<sha>`, kept for
+   14 days, even when earlier steps fail. Planned: on failure, link the serial capture first (§9).
+
+The job does not run `board-flash`. The board runs whatever firmware it has, and §9 explains
+how the provenance check reports that. The nightly `build-and-test-host-nightly` job in
+`ci-glolab.yml` is separate, and the harness does not change it.
 
 ## 6. Host-side improvements riding along
 
-- Register gtest per-file with `gtest_discover_tests()` so ctest can shard and retry, and
-  a red run names the file. The `sip_parser_tests` target name stays.
-- `sanitize` job as in §3.
-- `callgraph` into both host workflows.
-- ci-glolab gains `interop` and `sipp` (host target) once pjsua/sipp are provisioned.
+- Planned: register gtest per-file with `gtest_discover_tests()` so ctest can shard and retry,
+  and a red run names the file. The `sip_parser_tests` target name stays.
+- Planned: the `sanitize` job as in §3.
+- Done: `callgraph` in both host workflows (§0).
+- Planned: `interop` and `sipp` (host target) in `ci-glolab.yml`, once pjsua and sipp are
+  provisioned there. `interop` already runs in `interop.yml`.
 
 ## 7. Phasing
 
@@ -291,10 +315,9 @@ runner still never checks out PR code.
 5. A second board means a `--board <name>` registry (ip, by-id path, variant, phone
    extension); one-file change when it arrives.
 
-## 9. P0 status (what PR #360 actually delivers)
+## 9. P0 status (what PR #360 delivers)
 
-Honest delta between this spec and the first implementation, so the doc is not wrong on
-day one. Update this table as items land.
+This table compares the spec with what PR #360 delivers. Update it as items land.
 
 | Spec item | State in #360 |
 |---|---|
@@ -304,15 +327,15 @@ day one. Update this table as items land.
 | Board lock + hold file (§5.7) | done for every board suite; Discussion CHECK-OUT/IN posts not yet |
 | `board-provenance` | `/api/status` version vs `git describe` + `resetReason` only; no boot banner, no binary grep. A version mismatch is **WARN**, not FAIL, until `board-flash` runs before `board-smoke` (#338), so expect a green `hil-244` with a WARN verdict in the manifest |
 | `board-smoke` | provenance (recorded), `sip_probe`, `test_api.sh`, `office_smoke.py`, final heap snapshot; no serial capture, no Yealink/Timer B check |
-| `board-flash` | esptool `--after no_reset` + config export; no import, no post-flash reset (#338), dispatch-only with a human present |
+| `board-flash` | esptool `--after no_reset` + config export; no import, no post-flash reset (#338); run by hand with a human present |
 | `board-soak` | fixed 1 min / 10 s sampler to CSV, no slope verdict |
 | `anchor` | credential presence check only |
 | CI | firmware bundles uploaded (eth, heap_trace); callgraph step blocking in both host workflows (its first run found #361, fixed in #364); `hil-244` is `workflow_dispatch`-only and runs `board-smoke` without flashing |
 | Not started | remote-target interop/SIPp (P1), serial capture, `gtest_discover_tests`, sanitizer CI job, port-base plumbing, Discussion posts |
 
-`board-smoke` still runs `office_smoke.py` unconditionally: DND and forward toggles, a
-`POST /api/group`, and the 999 page to every registered phone. Dispatch-only fixed the
-trigger, not the behaviour. Whoever dispatches `hil-244` or runs `board-smoke` by hand
+Dispatch-only limits when `hil-244` runs, not what it does. `board-smoke` still runs
+`office_smoke.py` unconditionally: DND and forward toggles, a `POST /api/group`, and the 999
+page to every registered phone. Whoever dispatches `hil-244` or runs `board-smoke` by hand
 owes the CHECK-OUT broadcast; the harness does not post to the Discussion yet.
 
 Prerequisite before the first `hil-244` dispatch: the repo secret `PD_BOARD_ADMIN_PIN`
@@ -323,15 +346,19 @@ TC-AUTH-04 and cascades.
 
 `tests/load/anchor_scenarios.py` runs one named scenario against a rig's anchored outside
 line and computes its own verdict. Its self-test is `tests/tools/test_anchor_scenarios.py`
-(fakes on loopback only). Hardware results are posted on the issues; the first `x4_cancel_ringing`
-run (#379) is why its timing, below, changed.
+(fakes on loopback only). Hardware results are posted on the issues. The timing of `x4_cancel_ringing` below comes
+from its first hardware run (#379).
 
-**Closure rule** (desmo's approval, [#384](https://github.com/GlomarGadaffi/pocket-dial/issues/384#issuecomment-5966736679), verbatim):
+### Closure rule
+
+desmo approved this rule in [#384](https://github.com/GlomarGadaffi/pocket-dial/issues/384#issuecomment-5966736679). It is quoted verbatim:
 
 > The closure rule: a milestone-4 issue closes only when a named scenario in the repo runs on a provenance-checked image (the release stamp, or that commit's `-probe` stamp), its pre-registered path-exercised counter is >= 1 (else the run is INVALID), the script, not a person, computes PASS, and the redacted manifest and log are posted on the issue. A human decision (a re-scope, an approval) is linked as a comment and is never itself the reason to close.
 
-**Scenarios and their pre-registered counters.** A counter is a regex over the board's
-syslog. A run whose counter is 0 is INVALID, never PASS.
+### Scenarios and counters
+
+Each scenario has a pre-registered counter, a regex over the board's syslog. A run whose
+counter is 0 is INVALID, never PASS.
 
 | Scenario | For | Run | Counter | PASS also needs |
 |---|---|---|---|---|
@@ -343,10 +370,12 @@ syslog. A run whose counter is 0 is INVALID, never PASS.
 | `x279_degraded_bye` | #279 (Connected variant) | 1 answered call, 6101 sends RTP (Contact `;line=pd6101`); `post_stream_fail` armed 1.5 s after its POST stream opens; the BYE due within 3 s | `degraded_endcall`: `endCall <Call-ID> reason=anchor audio write failure` | `fired` ≥ 1; exactly one BYE at 6101, matching Call-ID and tags, Request-URI = its registered Contact with its parameters, answered 200; the leg dropped once (syslog only); sessionCount back to baseline; a re-INVITE on the dead dialog gets 481 |
 | `x952_token_age_held` | #952, #945 | 1 answered call (voicemail counts), 6101 sends RTP (Contact `;line=pd6101`), held `--hold-s` seconds (default 330; it must exceed 300, the old 5-minute token margin, and is at most 900) after `token_age` fires. `token_age` is armed once the call's POST stream is open (`--arm-at mid-call`, the default). `--arm-at before-call` arms it before the INVITE, where `makeCall()` refreshes the aged token at origination, so nothing is aged under a live stream. `--runs` held calls (default 1), at most `--run-cap` (default 1, ceiling 3). The call cap is the hold plus 30 s. The INVITE waits up to 45 s for the far end, or its voicemail, to answer (the agent's default 16 s would CANCEL a far end still ringing toward voicemail), then CANCELs | `bench_token_age`: `BENCHFAULT token_age fired` | `fired` ≥ 1 (the run gives up at once, with no long hold, if it does not fire within 5 s); the call answered with its POST stream open and still up past the old margin; a BYE answered 200 (the harness's, or the PBX's at 6101's registered Contact if it ended past the margin); each leg dropped once; sessionCount back to baseline. A call that ends within the margin is INVALID. **It reports, it does not judge the refresh**: per run the hold reached and the token witnesses below counted from when the token was aged, in `manifest.json` (`summary`) and `run.log`. On main nothing refreshes a token mid-call (`ensureToken()`'s only caller is `makeCall()`, before any stream opens), so by the code the expected counts are `bench_token_age=1` and zeros; anything else is the finding. The four #862 witnesses (`token_maint_*_862`, `token_sos_*_862`) are counted too: main does not emit them, so on a main image they are zeros, and they count on the #945 image. Needs an `--approval-url` in `LONG_HOLD_APPROVALS` (below) |
 | `x888_ws_upsert` | #888 | three synthetic upserts through `handleWsEvent()` with `ws_upsert` armed once per case (1 an unknown participant, no call; 2 the same while 6101's one call to the far end rings; 3 our own leg, no call); case 2 is CANCELled 0.5 s after the fire (one short ring, call cap 1, ≤ 30 s). 911, 933, 113, 1001 and any emergency number are refused as the far end before anything is armed or dialled | `bench_ws_upsert`: `BENCHFAULT ws_upsert fired` | `fired` = 3; each case's branch logs **exactly one** witness line for its own synthetic part id (`pdb-u<case>-<n>`): `Upset dropped, work item not queued` (1), `Upset absorbed while an outbound is in flight` (2), `Upset dropped as own leg with no outbound slot` (3). A branch with 0 lines is INVALID for that case, never PASS; a second line, or a line in another branch for the same upsert, is a FAIL; a synthetic participant in an `Inbound call on DN` line is a FAIL. The call ends 487 (CANCEL answered 200) or, if the far end answered first, is BYEd; the leg is dropped once; no INVITE at 6101 or 6104 but the register beep. One line per case and a summary are printed |
-| `x370_pressure_rebuild` | #370 | 1 call, 6101 → the far end (one ring, ≤ 30 s) with `get_status=404`, `get_max_attempts=8` and a DRAM ballast at the probe's 8192 B floor held across it (dead-man 35 s), CANCELled 2 s after the first GET transport failure (10 s at the latest); no HTTP request to the board between the hold and the release, which comes the moment the call returns and again in a `finally`. 911, 933, 113, 1001 and any emergency number are refused as the far end before anything is armed, held or dialled | `get_transport_fail`: `GET stream transport failure (no HTTP response, status=-1), attempt k/N` or `GET stream open failed (…), attempt k/N` | `fired` ≥ 1 for both faults; the rebuild witness: a failure at attempt k followed by an attempt line at k+1 of the same budget (a rebuild that worked; the firmware logs no success line for it, `TelephonyAnchorClient.cpp:3895-3899`). A failure with no next attempt, none at all, or only the `could not rebuild client` line (it is also logged when the loop is being torn down) is INVALID, never PASS; so is no leg (the far end never rang) or a ballast that did not take. FAIL: a panic line, a coredump, a reboot or a hang after the release (uptime back, reset reason changed, no `/api/status`), an `ORPHANED` line (#349: the ballast is held across `makeCall()`'s POST), a second rx task, one drop not met. Details: [BENCH_PROBE.md](BENCH_PROBE.md) |
+| `x370_pressure_rebuild` | #370 | 1 call, 6101 → the far end (one ring, ≤ 30 s) with `get_status=404`, `get_max_attempts=8` and a DRAM ballast at the probe's 8192 B floor held across it (dead-man 35 s), CANCELled 2 s after the first GET transport failure (10 s at the latest); no HTTP request to the board between the hold and the release, which comes the moment the call returns and again in a `finally`. 911, 933, 113, 1001 and any emergency number are refused as the far end before anything is armed, held or dialled | `get_transport_fail`: `GET stream transport failure (no HTTP response, status=-1), attempt k/N` or `GET stream open failed (…), attempt k/N` | `fired` ≥ 1 for both faults; the rebuild witness: a failure at attempt k followed by an attempt line at k+1 of the same budget (a rebuild that worked; the firmware logs no success line for it, `TelephonyAnchorClient.cpp:4253-4279`). A failure with no next attempt, none at all, or only the `could not rebuild client` line (it is also logged when the loop is being torn down) is INVALID, never PASS; so is no leg (the far end never rang) or a ballast that did not take. FAIL: a panic line, a coredump, a reboot or a hang after the release (uptime back, reset reason changed, no `/api/status`), an `ORPHANED` line (#349: the ballast is held across `makeCall()`'s POST), a second rx task, one drop not met. Details: [BENCH_PROBE.md](BENCH_PROBE.md) |
 | `h947_http_load` | #947, for #410 | idle, dashboard and dashboard-call runs, `--repeats` (3) of each, at most `--run-cap` (9) runs in all; only dashboard-call rings: 6101 → the designated far end, one call per run held `hold_s` (24 s, inside the 30 s cap), never put on SIP hold; `--call-mode ringing` (default: the far end rings and is not answered, a CANCEL at the window's end) or `answered` | `initiated` (INVALID if 0 when a call was placed) | `answered`: a call that answers and ends once (a harness BYE answered 200, one drop, sessionCount back to baseline); `ringing`: a 180 Ringing seen, the window held for `hold_s`, one CANCEL as it closes answered 200, the INVITE ended 487, no BYE, one drop, sessionCount back to baseline (no 180 is INVALID; a far end that answers anyway is held and BYEd as in `answered`); every dashboard path answers 200 at least once (else INVALID: its handler never ran; a path only the per-source cap refused with 503 is not held against it); no uptime drop inside a run (a reboot is a FAIL); at least one probe answered per run; no panic line; the usual S1/phantom/coredump checks. A slow or refused (503) answer is a measurement, not a failure |
 
-**HTTP under load (`h947_http_load`, #947 for #410).** `tests/load/http_load.py` holds the traffic, the
+### HTTP under load (`h947_http_load`)
+
+Issue #947, for #410. `tests/load/http_load.py` holds the traffic, the
 percentiles and the summary; its self-test is `tests/tools/test_http_load.py`. Every run: a `before` read of
 `/api/status`, the dashboard's pollers (the `setInterval` block of `index_html.h`: status 2 s, cdr 5 s,
 admin/status 15 s, ota/status 15 s, and with a panel open trace 1.5 s, moh 3 s), a sequential probe of
@@ -378,9 +407,11 @@ only check for it). A SIP reply time during the burst (#947 item 3) is not measu
 (4096); the summary prints the lowest reading with the log line it came from (`http-load.jsonl`) and the route
 that produced it. A reading within an hour of boot is flagged (#405): re-read after hours of use.
 
-**Call mode** (`--call-mode`, default `ringing`). A far end that only rings (a 180, never answered) was INVALID
-before this flag: the agent's own 16 s INVITE bound CANCELled it before the window ran at all. It is a valid
-`dashboard-call` in `ringing` mode: the INVITE waits on a thread for `hold_s + 2` s (the agent's
+### Call mode
+
+The `--call-mode` flag defaults to `ringing`. Without ringing mode, a far end that only rings
+(a 180, never answered) is INVALID, because the agent's own 16 s INVITE bound CANCELs it before
+the window runs at all. In `ringing` mode it is a valid `dashboard-call`: the INVITE waits on a thread for `hold_s + 2` s (the agent's
 `invite(invite_timeout=)`, the call cap still 30 s), the dashboard window runs on the run's thread for `hold_s`
 from the INVITE, and the CANCEL goes at the planned hold, INVITE + `hold_s`, not when the window's teardown ends
 (its pollers can sit in a 5 s request on a slow board, and the ring must not outlast the hold); or at once if the
@@ -393,39 +424,45 @@ a 487 nobody asked for) is INVALID, since the ring did not last the hold; the sy
 `anchor dropped a ringing outbound leg`) says who ended it. **The 180 is the PBX's own local ringback**,
 sent at INVITE time (see CANCEL timing below): it does not show the far phone alerting; the `initiated` path
 counter and the one drop line are the only evidence of the anchored leg. A 200 in ringing mode is the answered
-case: the window still runs to `hold_s`, then the harness BYEs. `answered` is the previous behaviour, unchanged:
-the far end must answer, else INVALID. The ring is bounded the same either way: one INVITE,
+case: the window still runs to `hold_s`, then the harness BYEs. In `answered` mode the far end
+must answer, else the run is INVALID. The ring is bounded the same either way: one INVITE,
 `hold_s` (24 s) plus the CANCEL round trip, and at worst `hold_s` + 2 s (the CANCEL's own backstops: +1 s if the
 window overruns, +2 s if no provisional ever arrives), inside the 30 s cap; the ring gate refuses 911, 933, 113,
 1001 and the rest before the INVITE in both modes.
 
-Ring OK is per run with a cap. `--run-cap` (default 9, at most 30) bounds the runs in all: modes × repeats past
+Each run rings at most once. `--run-cap` (default 9, at most 30) bounds the runs in all: modes × repeats past
 it is refused before anything is sent, and the run loop takes one budget unit per run and stops at the cap.
-Only `dashboard-call` rings, once a run, and `calls` follows the plan (at most 10). The far end carries every
+Only `dashboard-call` rings, and `calls` follows the plan (at most 10). The far end carries every
 refusal above (911/933 anywhere in it, 112, 113, 999, 1001-1003, PBX numbers), and the ring itself checks it
 again just before the INVITE. Evidence adds `http-load.jsonl` (every request and every status reading, raw)
 and `http-summary.txt`.
 
-**CANCEL timing.** 3CX's makecall response took 1.8-3.2 s on a real tenant (Stray's corrections on
-[#379](https://github.com/GlomarGadaffi/pocket-dial/issues/379#issuecomment-5985894096) and
-[#681](https://github.com/GlomarGadaffi/pocket-dial/issues/681#issuecomment-5985894278) withdraw the rest of
-that first report), so a CANCEL timed from the INVITE always lands before the 3CX leg exists.
+### CANCEL timing
+
+3CX's makecall response took 1.8-3.2 s on a real tenant
+([#379](https://github.com/GlomarGadaffi/pocket-dial/issues/379#issuecomment-5985894096) and
+[#681](https://github.com/GlomarGadaffi/pocket-dial/issues/681#issuecomment-5985894278)),
+so a CANCEL timed from the INVITE always lands before the 3CX leg exists.
 `x4_cancel_ringing` times it from a ringing reference instead. The PBX's 180 is local ringback sent at
 INVITE time, before the 3CX call is requested (`RequestsHandler.cpp`, `originateAnchorCall`), and no 183 or
 early RTP follows, so no SIP message says the far leg rings. The reference is the first syslog line
 `Upset <leg> -> control leg <leg> status '<not Connected>'` for a leg this INVITE started: 3CX lists our leg
 and it is not yet Connected, which the firmware itself calls ringing (#667). It does not prove the far phone
 is alerting. No reference within 8 s: the call is CANCELled at the timeout and is INVALID; a refusal first (a
-503) is still a FAIL. `x379_cancel_before_leg` keeps the old timing on purpose.
+503) is still a FAIL. `x379_cancel_before_leg` keeps the INVITE-relative timing on purpose.
 
-**A person's phone as the far end makes x4 unreliable** (#893). On `1446405a` desmo's cell diverted repeat
+### Phone as the far end
+
+A person's phone as the far end makes x4 unreliable (#893). On `1446405a`, desmo's cell diverted repeat
 calls to voicemail: the far end's audio opened at once, no `Dialing` upsert came, and runs stopped on
 diverted calls with gaps of 12 s (x4's default `gap_s`) and 60 s alike. The diversion is a property of the
 far end's state, not of this harness. The reliable fix is an automated far end (a non-owner 3CX extension
 answered by a harness UA), which needs desmo and the tenant; until then a diverted run is INVALID, not a
 firmware finding.
 
-**Probe scenarios** (`x349`, `x379`, `x518`, `x279`, `x952`, `x888`) drive the bench probe image
+### Probe scenarios
+
+The probe scenarios (`x349`, `x379`, `x518`, `x279`, `x952`, `x888`) drive the bench probe image
 ([BENCH_PROBE.md](BENCH_PROBE.md)). On top of the preconditions below, `--expect-version` must be
 a `-probe` stamp, and the admin login must be the owner when an owner credential exists
 (`PD_BOARD_ADMIN_USER`). Each run reads `/api/bench/fault` before and after, and arms only its
@@ -439,7 +476,9 @@ then 500 ms per attempt, plus a TLS reconnect of up to 1.3 s per attempt once th
 a real 200, so it fits the 30 s call cap. The Held variant of `x279` and `x350`/`x336` are not
 registered.
 
-**Path witnesses.** One `esp_log` line per fixed path (`src/SIP/Witness.hpp`: `ESP_LOGx` on the board,
+### Path witnesses
+
+One `esp_log` line per fixed path (`src/SIP/Witness.hpp`: `ESP_LOGx` on the board,
 a list a host test reads on the host), each registered in `LOG_COUNTERS` so a scenario can pre-register
 it as its path counter. No witness carries a number, a URI user or a credential.
 `tests/tools/test_anchor_scenarios.py` (`WitnessSampleTest`) checks every regex below against the line
@@ -479,9 +518,9 @@ the firmware formats.
 | `ctrl_request_884` | `ctrl request: attempt (\d+) (reused\|resumed\|cold) in (\d+) ms \(#884\)` | #884: one line per successful control request (drop or answer) saying whether it rode an open socket (`reused`, no connect event), reconnected on the kept handle in 400 ms or less (`resumed`) or paid a full handshake (`cold`: a fresh handle, or a connect above 400 ms, which is the repo's cut and a timing heuristic, not proof of resumption). Group 3 is the elapsed ms. After #884 a `reused` is a bug. A failed attempt logs `Control request failed ... on attempt N` instead. ESP-only |
 | `token_lifetime_fields_951` | `token_lifetime_fields_951: expires_in=(-?\d+) exp_minus_iat=(-?\d+) lifetime_used=(-?\d+) \(seconds; -1: not read\) \(#951\)` | #951: one line per token fetch for the first eight of a boot: the response's `expires_in`, the claims' `exp - iat` and the lifetime installed, in seconds (-1: not read). The bench check of what `expires_in` really is: the lifetime comes from the claims, never from it |
 
-The six `bench_token_age` … `ws_restart_stale_token` rows are existing `esp_log` lines on main, not
+The rows from `bench_token_age` to `ws_restart_stale_token` are existing `esp_log` lines on main, not
 `Witness.hpp` witnesses; `tests/tools/test_anchor_witness_wiring.py` checks each one's format string in
-`TelephonyAnchorClient.cpp` and `BenchProbe.cpp`. The four `_862` rows below them are `Witness.hpp`
+`TelephonyAnchorClient.cpp` and `BenchProbe.cpp`. The `_862` rows below them are `Witness.hpp`
 witnesses (`PD_WITNESS_W` = `ESP_LOGW`, `TelephonyAnchorLogic.hpp`) from the #945 tree. They are registered
 and counted by `x952` (`TOKEN_WITNESSES`), and main does not emit them, so on a main image they read 0; they
 count on the #945 image. `token_maint_skip_862` is sampled (the first of a boot, then every `kWitnessSampleEvery`-th), so its count
@@ -489,7 +528,9 @@ is a floor. The two `token_sos_*_862` lines fire only on a 911/933 POST path, wh
 `x952` is expected to read them 0 even on the #945 image. No wiring test pins their format strings yet (the
 source is not on main); add one when #945 lands.
 
-**Safety preconditions.** Each one is refused before anything is sent (exit 2), except
+### Safety preconditions
+
+Each precondition below refuses the run before anything is sent (exit 2), except
 the S1 pin and the far-end check, which are made against the board:
 
 - a discussion #428 CHECK-OUT link whose expiry covers the run;
@@ -521,13 +562,15 @@ the S1 pin and the far-end check, which are made against the board:
   DN and its DID rows, not the tenant's own inbound numbers, so a far end that is one of those cannot be
   caught here, and every phantom verdict says it is a firmware finding only if the far end cannot route
   back. Confirm the far end first.
-- **RING-REQUIRED**: until the far end is confirmed automated, a run against real 3CX needs
+- **Ring-required:** until the far end is confirmed automated, a run against real 3CX needs
   desmo's OK for that run. The script prints this but does not enforce it.
 
-**Evidence.** With `--set-syslog`, the board's syslog points at the run's UDP listener
+### Evidence
+
+With `--set-syslog`, the board's syslog points at the run's UDP listener
 (default port 5514), and the old setting is restored afterwards. `/api/pcap` is pulled after
 every call, because the ring holds 16 messages. Every text output is redacted, including the
 far end, the PIN, the session and the tenant host. The pcap is masked at the same length and
 still holds LAN addresses, so never post it.
 
-Exit codes match `run_soak.py`: 0 PASS, 1 FAIL, 2 refused, 3 INVALID, 4 ABORTED.
+Exit codes match `tools/soak/run_soak.py`: 0 PASS, 1 FAIL, 2 refused, 3 INVALID, 4 ABORTED.

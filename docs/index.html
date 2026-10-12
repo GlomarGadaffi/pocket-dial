@@ -1,287 +1,163 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>pocket-dial | Minimalist C++17 SIP Server for ESP32 & Desktop</title>
-    <meta name="description" content="A lightweight C++17 SIP registrar & stateless proxy for ESP32 (WiFi/Ethernet) and Desktop. Bypasses credential checks for flat trusted local networks.">
-    <meta name="keywords" content="SIP, VoIP, ESP32, ESP32-S3, C++17, SIP Registrar, PBX, LilyGO, W5500, LAN8720, network engineering">
-    
-    <!-- Modern Readable Typography -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    
-    <link rel="stylesheet" href="style.css">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>pocket-dial: a SIP PBX on an ESP32-S3</title>
+<meta name="description" content="A self-contained SIP PBX that runs on a single ESP32-S3. No router, no server, no cloud. The same C++17 engine builds as a desktop binary.">
+<style>
+html{background:#fefefe}
+body{font-family:"Open Sans",Arial,sans-serif;color:#454545;font-size:16px;margin:2em auto;max-width:800px;padding:1em;line-height:1.4;hyphens:auto;-webkit-hyphens:auto;overflow-wrap:break-word}
+a{color:#07a}a:visited{color:#941352}
+h1{line-height:1.2}
+p.st{margin-top:-1em;font-style:italic}
+code,pre{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9em}
+pre{overflow-x:auto;padding:.6em .8em;background:#f4f4f4;border-left:3px solid #ccc}
+table{border-collapse:collapse;width:100%;font-size:.95em}
+th,td{text-align:left;padding:.3em .6em .3em 0;border-bottom:1px solid #ddd;vertical-align:top}
+img{max-width:100%;height:auto}
+figure{margin:1.5em 0}
+figcaption{font-size:.8em}
+small{font-size:.75em}
+.wr{color:#c0392b;font-weight:600}
+nav{font-size:.9em}
+footer{margin-top:3em;font-size:.85em}
+button.ci{cursor:pointer;border-radius:2px;position:fixed;right:10px;font-size:.8em;text-decoration:underline;border:0;padding:2px 5px;font-family:inherit}
+#contrast{top:10px;color:#000;background:#f0f0f0}
+#invmode{top:34px;color:#fff;background:#000}
+@media screen and (max-width:1080px){button.ci{position:absolute}}
+@media screen and (max-width:500px){th,td{padding-right:.3em}}
+
+/* high contrast */
+html.contrast body{color:#050505}
+html.contrast a{color:#03f}html.contrast a:visited{color:#7d013e}
+html.contrast .wr{color:#800}
+
+/* dark: either the OS asks for it and the reader has not inverted, or the OS
+   is light and the reader has inverted */
+@media (prefers-color-scheme:dark){
+ html:not(.inverted){background:#000}
+ html:not(.inverted) body{color:#d9d9d9}
+ html:not(.inverted) a{color:#00a2e7}html:not(.inverted) a:visited{color:#ca1a70}
+ html:not(.inverted) .wr{color:#d24637}
+ html:not(.inverted) pre{background:#111;border-color:#444}
+ html:not(.inverted) th,html:not(.inverted) td{border-color:#333}
+ html:not(.inverted) #contrast{color:#fff;background:#000}
+ html:not(.inverted).contrast body{color:#fff}
+ html:not(.inverted).contrast a{color:#44c7ff}html:not(.inverted).contrast a:visited{color:#e9579e}
+ html:not(.inverted).contrast .wr{color:#db695d}
+ html.inverted #invmode{color:#000;background:#f0f0f0}
+}
+@media (prefers-color-scheme:light){
+ html.inverted{background:#000}
+ html.inverted body{color:#d9d9d9}
+ html.inverted a{color:#00a2e7}html.inverted a:visited{color:#ca1a70}
+ html.inverted .wr{color:#d24637}
+ html.inverted pre{background:#111;border-color:#444}
+ html.inverted th,html.inverted td{border-color:#333}
+ html.inverted #contrast,html.inverted #invmode{color:#fff;background:#000}
+ html.inverted.contrast body{color:#fff}
+ html.inverted.contrast a{color:#44c7ff}html.inverted.contrast a:visited{color:#e9579e}
+ html.inverted.contrast .wr{color:#db695d}
+}
+</style>
 </head>
 <body>
+<button class="ci" id="contrast" type="button">Contrast</button>
+<button class="ci" id="invmode" type="button">Invert</button>
 
-    <!-- Minimal Header Navigation -->
-    <header class="nav-bar">
-        <div class="nav-container">
-            <div class="brand">
-                <span class="logo">pocket-dial</span>
-                <span class="version-badge">v1.4.1</span>
-            </div>
-            <nav class="nav-links">
-                <a href="#features" class="nav-link">Features</a>
-                <a href="#telephony" class="nav-link">Call Features</a>
-                <a href="#hardware" class="nav-link">Hardware Config</a>
-                <a href="#quickstart" class="nav-link">Quickstart</a>
-                <a href="flasher/" class="nav-link">Flash a board</a>
-                <a href="https://github.com/GlomarGadaffi/pocket-dial" target="_blank" class="nav-btn">GitHub</a>
-            </nav>
-        </div>
-    </header>
+<h1>pocket-dial</h1>
+<p class="st">A SIP PBX on one ESP32-S3. No router, no server, no cloud.</p>
 
-    <div class="wrapper">
-        
-        <!-- HERO SECTION -->
-        <section class="hero-section">
-            <div class="hero-text-block">
-                <div class="status-indicator">
-                    <span class="pulse-dot"></span>
-                    <span>C++17 Core Hardened & Stable</span>
-                </div>
-                <!-- docs/index.html: Issue #27 resolved. -->
-                <h1 class="hero-title">Minimalist SIP Server for Embedded & Desktop</h1>
-                <p class="hero-subtitle">
-                    A small SIP registrar and stateless proxy for flat, trusted local networks. Point any SIP phone at the server to connect instantly on secure, flat local subnets.
-                </p>
-                <div class="hero-actions">
-                    <a href="#quickstart" class="btn btn-primary">Launch Quickstart</a>
-                    <a href="flasher/" class="btn btn-secondary">Flash a board from your browser</a>
-                    <a href="https://github.com/GlomarGadaffi/pocket-dial" target="_blank" class="btn btn-secondary">View GitHub Repository</a>
-                </div>
-            </div>
+<nav><a href="flasher/">Flash a board</a> · <a href="#quickstart">Quickstart</a> · <a href="#features">Features</a> · <a href="#hardware">Hardware</a> · <a href="#security">Security</a> · <a href="https://github.com/GlomarGadaffi/pocket-dial">Source</a> · <a href="https://github.com/GlomarGadaffi/pocket-dial/releases">Releases</a></nav>
 
-            <div class="screenshot-showcase-container">
-                <div class="showcase-card">
-                    <div class="card-title-bar">
-                        <span class="dot red"></span>
-                        <span class="dot yellow"></span>
-                        <span class="dot green"></span>
-                        <span class="card-title-text">pocket-dial Switchboard web dashboard</span>
-                    </div>
-                    <img src="screenshot.png" alt="The pocket-dial Switchboard web dashboard: jack board, ring groups and forwarding, and the call log" class="showcase-img" width="1512" height="1341" decoding="async">
-                </div>
-            </div>
-        </section>
+<h2>What it is</h2>
+<p>Point SIP phones at a small board and they can call each other, transfer, park, page and forward, the way they would on a rack-mounted PBX. The board handles registration and call control. Extension-to-extension audio goes straight between the phones, so the board stays out of the media path unless a feature needs it there (echo test, conference, voicemail, hold music, an outside line).</p>
+<p>The same C++17 engine builds as a desktop binary for Linux, macOS and Windows, which is how most of it is tested.</p>
 
-        <!-- INTERACTIVE RETRO TERMINAL EMULATOR -->
-        <section class="terminal-section">
-            <div class="section-header-block">
-                <h2 class="section-title">Interactive Console Simulator</h2>
-                <p class="section-desc">
-                    Experience the retro CGA-styled console built directly into the server. Execute commands in-browser to interact with the mock SIP registry.
-                </p>
-            </div>
+<h2 id="quickstart">Quickstart</h2>
+<p><b>On a board.</b> Use the <a href="flasher/">browser flasher</a> (Chrome, Edge or Opera on a desktop, over USB). It picks the image for your board, writes it, and can seed Wi-Fi, a WPA2 passphrase for the access point and the registrar mode before first boot. Prefer the command line? See <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/FLASHING.md">FLASHING.md</a>.</p>
+<p><b>On a PC or a Raspberry Pi.</b> No ESP32 needed:</p>
+<pre><code># Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | sh
 
-            <div class="modern-terminal-wrapper">
-                <div class="terminal-header-bar">
-                    <div class="term-tabs">
-                        <span class="term-tab active">guest@pocket-dial: ~</span>
-                    </div>
-                    <span class="term-addr">TCP/8080 (Admin Portal)</span>
-                </div>
-                <div class="terminal-container-inner" id="terminal-screen">
-                    <div class="terminal-body-content">
-                        <div class="system-message">pocket-dial core server initialized.</div>
-                        <div class="system-message">CGA console server listening on port 8080. SIP listening on port 5060.</div>
-                        <div class="system-message">Type <span class="highlight-yellow">help</span> to list commands, or try <span class="highlight-cyan">dial 102</span> to view a SIP transaction simulation.</div>
-                        <br>
-                        <div class="terminal-output" id="terminal-output"></div>
-                        <div class="terminal-input-line">
-                            <span class="prompt">guest@pocket-dial:&gt;</span>
-                            <input type="text" id="terminal-input" autocomplete="off" spellcheck="false" placeholder="type help...">
-                            <span class="blinking-cursor">█</span>
-                        </div>
-                    </div>
-                    <!-- Styled Scanline layer strictly inside terminal widget -->
-                    <div class="term-scanlines"></div>
-                </div>
-            </div>
-        </section>
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex</code></pre>
+<p><b>From source.</b></p>
+<pre><code>cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+./build/SipServer --ip 127.0.0.1 --port 5060 --web 8080</code></pre>
+<p>Open <code>http://127.0.0.1:8080</code>, register two softphones at <code>sip:127.0.0.1:5060</code> as <code>1001</code> and <code>1002</code>, then dial <code>777</code> for an echo test or <code>999</code> to page every phone. The full walkthrough is the <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/SETUP_GUIDE.md">setup guide</a>.</p>
 
-        <!-- FEATURES SECTION -->
-        <section id="features" class="features-section">
-            <div class="section-header-block">
-                <h2 class="section-title">Core Performance Metrics</h2>
-                <p class="section-desc">
-                    High-efficiency engineering designed specifically to fit on resource-constrained microcontrollers and local host environments.
-                </p>
-            </div>
+<h2 id="features">What the phones get</h2>
+<ul>
+<li>Extension-to-extension calls with PCMU, PCMA or G.722, whatever the two phones agree on.</li>
+<li>Blind transfer, and attended transfer with REFER + <code>Replaces</code> (RFC 3891).</li>
+<li>Hold and resume, UPDATE (RFC 3311), session timers (RFC 4028).</li>
+<li>Call park: dial an orbit <code>700</code>–<code>709</code> to park, dial it again from any phone to pick up.</li>
+<li>Call pickup: <code>*8</code> for your group, <code>**&lt;ext&gt;</code> for one extension.</li>
+<li>Ring groups, ring-all or hunt down the list.</li>
+<li>Paging zones <code>980</code>–<code>989</code>, and <code>999</code> to page everyone.</li>
+<li>Forwarding (unconditional, busy, no answer) and do-not-disturb per extension, with star codes from the handset.</li>
+<li>BLF lamps through the <code>dialog</code> event package (RFC 4235).</li>
+<li>Meet-me conference on <code>888</code>, voicemail, hold music, and a dial plan of up to 16 rules.</li>
+<li>Outside lines through a cloud media anchor (3CX, Apidaze). The direct carrier SIP trunk is shelved in favour of the anchors (<a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/ADR-002-PROGRAMMABLE-MEDIA-ANCHOR.md">ADR-002</a>).</li>
+</ul>
+<p>Not every one of these has run on real hardware yet. The <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/FEATURE_ROADMAP.md">feature roadmap</a> says which have, and which have only passed the host tests.</p>
 
-            <div class="features-grid">
-                <div class="feature-card">
-                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 11h14v10H5z"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
-                    <h3 class="feature-card-title">Open By Default, Locked If You Want</h3>
-                    <p class="feature-card-text">
-                        Out of the box any SIP endpoint registers immediately. No username, no password, nothing to configure. Turn on SIP digest auth (RFC&nbsp;2617) when you are ready, with a <em>Learn</em> mode that adopts an existing phone fleet without re-provisioning it. Either way: <strong>do not expose SIP or the dashboard to the public Internet.</strong>
-                    </p>
-                </div>
-                <div class="feature-card">
-                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a9 9 0 0 1 0 14"/></svg></div>
-                    <h3 class="feature-card-title">Direct RTP Media Flow</h3>
-                    <p class="feature-card-text">
-                        Voice data flows peer-to-peer directly between devices. By default the server handles only SIP signalling and never touches call audio, which is what keeps RAM use and latency down. The optional conference mixer is the one exception, and it is off unless you build it in.
-                    </p>
-                </div>
-                <div class="feature-card">
-                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
-                    <h3 class="feature-card-title">Hardened C++17 Core</h3>
-                    <p class="feature-card-text">
-                        Features memory-safe header parsing, bounded string modifications, and dynamic_cast failure handling to prevent Xtensa reboots or desktop crashes.
-                    </p>
-                </div>
-                <div class="feature-card">
-                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15 15 0 0 1 0 20a15 15 0 0 1 0-20z"/></svg></div>
-                    <h3 class="feature-card-title">Multi-Platform Sockets</h3>
-                    <p class="feature-card-text">
-                        Uses standard POSIX socket abstractions on Linux, Winsock on Windows, and native lwIP wrappers on ESP32 (running in a dedicated FreeRTOS 8KB stack task).
-                    </p>
-                </div>
-            </div>
-        </section>
+<figure>
+<img src="screenshot.png" alt="The pocket-dial Switchboard web dashboard: jack board, ring groups and forwarding, and the call log" width="1512" height="1341" loading="lazy" decoding="async">
+<figcaption>The web dashboard. It is the only picture on this page.</figcaption>
+</figure>
 
+<h2 id="hardware">Hardware</h2>
+<table>
+<thead><tr><th>Image</th><th>Board</th><th>Good for</th></tr></thead>
+<tbody>
+<tr><td><code>eth</code></td><td>ESP32-S3 + W5500 Ethernet. Default board: LilyGO T-ETH-ELITE S3 (802.3af PoE)</td><td>An office closet. The best-tested path.</td></tr>
+<tr><td><code>wifi</code></td><td>Any ESP32-S3, running its own access point</td><td>A bag, a field site, a demo. No cables, no router.</td></tr>
+<tr><td><code>display</code></td><td>Guition JC3248W535 (3.5" touchscreen)</td><td>A wallboard that shows what the PBX is doing.</td></tr>
+<tr><td><code>lan8720</code></td><td>Classic ESP32 + LAN8720. Build from source.</td><td>Older boards you already own.</td></tr>
+</tbody>
+</table>
+<p>Pin maps, wiring and parts lists are in <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/HARDWARE.md">HARDWARE.md</a>. Which phones work, and how well, is in <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/PHONE_COMPATIBILITY.md">PHONE_COMPATIBILITY.md</a>.</p>
 
-        <!-- TELEPHONY FEATURES -->
-        <section id="telephony" class="features-section">
-            <div class="section-header-block">
-                <h2 class="section-title">It Behaves Like a Real PBX</h2>
-                <p class="section-desc">
-                    Everything below runs on the microcontroller itself &mdash; no cloud service, no companion server, no per-seat licence.
-                </p>
-            </div>
+<h2 id="security">Read this before you plug it in</h2>
+<p>pocket-dial is built for a flat, trusted local network. Out of the box:</p>
+<ul>
+<li>The <code>wifi</code> image's access point is <b>open</b>. Anyone in radio range can join. WPA2 is one setting away and encrypts the dashboard, the signalling and the call audio at once.</li>
+<li>The registrar starts in <b>Learn</b> mode: a new phone is adopted on its first REGISTER, with no password. Promote it to Secured, or switch the whole registrar to Secure, and SIP digest auth is required.</li>
+<li>The dashboard ships with the login <code>admin</code> / <code>admin</code> and refuses to do anything until you replace it. On a fresh board the real control is who gets to the dashboard first.</li>
+<li>There is no flash encryption and no Secure Boot. Whoever holds the board holds its secrets.</li>
+</ul>
+<p>So: <span class="wr">do not expose UDP 5060 or the dashboard to the Internet.</span> Not with a port forward, not &ldquo;just for a minute&rdquo;. The <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/THREAT_MODEL.md">threat model</a> lists what is defended, what is not, and why.</p>
 
-            <div class="features-grid">
-                <div class="feature-card">
-                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/></svg></div>
-                    <h3 class="feature-card-title">Transfer, Blind &amp; Attended</h3>
-                    <p class="feature-card-text">
-                        Blind transfer hands the call straight over. Attended transfer lets you consult first, then splice the two parties together with REFER + <code>Replaces</code> (RFC&nbsp;3891) &mdash; the transferor drops out and a later hang-up from either side still tears the call down cleanly.
-                    </p>
-                </div>
-                <div class="feature-card">
-                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9 17V7h4a3 3 0 0 1 0 6H9"/></svg></div>
-                    <h3 class="feature-card-title">Park &amp; Retrieve</h3>
-                    <p class="feature-card-text">
-                        Dial a free orbit in <strong>700&ndash;709</strong> to park a call; anyone can dial the same orbit from any handset to pick it up. Useful for &ldquo;grab this on the phone in the back&rdquo; without an intercom.
-                    </p>
-                </div>
-                <div class="feature-card">
-                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.6a2 2 0 0 1-.5 2.1L8.1 9.7a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.8.3 1.7.6 2.6.7a2 2 0 0 1 1.9 2z"/></svg></div>
-                    <h3 class="feature-card-title">Call Pickup</h3>
-                    <p class="feature-card-text">
-                        <strong>*8</strong> answers whatever is ringing in your pickup group; <strong>**&lt;ext&gt;</strong> answers one specific extension. Stops the walk across the room to a ringing desk.
-                    </p>
-                </div>
-                <div class="feature-card">
-                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.9"/><path d="M16 3.1a4 4 0 0 1 0 7.8"/></svg></div>
-                    <h3 class="feature-card-title">Ring Groups &amp; Hunting</h3>
-                    <p class="feature-card-text">
-                        Ring every member at once, or hunt down the list to the first phone that answers. Unanswered legs are cancelled properly rather than left ringing.
-                    </p>
-                </div>
-                <div class="feature-card">
-                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 10l5 5-5 5"/><path d="M4 4v7a4 4 0 0 0 4 4h12"/></svg></div>
-                    <h3 class="feature-card-title">Forwarding &amp; DND</h3>
-                    <p class="feature-card-text">
-                        Forward unconditionally, on busy, or on no-answer (CFU / CFB / CFNA), plus do-not-disturb with dial codes to toggle it from the handset.
-                    </p>
-                </div>
-                <div class="feature-card">
-                    <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 11 18-5v12L3 14v-3z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/></svg></div>
-                    <h3 class="feature-card-title">Paging Zones</h3>
-                    <p class="feature-card-text">
-                        Dial <strong>980&ndash;989</strong> to talk out of a zone of phones at once, or <strong>999</strong> to page everything. Star codes cover the rest &mdash; echo test, DND toggle and friends.
-                    </p>
-                </div>
-            </div>
-        </section>
+<h2>Releases</h2>
+<p><b>v1.5.1</b> (2026-10-03) is the current release. The flasher offers it and every earlier tag; the images and checksums are also on the <a href="https://github.com/GlomarGadaffi/pocket-dial/releases">releases page</a>. <code>main</code> moves ahead of the newest tag between releases, and the <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/CHANGELOG.md">changelog</a> says what changed and what is still a known gap.</p>
 
-        <!-- HARDWARE MATRIX EXPLORER -->
-        <section id="hardware" class="hardware-section">
-            <div class="section-header-block">
-                <h2 class="section-title">Multi-Board Spec Explorer</h2>
-                <p class="section-desc">
-                    Explore pre-configured physical pinouts and code initialization templates for the industry-leading ESP32 and Ethernet boards.
-                </p>
-            </div>
+<h2>Further reading</h2>
+<ul>
+<li><a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/ARCHITECTURE.md">Architecture</a></li>
+<li><a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/API.md">HTTP API</a></li>
+<li><a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/PROVISIONING.md">Phone provisioning</a></li>
+<li><a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/OTA.md">Over-the-air updates</a></li>
+<li><a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/TROUBLESHOOTING.md">Troubleshooting</a></li>
+</ul>
 
-            <div class="hardware-box">
-                <div class="board-tabs-bar">
-                    <button class="board-tab active" data-board="t-eth-elite">LilyGO T-ETH-ELITE S3 (W5500 PoE)</button>
-                    <button class="board-tab" data-board="t-eth-lite">LilyGO T-ETH-Lite S3 (W5500 SPI)</button>
-                    <button class="board-tab" data-board="t-poe-pro">LilyGO T-POE-Pro (LAN8720 RMII)</button>
-                    <button class="board-tab" data-board="waveshare-poe">Waveshare S3-ETH (W5500)</button>
-                    <button class="board-tab" data-board="standard-wifi">ESP32 / CYD Wi-Fi AP (Wireless)</button>
-                </div>
+<footer>
+<p>pocket-dial is Apache 2.0. It began as a fork of BarGabriel&rsquo;s MIT-licensed SipServer; see <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/NOTICE">NOTICE</a>. This page is one HTML file: no framework, no web font, no tracking. The script below only remembers your contrast and invert choice.</p>
+</footer>
 
-                <div class="board-display-grid" id="board-info-container">
-                    <!-- Dynamic hardware details populated by app.js -->
-                </div>
-            </div>
-        </section>
-
-        <!-- QUICKSTART & SECURITY ARCHITECTURE -->
-        <section id="quickstart" class="specs-section">
-            <div class="specs-grid">
-                
-                <!-- Quickstarts -->
-                <div class="spec-block">
-                    <h2 class="section-title">&gt;_ Quickstart Installation</h2>
-                    <p class="section-desc">Get the server running on your desktop with zero dependencies using our automated build scripts:</p>
-                    
-                    <div class="tab-group-os">
-                        <button class="os-tab active" data-os="win">Windows CMD</button>
-                        <button class="os-tab" data-os="nix">Linux / macOS Bash</button>
-                    </div>
-
-                    <div class="code-box-container" id="os-code-box">
-                        <!-- Populated by app.js -->
-                    </div>
-                </div>
-
-                <!-- Technical Notes -->
-                <div class="spec-block">
-                    <h2 class="section-title">🔐 Deployment Guidelines</h2>
-                    <p class="section-desc">Critical specifications for running in development and field deployments:</p>
-                    
-                    <div class="security-list">
-                        <div class="sec-item">
-                            <span class="badge badge-trust">TRUST MODEL</span>
-                            <p><strong>Flat trusted networks by default:</strong> out of the box the registrar accepts any local device and the Wi-Fi access point is open, which is what makes it zero-friction for isolated labs, temporary networks and demos. Treat that default as &ldquo;everyone in radio range is a peer&rdquo;.</p>
-                        </div>
-                        <div class="sec-item">
-                            <span class="badge badge-trust">HARDENING</span>
-                            <p><strong>Opt-in, not automatic:</strong> WPA2 on the access point (one change that encrypts the dashboard, SIP signalling <em>and</em> call audio), SIP digest authentication with a Learn mode for adopting an existing phone fleet, and an admin PIN with a dark-by-default admin plane are all available and all off until you turn them on. See the <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/THREAT_MODEL.md">threat model</a> and <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/SETUP_GUIDE.md">setup guide</a>.</p>
-                        </div>
-                        <div class="sec-item">
-                            <span class="badge badge-warning">SECURITY LIMIT</span>
-                            <p><strong>WAN Isolation:</strong> Do not bind or port-forward UDP port 5060 or TCP port 8080 to public internet interfaces. Always run within secure local subnets or isolated VPN segments.</p>
-                        </div>
-                        <div class="sec-item">
-                            <span class="badge badge-trust">RELEASES</span>
-                            <p><strong>v1.4.1 is the current stable release</strong> and carries everything on this page &mdash; the call features, the admin PIN and hardened dashboard, and the access-point and registrar controls. Flash it from the browser flasher or grab the images from the <a href="https://github.com/GlomarGadaffi/pocket-dial/releases" target="_blank" rel="noreferrer">releases page</a>. A <strong>v1.5.0 beta</strong> is also published as a pre-release and selectable in the flasher; it is host-tested, not yet bench-proven. <code>main</code> moves ahead of the newest tag between releases, so build from source only if you want something that landed after it.</p>
-                        </div>
-                    </div>
-                </div>
-
-            </div>
-        </section>
-
-        <!-- MINIMAL FOOTER -->
-        <footer class="system-footer">
-            <div class="footer-columns">
-                <div>pocket-dial project, v1.4.1. Licensed under <span class="highlight-white">MIT</span>.</div>
-                <div>Source code available on <a href="https://github.com/GlomarGadaffi/pocket-dial" target="_blank" class="footer-link">GitHub</a></div>
-            </div>
-        </footer>
-
-    </div>
-
-    <!-- Scripts -->
-    <script src="app.js"></script>
+<script>
+(function(){
+ var h=document.documentElement;
+ function load(k){try{return localStorage.getItem(k)==="1"}catch(e){return false}}
+ function save(k,v){try{localStorage.setItem(k,v?"1":"0")}catch(e){}}
+ [["contrast","pd-contrast"],["inverted","pd-inverted"]].forEach(function(p){if(load(p[1]))h.classList.add(p[0])});
+ document.getElementById("contrast").onclick=function(){save("pd-contrast",h.classList.toggle("contrast"))};
+ document.getElementById("invmode").onclick=function(){save("pd-inverted",h.classList.toggle("inverted"))};
+})();
+</script>
 </body>
 </html>
