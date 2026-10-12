@@ -70,6 +70,20 @@ The cheap/expensive axis still holds, and it is now measurable. Signalling featu
 | CDR ring + `GET /api/cdr` | 32-record ring persisted to NVS (namespace `cdrlog`, `CdrRing.cpp`), so it survives a reboot **while the serialized ring stays under NVS's 4,000-byte string cap**: it can reach 4,481 B, and the writer ignores the error, so history silently goes stale (#470, fix #476); on SD builds also appended to a per-day CSV archive `/sdcard/cdr/YYYY-MM-DD.csv` (#194, `CdrArchive.hpp`). Both are wiped by factory reset. `GET /api/cdr` (JSON, admin-gated) is the only read route; the archive has no download route. | `CdrRing.*`, `CdrArchive.*` |
 | Virtual `777` echo | SDP loopback, **no media on the board**; since #304 the echoed answer also drops PCMA | `RequestsHandler.cpp`, `onInvite` (the `777` branch) |
 
+Emergency dialing, as the code routes it (see the emergency row above):
+
+```mermaid
+flowchart TD
+    A["Dialed number, or a dial-plan rule result, is 911, 9911 or 933"] --> B["Intercepted before the dial plan and registrar policy"]
+    B --> N["Kari's Law on-site notification"]
+    B --> C{"Boot-selected provider places real calls?"}
+    C -- "Yes (3CX anchor)" --> D["Offer the call to the anchor"]
+    D --> E{"Anchor placed the call?"}
+    E -- "Yes" --> F["Call routed"]
+    E -- "No" --> G["503 Emergency Call Not Routable"]
+    C -- "No (loopback, never offered)" --> G
+```
+
 ### 1.2 Media: the part the board actually carries
 
 | Capability | Notes | Where |
