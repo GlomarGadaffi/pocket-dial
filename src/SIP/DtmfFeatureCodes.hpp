@@ -69,6 +69,11 @@ public:
 	// than having it stamped later at drain time.
 	static uint32_t nowTickMs();
 
+	// Called from tick(): a finished admin PIN check (#986 slice 3) gets its attempt and lockout
+	// accounting and, if its caller is still on the call, its 3-digit code. A cheap no-op when
+	// nothing is waiting. Caller holds _mutex.
+	void applyAdminPin();
+
 	// Drop this Call-ID's accumulator as its dialog ends (Fix #4 — accumulators
 	// share the dialog lifecycle and must not outlive it). Caller holds _mutex.
 	void forgetCall(std::string_view callId);
@@ -100,6 +105,9 @@ public:
 	bool saveAdminExt(const std::string& ext);
 
 private:
+	// The admin menu's command codes (001 NTP, 101 topology, 200 stub, 999 factory reset).
+	void runAdminCode(std::string_view code, char confirm);
+
 	PbxEnv& _env;
 	PbxFeatureConfig& _cfg;
 	CdrRing& _cdr;

@@ -600,6 +600,16 @@ phone-keypad `*PIN#code` admin menu (NTP resync, topology switch, factory reset)
 entirely unreachable until a PIN is set here. It is a separate secret from the web
 login because a keypad cannot type a username.
 
+Keying `*PIN#code` takes effect seconds later, not at the last digit (#986). The PIN is
+checked on its own low-priority task (50000 SHA-256 rounds, about 3 s on the S3 and
+longer while calls are running, with no lock held, so signalling and media carry on), and
+the code runs on the next one-second tick after that. Stay on the call until it does:
+a code whose caller has hung up is dropped with a log line (the PIN attempt still counts
+toward the lockout). A second `*PIN#code` while one is being checked is ignored, logged
+like a wrong PIN and not counted. The factory reset is checked once its confirm digit is
+keyed, so key `*PIN#9991` straight through; `*PIN#999` alone no longer says anything about
+the PIN.
+
 > [!NOTE]
 > **There is no `/api/admin/set-pin` route**, and there never was one in this
 > firmware. Older notes and third-party write-ups describing a PIN-only admin model

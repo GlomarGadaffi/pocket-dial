@@ -205,16 +205,21 @@ namespace
 		uint64_t _bitLen = 0;
 	};
 
-	std::string toHex(const uint8_t* data, size_t len)
+	// Lowercase hex of `data` into out[0 .. 2*len); no NUL, no allocation.
+	void hexInto(char* out, const uint8_t* data, size_t len)
 	{
 		static const char* digits = "0123456789abcdef";
-		std::string out;
-		out.reserve(len * 2);
 		for (size_t i = 0; i < len; ++i)
 		{
-			out.push_back(digits[(data[i] >> 4) & 0x0F]);
-			out.push_back(digits[data[i] & 0x0F]);
+			out[i * 2] = digits[(data[i] >> 4) & 0x0F];
+			out[i * 2 + 1] = digits[data[i] & 0x0F];
 		}
+	}
+
+	std::string toHex(const uint8_t* data, size_t len)
+	{
+		std::string out(len * 2, '\0');
+		hexInto(out.data(), data, len);
 		return out;
 	}
 
@@ -521,29 +526,41 @@ namespace
 
 	// Salted, iterated SHA-256 (PBKDF-style key-stretch). The iteration count
 	// makes offline brute-forcing of a leaked hash markedly more expensive.
-	// Returns a 64-char lowercase hex digest. Used for both the login password
-	// and the DTMF PIN — same stretch cost either way.
-	std::string hashSecret(const std::string& salt, const std::string& secret)
+	// Used for both the login password and the DTMF PIN — same stretch cost either way.
+	//
+	// The round loop, once (#986 slice 3). It reads views and writes a fixed digest,
+	// so the DTMF worker can run it with no heap. `yield`, when non-null, is called
+	// every kYieldEveryRounds rounds: a worker at priority 1 sleeps a tick there so the
+	// idle task runs (see pbkdf2Sha256). Everyone else passes nullptr.
+	void hashSecretDigest(std::string_view salt, std::string_view secret, uint8_t digest[32],
+		void (*yield)())
 	{
-		uint8_t digest[32];
+		const uint8_t* saltBytes = reinterpret_cast<const uint8_t*>(salt.data());
 
 		// Round 0: SHA-256(salt || secret).
 		{
 			Sha256 sha;
-			sha.update(salt);
-			sha.update(secret);
+			sha.update(saltBytes, salt.size());
+			sha.update(reinterpret_cast<const uint8_t*>(secret.data()), secret.size());
 			sha.finalize(digest);
 		}
 
 		// Subsequent rounds: SHA-256(salt || previousDigest).
 		for (uint32_t i = 1; i < AdminAuth::kHashIterations; ++i)
 		{
+			if (yield != nullptr && i % AdminAuth::kYieldEveryRounds == 0) yield();
 			Sha256 sha;
-			sha.update(salt);
-			sha.update(digest, sizeof(digest));
+			sha.update(saltBytes, salt.size());
+			sha.update(digest, 32);
 			sha.finalize(digest);
 		}
+	}
 
+	// Returns a 64-char lowercase hex digest.
+	std::string hashSecret(const std::string& salt, const std::string& secret)
+	{
+		uint8_t digest[32];
+		hashSecretDigest(salt, secret, digest, nullptr);
 		return toHex(digest, sizeof(digest));
 	}
 
@@ -592,7 +609,7 @@ namespace
 	// username compare in verifyCredential() the password hash is always
 	// computed regardless of this result, so a wrong username costs the same
 	// wall-clock time as a wrong password.)
-	bool constantTimeEquals(const std::string& a, const std::string& b)
+	bool constantTimeEquals(std::string_view a, std::string_view b)
 	{
 		if (a.size() != b.size())
 		{
@@ -1057,6 +1074,14 @@ namespace
 		}
 	}
 
+	// The DTMF PIN's two lockout gates (its own bucket, then the aggregate backstop),
+	// read by both halves of the check (#986 slice 3). Caller must hold state().mutex.
+	bool dtmfLockedOutLocked(const AuthState& s, const AttemptBucket& b)
+	{
+		return (b.lockoutUntilMs != 0 && nowMs() < b.lockoutUntilMs) ||
+		       (s.globalLockoutUntilMs != 0 && nowMs() < s.globalLockoutUntilMs);
+	}
+
 	// Caller must hold state().mutex.
 	// #450: reports success. A key that is already absent counts as erased; a
 	// namespace that was never created means there is nothing to erase.
@@ -1481,6 +1506,16 @@ namespace AdminAuth
 
 	bool verifyDtmfPin(const std::string& pin)
 	{
+		DtmfPinTicket t{};
+		if (!beginDtmfPinVerify(t))
+		{
+			return false;
+		}
+		return finishDtmfPinVerify(t, matchesDtmfPin(t, pin, nullptr));
+	}
+
+	bool beginDtmfPinVerify(DtmfPinTicket& t)
+	{
 		AuthState& s = state();
 		std::lock_guard<std::mutex> lock(s.mutex);
 		loadCredentialLocked(s);
@@ -1491,21 +1526,48 @@ namespace AdminAuth
 		}
 
 		AttemptBucket& b = acquireBucketLocked(s, std::string());
-
-		if (b.lockoutUntilMs != 0 && nowMs() < b.lockoutUntilMs)
+		if (dtmfLockedOutLocked(s, b))
 		{
 			return false;
 		}
-		if (s.globalLockoutUntilMs != 0 && nowMs() < s.globalLockoutUntilMs)
+		if (s.pinSalt.size() >= sizeof(t.salt) || s.pinHash.size() >= sizeof(t.hash))
 		{
 			return false;
 		}
 
-		std::string candidate = hashSecret(s.pinSalt, pin);
-		bool ok = constantTimeEquals(candidate, s.pinHash);
+		std::memcpy(t.salt, s.pinSalt.c_str(), s.pinSalt.size() + 1);
+		std::memcpy(t.hash, s.pinHash.c_str(), s.pinHash.size() + 1);
+		return true;
+	}
 
-		recordAttemptLocked(s, b, ok);
-		return ok;
+	bool matchesDtmfPin(const DtmfPinTicket& t, std::string_view pin, void (*yield)())
+	{
+		uint8_t digest[32];
+		hashSecretDigest(t.salt, pin, digest, yield);
+		char hex[64];
+		hexInto(hex, digest, sizeof(digest));
+		return constantTimeEquals(std::string_view(hex, sizeof(hex)), t.hash);
+	}
+
+	bool finishDtmfPinVerify(const DtmfPinTicket& t, bool matched)
+	{
+		AuthState& s = state();
+		std::lock_guard<std::mutex> lock(s.mutex);
+		loadCredentialLocked(s);
+
+		if (!s.dtmfPinSet || s.pinSalt != t.salt || s.pinHash != t.hash)
+		{
+			return false;
+		}
+
+		AttemptBucket& b = acquireBucketLocked(s, std::string());
+		if (dtmfLockedOutLocked(s, b))
+		{
+			return false;
+		}
+
+		recordAttemptLocked(s, b, matched);
+		return matched;
 	}
 
 	std::string createSession(Role role)

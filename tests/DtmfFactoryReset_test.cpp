@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <vector>
 #include "AdminAuth.hpp"
+#include "AdminPinTestUtil.hpp"
+#include "AdminPinVerify.hpp"
 #include "ResetGuard.hpp"
 #include "ResetJournal.hpp"
 #include "CdrArchive.hpp"
@@ -95,12 +97,17 @@ namespace
 		return RequestsHandler::getMessageFromPool(head + body, s);
 	}
 
+	// #986 slice 3: the PIN is checked by a worker and the code runs on a later tick, so the
+	// digits ride on a live call (the code is dropped if its caller is gone) and the worker
+	// and the tick are played after the last digit.
 	void sendDtmfSequence(RequestsHandler& handler, const std::string& callId, const std::string& seq)
 	{
+		adminpin_test::startEchoCall(handler, kAdminExt, kAdminIp, callId);
 		for (char c : seq)
 		{
 			handler.handle(makeInfoDigit(kAdminExt, kAdminIp, callId, c));
 		}
+		adminpin_test::settle(handler);
 	}
 
 	// One fixture per test: a fresh credential store with a known DTMF PIN and
@@ -113,6 +120,7 @@ namespace
 		{
 			AdminAuth::clearCredential();
 			ASSERT_TRUE(AdminAuth::setDtmfPin(kPin));
+			adminpin::resetForTest();
 			handler = std::make_unique<RequestsHandler>("192.168.7.1", 5060,
 				[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
 			handler->handle(makeRegisterFor(kAdminExt, kAdminIp, "reg-admin-222"));
@@ -120,6 +128,7 @@ namespace
 		void TearDown() override
 		{
 			handler.reset();
+			adminpin::resetForTest();
 			AdminAuth::clearCredential();
 			resetguard::resetForTest();     // the host door leaves the guard up (no restart)
 			resetjournal::resetForTest();

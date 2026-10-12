@@ -6,7 +6,7 @@
 #include <cctype>
 #include <chrono>
 
-#include "AdminAuth.hpp"
+#include "AdminPinVerify.hpp"   // #986 slice 3
 #include "ResetJournal.hpp"   // #473
 #include "ResetGuard.hpp"   // #473
 #include "CdrArchive.hpp"
@@ -141,7 +141,6 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 		// brute-force lockout and could lock the admin out of both DTMF and the
 		// dashboard — verifyDtmfPin() shares its attempt-bucket table with the
 		// web login's verifyCredential(), so that risk is real in both directions.)
-		bool adminMatched = false;
 		size_t hashPos = seq.find('#');
 		if (hashPos != std::string::npos && hashPos >= 5 && (seq.size() - hashPos - 1) >= 3)
 		{
@@ -154,170 +153,42 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 			{
 				if (!std::isdigit(static_cast<unsigned char>(c))) { allDigits = false; break; }
 			}
-			// Single verify — a wrong PIN is exactly one counted failed attempt.
-			// verifyDtmfPin() always fails until a DTMF PIN has been explicitly
-			// set (AdminAuth::setDtmfPin) — there is no default, so this whole
-			// menu is unreachable on a freshly-flashed or freshly-reset device.
-			if (!allDigits || !AdminAuth::verifyDtmfPin(pinCandidate))
+			if (!allDigits)
 			{
 				_env.log("[admin] DTMF admin auth failed", true);
 				accum.digits.clear();
 				return;
 			}
-
-			// PIN verified — execute the command code.
-			if (code == "001")
+			// A factory reset takes a confirm digit after its code, so its entry is complete only
+			// with that digit. The PIN used to be checked at "999" and again at the digit; now a
+			// check outlasts the 1-2 s a person takes to press the digit, so the digit would be
+			// refused as a second entry. The one check waits for the digit instead, which also
+			// means "awaiting" no longer says the PIN was right.
+			if (code == "999" && rest.size() < 4)
 			{
-				// NTP resync. The inner ESP_IDF_VERSION >= 5.0.0 gate (and its
-				// "not available on this IDF version" fallback) is gone: v6.0 is
-				// the enforced floor, so esp_sntp_restart always exists here. The
-				// outer platform guard stays — this file also builds on the host,
-				// where there is no SNTP at all.
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-				esp_sntp_restart();
-#endif
-				_env.log("[admin] NTP sync requested via DTMF");
-				adminMatched = true;
-			}
-			else if (code == "101")
-			{
-				// #652: the restart would drop a live 911/933 on another handset.
-				if (_env.emergencyCallLive())
-				{
-					_env.log("[admin] topology switch refused: emergency call in progress", true);
-					accum.digits.clear();
-					return;
-				}
-				// Topology switch: toggle wifi_mode between 1 (CLIENT) and 2 (AP).
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-				nvs_handle_t h;
-				if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK)
-				{
-					uint8_t mode = 1;
-					nvs_get_u8(h, "wifi_mode", &mode);
-					mode = (mode == 1) ? 2 : 1;
-					nvs_set_u8(h, "wifi_mode", mode);
-					nvs_commit(h);
-					nvs_close(h);
-				}
-				_env.log("[admin] topology switch via DTMF, restarting");
-				esp_restart();
-#else
-				_env.log("[admin] topology switch requested (stub on host)");
-#endif
-				adminMatched = true;
-			}
-			else if (code == "200")
-			{
-				// Extension target config stub
-				_env.log("[admin] targets config: dial new ext (stub)");
-				adminMatched = true;
-			}
-			else if (code == "999")
-			{
-				// Factory reset — requires a follow-up confirm digit '1'.
-				if (rest.size() >= 4)
-				{
-					if (rest[3] == '1')
-					{
-						// #652: the reset restarts the board, which would drop a live 911/933.
-						if (_env.emergencyCallLive())
-						{
-							_env.log("[admin] factory reset refused: emergency call in progress", true);
-							accum.digits.clear();
-							return;
-						}
-						_env.log("[admin] factory reset confirmed via DTMF");
-						// #473 / #481 review: same order as the HTTP door, and FIRST --
-						// before any wipe below. The guard refuses new NVS data writes
-						// from here on; the journal records the reset as begun, so a
-						// power cut during the SD/voicemail/coredump wipes or the NVS
-						// erase is reported on the next boot. Outside the platform
-						// guard so the host suite pins the order
-						// (DtmfFactoryReset.TheGuardAndJournalAreOpenBeforeTheFirstWipe).
-						resetguard::begin();
-						(void)resetjournal::begin();   // failure is logged + counted inside
-						// Issue #222: wipe the SD CDR archive too, so this door and the
-						// HTTP one (HttpServer::sendApiFactoryReset) forget the same
-						// things. nvs_flash_erase() below takes out the NVS "cdrlog"
-						// ring along with every other namespace, but it never touches
-						// the card's filesystem, so without this line a DTMF reset left
-						// a full dated plaintext call history on the SD while the HTTP
-						// reset wiped it -- same "forget everything" action, different
-						// outcome depending on which door was used.
-						//
-						// This is a deliberate, scoped EXCEPTION to CdrArchive.hpp's SD
-						// write-discipline rule ("no blocking file I/O on the SIP
-						// thread / under RequestsHandler::_mutex"). The rule exists so
-						// directory I/O can never stall live call handling. Here the
-						// very next statement is esp_restart(): the SIP thread, the
-						// mutex and every call it was protecting are about to cease to
-						// exist, so the only thing the opendir/unlink sweep can delay is
-						// the reboot itself. No packet that arrives during the sweep
-						// would have been serviced anyway. wipeAll() also takes the
-						// archive's drain/wipe mutex, so it cannot race the writer task
-						// mid-drain (a std::mutex on ESP-IDF is a FreeRTOS mutex with
-						// priority inheritance, so the low-priority writer task cannot
-						// hold the SIP thread hostage either). Ordering: SD first, then
-						// NVS, then restart -- the NVS erase is fast and unconditional,
-						// so putting the (possibly slower, card-dependent) SD sweep
-						// first means both wipes are attempted before power is cut.
-						// Kept OUTSIDE the platform guard: on host wipeAll() reaches the
-						// test-installed Sink (or is a no-op with none), which is what
-						// makes this path's wipe contract host-testable -- see
-						// DtmfFactoryReset_test.cpp.
-						cdrarchive::wipeAll();
-						// #450: voicemail recordings on the SD, same door, same reasoning as
-						// the CDR archive wipe just above (the thread is about to restart).
-						_env.wipeVoicemail();
-						// #437 review: the HTTP door erases the last coredump (a copy of
-						// task stacks, which can hold any secret in the clear), and
-						// nvs_flash_erase() below does not reach the coredump partition,
-						// so this door must erase it too. A flash erase on this thread is
-						// safe: every esp_main variant creates sip_server_task with an
-						// internal-RAM stack (plain xTaskCreatePinnedToCore). Its result
-						// is ignored for the same reason FactoryReset ignores it: a board
-						// whose partition table predates #382 has no coredump partition.
-						// Outside the platform guard, so the host suite can pin it.
-						(void)CoreDumpStore::erase();
-						// #473: the guard and journal were opened at the top of this
-						// branch. Drain in-flight writes, erase (checked), then close
-						// the journal with the result. #594: a timed-out drain is
-						// logged, as the HTTP door does; the reset still proceeds.
-						// Outside the platform guard so the host suite pins the WARN.
-						if (!resetguard::waitForWritersIdle(500))
-						{
-							_env.log("[admin] factory reset: an NVS writer was still busy after 500 ms; erasing anyway", true);
-						}
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-						{
-							const esp_err_t eraseErr = nvs_flash_erase();
-							resetjournal::finish(eraseErr == ESP_OK ? 0 : resetjournal::kNvsErase);
-						}
-						esp_restart();
-#else
-						_env.log("[admin] factory reset (NVS erase + restart stubbed on host)");
-#endif
-					}
-					else
-					{
-						_env.log("[admin] factory reset aborted (confirm != '1')");
-					}
-					adminMatched = true;
-				}
-				else
-				{
-					// Confirm digit not yet received — keep the accumulator and
-					// wait. Do NOT set adminMatched (the tail would clear it).
-					_env.log("[admin] factory reset: awaiting confirm digit '1'");
-					return;
-				}
-			}
-			if (adminMatched)
-			{
-				accum.digits.clear();
+				_env.log("[admin] factory reset: awaiting confirm digit '1'");
 				return;
 			}
+
+			// Single check — a wrong PIN is exactly one counted failed attempt. It always
+			// fails until a DTMF PIN has been explicitly set (AdminAuth::setDtmfPin) — there
+			// is no default, so this whole menu is unreachable on a freshly-flashed or
+			// freshly-reset device.
+			//
+			// #986 slice 3 (Rule 5): the check is 50000 SHA-256 rounds, 2.9 s on the S3, and
+			// this runs inside _mutex on the task that drained the digit. So it only hands the
+			// entry to a worker (adminpin::submit copies it into one slot and wakes the
+			// task); applyAdminPin() records the attempt and runs the code on a later tick.
+			// A second entry while one is in the slot, a locked-out PIN and no PIN set all
+			// come back as a refusal here: logged like a wrong PIN, not counted as an attempt.
+			const adminpin::SubmitResult handoff = adminpin::submit(
+				pinCandidate, callId, callerExt, code, rest.size() > 3 ? rest[3] : '\0');
+			accum.digits.clear();
+			if (handoff != adminpin::SubmitResult::Accepted)
+			{
+				_env.log("[admin] DTMF admin auth failed", true);
+			}
+			return;
 		}
 
 		// If the sequence starts with *NNNN (4+ digits) but no code matched yet,
@@ -481,6 +352,169 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 	}
 }
 
+// #986 slice 3: the admin menu's command codes, run by applyAdminPin() once the PIN is verified
+// and its caller is still on the call. `confirm` is the digit after the code (0 when none).
+void DtmfFeatureCodes::runAdminCode(std::string_view code, char confirm)
+{
+	if (code == "001")
+	{
+		// NTP resync. The inner ESP_IDF_VERSION >= 5.0.0 gate (and its
+		// "not available on this IDF version" fallback) is gone: v6.0 is
+		// the enforced floor, so esp_sntp_restart always exists here. The
+		// outer platform guard stays — this file also builds on the host,
+		// where there is no SNTP at all.
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		esp_sntp_restart();
+#endif
+		_env.log("[admin] NTP sync requested via DTMF");
+	}
+	else if (code == "101")
+	{
+		// #652: the restart would drop a live 911/933 on another handset.
+		if (_env.emergencyCallLive())
+		{
+			_env.log("[admin] topology switch refused: emergency call in progress", true);
+			return;
+		}
+		// Topology switch: toggle wifi_mode between 1 (CLIENT) and 2 (AP).
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		nvs_handle_t h;
+		if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK)
+		{
+			uint8_t mode = 1;
+			nvs_get_u8(h, "wifi_mode", &mode);
+			mode = (mode == 1) ? 2 : 1;
+			nvs_set_u8(h, "wifi_mode", mode);
+			nvs_commit(h);
+			nvs_close(h);
+		}
+		_env.log("[admin] topology switch via DTMF, restarting");
+		esp_restart();
+#else
+		_env.log("[admin] topology switch requested (stub on host)");
+#endif
+	}
+	else if (code == "200")
+	{
+		// Extension target config stub
+		_env.log("[admin] targets config: dial new ext (stub)");
+	}
+	else if (code == "999")
+	{
+		// Factory reset — requires a follow-up confirm digit '1'.
+		if (confirm == '1')
+		{
+			// #652: the reset restarts the board, which would drop a live 911/933.
+			if (_env.emergencyCallLive())
+			{
+				_env.log("[admin] factory reset refused: emergency call in progress", true);
+				return;
+			}
+			_env.log("[admin] factory reset confirmed via DTMF");
+			// #473 / #481 review: same order as the HTTP door, and FIRST --
+			// before any wipe below. The guard refuses new NVS data writes
+			// from here on; the journal records the reset as begun, so a
+			// power cut during the SD/voicemail/coredump wipes or the NVS
+			// erase is reported on the next boot. Outside the platform
+			// guard so the host suite pins the order
+			// (DtmfFactoryReset.TheGuardAndJournalAreOpenBeforeTheFirstWipe).
+			resetguard::begin();
+			(void)resetjournal::begin();   // failure is logged + counted inside
+			// Issue #222: wipe the SD CDR archive too, so this door and the
+			// HTTP one (HttpServer::sendApiFactoryReset) forget the same
+			// things. nvs_flash_erase() below takes out the NVS "cdrlog"
+			// ring along with every other namespace, but it never touches
+			// the card's filesystem, so without this line a DTMF reset left
+			// a full dated plaintext call history on the SD while the HTTP
+			// reset wiped it -- same "forget everything" action, different
+			// outcome depending on which door was used.
+			//
+			// This is a deliberate, scoped EXCEPTION to CdrArchive.hpp's SD
+			// write-discipline rule ("no blocking file I/O on the SIP
+			// thread / under RequestsHandler::_mutex"). The rule exists so
+			// directory I/O can never stall live call handling. Here the
+			// very next statement is esp_restart(): the SIP thread, the
+			// mutex and every call it was protecting are about to cease to
+			// exist, so the only thing the opendir/unlink sweep can delay is
+			// the reboot itself. No packet that arrives during the sweep
+			// would have been serviced anyway. wipeAll() also takes the
+			// archive's drain/wipe mutex, so it cannot race the writer task
+			// mid-drain (a std::mutex on ESP-IDF is a FreeRTOS mutex with
+			// priority inheritance, so the low-priority writer task cannot
+			// hold the SIP thread hostage either). Ordering: SD first, then
+			// NVS, then restart -- the NVS erase is fast and unconditional,
+			// so putting the (possibly slower, card-dependent) SD sweep
+			// first means both wipes are attempted before power is cut.
+			// Kept OUTSIDE the platform guard: on host wipeAll() reaches the
+			// test-installed Sink (or is a no-op with none), which is what
+			// makes this path's wipe contract host-testable -- see
+			// DtmfFactoryReset_test.cpp.
+			cdrarchive::wipeAll();
+			// #450: voicemail recordings on the SD, same door, same reasoning as
+			// the CDR archive wipe just above (the thread is about to restart).
+			_env.wipeVoicemail();
+			// #437 review: the HTTP door erases the last coredump (a copy of
+			// task stacks, which can hold any secret in the clear), and
+			// nvs_flash_erase() below does not reach the coredump partition,
+			// so this door must erase it too. A flash erase on this thread is
+			// safe: every esp_main variant creates sip_server_task with an
+			// internal-RAM stack (plain xTaskCreatePinnedToCore). Its result
+			// is ignored for the same reason FactoryReset ignores it: a board
+			// whose partition table predates #382 has no coredump partition.
+			// Outside the platform guard, so the host suite can pin it.
+			(void)CoreDumpStore::erase();
+			// #473: the guard and journal were opened at the top of this
+			// branch. Drain in-flight writes, erase (checked), then close
+			// the journal with the result. #594: a timed-out drain is
+			// logged, as the HTTP door does; the reset still proceeds.
+			// Outside the platform guard so the host suite pins the WARN.
+			if (!resetguard::waitForWritersIdle(500))
+			{
+				_env.log("[admin] factory reset: an NVS writer was still busy after 500 ms; erasing anyway", true);
+			}
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+			{
+				const esp_err_t eraseErr = nvs_flash_erase();
+				resetjournal::finish(eraseErr == ESP_OK ? 0 : resetjournal::kNvsErase);
+			}
+			esp_restart();
+#else
+			_env.log("[admin] factory reset (NVS erase + restart stubbed on host)");
+#endif
+		}
+		else
+		{
+			_env.log("[admin] factory reset aborted (confirm != '1')");
+		}
+	}
+}
+
+// Called from tick(), under _mutex. The worker's hash is finished by the time a job is Done; this
+// does what the synchronous check did next, in the same order: the attempt and lockout accounting
+// (finishDtmfPinVerify, inside adminpin::applyIfReady), then the log or the code.
+//
+// The attempt is counted whether or not the caller is still there: dialling a wrong PIN and hanging
+// up must not be a way round the lockout. Only the code is conditional: it runs only while the dialog
+// the entry came on is still up and the caller is still the admin extension. Nobody is left to hear
+// a reset, a restart or a topology switch, and dropping is never destructive.
+void DtmfFeatureCodes::applyAdminPin()
+{
+	adminpin::applyIfReady([this](const adminpin::Job& job, bool authenticated) {
+		if (!authenticated)
+		{
+			_env.log("[admin] DTMF admin auth failed", true);
+			return;
+		}
+		if (_adminExt != job.callerExt || !_env.findSession(job.callId))
+		{
+			_env.log("[admin] DTMF admin command dropped: the caller hung up (or is no longer the admin "
+				"extension) before the PIN check finished", true);
+			return;
+		}
+		runAdminCode(job.code, job.confirm);
+	});
+}
+
 void DtmfFeatureCodes::forgetCall(std::string_view callId)
 {
 	// DTMF accumulators are keyed by Call-ID and share the dialog lifecycle; drop
@@ -501,6 +535,9 @@ void DtmfFeatureCodes::sweepStale()
 
 void DtmfFeatureCodes::load()
 {
+	// #986 slice 3: the PIN check's worker, created here at boot and not under _mutex on the
+	// first *PIN#. Idempotent; a board where it cannot start refuses every admin entry.
+	adminpin::start();
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	nvs_handle_t h;
 	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
