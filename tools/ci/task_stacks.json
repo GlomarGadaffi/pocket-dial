@@ -47,6 +47,7 @@
   {"name": "cdr_archive", "entry": "\\bwriterTaskBody\\(", "bytes": 6144, "file": "src/SIP/CdrArchive.cpp", "line": 420},
   {"name": "cdr_persist", "entry": "\\bcdrPersistWriterTask\\(", "bytes": 6144, "file": "src/SIP/CdrRing.cpp", "line": 187},
   {"name": "nvs_writer", "entry": "\\bnvsWriterTask\\(", "bytes": 6144, "file": "src/Helpers/NvsWriter.cpp", "line": 237, "note": "#986: device table + forwards NVS writer; pinned core 0, priority 1, plain internal stack"},
+  {"name": "pin_verify", "entry": "\\bpinVerifyTask\\(", "bytes": 4096, "file": "src/SIP/AdminPinVerify.cpp", "line": 130, "note": "#986 slice 3: the DTMF admin PIN hash; core 0, priority 1, PSRAM stack (it never flashes), heap-free chain, one capped witness log line after each hash (the log path, a printf, is the deepest chain, so 4096); the task logs its own stack high-water mark"},
   {"name": "conf_mix_tick", "entry": "ConferenceRoom::taskTrampoline\\(", "bytes": 3072, "file": "src/SIP/ConferenceRoom.cpp", "line": 308, "note": "#479: xTaskCreateStaticPinnedToCore on the room's boot-allocated internal stack; persistent, parked between conferences"},
   {"name": "moh_tx", "entry": "HoldMusic::taskTrampoline\\(", "bytes": 6144, "file": "src/SIP/HoldMusic.cpp", "line": 508, "note": "kTaskStackBytes, HoldMusic.hpp:92"},
   {"name": "(createTaskPreferPsram wrapper)", "entry": null, "bytes": 0, "file": "src/SIP/PsramTask.hpp", "line": 103, "note": "the wrapper's own fallback call; its callers are listed individually"},

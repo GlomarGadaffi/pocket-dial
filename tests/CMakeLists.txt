@@ -753,6 +753,10 @@ add_executable(sip_parser_tests
     # The DTMF digit-collection state machine + CLASS/admin codes, extracted
     # out of RequestsHandler into its own translation unit.
     ../src/SIP/DtmfFeatureCodes.cpp
+    # Issue #986 slice 3: the DTMF admin PIN check's hand-off to a worker (policy in
+    # AdminPinVerifyLogic.hpp; the host plays the worker), and its tests.
+    ../src/SIP/AdminPinVerify.cpp
+    AdminPinOffthread_test.cpp
     # The fork/group/dial-plan routing engine, extracted out of RequestsHandler
     # into its own translation unit.
     ../src/SIP/CallForker.cpp

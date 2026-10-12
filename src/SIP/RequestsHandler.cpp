@@ -10499,6 +10499,11 @@ void RequestsHandler::tick()
 		// on this path alone.
 		drainDtmfInbox();
 
+		// #986 slice 3: a finished admin PIN check is recorded and its code run here, inside
+		// this pass's lock scope, so the log and anything the code queues ride out with it.
+		// The hash was the worker's; this is the cheap half.
+		_dtmf.applyAdminPin();
+
 		sweepExpired();
 
 		// AnchorClient::tick(): "periodic, non-blocking maintenance pump ... (<=1 Hz)"

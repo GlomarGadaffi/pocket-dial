@@ -34,6 +34,7 @@
 //     thread per connection, so concurrent access is possible.
 
 #include <string>
+#include <string_view>
 #include <cstdint>
 
 namespace AdminAuth
@@ -222,6 +223,37 @@ namespace AdminAuth
 	// is false. Uses the unkeyed ("") attempt bucket — the DTMF path has no
 	// HTTP peer to key accounting on — shared with any other unkeyed caller.
 	bool verifyDtmfPin(const std::string& pin);
+
+	// #986 slice 3: verifyDtmfPin() in three steps, so the 50000-round hash can run
+	// on a worker task and not on the SIP thread. verifyDtmfPin() above is these
+	// three in a row; there is one copy of the lockout and attempt accounting.
+	//
+	// The PIN's salt and stored hash, copied under the credential mutex. Hex, so
+	// 64 characters and a NUL is a SHA-256 digest; setDtmfPin() writes a 32-char salt.
+	struct DtmfPinTicket
+	{
+		char salt[65];
+		char hash[65];
+	};
+
+	// Under the credential mutex, and quick: false (and no attempt counted) when no
+	// PIN is set, the PIN's own bucket or the global backstop is locked out, or the
+	// stored values do not fit the ticket. True: `t` holds what matchesDtmfPin() needs.
+	bool beginDtmfPinVerify(DtmfPinTicket& t);
+
+	// The hash and the constant-time compare. Takes no lock and touches no shared
+	// state, so it can run on any task for as long as it takes. `yield`, when
+	// non-null, is called every kYieldEveryRounds rounds (the round loop is the same
+	// one setDtmfPin() and the web login use; their digest is unchanged).
+	bool matchesDtmfPin(const DtmfPinTicket& t, std::string_view pin, void (*yield)());
+
+	// Under the credential mutex: records the attempt exactly as verifyDtmfPin()
+	// always has, and returns `matched`. Returns false and records nothing when the
+	// PIN was replaced or cleared since beginDtmfPinVerify() (the guess was against
+	// a PIN that no longer exists) or a lockout engaged meanwhile.
+	bool finishDtmfPinVerify(const DtmfPinTicket& t, bool matched);
+
+	constexpr uint32_t kYieldEveryRounds = 256;   // ~15 ms of software SHA-256 on the S3
 
 	// Create a new server-side session and return its opaque random token
 	// (kSessionTokenHex hex chars). Evicts the oldest/expired entry if the table

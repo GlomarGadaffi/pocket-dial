@@ -159,6 +159,8 @@ idf_component_register(SRCS ${MAIN_SRC}
                             # define PD_ETH_HAS_SD above -- see CdrArchive.hpp/.cpp.
                             "../src/SIP/CdrArchive.cpp"
                             "../src/SIP/DtmfFeatureCodes.cpp"
+                            # Issue #986 slice 3: the DTMF admin PIN check's worker task.
+                            "../src/SIP/AdminPinVerify.cpp"
                             "../src/SIP/CallForker.cpp"
                             "../src/SIP/CallPickup.cpp"
                             "../src/SIP/RequestsHandler.cpp"
