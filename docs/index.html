@@ -73,22 +73,22 @@ html.contrast .wr{color:#800}
 <nav><a href="flasher/">Flash a board</a> · <a href="#quickstart">Quickstart</a> · <a href="#features">Features</a> · <a href="#hardware">Hardware</a> · <a href="#security">Security</a> · <a href="https://github.com/GlomarGadaffi/pocket-dial">Source</a> · <a href="https://github.com/GlomarGadaffi/pocket-dial/releases">Releases</a></nav>
 
 <h2>What it is</h2>
-<p>Point SIP phones at a small board and they can call each other, transfer, park, page and forward, the way they would on a rack-mounted PBX. The board handles registration and call control. Extension-to-extension audio goes straight between the phones, so the board stays out of the media path unless a feature needs it there (echo test, conference, voicemail, hold music, an outside line).</p>
-<p>The same C++17 engine builds as a desktop binary for Linux, macOS and Windows, which is how most of it is tested.</p>
+<p>Point a few SIP phones at a small board and they can call each other, transfer, park, page and forward, same as on a rack-mounted PBX. The board handles registration and call control; the audio goes phone to phone. It only touches media when a feature actually needs it: echo test, conference, voicemail, hold music, an outside line.</p>
+<p>The same C++17 engine also builds as a plain desktop binary for Linux, macOS and Windows. That&rsquo;s where most of the testing happens.</p>
 
 <h2 id="quickstart">Quickstart</h2>
-<p><b>On a board.</b> Use the <a href="flasher/">browser flasher</a> (Chrome, Edge or Opera on a desktop, over USB). It picks the image for your board, writes it, and can seed Wi-Fi, a WPA2 passphrase for the access point and the registrar mode before first boot. Prefer the command line? See <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/FLASHING.md">FLASHING.md</a>.</p>
-<p><b>On a PC or a Raspberry Pi.</b> No ESP32 needed:</p>
+<p><b>Got a board?</b> Plug it in over USB and open the <a href="flasher/">browser flasher</a> (Chrome, Edge or Opera, desktop only). It picks the right image, writes it, and can set up Wi-Fi, a WPA2 passphrase for the access point and the registrar mode before the first boot. If you&rsquo;d rather do it from a terminal, <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/FLASHING.md">FLASHING.md</a> has you covered.</p>
+<p><b>No board?</b> Run it on a PC or a Raspberry Pi:</p>
 <pre><code># Linux / macOS
 curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | sh
 
 # Windows (PowerShell)
 irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex</code></pre>
-<p><b>From source.</b></p>
+<p><b>Or build it yourself:</b></p>
 <pre><code>cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ./build/SipServer --ip 127.0.0.1 --port 5060 --web 8080</code></pre>
-<p>Open <code>http://127.0.0.1:8080</code>, register two softphones at <code>sip:127.0.0.1:5060</code> as <code>1001</code> and <code>1002</code>, then dial <code>777</code> for an echo test or <code>999</code> to page every phone. The full walkthrough is the <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/SETUP_GUIDE.md">setup guide</a>.</p>
+<p>Then open <code>http://127.0.0.1:8080</code>, point two softphones at <code>sip:127.0.0.1:5060</code> as <code>1001</code> and <code>1002</code>, and dial <code>777</code> for an echo test or <code>999</code> to page everyone. The <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/SETUP_GUIDE.md">setup guide</a> walks through the rest.</p>
 
 <h2 id="features">What the phones get</h2>
 <ul>
@@ -102,13 +102,13 @@ cmake --build build --config Release
 <li>Forwarding (unconditional, busy, no answer) and do-not-disturb per extension, with star codes from the handset.</li>
 <li>BLF lamps through the <code>dialog</code> event package (RFC 4235).</li>
 <li>Meet-me conference on <code>888</code>, voicemail, hold music, and a dial plan of up to 16 rules.</li>
-<li>Outside lines through a cloud media anchor (3CX, Apidaze). The direct carrier SIP trunk is shelved in favour of the anchors (<a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/ADR-002-PROGRAMMABLE-MEDIA-ANCHOR.md">ADR-002</a>).</li>
+<li>Outside lines through a cloud media anchor (3CX, Apidaze). A direct carrier SIP trunk is shelved for now; <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/ADR-002-PROGRAMMABLE-MEDIA-ANCHOR.md">ADR-002</a> explains why.</li>
 </ul>
-<p>Not every one of these has run on real hardware yet. The <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/FEATURE_ROADMAP.md">feature roadmap</a> says which have, and which have only passed the host tests.</p>
+<p>Not all of this has been exercised on real hardware yet. The <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/FEATURE_ROADMAP.md">feature roadmap</a> is honest about which features have, and which have only passed the host tests.</p>
 
 <figure>
 <img src="screenshot.png" alt="The pocket-dial Switchboard web dashboard: jack board, ring groups and forwarding, and the call log" width="1512" height="1341" loading="lazy" decoding="async">
-<figcaption>The web dashboard. It is the only picture on this page.</figcaption>
+<figcaption>The Switchboard dashboard, here on a desktop build with no phones registered yet.</figcaption>
 </figure>
 
 <h2 id="hardware">Hardware</h2>
@@ -121,20 +121,20 @@ cmake --build build --config Release
 <tr><td><code>lan8720</code></td><td>Classic ESP32 + LAN8720. Build from source.</td><td>Older boards you already own.</td></tr>
 </tbody>
 </table>
-<p>Pin maps, wiring and parts lists are in <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/HARDWARE.md">HARDWARE.md</a>. Which phones work, and how well, is in <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/PHONE_COMPATIBILITY.md">PHONE_COMPATIBILITY.md</a>.</p>
+<p>Pin maps, wiring and parts lists live in <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/HARDWARE.md">HARDWARE.md</a>. <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/PHONE_COMPATIBILITY.md">PHONE_COMPATIBILITY.md</a> covers which phones work, and how well.</p>
 
 <h2 id="security">Read this before you plug it in</h2>
-<p>pocket-dial is built for a flat, trusted local network. Out of the box:</p>
+<p>pocket-dial assumes a flat, trusted local network. Out of the box:</p>
 <ul>
-<li>The <code>wifi</code> image's access point is <b>open</b>. Anyone in radio range can join. WPA2 is one setting away and encrypts the dashboard, the signalling and the call audio at once.</li>
-<li>The registrar starts in <b>Learn</b> mode: a new phone is adopted on its first REGISTER, with no password. Promote it to Secured, or switch the whole registrar to Secure, and SIP digest auth is required.</li>
-<li>The dashboard ships with the login <code>admin</code> / <code>admin</code> and refuses to do anything until you replace it. On a fresh board the real control is who gets to the dashboard first.</li>
+<li>The <code>wifi</code> image boots an <b>open</b> access point. Anyone in radio range can join. WPA2 is one setting away, and it covers the dashboard, the signalling and the call audio in one go.</li>
+<li>The registrar starts in <b>Learn</b> mode: any phone that sends a REGISTER gets adopted, no password asked. Promote the phone to Secured, or flip the whole registrar to Secure, and SIP digest auth kicks in.</li>
+<li>The dashboard ships as <code>admin</code> / <code>admin</code> and won&rsquo;t do anything until you change it. On a fresh board, whoever reaches the dashboard first owns it.</li>
 <li>There is no flash encryption and no Secure Boot. Whoever holds the board holds its secrets.</li>
 </ul>
-<p>So: <span class="wr">do not expose UDP 5060 or the dashboard to the Internet.</span> Not with a port forward, not &ldquo;just for a minute&rdquo;. The <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/THREAT_MODEL.md">threat model</a> lists what is defended, what is not, and why.</p>
+<p>Which all adds up to one rule: <span class="wr">do not expose UDP 5060 or the dashboard to the Internet.</span> Not with a port forward, not &ldquo;just for a minute&rdquo;. The <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/THREAT_MODEL.md">threat model</a> spells out what&rsquo;s defended, what isn&rsquo;t, and why.</p>
 
 <h2>Releases</h2>
-<p><b>v1.5.1</b> (2026-10-03) is the current release. The flasher offers it and every earlier tag; the images and checksums are also on the <a href="https://github.com/GlomarGadaffi/pocket-dial/releases">releases page</a>. <code>main</code> moves ahead of the newest tag between releases, and the <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/CHANGELOG.md">changelog</a> says what changed and what is still a known gap.</p>
+<p><b>v1.5.1</b> (2026-10-03) is current. The flasher offers it and every earlier tag; images and checksums are on the <a href="https://github.com/GlomarGadaffi/pocket-dial/releases">releases page</a> too. <code>main</code> runs ahead of the latest tag between releases, and the <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/CHANGELOG.md">changelog</a> tracks what changed and what&rsquo;s still a known gap.</p>
 
 <h2>Further reading</h2>
 <ul>
@@ -146,7 +146,7 @@ cmake --build build --config Release
 </ul>
 
 <footer>
-<p>pocket-dial is Apache 2.0. It began as a fork of BarGabriel&rsquo;s MIT-licensed SipServer; see <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/NOTICE">NOTICE</a>. This page is one HTML file: no framework, no web font, no tracking. The script below only remembers your contrast and invert choice.</p>
+<p>pocket-dial is Apache 2.0. It started life as a fork of BarGabriel&rsquo;s MIT-licensed SipServer; see <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/NOTICE">NOTICE</a>. This page is a single HTML file with no framework, no web font and no tracking. The only script on it remembers your contrast and invert settings.</p>
 </footer>
 
 <script>
