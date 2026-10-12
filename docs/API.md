@@ -1,21 +1,8 @@
-# Pocket-Dial ESP32 Firmware: HTTP REST API Specification
+# Pocket-Dial ESP32 Firmware: HTTP REST API
 
-This document provides the formal API specification for the HTTP control interface of the **pocket-dial** firmware. The API handles status reporting, client management, and Wi-Fi onboarding.
+This document specifies the HTTP control interface of the pocket-dial firmware: status, configuration, admin login, and the telephony and registrar features behind them.
 
-> [!NOTE]
-> **This catalog is complete as of 2026-09-13.** Every route
-> `HttpServer::handleClient()` dispatches appears in §4's table, and every row in
-> that table links to a section that specifies it, including the four
-> `/api/admin/*` session routes, which used to live only in §0. Source of truth
-> for all of it: `src/Helpers/HttpServer.cpp`, the `handleClient()` dispatch
-> chain from line 433, plus the `POST /api/ota/upload` interception at line 300
-> that is deliberately *not* in that chain.
->
-> Everything here was derived by reading the handlers. Where a response string is
-> quoted, it is the literal string in a `sendResponse(...)` call. Where a
-> parameter is listed, it is a real `getFormParam()` read. Nothing in this
-> document is claimed to be hardware-verified unless it names the test that
-> covers it (`tests/http/test_api.sh`, whose TC-IDs are cited inline).
+The contract was derived by reading the handlers in `src/Helpers/HttpServer.cpp`. Where a response string is quoted, it is the literal string passed to `sendResponse(...)`. Where a parameter is listed, it is read with `getFormParam()`. Nothing here is claimed to be hardware-verified unless the text names the test that covers it (`tests/http/test_api.sh`, whose TC-IDs are cited inline). Routes are dispatched by `handleClient()`. Section 4 indexes them.
 
 ## 0. Reachability & Admin Session Layer (read this first)
 
@@ -28,25 +15,11 @@ every admin-gated endpoint **except** `set-credential` itself is refused with
 `403 {"error":"setup_required"}`. That is "force setup on first use," enforced
 server-side, not just suggested by the dashboard UI.
 
-> [!IMPORTANT]
-> **Any endpoint in this document can answer `503 {"error":"busy","message":"too
-> many concurrent connections"}`** (issue #368). The listener still always
-> accepts — that statement above is unchanged — but the server handles a bounded
-> number of requests at once (`HttpServer::kMaxConcurrentConnections`), and over
-> that ceiling a connection is answered and closed immediately instead of being
-> given a handler.
->
-> This is not rate limiting and it is not per-client: it is a hard ceiling on
-> *simultaneous* requests, because each handler costs a thread stack out of the
-> same internal-DRAM pool the Ethernet driver allocates its DMA buffers from.
-> Unbounded, a burst of a dozen concurrent requests was measured taking the
-> device's network interface down entirely, so refusing the surplus is the
-> conservative behaviour.
->
-> A `503` here is **retryable and usually instant** — it means "not right now,"
-> not "that request was wrong." Clients that fan out parallel requests should
-> retry rather than treat it as a failure. The dashboard never approaches the
-> ceiling; one document plus its polled JSON is well inside it.
+Any endpoint in this document can answer `503 {"error":"busy","message":"too many concurrent connections"}` (issue #368). The listener always accepts connections, but the server handles a bounded number of requests at once (`HttpServer::kMaxConcurrentConnections`). Over that ceiling a connection is answered and closed immediately instead of being given a handler.
+
+This is not rate limiting and it is not per-client. It is a hard ceiling on simultaneous requests, because each handler costs a thread stack out of the same internal-DRAM pool the Ethernet driver allocates its DMA buffers from. Unbounded, a burst of a dozen concurrent requests was measured taking the device's network interface down entirely, so refusing the surplus is the conservative behaviour.
+
+A `503` here is retryable and usually instant. It means "not right now," not "that request was wrong." Clients that fan out parallel requests should retry rather than treat it as a failure. The dashboard never approaches the ceiling; one document plus its polled JSON is well inside it.
 
 A separate, independent numeric **DTMF admin PIN** (phone-keypad `*PIN#code`
 menu: NTP resync, topology switch, factory reset) has no default at all and
@@ -68,11 +41,9 @@ Every state-mutating endpoint (`/api/kill`, `/api/dnd`, `/api/forward`,
 requires both the `pd_session` cookie and the per-session CSRF token, from
 the very first login, including while still on the default credential.
 
-### 0.1 The four gates, in the order `requireAdmin()` applies them
+### 0.1 The gates, in the order `requireAdmin()` applies them
 
-`HttpServer::requireAdmin(sock, req, needCsrf)` (`src/Helpers/HttpServer.cpp:1828`)
-is the single gate every admin-gated route goes through. It short-circuits on the
-first failure, so these are the error bodies you will actually see, in this order:
+`HttpServer::requireAdmin(sock, req, needCsrf, minRole)` is the single gate every admin-gated route goes through. It short-circuits on the first failure, so these are the error bodies you will actually see, in this order:
 
 | # | Check | Applies to | Failure | Body |
 | :-: | :--- | :--- | :--- | :--- |
@@ -80,25 +51,30 @@ first failure, so these are the error bodies you will actually see, in this orde
 | 2 | Valid `pd_session` cookie | Every gated route, `GET`s included | `401` | `{"error":"authentication required"}` |
 | 3 | Matching `X-CSRF` header | Only when `needCsrf` is `true` (mutating routes) | `403` | `{"error":"missing or invalid CSRF token"}` |
 | 4 | Forced initial setup | Every gated route **except** `POST /api/admin/set-credential` | `403` | `{"error":"setup_required","message":"Change the default admin credential before continuing."}` |
+| 5 | Owner role | Only routes that require the owner role (see [Two-Role Privilege Model](#two-role-privilege-model-issue-173)). A sysop session also passes until an owner credential exists. | `403` | `{"error":"owner privilege required"}` |
 
-> [!IMPORTANT]
-> **Gate 4 is the one that surprises every new integrator.** While the device is
-> still on the shipped `admin`/`admin` credential, a correctly authenticated,
-> correctly CSRF-tokened request to *any* admin-gated route, including read-only
-> `GET`s like `/api/registrar`, `/api/telephony-config` and `/api/pcap`, comes
-> back `403 {"error":"setup_required"}`. The only route that works is
-> `POST /api/admin/set-credential`. Until you have called it once, the API is
-> effectively a two-call API: log in, then set a real credential. Covered by
-> `test_api.sh` TC-AUTH-05 (a gated `POST` refused `403` while on the default) and
-> TC-AUTH-07/08 (setup completes, `needsSetup` flips to `false`).
+```mermaid
+flowchart TD
+    A["Request to a gated route"] --> B{"1. Same-origin check passes?"}
+    B -->|no, 403 cross-origin request rejected| X1["Rejected"]
+    B -->|yes| C{"2. Valid pd_session cookie?"}
+    C -->|no, 401 authentication required| X2["Rejected"]
+    C -->|yes| D{"Mutating route, needCsrf?"}
+    D -->|yes| E{"3. X-CSRF matches the session?"}
+    E -->|no, 403 missing or invalid CSRF token| X3["Rejected"]
+    E -->|yes| F
+    D -->|no| F{"4. Setup complete, or set-credential?"}
+    F -->|no, 403 setup_required| X4["Rejected"]
+    F -->|yes| G{"5. Owner-only route?"}
+    G -->|no| OK["Handler runs"]
+    G -->|yes| H{"Owner session, or sysop with no owner yet?"}
+    H -->|no, 403 owner privilege required| X5["Rejected"]
+    H -->|yes| OK
+```
 
-> [!NOTE]
-> **`curl` needs no special handling for the same-origin check.** `isSameOrigin()`
-> returns `true` immediately when the request carries no `Origin` header at all
-> (`HttpServer.cpp:1741`), a deliberate decision rather than an oversight, so
-> that CLI clients, native clients and the CI smoke suite keep working. Gate 1 is a
-> browser-only control and cannot stand alone; gates 2-4 are what actually protect
-> the device. Verified by `test_api.sh` TC-SEC-01 (no `Origin` header → `200`).
+Gate 4 is the one that surprises every new integrator. While the device is still on the shipped `admin`/`admin` credential, a correctly authenticated, correctly CSRF-tokened request to *any* admin-gated route, including read-only `GET`s like `/api/registrar`, `/api/telephony-config` and `/api/pcap`, comes back `403 {"error":"setup_required"}`. The only route that works is `POST /api/admin/set-credential`. Until you have called it once, the API is effectively a two-call API: log in, then set a real credential. Covered by `test_api.sh` TC-AUTH-05 (a gated `POST` refused `403` while on the default) and TC-AUTH-07/08 (setup completes, `needsSetup` flips to `false`).
+
+`curl` needs no special handling for the same-origin check. `isSameOrigin()` returns `true` immediately when the request carries no `Origin` header at all, a deliberate decision rather than an oversight, so that CLI clients, native clients and the CI smoke suite keep working. Gate 1 is a browser-only control and cannot stand alone; gates 2-4 are what actually protect the device. Verified by `test_api.sh` TC-SEC-01 (no `Origin` header → `200`).
 
 ## 1. Global Server Settings & Connection Behavior
 
@@ -108,9 +84,9 @@ The HTTP server operates under strict resource constraints and security policies
 * Protocol: HTTP/1.1
 * Default Port: 80 (Overridden to custom port if configured)
 * Socket Timeout (`SO_RCVTIMEO`): **5 Seconds**. Connections that do not send data within 5 seconds of connection are forcefully closed.
-* Payload Limit: **16 KB (16,384 bytes)**. Any request body larger than 16 KB (including large Wi-Fi passwords) is rejected with status `413 Payload Too Large` and the body `{"error":"request body exceeds 16 KB limit"}` (`HttpServer.cpp:405-410`). There are **two** exceptions, both intercepted before this cap is applied and streamed instead: [`POST /api/ota/upload`](#post-apiotaupload) and **`POST /api/moh/upload`**, which carries its own **8 MB** cap (`HttpServer.cpp:2911-2923`) rather than 16 KB. The interception matches either path on the request line (`HttpServer.cpp:314-316`).
+* Payload Limit: **16 KB (16,384 bytes)**. Any request body larger than 16 KB (including large Wi-Fi passwords) is rejected with status `413 Payload Too Large` and the body `{"error":"request body exceeds 16 KB limit"}`. There are **two** exceptions, both intercepted before this cap is applied and streamed instead: [`POST /api/ota/upload`](#post-apiotaupload) and **`POST /api/moh/upload`**, which carries its own **8 MB** cap (checked in `handleMohUpload()`) rather than 16 KB. The interception matches either path on the request line in `handleClient()`.
 * Request body framing: `Content-Length` only. There is no `Transfer-Encoding: chunked` support anywhere in the parser; a chunked upload would be read as an opaque body with chunk framing bytes in it. Always send an explicit `Content-Length` (curl does this for you for `-d` and `--data-binary @file`).
-* Concurrency: one detached thread per accepted connection. If thread creation fails under memory pressure the connection is dropped silently rather than answered (`HttpServer.cpp:218`).
+* Concurrency: one detached thread per accepted connection. If thread creation fails under memory pressure the connection is dropped silently rather than answered (`acceptLoop()`).
 
 ### Global error responses
 
@@ -119,18 +95,12 @@ appear on any path:
 
 | Status | Content-Type | Body | When |
 | :--- | :--- | :--- | :--- |
-| `413 Payload Too Large` | `application/json` | `{"error":"request body exceeds 16 KB limit"}` | `Content-Length` over 16,384 on any route except the OTA upload. |
+| `413 Payload Too Large` | `application/json` | `{"error":"request body exceeds 16 KB limit"}` | `Content-Length` over 16,384 on any route except the OTA and MoH uploads. |
 | `404 Not Found` | **`text/plain`** | `404 Not Found` | No route in the dispatch chain matched the method+path pair. |
 
-> [!NOTE]
-> The fallback `404` is the **only non-JSON error in the API** (`send404()`,
-> `HttpServer.cpp:1885`). A client that blindly `JSON.parse()`s every error body
-> will throw on an unknown route and on a `/config/<mac>.cfg` miss. `test_api.sh`
-> TC-ED-04 asserts the status code but not the content type.
->
-> Note also that a *method* mismatch produces this same `404`, not a `405`: there is
-> no `Allow` header and no `405 Method Not Allowed` anywhere in the server. `GET
-> /api/kill` is a `404`, not a `405`.
+The fallback `404` is the **only non-JSON error in the API** (`send404()`). A client that blindly `JSON.parse()`s every error body will throw on an unknown route and on a `/config/<mac>.cfg` miss. `test_api.sh` TC-ED-04 asserts the status code but not the content type.
+
+A *method* mismatch produces this same `404`, not a `405`: there is no `Allow` header and no `405 Method Not Allowed` anywhere in the server. `GET /api/kill` is a `404`, not a `405`.
 
 ### Response Framing Headers
 Every API response carries the usual framing headers:
@@ -142,8 +112,8 @@ Connection: close
 The **security** headers (CSP, `X-Frame-Options`, `nosniff`, `Cache-Control`,
 `Referrer-Policy`) are emitted centrally on every response as well; they are listed in
 §2.2, which is the authoritative set.
-> [!IMPORTANT]
-> CORS Restrictions: No `Access-Control-Allow-Origin` headers are sent. Wildcard CORS is prohibited to prevent background malicious browser tabs from reading internal VoIP station mappings.
+
+CORS: no `Access-Control-Allow-Origin` headers are sent. Wildcard CORS is prohibited to prevent background malicious browser tabs from reading internal VoIP station mappings.
 
 ## 2. Security & Same-Origin Verification (CSRF Protection)
 
@@ -156,7 +126,7 @@ state-mutating endpoint (`/api/kill`, `/api/dnd`, `/api/forward`, `/api/group`,
 gated reads** (`/api/pcap`, `/api/diagnostics/pcap`, `/api/trace`,
 `/api/telephony-config`, `/api/did-mapping`, `/api/registrar`, `/api/ap-security`), plus
 `/api/admin/login` and `/api/admin/logout` via `requireSameOrigin()` directly. It is
-gate 1 of `HttpServer::requireAdmin()` ([§0.1](#01-the-four-gates-in-the-order-requireadmin-applies-them)),
+gate 1 of `HttpServer::requireAdmin()` ([§0.1](#01-the-gates-in-the-order-requireadmin-applies-them)),
 applied centrally so no route can omit it. Only the genuinely public reads listed in §4
 skip it:
 
@@ -201,12 +171,7 @@ Exemptions, and why:
 | `POST /api/admin/logout` | A forced logout is a nuisance, not a compromise, and `SameSite=Strict` already blocks it. Requiring a token would strand a user on a stale page. |
 | All `GET` endpoints | Reads are not state changes. They are still same-origin checked and, where sensitive, session-gated. |
 
-> **Changed.** Earlier firmware also exempted *every* request made while the device was
-> unprovisioned, on the grounds that a factory-fresh device had no session to bind a
-> token to. That exemption no longer exists: the device ships with a default credential,
-> so there is always a session to log into and always a token to mint. Onboarding
-> (`/api/wifi/connect`, `/api/wifi/mode_ap`, `/api/configuring`) now requires logging in
-> with `admin`/`admin` and then completing the forced setup first.
+The device ships with a default credential, so there is always a session to log into and always a token to mint. There is no exemption for an unprovisioned device. Onboarding (`/api/wifi/connect`, `/api/wifi/mode_ap`, `/api/configuring`) requires a logged-in session and completed setup, the same as every other mutating route.
 
 ### 2.2 Security response headers
 
@@ -232,7 +197,7 @@ with no way for a user to override it.
 When booting into onboarding mode, the device intercepts client browser check domains (e.g. `captive.apple.com`, `connectivitycheck.gstatic.com`) to display the setup screen.
 
 * Build guard: the whole mechanism is inside `#if defined(ESP_PLATFORM)`
-  (`HttpServer.cpp:415`). **The host/desktop build never redirects**, which is why
+  (in `handleClient()`). **The host/desktop build never redirects**, which is why
   the CI smoke suite can point any `Host` header it likes at `127.0.0.1`.
 * Method: `GET` only. A `POST`/`PUT`/`DELETE` with a foreign `Host` is dispatched
   normally and answered by its handler (or the fallback `404`), never redirected.
@@ -259,26 +224,11 @@ When booting into onboarding mode, the device intercepts client browser check do
 
 ## 4. REST API Endpoint Catalog
 
-> **Reading the "Auth Required" column.** "Gated" means the request goes through
-> `HttpServer::requireAdmin()` (`src/Helpers/HttpServer.cpp:1828`) and its four ordered
-> checks, spelled out with their exact failure bodies in [§0.1](#01-the-four-gates-in-the-order-requireadmin-applies-them).
-> "Gated (+ `X-CSRF`)" is a mutating route (`needCsrf = true`); "Gated" or
-> "Gated (no `X-CSRF`)" is a read that still requires same-origin, a session **and**
-> completed setup, but no token.
->
-> There is **no unprovisioned bypass**. An earlier firmware skipped the session and
-> token checks until an admin PIN existed; that window is gone; the device ships with
-> a default credential precisely so the gate can be unconditional from first boot.
-> Endpoints marked "None" are read-only and intentionally reachable without a session:
-> `/`, `/index.html`, `/api/status`, `/api/cdr`, `/metrics`, `/api/wifi/scan`,
-> `/api/ota/status`, `/api/admin/status`, `/config/<mac>.cfg` and, since issue #159,
-> `/setup/email` (the page SHELL only, every field on it is fetched from the gated
-> `GET /api/email`, same split as `/` itself vs. its own gated data endpoints). That is
-> the complete list (**`/metrics` was missing from it** until this audit); it is ungated by a
-> deliberate decision argued at `HttpServer.cpp:1120-1184` (a Prometheus scraper cannot
-> drive the login/CSRF handshake). Everything
-> else goes through `requireAdmin()`, except `POST /api/admin/login` and
-> `POST /api/admin/logout`, which take `requireSameOrigin()` alone (gate 1 only).
+"Gated" in the "Auth Required" column means the request goes through `HttpServer::requireAdmin()` and its ordered checks, spelled out with their exact failure bodies in [§0.1](#01-the-gates-in-the-order-requireadmin-applies-them). "Gated (+ `X-CSRF`)" is a mutating route (`needCsrf = true`). "Gated" or "Gated (no `X-CSRF`)" is a read that still requires same-origin, a session **and** completed setup, but no token.
+
+There is no unprovisioned bypass. The device ships with a default credential so that the gate is unconditional from first boot.
+
+Endpoints marked "None" are read-only and reachable without a session: `/`, `/index.html`, `/api/status`, `/metrics`, `/api/wifi/scan`, `/api/ota/status`, `/api/admin/status`, `/config/<mac>.cfg`, `/setup/email` and `/setup/trunk`. The two setup pages serve the page shell only; every field on them is fetched from a gated API (`GET /api/email` and `GET /api/trunk`), the same split as `/` and its gated data endpoints. `/metrics` is ungated by a deliberate decision: a Prometheus scraper cannot drive the login/CSRF handshake. Everything else goes through `requireAdmin()`, except `POST /api/admin/login` and `POST /api/admin/logout`, which take `requireSameOrigin()` alone (gate 1 only).
 
 | Endpoint | Method | Security Level | Auth Required | Description |
 | :--- | :---: | :---: | :---: | :--- |
@@ -289,8 +239,8 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/admin/set-credential`](#post-apiadminset-credential) | `POST` | High | Gated (+ `X-CSRF`) | Replaces the admin login credential and/or sets the DTMF PIN. **The only route exempt from the `setup_required` gate.** |
 | [`/api/status`](#get-apistatus) | `GET` | Low | None | Retrieves registrar uptime, packet statistics, active extensions, ongoing sessions, the whole PBX feature configuration, and (#185) heap/reset/per-task stack-headroom telemetry. |
 | [`/api/kill`](#post-apikill) | `POST` | High | Gated (+ `X-CSRF`) | Forcefully disconnects and de-registers an active SIP extension. |
-| [`/api/cdr`](#get-apicdr) | `GET` | Low | Session | Returns the in-memory Call Detail Record ring (most recent calls, newest first). **Gated since #215.** Call metadata (who called whom, when, for how long) was previously readable by any host that could reach the board. It was ungated by analogy to `/api/status`, which `THREAT_MODEL.md` section 4 E-2 justifies by what the LOGIN FORM needs; a login form does not need call history. See [THREAT_MODEL.md](THREAT_MODEL.md) §4 E-2. |
-| `/metrics` | `GET` | Low | None | Prometheus text format (`text/plain; version=0.0.4`). Six families, all `pocketdial_`-prefixed: `uptime_seconds`, `sip_registrations_active`, `sip_calls_active` (gauges), `packets_processed_total`, `packets_dropped_total`, `sdp_rejected_total` (counters). Always `200`; all-zero when the SIP engine is not yet attached. Ungated by design (`HttpServer.cpp:1120-1184`). **Not** on the captive-portal exempt list, so on a Wi-Fi build a scraper sending a foreign `Host` header gets the portal `302` instead. |
+| [`/api/cdr`](#get-apicdr) | `GET` | Low | Session | Returns the in-memory Call Detail Record ring (most recent calls, newest first). Gated since #215: the login form does not need call history, which is why the ungated routes are kept to what it does. See [THREAT_MODEL.md](THREAT_MODEL.md) §4 E-2. |
+| `/metrics` | `GET` | Low | None | Prometheus text format (`text/plain; version=0.0.4; charset=utf-8`), every family prefixed `pocketdial_`. Gauges: `uptime_seconds`, `sip_registrations_active`, `sip_calls_active`. Counters: `packets_processed_total`, `packets_dropped_total`, `packets_dropped_invalid_total`, `packets_dropped_rate_total`, `packets_dropped_no_pool_total`, `packets_dropped_oversize_total`, `sip_keepalives_crlf_total`, `sip_recv_errors_total`, `sdp_rejected_total`, `invite_unbound_caller_total`. Always `200`; all-zero when the SIP engine is not yet attached. Ungated by design (see the `/metrics` route in `handleClient()`). **Not** on the captive-portal exempt list, so on a Wi-Fi build a scraper sending a foreign `Host` header gets the portal `302` instead. |
 | `/api/moh` | `GET` | Medium | Gated (no `X-CSRF`) | Music-on-hold status: `200 {supported, loaded, seconds, listeners, preview}`, or `503 {"error":"SIP engine not attached yet"}`. |
 | `/api/moh/preview` | `POST` | High | Gated (+ `X-CSRF`) | **Places a real call to a handset** to audition the hold clip. Param `extension`. `400` missing extension; `409` "extension is not registered" or "no hold clip loaded — upload one first"; `503`; `200 {"status":"ok","message":"ringing <ext>"}`. |
 | `/api/moh/preview/stop` | `POST` | High | Gated (+ `X-CSRF`) | Ends the preview call. `503`, or `200 {"status":"ok"}`. |
@@ -298,7 +248,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/pcap`](#get-apipcap) | `GET` | Medium | Gated (no `X-CSRF`) | Downloads the last `POCKETDIAL_PCAP_RING_SIZE` SIP signaling packets as a `.pcap` (Wireshark-readable). |
 | [`/api/diagnostics/pcap`](#get-apidiagnosticspcap) | `GET` | Medium | Gated (no `X-CSRF`) | Alias for `/api/pcap` (Issue #33's originally-requested path), identical response, same ring, same gate. |
 | [`/api/trace`](#get-apitrace) | `GET` | Medium | Gated (no `X-CSRF`) | The same capture ring as JSON, for the dashboard's polling live SIP tracer. |
-| [`/config/<mac>.cfg`](#get-configmaccfg) | `GET` | Low | None (MAC is the bearer token) | Yealink auto-provisioning config for an already-adopted device. |
+| [`/config/<mac>.cfg`](#get-configmaccfg) | `GET` | Low | None (MAC is the bearer token) | Auto-provisioning config for an already-adopted phone. Seven filename shapes are accepted; see the section. |
 | [`/api/dnd`](#post-apidnd) | `POST` | High | Gated (+ `X-CSRF`) | Sets or clears Do-Not-Disturb on an extension. |
 | [`/api/forward`](#post-apiforward) | `POST` | High | Gated (+ `X-CSRF`) | Configures call forwarding (`always`/`busy`/`noanswer`) for an extension. `200` means accepted and staged for the NVS writer, not yet on flash (#986). |
 | [`/api/group`](#post-apigroup) | `POST` | High | Gated (+ `X-CSRF`) | Creates, updates, or deletes a ring/hunt group. |
@@ -306,7 +256,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/telephony-config`](#get-apitelephony-config) | `GET` | Medium | Gated | Lists the four carrier/anchor credential slots. The stored secret is never returned, only `secretSet`. |
 | [`/api/telephony-config/<slot>`](#put-apitelephony-configslot) | `PUT` | High | Gated (+ `X-CSRF`) | Writes one credential slot (`enabled`, `baseUrl`, `clientId`, `secret`, `routeDn`). An empty `secret` keeps the stored one. |
 | [`/api/telephony-config/<slot>/activate`](#post-apitelephony-configslotactivate) | `POST` | High | Gated (+ `X-CSRF`) | Makes that slot the active provider. |
-| [`/api/telephony-config/<slot>/test`](#post-apitelephony-configslottest) | `POST` | High | Gated (+ `X-CSRF`) | **Not read-only**. Places a real outbound call to the slot's own route DN and immediately drops it. Active slot only. Read the CAUTION in its section before calling it against anything live. |
+| [`/api/telephony-config/<slot>/test`](#post-apitelephony-configslottest) | `POST` | High | Gated (+ `X-CSRF`) | **Not read-only**. Places a real outbound call to the slot's own route DN and immediately drops it. Active slot only. Read the warning in its section before calling it against anything live. |
 | [`/api/telephony-config/<slot>`](#delete-apitelephony-configslot) | `DELETE` | High | Gated (+ `X-CSRF`) | Clears one slot, including its stored secret, without a factory reset. |
 | [`/api/did-mapping`](#get-apidid-mapping) | `GET` | Medium | Gated | Lists the inbound DID→extension table. |
 | [`/api/did-mapping`](#put-apidid-mapping) | `PUT` | High | Gated (+ `X-CSRF`) | Creates or updates one DID→extension mapping. `200` means accepted and staged for the NVS writer, not yet on flash (#986). |
@@ -315,7 +265,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/wifi/connect`](#post-apiwificonnect) | `POST` | High | Gated (+ `X-CSRF`) | Saves Wi-Fi credentials to NVS and schedules a reboot into Station Mode. `501` on `eth`/`lan8720`/desktop (§4.2). |
 | [`/api/wifi/mode_ap`](#post-apiwifimode_ap) | `POST` | High | Gated (+ `X-CSRF`) | Sets the device to Standalone Access Point Mode and schedules a reboot. No confirmation parameter. `501` on `eth`/`lan8720`/desktop (§4.2). |
 | [`/api/configuring`](#post-apiconfiguring) | `POST` | Low | Gated (+ `X-CSRF`) | Pauses the captive-portal auto-switch-to-Standalone decay while a user is mid-setup. It mutates device state, so it takes the standard gate like every other mutating route; a logged-in, fully-set-up session is required, same as WiFi setup itself. |
-| [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Gated (+ `X-CSRF`) | Requires `confirm=ERASE`. Wipes the login credential, the DTMF PIN, every session, AP security, every stored secret, the carrier-API credential table, the DID→extension table, the CDR ring, call forwards, E911 and (Wi-Fi builds only) Wi-Fi/mode NVS, plus the SD CDR and voicemail archives; then, on any ESP build, erases the whole NVS partition and reboots. Answers `200` on every build, `500` `{"status":"error","failed":{...}}` if a per-key erase failed (the whole-NVS erase and reboot still follow), or `409` `{"error":"emergency call in progress"}` while a 911/933 call is live (#652). |
+| [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Gated, owner (+ `X-CSRF`) | Requires `confirm=ERASE`. Wipes the login credential, the DTMF PIN, every session, AP security, every stored secret, the carrier-API credential table, the DID→extension table, the CDR ring, call forwards, E911 and (Wi-Fi builds only) Wi-Fi/mode NVS, plus the SD CDR and voicemail archives; then, on any ESP build, erases the whole NVS partition and reboots. Answers `200` on every build, `500` `{"status":"error","failed":{...}}` if a per-key erase failed (the whole-NVS erase and reboot still follow), or `409` `{"error":"emergency call in progress"}` while a 911/933 call is live (#652). |
 | [`/api/ap-security`](#get-apiap-security) | `GET` | Medium | Gated | Reports whether the SoftAP requires WPA2 and returns its passphrase. |
 | [`/api/ap-security`](#post-apiap-security) | `POST` | High | Gated (+ `X-CSRF`) | Enables/disables WPA2 on the SoftAP and sets or regenerates the passphrase. Takes effect at the next AP bringup. |
 | [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster, each row with its `locked` and `shared` flags. |
@@ -327,13 +277,33 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
 | [`/api/registrar/forget-learned`](#post-apiregistrarforget-learned) | `POST` | High | Gated (+ `X-CSRF`) | Forgets every `learned` device at once; `secured` ones stay (#515). |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
-| [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
+| [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated, owner (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
 | [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image, or plainly restarts with `confirm=1` if none is staged (#645). Simulated (`200`, no-op) on desktop. While a 911/933 call is live a plain restart answers `409` `{"error":"emergency call in progress"}` and a staged-image reboot waits for the call to end (#652). |
 | [`/api/media-tx`](#post-apimedia-tx) | `POST` | High | Gated, owner (+ `X-CSRF`) | **Experimental (#985).** `nodelay=0\|1`: the A/B switch for `TCP_NODELAY` on the anchor's audio POST socket. RAM only, off at every boot; read back as `mediaTx.nodelay` in `/api/status`. |
 | [`/setup/email`](#get-setupemail) | `GET` | Low | None | Standalone SMTP-configuration page (own document, not part of the `/` SPA). Shell only, no data. |
 | [`/api/email`](#get-apiemail) | `GET` | Medium | Gated | Current SMTP configuration. Secrets redacted to `hasPassword`/`hasGsaKey` booleans. |
 | [`/api/email`](#post-apiemail) | `POST` | High | Gated (+ `X-CSRF`) | Saves SMTP host/port/mode/auth/credentials. Empty `pass`/`gsaKey`/`caPem` keeps the stored value. |
 | [`/api/email/test`](#post-apiemailtest) | `POST` | High | Gated (+ `X-CSRF`) | Sends a real test message and reports the structured `SmtpDialogue::ResultCode` inline. Always `200`; `ok` in the body is the real result. |
+| `/api/syslog` | `GET` | Medium | Gated | Remote syslog collector: `{supported, enabled, host, port}`. Gated because the collector address is infrastructure detail. |
+| `/api/syslog` | `POST` | High | Gated (+ `X-CSRF`) | Sets the syslog collector: `host` (a dotted-quad IPv4 address, or empty to disable remote logging) and `port` (default 514, `1`-`65535`). |
+| `/setup/trunk` | `GET` | Low | None | Standalone SIP-trunk configuration page. Shell only; its values come from the gated `GET /api/trunk`. |
+| `/api/trunk` | `GET` | Medium | Gated | Current SIP trunk configuration. The password is never returned, only `hasPassword`. |
+| `/api/trunk` | `POST` | High | Gated (+ `X-CSRF`) | Saves the SIP trunk configuration: host, proxy, user, caller ID, port and password. An empty password keeps the stored one. |
+| `/api/voicemail` | `POST` | High | Gated (+ `X-CSRF`) | Enables or disables voicemail for one extension (`extension`, `on`). Reserved and park-orbit numbers are refused. |
+| `/api/coredump/info` | `GET` | Medium | Gated | Stored panic coredump metadata: `supported`, `present`, `size`, and the fault details when a dump is stored. |
+| `/api/coredump` | `GET` | High | Gated, owner | Downloads the stored raw panic coredump. |
+| `/api/coredump/erase` | `POST` | High | Gated (+ `X-CSRF`) | Erases the stored coredump. Answers `{"erased":true}` or `{"erased":false}`. |
+| `/api/e911-config` | `GET` | Medium | Gated | E911 notify list, callback and location, with `maxNotifyExts`. |
+| `/api/e911-config` | `PUT` | High | Gated (+ `X-CSRF`) | Sets `notifyExts`, `callback` and `location`. All optional; an empty `notifyExts` turns SIP notification off. |
+| `/api/sbc-mode` | `GET` | Medium | Gated | SBC mode and the telephony slot it routes through. |
+| `/api/sbc-mode` | `PUT` | High | Gated (+ `X-CSRF`) | Sets `enabled` and `route` (a telephony slot index). Enabling with a bad route is a `400`. |
+| [`/api/multicast-paging`](#get-apimulticast-paging) | `GET` | Medium | Gated | Multicast paging configuration (`enabled`, `group`, `port`). |
+| [`/api/multicast-paging`](#put-apimulticast-paging) | `PUT` | High | Gated (+ `X-CSRF`) | Sets the multicast paging configuration. Every parameter is optional. |
+| [`/api/config/export`](#get-apiconfigexport) | `GET` | Medium | Gated | Plaintext configuration backup. |
+| [`/api/config/export`](#post-apiconfigexport) | `POST` | High | Gated (+ `X-CSRF`), owner if `password` is set | Backup, plus the encrypted `secretsEnc` block when `password` is non-empty. |
+| [`/api/config/import`](#post-apiconfigimport) | `POST` | High | Gated (+ `X-CSRF`), owner if `password` is set | Restores a backup. Replaces the tables it covers. |
+| [`/api/admin/set-owner-credential`](#post-apiadminset-owner-credential) | `POST` | High | Owner (+ `X-CSRF`) | Sets or replaces the owner credential. |
+| `/api/bench/fault` | `GET`, `POST` | High | Owner (`POST` also needs `X-CSRF`) | Bench-probe images only. Arms one fault or holds the DRAM ballast, and answers with the counters. See [BENCH_PROBE.md](BENCH_PROBE.md). |
 
 ### 4.1 Establishing a session (run this before any `curl` example below)
 
@@ -381,7 +351,7 @@ Three things worth knowing before you paste:
 * **All request bodies are `application/x-www-form-urlencoded`**, which is what
   `curl -d` sends by default. **There is no JSON request body anywhere in this API**,
   not on `PUT`, not on `DELETE`, not on the admin routes. Every parameter is read
-  with `getFormParam()` (`HttpServer.cpp:1933`), which splits on `&`, matches the key
+  with `getFormParam()`, which splits on `&`, matches the key
   only at a parameter boundary, and URL-decodes the value (`+` becomes a space).
   Sending JSON produces no error: every parameter simply reads as empty, and you get
   whichever "missing X parameter" `400` the handler checks for first.
@@ -389,25 +359,25 @@ Three things worth knowing before you paste:
   validation*, not 30 minutes after login (`AdminAuth::kSessionTtlMs`, sliding).
   Any gated request, including a `GET /api/admin/status` poll, pushes the deadline
   out by a full TTL. Only 8 sessions exist at once (`kMaxSessions`), and a 9th login
-  **evicts** the least-recently-active one rather than being refused, so log in once
+  **evicts** the session closest to expiry rather than being refused, so log in once
   and reuse `$SESSION` rather than logging in per request.
 
 ### `GET /`
 Serves the retro CGA CRT web interface. `GET /index.html` is the same route and the
-same response (`HttpServer.cpp:433`).
+same response (in `handleClient()`).
 
 Ungated (the page itself is public), because it is inert without a session: it renders
 a login form and every panel behind it calls a gated endpoint.
 
 The page is assembled from the flash-resident parts in `src/Helpers/index_html.h`, and
 the literal marker `__PD_CSRF__` inside it is replaced with **the calling session's**
-CSRF token before the response is sent (`HttpServer::sendHtml`, `HttpServer.cpp:864`).
+CSRF token before the response is sent (`HttpServer::sendHtml()`).
 An unauthenticated load substitutes an empty token, which is correct; there is no
 session yet, and the login response carries the token the page then uses without
 needing a reload. Scraping the token out of this page is therefore a legitimate
 alternative to reading it from the login response, but only if you send the cookie.
 The marker itself is gone from the rendered page (it is *replaced*, not annotated), so
-grep for the assignment it sits in (`var PD_CSRF="…";`, `index_html.h:766`):
+grep for the assignment it sits in (`var PD_CSRF="…";` in `src/Helpers/index_html.h`):
 
 ```bash
 curl -s "http://$DEV/" -b "pd_session=$SESSION" \
@@ -428,7 +398,7 @@ curl -s -o dashboard.html -w '%{http_code}\n' "http://$DEV/"
 
 ### `GET /api/admin/status`
 
-The dashboard's first call, and the one read that tells you which of the four gates
+The dashboard's first call, and the one read that tells you which of the gates
 you are about to hit. **Ungated**; it has to be reachable before login.
 
 * Request Headers: `Cookie: pd_session=…` (optional; without it `authenticated` is `false`)
@@ -453,18 +423,10 @@ you are about to hit. **Ungated**; it has to be reachable before login.
 | `needsSetup` | Boolean | Exactly `!provisioned`. Emitted separately so the frontend reads as intent rather than a double negative. While this is `true`, gate 4 refuses every admin-gated route except `set-credential`. |
 | `authenticated` | Boolean | Whether **this request's** `pd_session` cookie names a live session. |
 | `role` | String | (Issue #173) `"sysop"` or `"owner"` while `authenticated`, `""` otherwise. See [Two-Role Privilege Model](#two-role-privilege-model-issue-173) below. |
-| `ownerProvisioned` | Boolean | (Issue #173) `true` once a real owner credential has ever been set. While `false`, a sysop session satisfies an owner-gated action too (the no-owner-yet fallback); the dashboard can use this to decide whether to show "create the owner account" or the three owner-only buttons. |
+| `ownerProvisioned` | Boolean | (Issue #173) `true` once a real owner credential has ever been set. While `false`, a sysop session satisfies an owner-gated action too (the no-owner-yet fallback); the dashboard can use this to decide whether to show "create the owner account" or the owner-only buttons. |
 | `sessionRemainingSec` | Integer | Seconds left on this request's session, `0` when unauthenticated. Derived from `AdminAuth::sessionRemainingMs()` divided by 1000, so a session with 900 ms left reads `0`, not `1`. |
 
-> [!WARNING]
-> **Polling this endpoint keeps the session alive.** The handler calls `isAuthed()`,
-> which calls `AdminAuth::validateSession()`, which applies the sliding-expiry push
-> (`HttpServer.cpp:2357`). A dashboard polling `/api/admin/status` on a timer will
-> never let its own session time out. The narrower thing the source comment means is
-> that reading `sessionRemainingSec` adds no *second* slide on top of that one, so
-> the number displayed is not distorted beyond what the `isAuthed()` call already
-> caused. Earlier revisions of this document claimed the read does not slide the
-> expiry at all; that was wrong.
+Polling this endpoint keeps the session alive. The handler calls `isAuthed()`, which calls `AdminAuth::validateSession()`, which applies the sliding-expiry push (in `sendApiAdminStatus()`). A dashboard polling `/api/admin/status` on a timer never lets its own session time out. Reading `sessionRemainingSec` adds no second slide on top of that one, so the number displayed is not distorted beyond what the `isAuthed()` call already causes.
 
 ```bash
 curl -s "http://$DEV/api/admin/status"
@@ -493,22 +455,15 @@ to authenticate, and no session to bind a CSRF token to, so gates 2-4 cannot app
   * `401 Unauthorized`: `{"error":"invalid username or password"}`
   * `403 Forbidden`: `{"error":"cross-origin request rejected"}`
   * `429 Too Many Requests`: `{"error":"too many failed attempts; try again later"}`. Returned both when the client was *already* locked out (checked before any hashing work) and when this attempt is the one that trips the lockout.
-  * `500 Internal Server Error`: `{"error":"failed to create session"}`. `AdminAuth::createSession()` returned an empty token, which happens only when the random-token generator fails (`AdminAuth.cpp:840`). **Not** a "table full" condition; see below.
+  * `500 Internal Server Error`: `{"error":"failed to create session"}`. `AdminAuth::createSession()` returned an empty token, which happens only when the random-token generator fails. **Not** a "table full" condition; see below.
 
-> [!NOTE]
-> **A 9th concurrent login evicts the oldest session rather than failing.** The session
-> table is a fixed 8 slots (`kMaxSessions`); `createSession()` takes an unused slot,
-> else an expired one, else **the soonest-to-expire live session**, overwriting it
-> (`AdminAuth.cpp:848`). The evicted client's next gated request comes back `401`
-> with no warning, and because expiry slides, "soonest to expire" is effectively
-> "least recently active". This matters for scripted clients that log in per-request
-> instead of reusing a session.
+A 9th concurrent login evicts the session closest to expiry rather than failing. The session table is a fixed 8 slots (`kMaxSessions`); `AdminAuth::createSession()` takes an unused slot, else an expired one, else **the soonest-to-expire live session**, overwriting it. The evicted client's next gated request comes back `401` with no warning, and because expiry slides, "soonest to expire" is effectively "least recently active". This matters for scripted clients that log in per-request instead of reusing a session.
 
 ```json
-{ "status": "ok", "authenticated": true, "needsSetup": true, "csrf": "3f2a…e91c" }
+{ "status": "ok", "authenticated": true, "needsSetup": true, "role": "sysop", "csrf": "3f2a…e91c" }
 ```
 
-`csrf` is the per-session CSRF token, returned here as well as rendered into the
+`role` is `sysop` or `owner` (see the Two-Role section below). `csrf` is the per-session CSRF token, returned here as well as rendered into the
 dashboard page so a `fetch()`-based login can start making mutating calls immediately
 instead of reloading. `needsSetup` tells the caller whether this login just
 authenticated with the default credential; if `true`, route straight to setup,
@@ -520,19 +475,7 @@ attach it to cross-site requests). There is **no `Secure` flag**; the dashboard 
 plain HTTP on a LAN appliance, and `Secure` would make the cookie unusable. The
 cookie value is the session token; the CSRF token is never a cookie, by design.
 
-**Brute-force accounting** is **per client since #530**: `handleClient()` sets
-`req.clientIp` from the peer address on every request, and `sendApiAdminLogin` keys the
-lockout on that address plus the principal. **One guesser can still lock the real admin
-out** through the per-principal aggregate backstop, which counts across that client's own
-cooldowns; see [THREAT_MODEL.md](THREAT_MODEL.md) D-3. The thresholds below are real:
-`kMaxFailedAttempts` = 5 consecutive failures engage a
-`kLockoutMs` = 60 s cooldown, and consecutive lockouts back off exponentially to a
-cap of 60 s << 4 ≈ 16 minutes. A separate aggregate backstop
-(`kMaxFailedAttemptsGlobal` = 20) bounds the total guess rate across all source
-addresses, since addresses are spoofable. *(Keying per-client was meant to stop one
-guesser locking the real admin out; as above, the key never arrives, so the aggregate
-backstop is carrying this alone.)* The default credential is **not** exempt from any of
-this.
+**Brute-force accounting** is per client (#530): `handleClient()` sets `req.clientIp` from the peer address on every request, and `sendApiAdminLogin` keys the lockout on that address plus the principal. One guesser can still lock the real admin out through the per-principal aggregate backstop, which counts across that client's own cooldowns; see [THREAT_MODEL.md](THREAT_MODEL.md) D-3. The thresholds are: `kMaxFailedAttempts` = 5 consecutive failures engage a `kLockoutMs` = 60 s cooldown, and consecutive lockouts back off exponentially to a cap of 60 s << 4 ≈ 16 minutes. A separate aggregate backstop (`kMaxFailedAttemptsGlobal` = 20) bounds the total guess rate across all source addresses, since addresses are spoofable. The default credential is not exempt from any of this.
 
 ```bash
 curl -s -i -X POST "http://$DEV/api/admin/login" -d "username=admin&password=admin"
@@ -589,7 +532,7 @@ gates 1-3.
   * `400 Bad Request`: `{"error":"invalid username or password"}`. A field is outside its length bounds, the username contains whitespace/control characters, or it collides with the owner username.
   * `400 Bad Request`: `{"error":"DTMF PIN must be 4-16 digits"}`
   * `400 Bad Request`: `{"error":"nothing to change"}`. Neither a credential pair nor a PIN was supplied.
-  * `403 Forbidden`: `{"error":"owner privilege required to set the DTMF admin PIN"}`. **Only for a non-empty `dtmfPin`**, and **only once an owner account exists** (Issue #173, found in review: the DTMF admin menu's `999` factory-reset code, see `DtmfFeatureCodes.cpp`, wipes the entire NVS flash, including the owner credential itself, so planting a PIN is an owner-only action once there is an owner to protect). Before any owner exists, the no-owner-yet fallback still lets the sysop doing initial setup set a PIN. `username`/`password` changes are unaffected, still sysop-level.
+  * `403 Forbidden`: `{"error":"owner privilege required to set the DTMF admin PIN"}`. **Only for a non-empty `dtmfPin`**, and **only once an owner account exists** (Issue #173: the DTMF admin menu's `999` factory-reset code, see `DtmfFeatureCodes.cpp`, wipes the entire NVS flash, including the owner credential itself, so planting a PIN is an owner-only action once there is an owner to protect). Before any owner exists, the no-owner-yet fallback still lets the sysop doing initial setup set a PIN. `username`/`password` changes are unaffected, still sysop-level.
   * `401`/`403`: gates 1-3 as in §0.1.
 
 The session you call this through **stays valid**; changing the credential does not
@@ -608,14 +551,9 @@ the code runs on the next one-second tick after that. Stay on the call until it 
 a code whose caller has hung up is dropped with a log line (the PIN attempt still counts
 toward the lockout). A second `*PIN#code` while one is being checked is ignored, logged
 like a wrong PIN and not counted. The factory reset is checked once its confirm digit is
-keyed, so key `*PIN#9991` straight through; `*PIN#999` alone no longer says anything about
-the PIN.
+keyed, so key `*PIN#9991` straight through; `*PIN#999` alone says nothing about the PIN.
 
-> [!NOTE]
-> **There is no `/api/admin/set-pin` route**, and there never was one in this
-> firmware. Older notes and third-party write-ups describing a PIN-only admin model
-> predate the username+password credential; `dtmfPin=` on *this* endpoint is the only
-> PIN-setting surface in the HTTP API.
+There is no `/api/admin/set-pin` route. `dtmfPin=` on this endpoint is the only PIN-setting surface in the HTTP API.
 
 ```bash
 # Complete forced initial setup (login credential only)
@@ -642,22 +580,21 @@ via `POST /api/admin/set-owner-credential` below). A session resolves to exactly
 [`POST /api/admin/login`](#post-apiadminlogin)'s and
 [`GET /api/admin/status`](#get-apiadminstatus)'s response bodies.
 
-**Gated at the action site, not the page.** Three actions require `Role::Owner`:
+**Gated at the action site, not the page.** These actions require `Role::Owner`:
 
 * `POST /api/factory-reset`
-* `POST /api/config/export` **with a `password`** (the encrypted `secretsEnc` block;
-  the plaintext-only export/`GET` stays sysop-level)
+* `POST /api/config/export` and `POST /api/config/import`, but only when `password` is non-empty (the encrypted `secretsEnc` block). The plaintext-only export (`GET /api/config/export`) and a plaintext import stay sysop-level.
 * `POST /api/ota/upload`
+* `GET /api/coredump`
+* `POST /api/media-tx`
+* `GET` and `POST /api/bench/fault` (bench-probe images only)
+* `POST /api/admin/set-owner-credential`, which a sysop session can satisfy only while no owner exists
+* `POST /api/admin/set-credential` with a non-empty `dtmfPin`, once an owner exists (see that endpoint's `403` entry above for why)
 
-…plus one found during review, not in the original issue text: `dtmfPin=` on
-`POST /api/admin/set-credential`, once an owner exists (see that endpoint's `403`
-entry above for why). Every other mutating route stays sysop-level, unchanged.
+Every other mutating route stays sysop-level.
 
 **No-owner-yet fallback.** Until `POST /api/admin/set-owner-credential` has ever
-succeeded, a **sysop** session satisfies an owner-gated action too. Without this,
-every board that upgrades to this firmware from an earlier single-credential release
-would lose factory-reset/OTA/the encrypted export the instant it boots, with no owner
-account yet to grant them back. The fallback closes permanently the moment an owner
+succeeded, a **sysop** session satisfies an owner-gated action too. Without this, a board upgraded from a single-credential firmware would lose factory-reset, OTA and the encrypted export at boot, with no owner account yet to grant them back. The fallback closes permanently the moment an owner
 account is created; from then on, only an owner session satisfies an owner gate, and
 `GET /api/admin/status`'s `ownerProvisioned` field tells a caller which side of that
 line the device is on.
@@ -667,8 +604,7 @@ on the *client address plus which principal the submitted username resolved to*,
 each principal also tracks its own aggregate backstop independently
 (`AdminAuth::authenticate()`/`isLockedOutForAuth()`). Spraying the sysop password
 cannot lock the owner out, and vice versa, and neither shares any accounting with the
-DTMF admin PIN's own lockout bucket (a review finding: an earlier draft of this
-feature accidentally reused the DTMF PIN's shared counter for HTTP logins too).
+DTMF admin PIN's own lockout bucket.
 
 **The owner secret is not software-recoverable.** There is no "forgot owner password"
 flow and no way to read one back. If both the owner credential and the DTMF admin PIN
@@ -710,9 +646,9 @@ A single-file JSON backup/restore for the whole device, split into an
 (AES-256-GCM, PBKDF2-SHA256-derived key, 200000 iterations). See
 `src/Helpers/HttpServer.cpp`'s `sendApiConfigExport()`/`sendApiConfigImport()` for the
 authoritative field-by-field accounting of what is plaintext, what is gated, and the
-two data gaps neither direction can currently close (per-extension digest secrets and
+two data gaps neither direction can close (per-extension digest secrets and
 MAC bindings export but cannot import; a trunk slot's client secret is never exported
-at all), filed as a followup; see the PR that introduced this section.
+at all).
 
 ### `GET /api/config/export`
 
@@ -734,7 +670,7 @@ curl -s "http://$DEV/api/config/export" -b "pd_session=$SESSION" > backup.json
 Same plaintext body as the `GET`, plus (only when `password` is non-empty) an
 encrypted `secretsEnc` block carrying the Wi-Fi upstream password, the SoftAP WPA2
 passphrase, and each telephony-trunk slot's `baseUrl`/`clientId`/`routeDn` (never the
-slot's secret; see the followup note above). **Owner-gated, but only when a
+slot's secret; see the data gaps above). **Owner-gated, but only when a
 non-empty `password` is sent**; an empty/absent `password` behaves exactly like the
 `GET` (sysop-level, plaintext only), so a single dashboard form can drive both.
 
@@ -742,7 +678,7 @@ non-empty `password` is sent**; an empty/absent `password` behaves exactly like 
 * Requires `pd_session` cookie: Owner-gated iff `password` is non-empty; otherwise sysop-level
 * Request Content-Type: `application/x-www-form-urlencoded`
 * Request Parameters:
-  * `password` (Optional): non-empty selects the encrypted block.
+  * `password` (Optional): non-empty selects the encrypted block. It must be at least 12 characters; a shorter one answers `400` `{"error":"the export password must be at least 12 characters"}`.
 * Response Status Codes:
   * `200 OK`
   * `403 Forbidden`: `{"error":"owner privilege required"}`. `password` was non-empty and the session was sysop, with an owner already provisioned.
@@ -763,9 +699,7 @@ curl -s -X POST "http://$DEV/api/config/export" \
 Restores config from a blob produced by either export route above.
 Replace-not-merge: for every table this can restore (ring groups, call-forward,
 DND, page zones, dial plan, DID mappings), an entry present on the device but absent
-from the blob is **removed**, not left behind. Sysop-level, with its own
-`confirm=REPLACE` interlock; restoring config is not one of the three owner-only
-actions.
+from the blob is **removed**, not left behind. Sysop-level, with its own `confirm=REPLACE` interlock. It is owner-only when `password` is non-empty (see [Two-Role Privilege Model](#two-role-privilege-model-issue-173)).
 
 * Requires Same-Origin Check + CSRF Token: Yes
 * Requires `pd_session` cookie: Yes (sysop)
@@ -776,7 +710,7 @@ actions.
   * `confirm` (Required): must be the literal string `REPLACE`.
 * Response Content-Type: `application/json`
 * Response Status Codes:
-  * `200 OK`: `{"status":"ok","applied":[...],"skipped":[...]}`. For `forwards` and `didMappings`, `applied` means accepted and staged for the NVS writer, not yet on flash (see the notes under [`POST /api/forward`](#post-apiforward) and [`PUT /api/did-mapping`](#put-apidid-mapping) for the power-fail window); the burst of per-entry writes an import makes coalesces into one flash write, the last table, for as long as the writer has not yet taken the previous one (it runs at priority 1 and may wake between entries under light load, in which case an intermediate table is written first; the last table is always written last). The other settings an import applies (ring groups, voicemail, page zones, dial plan, registrar mode, telephony slots, E911, admin extension) are still written to flash before their setter returns. **Deviates from a bare `204`**; see the followup note above. This feature cannot restore everything a plaintext-capable export can carry, and a bare `204` would tell the operator "fully restored" when it was not.
+  * `200 OK`: `{"status":"ok","applied":[...],"skipped":[...]}`. For `forwards` and `didMappings`, `applied` means accepted and staged for the NVS writer, not yet on flash (see the notes under [`POST /api/forward`](#post-apiforward) and [`PUT /api/did-mapping`](#put-apidid-mapping) for the power-fail window); the burst of per-entry writes an import makes coalesces into one flash write, the last table, for as long as the writer has not yet taken the previous one (it runs at priority 1 and may wake between entries under light load, in which case an intermediate table is written first; the last table is always written last). The other settings an import applies (ring groups, voicemail, page zones, dial plan, registrar mode, telephony slots, E911, admin extension) are still written to flash before their setter returns. The response is not a bare `204`. This feature cannot restore everything a plaintext-capable export can carry, and a bare `204` would tell the operator "fully restored" when it was not.
   * `400 Bad Request`: `{"error":"import requires confirm=REPLACE"}` / `"missing blob parameter"` / `"malformed export blob"` / `"export blob is missing a plaintext object"` / `"unsupported exportVer"` / `"malformed secretsEnc block"`.
   * `422 Unprocessable Entity`: `{"error":"bad password or corrupted secrets block"}`. A wrong password and a tampered/corrupted `secretsEnc` block are **deliberately indistinguishable** (the GCM tag check fails identically either way). A `400`/`422` leaves the device completely untouched; the whole blob is validated (and decrypted, if a password was given) before the first setter runs.
   * `401`/`403`: gates 1-3 as in §0.1.
@@ -785,7 +719,7 @@ Switching the registrar to `secure` mode via an imported blob is refused (report
 `skipped`, not an error) when the device has no secured extensions after the
 import (the same guard [`POST /api/registrar`](#post-apiregistrar) already applies to
 a live switch), since restoring `secure` onto a board whose per-extension digest
-secrets could not be restored (see the followup note) would digest-challenge every
+secrets could not be restored (see the data gaps above) would digest-challenge every
 `REGISTER` with no working handset left to notice.
 
 ```bash
@@ -811,10 +745,10 @@ read back what you just wrote. It is also exempt from the captive-portal redirec
 * Response Status Codes:
   * `200 OK`: Always. Every field is present on every response; the arrays are
     emitted empty rather than omitted. If the SIP engine has not been attached to the
-    dashboard yet (a boot-time transient of a second or two, see
+    dashboard yet (a transient after boot, or longer on a board that has not finished setup; see
     [`GET /api/registrar`](#get-apiregistrar)'s `attached`), the counters read `0` and
     **every array is empty**, which is indistinguishable from a genuinely idle box.
-* Response Payload JSON Example (complete: this is the full field set, not an abridgement):
+* Response Payload JSON Example (abridged; the field table below describes the keys this example leaves out):
 ```json
 {
   "ip": "192.168.4.1",
@@ -893,7 +827,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | Field Name | Type | Description |
 | :--- | :---: | :--- |
 | `ip` | String | The primary active IP address of the SIP server interface. |
-| `port` | Integer | The UDP signaling port. **Always the literal `5060`**; it is hardcoded in the handler (`HttpServer.cpp:951`), not read from configuration, because this codebase has no way to run the SIP listener on another port. Do not treat it as a discovered value. |
+| `port` | Integer | The UDP signaling port. **Always the literal `5060`**; it is hardcoded in the handler (`sendApiStatus()`), not read from configuration, because this codebase has no way to run the SIP listener on another port. Do not treat it as a discovered value. |
 | `httpPort` | Integer | The active TCP HTTP port (typically 80). |
 | `httpReadDeadlineDrops` | Integer | HTTP connections dropped because the request (headers + buffered body) did not arrive within 10 s of the accept (#529), or whose receive timeout could not be set at all (#534; closed unread rather than left to block). A climbing count means a slow or hostile client. |
 | `httpPerSourceRefusals` | Integer | HTTP connections refused `503` because one source address already held 2 of the 3 connection slots (#529). |
@@ -901,7 +835,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `memory.dynamicTaskCreates` | Integer | (#479) Tasks created with a heap stack and TCB since boot: every `pd::createTaskPreferPsram()` task plus the media call path's `moh_tx`. RTP media tasks and `conf_mix_tick` run on boot-preallocated stacks and are not counted. Read it before and after a call; the difference is the call path's dynamic task creation (0 for an ordinary extension-to-extension call). Also counts the anchor client's persistent `tel_maint` task (#658), created once by its first `start()`; restart, TLS re-warm, reconcile and the background token refresh (#862) run on it and create nothing. |
 | `version` | String | (#411) The firmware build stamp (the `git describe` of the commit it was built from). No build host, path or timestamp. |
 | `wifiCapable` | Boolean | (#167) Whether this build has a radio at all. `false` on the Ethernet builds, so an empty Wi-Fi scan is not mistaken for "no networks found". |
-| `emergencyRoute` | String | (#521) Where a 911/933 dial would go right now: `"anchor"` (the boot-selected telephony provider places real calls; a configured SIP trunk is its fallback when it is down), `"trunk"` (no such provider, but a valid SIP trunk is configured **and has answered an INVITE with a 2xx since boot or since its configuration last changed**), `"trunk-unverified"` (#546: a valid trunk is configured but has not yet completed a call, so it is *configured*, not *proved*: the generic trunk cannot answer a 401/407 digest challenge yet (#399). The dashboard shows a banner asking for a 933 test call. Emergency calls are still tried on it), or `"none"` (only the loopback test provider is present, so the board **refuses** emergency calls with `503 Emergency Call Not Routable`; the loopback simulator never answers one). The dashboard shows a warning banner while this is `"none"`. Ungated like the rest of the block. **Absent** while no SIP engine is attached yet (the first seconds after boot), which a client should treat as unknown, not as `"none"`. |
+| `emergencyRoute` | String | (#521) The emergency route the telephony layer provides: `"anchor"` when the boot-selected telephony provider places real 911/933 calls, or `"none"` when only the loopback test provider is present. With `"none"` the board **refuses** emergency calls with `503 Emergency Call Not Routable`; the loopback simulator never answers one. The dashboard shows a warning banner while this is `"none"`. Ungated like the rest of the block. **Absent** while no SIP engine is attached yet (the first seconds after boot), which a client should treat as unknown, not as `"none"`. |
 | `uptime` | Integer | Time in seconds since the HTTP server initialized. |
 | `cdrPersistFailures` | Integer | (#470) CDR ring writes to flash that failed. Non-zero means call history is not surviving reboots. |
 | `cdrPersistSuppressed` | Integer | (#473) CDR ring writes refused while a factory reset was in progress. |
@@ -948,7 +882,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `sessions` | Array | Active calls: `{caller, callee, state, duration}`. **Empty without an admin session** (#539): who is calling whom is the live call log, gated like `/api/cdr` and the `clients` roster (#207). |
 | `sessions[].caller` | String | Extension that initiated the call. |
 | `sessions[].callee` | String | Target extension receiving the call. |
-| `sessions[].state` | String | Active session state. Exactly one of `Invited`, `Connected`, `Busy`, `Unavailable`, `Cancel`, `Bye`, or `Unknown` for an unmapped enumerator (`sessionStateToString`, `src/SIP/RequestsHandler.cpp:4262`). |
+| `sessions[].state` | String | Active session state. Exactly one of `Invited`, `Connected`, `Busy`, `Unavailable`, `Cancel`, `Bye`, or `Unknown` for an unmapped enumerator (`sessionStateToString()` in `src/SIP/RequestsHandler.cpp`). |
 | `sessions[].duration` | String | **A preformatted display string, not a number.** `MM:SS` under an hour, `HH:MM:SS` at or above it, zero-padded either way (`"03:45"`, `"01:02:03"`). The underlying integer seconds is not exposed anywhere; a client that wants arithmetic has to parse this back. |
 | `sessionCount` | Integer | (#539) Number of active calls. Always present, authenticated or not. |
 | `oldestSessionSec` | Integer | (#539) Age in seconds of the oldest active call, 0 when none. Always present; the #401 soak reads it to find a stuck leg without a credential. |
@@ -1007,7 +941,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 > the IDF Task Watchdog Timer (`esp_task_wdt_add()` + a per-tick
 > `esp_task_wdt_reset()`, `main/esp_main*.cpp`) and `sdkconfig.defaults` sets
 > `CONFIG_ESP_TASK_WDT_PANIC=y`, so a stall there is a controlled reset with a
-> logged cause (`resetReason":"TASK_WDT"` on the *next* boot), not silence.
+> logged cause (`"resetReason":"TASK_WDT"` on the *next* boot), not silence.
 > `udp_receiver_task`, `rtp_media_tx`, `rtp_media_rx` and `conf_mix_tick` are
 > **not yet** watchdog-subscribed; their stack headroom is visible above, but
 > a stall in one of them today is not self-healing. Subscribing them requires
@@ -1015,19 +949,11 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 > loop (`UdpServer.cpp`, `RtpSender.cpp`, `RtpReceiver.cpp`,
 > `ConferenceRoom.cpp` respectively; a FreeRTOS task can only feed the
 > watchdog on its own behalf, so this cannot be done from outside those
-> files), which is tracked as follow-up work rather than folded into this
-> change.
+> files). Subscribing them is follow-up work.
 
-> **Ordering.** `dialplan[]` is the one array whose order carries meaning: it is
-> emitted in table order, and the table is evaluated **first match wins**
-> (`HttpServer.cpp:1028`). Preserve it. `clients`, `sessions`, `dnd`, `forwards`,
-> `groups` and `parkedCalls` are sets; their order is whatever the underlying
-> container produced and must not be relied on. There is no way to reorder the dial
-> plan through the API; see [`POST /api/dialplan`](#post-apidialplan).
->
-> Full shape: `HttpServer::sendApiStatus()`, `src/Helpers/HttpServer.cpp:913`. All
-> string values are JSON-escaped, including C0 control bytes as `\u00XX`
-> (`jsonEscape`, `HttpServer.cpp:883`).
+`dialplan[]` is the one array whose order carries meaning: it is emitted in table order, and the table is evaluated **first match wins** (in `sendApiStatus()`). Preserve it. `clients`, `sessions`, `dnd`, `forwards`, `groups` and `parkedCalls` are sets; their order is whatever the underlying container produced and must not be relied on. There is no way to reorder the dial plan through the API; see [`POST /api/dialplan`](#post-apidialplan).
+
+The full shape is built by `HttpServer::sendApiStatus()` in `src/Helpers/HttpServer.cpp`. All string values are JSON-escaped, including C0 control bytes as `\u00XX` (`jsonEscape()`).
 
 ### `POST /api/kill`
 Disconnects a specified VoIP station, removing its registration and terminating any active calls involving its extension.
@@ -1044,25 +970,9 @@ Disconnects a specified VoIP station, removing its registration and terminating 
   * `409 Conflict`: `{"error":"extension is on an emergency call"}`. An admin kill never ends a 911/933 call (#714): nothing is disconnected and the extension stays registered.
   * `401`/`403`: gates 1-4 as in §0.1.
 
-> [!NOTE]
-> **Corrected: this endpoint now parses like every other one.** Earlier revisions of
-> this document warned that `sendApiKill()` was the one handler that did *not* use
-> `getFormParam()`: that it did a bare `body.find("extension=")`, swallowed extra
-> parameters into the value, never URL-decoded, and accepted `myextension=1001` as
-> `extension=1001`. **All four of those behaviours were removed in issue #191.**
-> `sendApiKill()` now calls `getFormParam(body, "extension")`
-> (`HttpServer.cpp:1294`), which enforces an `&` token boundary, stops at the next
-> `&`, and URL-decodes. So extra parameters are fine, `%2A` decodes to `*`, and a body
-> carrying only `myextension=1001` answers `400` rather than killing extension 1001.
-> Do not write a client against the old contract.
+`sendApiKill()` reads `extension` with `getFormParam()` (#191), which enforces an `&` token boundary, stops at the next `&`, and URL-decodes. Extra parameters are fine, `%2A` decodes to `*`, and a body carrying only `myextension=1001` answers `400` rather than killing extension 1001.
 
-> [!NOTE]
-> **`200` means "the request was well-formed", not "an extension was disconnected".**
-> `RequestsHandler::forceDisconnect()` walks the client pool, releases the first
-> matching registration and reports only whether it was refused (an emergency call,
-> `409`); an extension that is not registered is a no-op. The response echoes back whatever string you sent either way. Read
-> [`GET /api/status`](#get-apistatus)'s `clients[]` to confirm the registration is
-> actually gone.
+`200` means the request was well-formed, not that an extension was disconnected. `RequestsHandler::forceDisconnect()` walks the client pool, releases the first matching registration and reports only whether it was refused (an emergency call, `409`). An extension that is not registered is a no-op. The response echoes back whatever string you sent either way. Read [`GET /api/status`](#get-apistatus)'s `clients[]` to confirm the registration is actually gone.
 
 #### Request Example (Form URL-Encoded)
 ```http
@@ -1102,17 +1012,15 @@ Covered by `test_api.sh` TC-SEC-01/02/03 (the same-origin matrix), TC-AUTH-02/05
 ### 4.2 Build-dependent routes: read before using `/api/wifi/*`
 
 Three routes are compiled against `POCKETDIAL_HAS_WIFI`, which
-`main/CMakeLists.txt:134` defines for **every transport except `eth` (W5500) and
+`main/CMakeLists.txt` defines for **every transport except `eth` (W5500) and
 `lan8720`**, the two pure-Ethernet builds, which have no Wi-Fi radio at all. On those
 builds, and on the host/desktop build, the `#else` stub answers instead of the real
-implementation. This is Issue #167, and the stub messages all say *"on desktop"*
-regardless of whether you are on a desktop or on Ethernet hardware.
+implementation (Issue #167). The stub text is `WiFi is not available on this build -- this board has no WiFi radio in its current Ethernet-transport configuration`.
 
 `/api/factory-reset` is listed below too, but it is **not** one of those three: it is
 fully functional on every build. Only its Wi-Fi NVS key erase is transport-gated, and a
 wired board has no such keys to erase. It answers `200` everywhere and reboots on every
-ESP transport. (Before #189 it did belong in that set, and was the worst member of it;
-it performed the whole wipe and *then* answered `501`.)
+ESP transport.
 
 A second, **different** guard, `ESP_PLATFORM`, covers the OTA routes. It is defined
 on *every* ESP transport including `eth`/`lan8720`, so OTA works on Ethernet boards
@@ -1120,9 +1028,9 @@ even though Wi-Fi does not. Do not conflate the two.
 
 | Route | Guard | On `eth` / `lan8720` / desktop |
 | :--- | :--- | :--- |
-| [`GET /api/wifi/scan`](#get-apiwifiscan) | `POCKETDIAL_HAS_WIFI` | `200` with `{"networks":[], "note":"WiFi scan not available on desktop"}` |
-| [`POST /api/wifi/connect`](#post-apiwificonnect) | `POCKETDIAL_HAS_WIFI` | `501` `{"error":"WiFi connect not available on desktop"}` (after the `ssid` check) |
-| [`POST /api/wifi/mode_ap`](#post-apiwifimode_ap) | `POCKETDIAL_HAS_WIFI` | `501` `{"error":"WiFi mode select not available on desktop"}` |
+| [`GET /api/wifi/scan`](#get-apiwifiscan) | `POCKETDIAL_HAS_WIFI` | `200` with `{"networks":[], "note":"<stub text>"}` |
+| [`POST /api/wifi/connect`](#post-apiwificonnect) | `POCKETDIAL_HAS_WIFI` | `501` with `{"error":"<stub text>"}` (after the `ssid` check) |
+| [`POST /api/wifi/mode_ap`](#post-apiwifimode_ap) | `POCKETDIAL_HAS_WIFI` | `501` with `{"error":"<stub text>"}` |
 | [`POST /api/factory-reset`](#post-apifactory-reset) | `POCKETDIAL_HAS_WIFI` *(Wi-Fi NVS keys only)* | Fully real everywhere: `200` on every build, and every ESP build reboots. Only the four Wi-Fi NVS keys and the captive-portal wording are transport-specific. |
 | [`POST /api/ota/upload`](#post-apiotaupload) | `ESP_PLATFORM` | Real on `eth`/`lan8720`; `501` only on desktop |
 | [`POST /api/ota/reboot`](#post-apiotareboot) | `ESP_PLATFORM` | Real on `eth`/`lan8720`; simulated `200` only on desktop |
@@ -1145,13 +1053,7 @@ exempt from the captive-portal redirect (§3).
   * `200 OK`
   * `500 Internal Server Error`: `{"error":"WiFi scan start failed","code":<esp_err_t>}`. `esp_wifi_scan_start()` refused. `code` is the raw numeric `esp_err_t`.
 
-> [!WARNING]
-> **This is a blocking scan, and it leaves the radio in `AP+STA`.** The handler calls
-> `esp_wifi_scan_start(&cfg, true)` (the `true` is `block`), so the HTTP request is
-> held for the full scan (seconds, `show_hidden` enabled) on one of the server's
-> connection threads. And if the radio was in `WIFI_MODE_AP` it is switched to
-> `WIFI_MODE_APSTA` to scan and **is never switched back**
-> (`HttpServer.cpp:1966`). Being ungated, this is reachable by anything on the AP.
+**Warning:** this is a blocking scan, and it leaves the radio in `AP+STA`. The handler calls `esp_wifi_scan_start(&cfg, true)` (the `true` is `block`), so the HTTP request is held for the full scan (seconds, `show_hidden` enabled) on one of the server's connection threads. And if the radio was in `WIFI_MODE_AP` it is switched to `WIFI_MODE_APSTA` to scan and **is never switched back** (in `sendApiWifiScan()`). Being ungated, this is reachable by anything on the AP.
 
 #### Response Example (200 OK - ESP32 Platform)
 ```json
@@ -1174,14 +1076,9 @@ exempt from the captive-portal redirect (§3).
 | :--- | :---: | :--- |
 | `ssid` | String | The SSID as reported by the driver. Hidden networks are included (`show_hidden` is set), and their SSID is an empty string. |
 | `rssi` | Integer | Signal strength in dBm (negative). |
-| `encryption` | String | Exactly one of `OPEN`, `WEP`, `WPA`, `WPA2`, `WPA/WPA2`, `WPA2 Enterprise`, `WPA3`, `WPA2/WPA3`. Any auth mode outside that switch falls through to `OPEN` (`HttpServer.cpp:1997`); treat `OPEN` as "open *or* unrecognised", not as a guarantee. |
+| `encryption` | String | Exactly one of `OPEN`, `WEP`, `WPA`, `WPA2`, `WPA/WPA2`, `WPA2 Enterprise`, `WPA3`, `WPA2/WPA3`. Any auth mode outside that switch falls through to `OPEN` (in `sendApiWifiScan()`); treat `OPEN` as "open *or* unrecognised", not as a guarantee. |
 
-> [!NOTE]
-> On a build without `POCKETDIAL_HAS_WIFI` (the `eth`/`lan8720` Ethernet firmwares as
-> well as the desktop build), this endpoint returns `200` with
-> `{"networks":[], "note":"WiFi scan not available on desktop"}`. The presence of the
-> `note` key is the only way to tell a stubbed build from a board that genuinely sees
-> no networks. See §4.2.
+On a build without `POCKETDIAL_HAS_WIFI` (the `eth`/`lan8720` Ethernet firmwares as well as the desktop build), this endpoint returns `200` with `{"networks":[], "note":"<stub text>"}`, where the stub text is the one given in §4.2. The presence of the `note` key is the only way to tell a stubbed build from a board that genuinely sees no networks. See §4.2.
 
 ```bash
 curl -s "http://$DEV/api/wifi/scan"
@@ -1203,13 +1100,9 @@ Configures the device to operate in **Wi-Fi Station Mode**, saving the SSID and 
   * `400 Bad Request`: `{"error":"missing ssid parameter"}`. Checked **before** the build guard, so it is the response on every build.
   * `401`/`403`: gates 1-4 as in §0.1.
   * `413 Payload Too Large`: body over 16 KB (`test_api.sh` TC-ED-01 uses this route for that check).
-  * `501 Not Implemented`: `{"error":"WiFi connect not available on desktop"}` on a build without `POCKETDIAL_HAS_WIFI`, including the `eth`/`lan8720` Ethernet firmwares.
+  * `501 Not Implemented`: `{"error":"<stub text>"}` (see §4.2) on a build without `POCKETDIAL_HAS_WIFI`, including the `eth`/`lan8720` Ethernet firmwares.
 
-> [!NOTE]
-> An empty `password` is accepted and stored as an empty string (an open network);
-> only `ssid` is required. The NVS write is best-effort: if `nvs_open()` fails, nothing
-> is stored, the response is still `200`, and the device still reboots, into its
-> previous mode. There is no way to tell from the response that this happened.
+An empty `password` is accepted and stored as an empty string (an open network); only `ssid` is required. The NVS write is best-effort: if `nvs_open()` fails, nothing is stored, the response is still `200`, and the device still reboots, into its previous mode. There is no way to tell from the response that this happened.
 
 #### Request Example
 ```http
@@ -1217,7 +1110,7 @@ POST /api/wifi/connect HTTP/1.1
 Host: 192.168.4.1
 Origin: http://192.168.4.1
 Content-Type: application/x-www-form-urlencoded
-Content-Length: 35
+Content-Length: 36
 
 ssid=My-Home-WiFi&password=secure123
 ```
@@ -1254,7 +1147,7 @@ Sets the operational mode of the device back to **Standalone Access Point Mode**
 * Response Status Codes:
   * `200 OK`: `wifi_mode=2` committed to NVS, reboot scheduled ~1 s out.
   * `401`/`403`: gates 1-4 as in §0.1.
-  * `501 Not Implemented`: `{"error":"WiFi mode select not available on desktop"}` on a build without `POCKETDIAL_HAS_WIFI`, including the `eth`/`lan8720` Ethernet firmwares.
+  * `501 Not Implemented`: `{"error":"<stub text>"}` (see §4.2) on a build without `POCKETDIAL_HAS_WIFI`, including the `eth`/`lan8720` Ethernet firmwares.
 
 Unlike `/api/wifi/connect`, this endpoint has **no confirmation parameter** and no
 precondition check: any authenticated, fully-set-up session can reboot the device into
@@ -1291,18 +1184,7 @@ Reports how a `REGISTER` is admitted, and which phones have been adopted.
 }
 ```
 
-* `attached`: `false` when the SIP engine has not been bound to the dashboard yet. The
-  HTTP server starts before the registrar exists and the main loop attaches the handler
-  once it does (`main/esp_main_eth.cpp:424`). **It is not always a "boot-time transient
-  of a second or two".** On the `eth` build the SIP task is not started at all until an
-  admin credential exists (`main/esp_main_eth.cpp:587-631` waits on
-  `AdminAuth::credentialIsSet()` before `xTaskCreatePinnedToCore(&sip_server_task, …)`),
-  so on a freshly flashed or freshly factory-reset board `attached` stays `false`
-  indefinitely, until someone completes first-run setup. Treat a persistent
-  `attached:false` as "setup not finished", not as a hung registrar. `mode` reads
-  `"unknown"` and `devices` is empty meanwhile. Every
-  other endpoint that reads registrar state behaves the same way: empty datasets, not
-  failures.
+* `attached`: `false` when the SIP engine has not been bound to the dashboard yet. The HTTP server starts before the registrar exists and the main loop attaches the handler once it does (in `main/esp_main_eth.cpp`). This can last a long time, not just a second or two. On the `eth` build the SIP task is not started until an admin credential exists: `main/esp_main_eth.cpp` waits on `AdminAuth::credentialIsSet()` before it creates `sip_server_task`. On a freshly flashed or freshly factory-reset board, `attached` therefore stays `false` until someone completes first-run setup. Treat a persistent `attached:false` as "setup not finished", not as a hung registrar. `mode` reads `"unknown"` and `devices` is empty meanwhile. Every other endpoint that reads registrar state behaves the same way: empty datasets, not failures.
 * `mode`: `learn` or `secure` (see `POST` below). There is no `open` mode (#500).
 * `state`: `learned` (adopted on first contact, not yet enforced) or `secured`
   (MAC-locked and digest-enforced for its extension).
@@ -1321,12 +1203,6 @@ Reports how a `REGISTER` is admitted, and which phones have been adopted.
   * Both `false` on a `learned` row: plain trust-on-first-use, seen but not locked yet.
   * A `secured` row reports the flags it had when it was secured: `secure` does not change
     them. It is MAC-locked and digest-enforced by its `state`, whatever `locked` says.
-
-> **Why this endpoint exists.** SIP digest authentication has been implemented and tested
-> for some time, but `setRegistrarMode()` was called from **unit tests only**; nothing in
-> production ever wrote the persisted `reg_mode`, so every device came up in the
-> compiled-in `open` default and stayed there regardless of what the docs claimed. This
-> and the flash-time `cfgseed` field are what make it operable.
 
 * Auth: gated read (same-origin, session and completed setup), **no** `X-CSRF`.
 * Response Status Codes:
@@ -1352,9 +1228,7 @@ curl -s "http://$DEV/api/registrar" -b "pd_session=$SESSION"
   (the first claim wins); another MAC then gets `403`. Until then, and for a phone on
   another subnet or sharing a NAT router's MAC, any device that asks can claim it. Adopt
   phones on a trusted/WPA2 link.
-* `open` (retired, #500): used to accept every `REGISTER` with no credential. A board that
-  had it stored boots `learn` and rewrites the setting; a config import that says `open`
-  applies `learn` and lists it under `skipped`.
+* `open` (retired, #500): not accepted. A board that still has it stored boots `learn` and rewrites the setting; a config import that says `open` applies `learn` and lists it under `skipped`.
 * `secure`: every `REGISTER` is digest-challenged; an extension is registrable only by
   a party that knows its secret.
 
@@ -1500,10 +1374,7 @@ curl -s -X POST "http://$DEV/api/registrar/forget-learned" \
      -b "pd_session=$SESSION" -H "X-CSRF: $CSRF"
 ```
 
-> **The MAC lock is not a cryptographic boundary.** It is learned from the ARP table, and
-> ARP/MAC are spoofable on a hostile L2. It defeats accidental collisions and casual
-> impersonation and composes with digest auth as defence in depth; it is not a substitute
-> for it. See [THREAT_MODEL.md](THREAT_MODEL.md) §9.2 E-3.
+The MAC lock is not a cryptographic boundary. It is learned from the ARP table, and ARP/MAC are spoofable on a hostile L2. It defeats accidental collisions and casual impersonation and composes with digest auth as defence in depth; it is not a substitute for it. See [THREAT_MODEL.md](THREAT_MODEL.md) §9.2 E-3.
 
 ### `GET /api/ap-security`
 
@@ -1609,7 +1480,7 @@ Returns the in-memory Call Detail Record ring (most recent calls first). Read-on
 The response is a **bare JSON array**, not an object with a wrapper key, unlike
 `/api/telephony-config` (`{"slots":[…]}`) and `/api/did-mapping` (`{"mappings":[…]}`).
 An empty ring is `[]`. The ring holds `POCKETDIAL_CDR_RECORDS` = **32** entries
-(`src/SIP/CallDetailRecord.hpp:19`), newest first, and is cleared by
+(`POCKETDIAL_CDR_RECORDS` in `src/SIP/CallDetailRecord.hpp`), newest first, and is cleared by
 [`POST /api/factory-reset`](#post-apifactory-reset).
 
 #### Field Schema Definitions
@@ -1621,12 +1492,9 @@ An empty ring is `[]`. The ring holds `POCKETDIAL_CDR_RECORDS` = **32** entries
 | `startMs` | Integer | Call start time on the server's steady-clock basis (not wall-clock; no RTC is guaranteed on-device). Comparable only against other values from the same boot; it is meaningless as an absolute timestamp and resets on reboot. |
 | `ageSec` | Integer | Seconds since the call started, derived from the same steady-clock basis as `startMs`. This is the field to use for "how long ago"; `startMs` is not convertible to a date. |
 | `duration` | Integer | Call length in seconds. |
-| `result` | String | How the call ended. Exactly one of `answered`, `busy`, `cancelled`, `unavailable`, `failed` (`cdrResultToString()`, `src/SIP/CallDetailRecord.hpp:32`). `failed` is also the fallback for an unmapped enumerator. |
+| `result` | String | How the call ended. Exactly one of `answered`, `busy`, `cancelled`, `unavailable`, `failed` (`cdrResultToString()` in `src/SIP/CallDetailRecord.hpp`). `failed` is also the fallback for an unmapped enumerator. |
 
-> [!WARNING]
-> **`result` is never `"completed"`.** Earlier revisions of this document used that
-> value in the example above; no such string exists in the firmware. A client
-> switching on `"completed"` matches nothing; the answered case is `"answered"`.
+`result` is never `"completed"`. No such string exists in the firmware, so a client switching on it matches nothing. The answered case is `"answered"`.
 
 ```bash
 curl -s "http://$DEV/api/cdr"
@@ -1635,13 +1503,13 @@ curl -s "http://$DEV/api/cdr"
 ### `GET /api/pcap`
 Downloads a classic libpcap file of the most recent SIP signaling packets, ready to open directly in Wireshark. Both directions are captured (packets the server received and packets it sent); **RTP/media is never included**; the capture ring is fed from the SIP socket only.
 
-For an ordinary extension-to-extension call that also means there is nothing to miss: the board relays signalling and the two phones stream RTP directly to each other, so no media ever reaches it. That is not true of every call. The board terminates media itself on `440` (tone), `555` (anchor bridge) and `888` (conference). An outbound trunk call crosses it on **both** sides (RTP to and from the handset, chunked-HTTPS PCM16 to and from the provider), with `MediaBridge` shuttling PCM16 between the two. None of that appears here either; this endpoint captures SIP, not media, whoever is carrying it. (`777` is an SDP loopback: the phone streams to its own address, so there is genuinely no media leg on the board; see `src/SIP/RequestsHandler.cpp:1228`.)
+For an ordinary extension-to-extension call that also means there is nothing to miss: the board relays signalling and the two phones stream RTP directly to each other, so no media ever reaches it. That is not true of every call. The board terminates media itself on `440` (tone), `555` (anchor bridge) and `888` (conference). An outbound trunk call crosses it on **both** sides (RTP to and from the handset, chunked-HTTPS PCM16 to and from the provider), with `MediaBridge` shuttling PCM16 between the two. None of that appears here either; this endpoint captures SIP, not media, whoever is carrying it. (`777` is an SDP loopback: the phone streams to its own address, so there is genuinely no media leg on the board; see the 777 echo branch in `RequestsHandler::onInvite()`.)
 
 Captured packets are synthesized into a minimal Ethernet+IPv4+UDP frame around the exact SIP bytes (dummy MAC addresses, since the server has no real link-layer information, but real source/destination IP:port), so Wireshark's SIP dissector decodes them exactly as it would a real capture. Timestamps are relative to the server's monotonic clock, not wall-clock (no RTC is guaranteed on the device; same basis as `/api/cdr`'s `startMs`).
 
-Only packets that pass structural validation and the per-source-IP rate limiter (Issue #38) are captured; this is a signaling-research aid, not a wire-level DoS forensics tool. The ring is bounded (`POCKETDIAL_PCAP_RING_SIZE`, default 64); older packets are dropped as new ones arrive.
+Only packets that pass structural validation and the per-source-IP rate limiter (Issue #38) are captured; this is a signaling-research aid, not a wire-level DoS forensics tool. The ring is bounded (`POCKETDIAL_PCAP_RING_SIZE`, default 16, or 4 on the constrained profile); older packets are dropped as new ones arrive.
 
-* Auth: fully gated. The dispatch chain calls `requireAdmin(sock, req, /*needCsrf=*/false)` (`HttpServer.cpp:467`), so gates 1, 2 and 4 all apply. **The same-origin check is applied**; what this route skips is only the CSRF token, because it is a read.
+* Auth: fully gated. The dispatch chain calls `requireAdmin(sock, req, /*needCsrf=*/false)` (in `handleClient()`), so gates 1, 2 and 4 all apply. **The same-origin check is applied**; what this route skips is only the CSRF token, because it is a read.
 * Request Headers: `Cookie: pd_session=…` (required)
 * Response Content-Type: `application/vnd.tcpdump.pcap`
 * Response Headers: `Content-Disposition: attachment; filename="pocket-dial.pcap"`
@@ -1650,14 +1518,7 @@ Only packets that pass structural validation and the per-source-IP rate limiter 
   * `401 Unauthorized`: `{"error":"authentication required"}`. Note this is a JSON body on an endpoint that otherwise serves binary.
   * `403 Forbidden`: cross-origin, or `setup_required` while still on the default credential.
 
-> [!NOTE]
-> **Correction.** Earlier revisions of this document said this route has "no
-> same-origin check". It does: `requireAdmin()` runs `requireSameOrigin()` first for
-> every gated route, reads included. The comment inside `sendApiPcap()`
-> (`HttpServer.cpp:1125`) that says otherwise describes the handler in isolation and
-> is stale with respect to the dispatch chain that calls it. The reasoning it gives
-> (a file download is not a state change, and `SameSite=Strict` already blocks
-> cross-site cookie replay) is sound; it just is not what the code does.
+The same-origin check applies to this route. `requireAdmin()` runs `requireSameOrigin()` first for every gated route, reads included. Skipping the CSRF token is acceptable here because a file download is not a state change, and `SameSite=Strict` already blocks cross-site cookie replay.
 
 ```bash
 curl -s -o pocket-dial.pcap -b "pd_session=$SESSION" "http://$DEV/api/pcap"
@@ -1669,7 +1530,7 @@ A second route to the exact same handler as [`GET /api/pcap`](#get-apipcap), the
 Issue #33's original feature request asked for. It is a real route rather than an HTTP
 redirect so that `curl -o dump.pcap http://<device>/api/diagnostics/pcap` works without
 `-L`, and because there is no second capture mechanism to point at: `sendApiPcap()`
-reads the same `PcapCapture` ring either way (`HttpServer.cpp:480`).
+reads the same `PcapCapture` ring either way.
 
 Identical in every respect: same response body, same `Content-Type`, same
 `Content-Disposition`, same `requireAdmin(…, needCsrf=false)` gate, same status codes.
@@ -1680,7 +1541,7 @@ curl -s -o pocket-dial.pcap -b "pd_session=$SESSION" "http://$DEV/api/diagnostic
 ```
 
 ### `GET /api/trace`
-Returns the same capture ring as `/api/pcap`, as JSON, for the dashboard's live SIP tracer panel. Returns the **whole current ring on every call** rather than an incremental "since" delta; the ring is small (`POCKETDIAL_PCAP_RING_SIZE`, default 64) and this is meant to be polled every second or two on a LAN, so re-sending it is cheap and the server doesn't need to track any per-client polling state. The client filters to `seq` values it hasn't already rendered.
+Returns the same capture ring as `/api/pcap`, as JSON, for the dashboard's live SIP tracer panel. Returns the **whole current ring on every call** rather than an incremental "since" delta; the ring is small (`POCKETDIAL_PCAP_RING_SIZE`, default 16) and this is meant to be polled every second or two on a LAN, so re-sending it is cheap and the server doesn't need to track any per-client polling state. The client filters to `seq` values it hasn't already rendered.
 
 * Auth: fully gated with `needCsrf = false`, the same gate as `/api/pcap` (gates 1, 2 and 4; no token), because it is the same underlying data.
 * Request Headers: `Cookie: pd_session=…` (required)
@@ -1710,7 +1571,7 @@ Returns the same capture ring as `/api/pcap`, as JSON, for the dashboard's live 
 | `tsUs` | Integer | Capture time in microseconds on the server's monotonic clock (not wall-clock; no RTC is guaranteed on the device). |
 | `dir` | String | `"in"` for a packet the server received, `"out"` for one it sent. |
 | `peer` | String | The other party's `"ip:port"`. |
-| `text` | String | The raw SIP message bytes, exactly as captured, JSON-escaped, including any C0 control byte as `\u00XX`, so a malformed-but-tolerated packet cannot break `JSON.parse()` (`jsonEscape`, `HttpServer.cpp:883`; regression-tested in `tests/JsonEscape_test.cpp`). |
+| `text` | String | The raw SIP message bytes, exactly as captured, JSON-escaped, including any C0 control byte as `\u00XX`, so a malformed-but-tolerated packet cannot break `JSON.parse()` (`jsonEscape()`; regression-tested in `tests/JsonEscape_test.cpp`). |
 
 ```bash
 curl -s -b "pd_session=$SESSION" "http://$DEV/api/trace"
@@ -1721,33 +1582,31 @@ Zero-touch phone auto-provisioning (Issue #35). `<mac>` is 12 lowercase hex char
 
 Only serves configs for MACs already in the Registrar's adopted-device registry (Learn or Secure mode, see `docs/LEARN_MODE.md`/`Registrar.hpp`), so this covers **re**-provisioning (factory reset, handset swap, config refresh) rather than a phone's very first-ever contact: that first REGISTER is what gets a MAC adopted in the first place, and still needs the phone told its own extension number by some other means (typically typed once on the handset, or carried over from a previous config). Every subsequent boot can fetch this URL and get the account/server/codec settings back with no typing.
 
-> [!IMPORTANT]
-> **On a fresh board this endpoint is a 404 for every MAC until the phones register
-> once.** The default registrar mode is `learn` (see [`POST /api/registrar`](#post-apiregistrar)),
-> which adopts each phone on its first REGISTER; only then does its MAC have a config
-> to serve. (Before #500 the default on existing boards was `open`, which never recorded
-> a device, so this endpoint stayed inert until an operator switched modes.)
-> That is a configuration prerequisite, not a bug, and it is the single thing most
-> likely to make this endpoint look broken.
+On a fresh board this endpoint returns `404` for every MAC until the phones register once. The default registrar mode is `learn` (see [`POST /api/registrar`](#post-apiregistrar)), which adopts each phone on its first REGISTER; only then does its MAC have a config to serve. That is a configuration prerequisite, not a bug, and it is the single thing most likely to make this endpoint look broken.
 
 Intentionally **not session-gated**; a booting phone has no way to present a session cookie. The MAC is the only credential this endpoint checks: it's drawn from a 2^48 space and only ever served for a MAC that's already adopted, so guessing is impractical, and both an unknown MAC and a not-yet-adopted one return the same `404` (no distinguishing information). The HTTP listener is always open (§0), so a phone can always reach the URL; whether it gets a config back depends only on adoption.
 
 The config never carries a working SIP password: `Registrar`/`SipSecretStore` only ever store `HA1 = MD5(ext:realm:secret)`, a one-way hash; the server never has the plaintext to hand out, even for a device that requires one (Secure mode, or a Learn-mode device individually promoted via `secure()`). For those, the config still provisions everything else and adds a comment noting the admin has to set the password by hand on the handset.
 
-**The path shape is checked before any lookup, and it is strict**
-(`isProvisioningConfigPath`, `HttpServer.cpp:1166`). The path must be exactly
-`/config/` + **12 characters** + `.cfg`, and each of those 12 must be in `[0-9a-f]`,
-**lowercase only**. `GET /config/805EC079C37F.cfg` fails the shape test and falls
-through to the generic dispatch `404` (plain text, §1) without the registry ever being
-consulted; so does an 11- or 13-character MAC, and so does a MAC with separators.
-Lowercase your MAC before you ask. Yealink handsets template the filename with their
-own MAC in lowercase, which is why the firmware only accepts that form.
+The path must match one of the accepted filename shapes. The shape is checked before any lookup (`isProvisioningConfigPath()`, which runs `parseProvisioningPath()`). The seven shapes are:
+
+| Filename | Vendor | Notes |
+| :--- | :--- | :--- |
+| `000000000000.cfg` | Polycom | Master config. Served without a registry lookup. |
+| `cfg<12 hex>.xml` | Grandstream | |
+| `<12 hex>-phone.cfg` | Polycom | Per-phone config. |
+| `spa<12 hex>.cfg` | Cisco SPA | MAC-keyed. |
+| `snom<12 hex>.xml` | snom | Accepts either case in the MAC. |
+| `spa<model>.cfg` | Cisco SPA | Model-keyed, for example `spa504g.cfg`. |
+| `<12 hex>.cfg` | Yealink | The shape used by the example below. |
+
+In the 12-hex shapes each character must be in `[0-9a-f]`, lowercase only, except the snom shape. `GET /config/805EC079C37F.cfg` fails the Yealink shape test and falls through to the generic dispatch `404` (plain text, §1) without the registry being consulted. So does an 11- or 13-character MAC, and so does a MAC with separators. Lowercase your MAC before you ask. Yealink handsets template the filename with their own MAC in lowercase. For the body each vendor receives and how to set up its phones, see [PROVISIONING.md](PROVISIONING.md). The response example below is the Yealink body.
 
 * Request Headers: None
 * Response Content-Type: `text/plain`
 * Response Status Codes:
   * `200 OK`: MAC is adopted; config body returned.
-  * `404 Not Found`: `<mac>` isn't in the adopted-device registry; **or** the path doesn't match the `/config/<12 lowercase hex>.cfg` shape at all; **or** the config builder refused the extension (a CR/LF in it, Issue #107, produces a miss rather than a partial config). All three are the same plain-text `404 Not Found`, deliberately indistinguishable.
+  * `404 Not Found`: `<mac>` isn't in the adopted-device registry; **or** the path doesn't match any accepted filename shape; **or** the config builder refused the extension (a CR/LF in it, Issue #107, produces a miss rather than a partial config). All three are the same plain-text `404 Not Found`, deliberately indistinguishable.
 
 ```bash
 # Note the lowercase MAC — uppercase is a 404 before the lookup even runs
@@ -1776,12 +1635,7 @@ account.1.codec.2.payload_type = PCMA
 account.1.codec.2.priority = 2
 ```
 
-> [!NOTE]
-> **This key set has never been confirmed against a physical handset.** The names and
-> syntax follow Yealink's long-stable, widely-documented auto-provisioning key set, and
-> a real Yealink T29 has since been registered to a bench board, but by hand, not by
-> fetching this file. Treat the rendered config as best-effort until a handset is
-> actually provisioned from it.
+This key set has never been confirmed against a physical handset. The names and syntax follow Yealink's long-stable, widely documented auto-provisioning key set. A Yealink T29 has been registered to a bench board, but by hand, not by fetching this file. Treat the rendered config as best-effort until a handset is actually provisioned from it.
 
 ### `POST /api/dnd`
 Sets or clears Do-Not-Disturb on a registered extension.
@@ -1790,7 +1644,7 @@ Sets or clears Do-Not-Disturb on a registered extension.
 * Requires `pd_session` cookie: Always (see §0)
 * Request Content-Type: `application/x-www-form-urlencoded`
 * Request Parameters:
-  * `extension` (Required): The extension to set DND on. Must not be `777` (echo test), `999` (all-page broadcast) or `555` (anchor media bridge); none of the three is a real endpoint (`HttpServer.cpp:1222`).
+  * `extension` (Required): The extension to set DND on. Must not be `777` (echo test), `999` (all-page broadcast) or `555` (anchor media bridge); none of the three is a real endpoint (in `sendApiDnd()`).
   * `on` (Optional): `1`, `true`, or `on` enables DND; **anything else disables it**, including omitting the parameter, `0`, `yes`, `TRUE` and `ON`. The comparison is exact and case-sensitive, so `on=True` turns DND **off**.
 * Response Content-Type: `application/json`
 * Response Status Codes:
@@ -1799,18 +1653,9 @@ Sets or clears Do-Not-Disturb on a registered extension.
   * `400 Bad Request`: `{"error":"cannot set DND on a virtual extension"}`. `extension` is `777`, `999` or `555`.
   * `401`/`403`: gates 1-4 as in §0.1.
 
-> [!NOTE]
-> **`200` is an echo of the request, not a confirmation it was stored.**
-> `RequestsHandler::setDnd()` returns `void`; the config layer below it logs and drops
-> anything it will not accept, and the handler has already sent `200` by then. The one
-> case that matters here is the table cap: a **new** extension is refused once
-> `POCKETDIAL_MAX_CLIENTS` = **32** extensions are already in DND
-> (`PbxFeatureConfig.cpp:28`), silently, with a `200`. Turning DND off frees the slot.
-> Read [`GET /api/status`](#get-apistatus)'s `dnd[]` back to confirm.
->
-> Unlike forward and group below, the DND config layer applies **no** reserved-extension
-> check of its own, so `888` (the meet-me conference) is not refused anywhere and DND
-> on it is genuinely stored, an asymmetry, not a documented feature.
+`200` is an echo of the request, not a confirmation it was stored. `RequestsHandler::setDnd()` returns `void`; the config layer below it logs and drops anything it will not accept, and the handler has already sent `200` by then. The one case that matters here is the table cap: a **new** extension is refused once `POCKETDIAL_MAX_CLIENTS` = **32** extensions are already in DND (`PbxFeatureConfig::setDndLocked()`), silently, with a `200`. Turning DND off frees the slot. Read [`GET /api/status`](#get-apistatus)'s `dnd[]` back to confirm.
+
+Unlike forward and group, the DND config layer applies no reserved-extension check of its own, so DND on `888` (the meet-me conference) is not refused and is stored. That asymmetry is not a documented feature.
 
 #### Response Example (200 OK)
 ```json
@@ -1840,7 +1685,7 @@ Configures call forwarding for an extension.
 * Requires `pd_session` cookie: Always (see §0)
 * Request Content-Type: `application/x-www-form-urlencoded`
 * Request Parameters:
-  * `extension` (Required): The extension to configure. Must not be `777`, `999` or `555` (`HttpServer.cpp:1261`).
+  * `extension` (Required): The extension to configure. Must not be `777`, `999` or `555` (in `sendApiForward()`).
   * `trigger` (Required): Exactly one of `always`, `busy`, `noanswer`. Case-sensitive.
   * `target` (Optional): The extension to forward to. **Empty clears the rule for that trigger**; that is the only way to unset one.
 * Response Content-Type: `application/json`
@@ -1851,25 +1696,9 @@ Configures call forwarding for an extension.
   * `400 Bad Request`: `{"error":"cannot forward a virtual extension"}`. `extension` is `777`, `999` or `555`.
   * `401`/`403`: gates 1-4 as in §0.1.
 
-> [!NOTE]
-> **`200` is an echo, not a confirmation** (same contract as `/api/dnd`). Two cases
-> are refused *below* the HTTP layer and still answer `200`:
-> `extension=888` (the meet-me conference, the HTTP layer does **not** reject it, but
-> `PbxFeatureConfig::setForwardLocked` does, `PbxFeatureConfig.cpp:99`), and a **new**
-> extension once `POCKETDIAL_MAX_CLIENTS` = **32** extensions already have forwards.
-> `target` gets no charset validation at this layer at all. Read
-> [`GET /api/status`](#get-apistatus)'s `forwards[]` back to confirm.
+`200` is an echo, not a confirmation (same contract as `/api/dnd`). Two cases are refused below the HTTP layer and still answer `200`: `extension=888` (the meet-me conference; the HTTP layer does not reject it, but `PbxFeatureConfig::setForwardLocked()` does), and a **new** extension once `POCKETDIAL_MAX_CLIENTS` = **32** extensions already have forwards. `target` gets no charset validation at this layer at all. Read [`GET /api/status`](#get-apistatus)'s `forwards[]` back to confirm.
 
-> [!NOTE]
-> **`200` also means accepted and staged, not yet persisted** (#986). The forward table
-> is copied to the NVS writer task, which writes it to flash after the request has been
-> answered: a few milliseconds typically, longer if the write triggers a flash page
-> garbage collection or the writer is starved by media load. The new forward is live in
-> RAM at once. A power cut, panic or restart (OTA, reboot) inside that window brings the
-> board back with the **previous** persisted table; nothing is flushed before a planned
-> restart. The same applies to the `*72`/`*73` keypad codes, which share this path. A table
-> too large for its 4000-byte slot is refused and logged, never truncated, and the `200`
-> does not change. While a factory reset is running nothing is staged.
+`200` also means accepted and staged, not yet persisted (#986). The forward table is copied to the NVS writer task, which writes it to flash after the request has been answered: a few milliseconds typically, longer if the write triggers a flash page garbage collection or the writer is starved by media load. The new forward is live in RAM at once. A power cut, panic or restart (OTA, reboot) inside that window brings the board back with the **previous** persisted table; nothing is flushed before a planned restart. The same applies to the `*72`/`*73` keypad codes, which share this path. A table too large for its 4000-byte slot is refused and logged, never truncated, and the `200` does not change. While a factory reset is running nothing is staged.
 
 #### Response Example (200 OK)
 ```json
@@ -1900,8 +1729,8 @@ Creates, updates, or deletes a ring/hunt group.
 * Requires `pd_session` cookie: Always (see §0)
 * Request Content-Type: `application/x-www-form-urlencoded`
 * Request Parameters:
-  * `extension` (Required): The group's own extension number. Must not be `777`, `999` or `555` (`HttpServer.cpp:1293`).
-  * `members` (Optional): Member extensions separated by **commas or any whitespace**; `pbx::splitMembers` treats both as separators and skips runs of them, so `1001,1002 1003` and `1001, 1002,1003` parse identically (`src/SIP/PbxConfig.hpp:107`). **An empty or whitespace-only list deletes the group.** At most `POCKETDIAL_MAX_CLIENTS` = 32 members are parsed; the rest of the string is ignored silently.
+  * `extension` (Required): The group's own extension number. Must not be `777`, `999` or `555` (in `sendApiGroup()`).
+  * `members` (Optional): Member extensions separated by **commas or any whitespace**; `pbx::splitMembers` treats both as separators and skips runs of them, so `1001,1002 1003` and `1001, 1002,1003` parse identically (`pbx::splitMembers()` in `src/SIP/PbxConfig.hpp`). **An empty or whitespace-only list deletes the group.** At most `POCKETDIAL_MAX_CLIENTS` = 32 members are parsed; the rest of the string is ignored silently.
   * `mode` (Optional): `ringall` (the default when omitted or empty) or `hunt`. Case-sensitive.
 * Response Content-Type: `application/json`
 * Response Status Codes:
@@ -1911,14 +1740,7 @@ Creates, updates, or deletes a ring/hunt group.
   * `400 Bad Request`: `{"error":"mode must be ringall|hunt"}`
   * `401`/`403`: gates 1-4 as in §0.1.
 
-> [!NOTE]
-> **`200` is an echo, not a confirmation** (same contract as `/api/dnd`). Refused below
-> the HTTP layer, still `200`: `extension=888` (the meet-me conference, rejected by
-> `PbxFeatureConfig::setRingGroup`, `PbxFeatureConfig.cpp:163`, but **not** by the HTTP
-> layer), and a **new** group once `POCKETDIAL_MAX_CLIENTS` = **32** groups exist.
-> The response echoes your raw `members` string verbatim, *not* the parsed list; read
-> [`GET /api/status`](#get-apistatus)'s `groups[]` to see what was actually stored (as
-> a comma-joined string).
+`200` is an echo, not a confirmation (same contract as `/api/dnd`). Refused below the HTTP layer, still `200`: `extension=888` (the meet-me conference, rejected by `PbxFeatureConfig::setRingGroup()` but not by the HTTP layer), and a **new** group once `POCKETDIAL_MAX_CLIENTS` = **32** groups exist. The response echoes your raw `members` string verbatim, not the parsed list. Read [`GET /api/status`](#get-apistatus)'s `groups[]` to see what was actually stored (as a comma-joined string).
 
 #### Response Example (200 OK)
 ```json
@@ -1954,26 +1776,21 @@ plan, every outside number is answered `404` without the call ever leaving the b
 **Upsert vs. delete.** Naming an `action` **always** means create/update. **Omitting
 both `action` and `target` deletes** the rule with that pattern. The two are separate
 signals on purpose: a `trunk` rule may legitimately carry an empty `target` (that is
-how you say "strip N digits and prepend nothing"), so an empty target alone can no
-longer mean "delete". It used to, which made the request that creates a strip-only
-trunk rule byte-identical to the request that deletes it (`HttpServer.cpp:1354-1358`).
-A non-trunk action with an empty target is now refused `400` rather than silently
-deleting the rule the operator was editing.
+how you say "strip N digits and prepend nothing"), so an empty target alone does not
+mean "delete". A non-trunk action with an empty target is refused `400` rather than
+silently deleting the rule the operator was editing.
 
 Rules are evaluated **in table order, first match wins**. A pattern already in the
 table is edited **in place**, keeping its evaluation position; a new pattern is
 appended to the end. To reorder, delete a rule and re-add it. An edit replaces the
-rule's action, target **and** `stripDigits` together; an earlier build kept the first
-insert's strip count forever, which silently misdialled every edited trunk rule. The
-table is hard-capped at `POCKETDIAL_MAX_DIAL_RULES` (**16** by default, see
-`src/SIP/PoolConfig.hpp:163`); once it is full a *new* pattern is rejected server-side
+rule's action, target **and** `stripDigits` together. The table is hard-capped at
+`POCKETDIAL_MAX_DIAL_RULES` (**16** by default; see `src/SIP/PoolConfig.hpp`); once it is full a *new* pattern is rejected server-side
 (logged, still `200`), while existing rules stay editable.
 
 The plan is consulted **after** every reserved virtual extension (`777` echo, `999`
 all-page, the `980`–`989` paging zones, `440` tone, `888` conference, `555`
 anchor bridge and the `700`–`70N` park orbits), and after a direct ring-group
-extension lookup, and **before** call-forwarding / DND / ordinary extension lookup
-(`src/SIP/RequestsHandler.cpp:1410`). So a rule can only capture a number that would
+extension lookup, and **before** call-forwarding / DND / ordinary extension lookup. So a rule can only capture a number that would
 otherwise have reached the ordinary extension lookup; no rule, not even a catch-all
 `*`, can shadow the echo test, a park retrieval, or a configured group extension.
 **A dialed number that matches no rule routes exactly as it did before the dial plan
@@ -2008,7 +1825,7 @@ this device. Examples: `601` (exact),
 * Requires `pd_session` cookie: Always (see §0)
 * Request Content-Type: `application/x-www-form-urlencoded`
 * Request Parameters:
-  * `pattern` (Required): The rule's dialed-number pattern, and its key in the table. May contain only letters, digits, `#` and `*`. Must not be `777`, `999`, `440` or `555`; those are routed before the dial plan, so such a rule could never fire (`HttpServer.cpp:1346`).
+  * `pattern` (Required): The rule's dialed-number pattern, and its key in the table. May contain only letters, digits, `#` and `*`. Must not be `777`, `999`, `440` or `555`; those are routed before the dial plan, so such a rule could never fire.
   * `action` (Optional, default `group` when a `target` is given): `group` (ring/hunt group), `page` (paging zone), `park` (park orbit), or `trunk` (outbound access through the configured anchor/telephony provider, Issue #165). **Naming any action means upsert.**
   * `target` (Optional): The extension the action routes to: a ring-group extension for `group`, a `980`–`989` zone for `page`, a `700`–`70N` orbit for `park`, or, for `trunk`, the digit string **prepended** to the dialed number after stripping. A `trunk` rule may leave it **empty**, meaning "prepend nothing"; every other action requires it. **Omitting `action` *and* `target` together deletes the rule with that pattern.**
   * `stripDigits` (Optional, `trunk` only, default `0`): how many leading digits to remove from the dialed number before prepending `target`. Must fit the pattern: for a fixed-length pattern (no trailing `*`) it cannot exceed the pattern's length; a prefix pattern (trailing `*`) is instead checked against the *actual* dialed number at call time, and a rule that no longer fits answers `404` rather than placing a truncated number.
@@ -2018,14 +1835,9 @@ this device. Examples: `601` (exact),
   * `400 Bad Request`: `pattern` missing, `pattern`/`target` contains a character outside `[0-9A-Za-z#*]`, `pattern` is a reserved extension, `action` is not `group`/`page`/`park`/`trunk`, `target` is empty on a non-`trunk` action, the `target` is the wrong shape for the action (`page` must name a `980`–`989` zone, `park` a park orbit), or `stripDigits` is not a small non-negative integer that fits the pattern.
   * `401 Unauthorized` / `403 Forbidden`: as above.
 
-> [!NOTE]
-> A rule whose target no longer resolves (a group or zone deleted after the rule
-> was written, a `trunk` rule whose `stripDigits` no longer fits the dialed number,
-> or no anchor/telephony provider currently connected) is answered `404 Not Found`
-> at dial time rather than falling through, so a stale rule fails visibly instead of
-> silently ringing whichever real extension happens to share the dialed digits.
+A rule whose target no longer resolves (a group or zone deleted after the rule was written, a `trunk` rule whose `stripDigits` no longer fits the dialed number, or no anchor/telephony provider currently connected) is answered `404 Not Found` at dial time rather than falling through, so a stale rule fails visibly instead of silently ringing whichever real extension happens to share the dialed digits.
 
-**`trunk` example**: dialing `9` + 11 digits, stripping the `9` and prepending `1`
+**`trunk` example**: dialing `9` followed by 10 digits, stripping the `9` and prepending `1`
 so `92025550123` reaches the configured trunk as `12025550123`:
 ```
 pattern=9XXXXXXXXXX&action=trunk&target=1&stripDigits=1
@@ -2039,14 +1851,7 @@ using the same origination path virtual extension `555` uses
 (`RequestsHandler::originateAnchorCall()`), so it requires that provider to actually be
 connected.
 
-> **This is not a SIP trunk.** The outbound path is an `AnchorClient`: HTTP/OAuth2 plus
-> a call-control WebSocket, with media as chunked-HTTPS PCM16, and the shipping real
-> client speaks the 3CX Call Control API. Nothing in the tree ever *sends* a `REGISTER`,
-> so the board never registers to an ITSP and speaks no SIP to a carrier at all.
-> `POCKETDIAL_MAX_ANCHOR_CALLS` is **4** (`src/SIP/PoolConfig.hpp:221`), and the effective
-> limit is `min(provider, 4)`; the default `LoopbackAnchorClient` declares 1, so a stock
-> board still gets one outside call
-> at a time, and a second attempt is refused rather than queued.
+This is not a SIP trunk. The outbound path is an `AnchorClient`: HTTP/OAuth2 plus a call-control WebSocket, with media as chunked-HTTPS PCM16, and the shipping real client speaks the 3CX Call Control API. Nothing in the tree ever *sends* a `REGISTER`, so the board never registers to an ITSP and speaks no SIP to a carrier at all. `POCKETDIAL_MAX_ANCHOR_CALLS` is **4** (`src/SIP/PoolConfig.hpp`), and the effective limit is `min(provider, 4)`. The default `LoopbackAnchorClient` declares 1, so a stock board still gets one outside call at a time, and a second attempt is refused rather than queued.
 
 `target` is charset-limited the same as every other dial-plan token
 (`[0-9A-Za-z#*]`); a bare national number like `1` works with most US trunks.
@@ -2076,16 +1881,10 @@ pattern=2XX&action=group&target=610
 ```
 
 `stripDigits` is **always** present in the response, `0` for every non-`trunk` action
-(`HttpServer.cpp:1426`). The response is an echo of the accepted request, so on a
+(`sendApiDialPlan()`). The response is an echo of the accepted request, so on a
 delete it reads back `"action":""`, `"target":""`, `"stripDigits":0`.
 
-> [!NOTE]
-> **`200` is an echo, not a confirmation.** `RequestsHandler::setDialRule()` returns
-> `void` and the config layer logs-and-drops what it refuses. The case that bites is
-> the table cap: once `POCKETDIAL_MAX_DIAL_RULES` = **16** rules exist, a *new* pattern
-> is dropped with a log line and a `200` (`PbxFeatureConfig.cpp:358`). Existing rules
-> stay editable. Read [`GET /api/status`](#get-apistatus)'s `dialplan[]` back; it is
-> also the only way to see the evaluation order you now have.
+`200` is an echo, not a confirmation. `RequestsHandler::setDialRule()` returns `void` and the config layer logs-and-drops what it refuses. The case that bites is the table cap: once `POCKETDIAL_MAX_DIAL_RULES` = **16** rules exist, a *new* pattern is dropped with a log line and a `200` (in `PbxFeatureConfig::setDialRule()`). Existing rules stay editable. Read [`GET /api/status`](#get-apistatus)'s `dialplan[]` back; it is also the only way to see the evaluation order you now have.
 
 ```bash
 # Route 2XX to ring group 610
@@ -2093,7 +1892,7 @@ curl -s -X POST "http://$DEV/api/dialplan" \
      -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" \
      -d "pattern=2XX&action=group&target=610"
 
-# Outside line: dial 9 + 11 digits, strip the 9, prepend 1
+# Outside line: dial 9 followed by 10 digits, strip the 9, prepend 1
 curl -s -X POST "http://$DEV/api/dialplan" \
      -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" \
      -d "pattern=9XXXXXXXXXX&action=trunk&target=1&stripDigits=1"
@@ -2109,21 +1908,12 @@ curl -s -X POST "http://$DEV/api/dialplan" \
      -d "pattern=2XX"
 ```
 
-> [!IMPORTANT]
-> **It is the emptiness of the *values* that decides, not the presence of the keys.**
-> `getFormParam()` returns an empty string both for a parameter that was omitted and
-> for one sent with an empty value, so the server cannot tell them apart:
-> `pattern=2XX`, `pattern=2XX&target=` and `pattern=2XX&action=&target=` are all the
-> same request and all delete the rule. An upsert therefore requires a **non-empty**
-> `action` or a **non-empty** `target`. The "strip N, prepend nothing" trunk rule is
-> expressible only because `action=trunk` is non-empty while `target=` is empty,
-> which is exactly the case that would be lost if the delete keyed on `target` alone
-> (`HttpServer.cpp:1354-1358`).
+**Warning:** it is the emptiness of the *values* that decides, not the presence of the keys. `getFormParam()` returns an empty string both for a parameter that was omitted and for one sent with an empty value, so the server cannot tell them apart: `pattern=2XX`, `pattern=2XX&target=` and `pattern=2XX&action=&target=` are all the same request and all delete the rule. An upsert therefore requires a **non-empty** `action` or a **non-empty** `target`. The "strip N, prepend nothing" trunk rule is expressible only because `action=trunk` is non-empty while `target=` is empty, which is exactly the case that would be lost if the delete keyed on `target` alone (in `sendApiDialPlan()`).
 
 ### `GET /api/telephony-config`
 
 Lists the carrier/anchor credential slots, the outbound side of the box. There are
-exactly `TelephonyApiConfig::kSlots` = **4** of them (`src/SIP/TelephonyApiConfig.hpp:35`),
+exactly `TelephonyApiConfig::kSlots` = **4** of them (`src/SIP/TelephonyApiConfig.hpp`),
 and at most one is active at a time.
 
 ```json
@@ -2147,21 +1937,16 @@ and at most one is active at a time.
 | Field | Type | Description |
 | :--- | :---: | :--- |
 | `index` | Integer | The slot's position, and the `<slot>` path segment for the mutating routes below. |
-| `type` | String | `LOOPBACK` (the built-in reference client) or `TELEPHONY-API` (a real provider). Exact spellings (`telephonyProviderName()`, `src/SIP/TelephonyProvider.cpp:3`). |
+| `type` | String | `LOOPBACK` (the built-in reference client) or `TELEPHONY-API` (a real provider). Exact spellings (`telephonyProviderName()` in `src/SIP/TelephonyProvider.cpp`). |
 | `enabled` | Boolean | Operator's on/off switch for the slot. An enabled real slot must be fully configured; see the `PUT` below. |
 | `implemented` | Boolean | Whether a client for this provider type is actually compiled in. |
 | `active` | Boolean | `true` for the one slot the anchor path currently originates through. |
 | `baseUrl` | String | Provider API base URL. Must be `https://` on an enabled real slot. |
 | `clientId` | String | OAuth2 client identifier. |
 | `routeDn` | String | The provider-side DN this box owns. Outbound calls originate from it; inbound calls to it are what [`/api/did-mapping`](#get-apidid-mapping) routes. |
-| `secretSet` | Boolean | Whether a secret is stored. **The secret itself is never returned by any endpoint**, by design (`telephonySlotJson`, `HttpServer.cpp:1490`). |
+| `secretSet` | Boolean | Whether a secret is stored. **The secret itself is never returned by any endpoint**, by design (`telephonySlotJson()`). |
 
-> **What this is not.** These slots do not describe a SIP trunk. The client speaks
-> HTTP/OAuth2 plus a call-control WebSocket, with media as chunked-HTTPS PCM16, and the
-> shipping real client targets the **3CX Call Control API**. The firmware never sends a
-> `REGISTER` of its own, so the box does not register to an ITSP and speaks no SIP to a
-> carrier. Reaching a trunk also requires a dial-plan rule with `action=trunk`
-> ([`POST /api/dialplan`](#post-apidialplan)); there is no `9`-prefix default.
+These slots do not describe a SIP trunk. The client speaks HTTP/OAuth2 plus a call-control WebSocket, with media as chunked-HTTPS PCM16, and the shipping real client targets the **3CX Call Control API**. The firmware never sends a `REGISTER` of its own, so the box does not register to an ITSP and speaks no SIP to a carrier. Reaching a trunk also requires a dial-plan rule with `action=trunk` ([`POST /api/dialplan`](#post-apidialplan)); there is no `9`-prefix default.
 
 * Auth: gated read (same-origin, session and completed setup), **no** `X-CSRF`. Read-gated rather than public (unlike `/api/status`) because this is credential-adjacent configuration.
 * Response Status Codes:
@@ -2190,13 +1975,9 @@ the API (`HttpServer::sendApiTelephonyConfigSet`).
 
 An **enabled** real slot is validated as actually dialable, and refused `400` otherwise
 (`TelephonyApiConfig::setSlot`): the base URL must start `https://`, and `routeDn`,
-`clientId` and an effective secret must all be non-empty. A blank route DN in particular
-used to be accepted and is the one misconfiguration nothing downstream can report: the
-control WebSocket carries no DN, so the board comes up "connected" and every call posts
-to `.../callcontrol//makecall`, which reads in the field as "the API was hit but no call
-happened". A **disabled** slot is free to be an incomplete draft.
+`clientId` and an effective secret must all be non-empty. A blank route DN is refused for an enabled slot, because nothing downstream can report it: the control WebSocket carries no DN, so without the check the board would come up "connected" and every call would post to `.../callcontrol//makecall`. A **disabled** slot is free to be an incomplete draft.
 
-`<slot>` path shape: `parseTelephonyConfigSlotPath` (`HttpServer.cpp:1436`) accepts
+`<slot>` path shape: `parseTelephonyConfigSlotPath()` accepts
 1-9 decimal digits with no trailing segment. Anything else (a negative number, a
 non-digit, a trailing slash) does not match the route at all and falls through to the
 plain-text dispatch `404` (§1) rather than a JSON error. A well-formed but out-of-range
@@ -2209,13 +1990,7 @@ lives in exactly one place in the codebase, deliberately.
   * `400 Bad Request`: the body carries the literal reason from `TelephonyApiConfig::setSlot`, one of `{"error":"Bad slot index"}`, `{"error":"Unknown provider type"}`, `{"error":"Base URL too long"}` (over 128), `{"error":"Field too long"}` (`clientId`/`secret`/`routeDn` over 64), `{"error":"Enabled slot needs an https:// base URL"}`, `{"error":"Enabled slot needs a route DN"}`, `{"error":"Enabled slot needs a client ID"}`, `{"error":"Enabled slot needs a client secret"}`, or an NVS failure (`{"error":"NVS open failed"}` / `{"error":"NVS write failed"}` on device, `{"error":"config file open failed"}` on host).
   * `401`/`403`: gates 1-4 as in §0.1.
 
-> [!NOTE]
-> If the SIP engine is not attached yet, this endpoint **echoes the request back as
-> `200` without persisting anything** (`HttpServer.cpp:1563`), the same convention
-> `/api/forward` and `/api/group` use. The echoed `slot` object is built from what you
-> sent, so it looks like a successful write. Check
-> [`GET /api/registrar`](#get-apiregistrar)'s `attached` first if you are scripting
-> against a just-booted device.
+If the SIP engine is not attached yet, this endpoint **echoes the request back as `200` without persisting anything** (in `sendApiTelephonyConfigSet()`), the same convention `/api/forward` and `/api/group` use. The echoed `slot` object is built from what you sent, so it looks like a successful write. Check [`GET /api/registrar`](#get-apiregistrar)'s `attached` first if you are scripting against a just-booted device.
 
 ```bash
 curl -s -X PUT "http://$DEV/api/telephony-config/0" \
@@ -2240,14 +2015,7 @@ full replace, and omitting `enabled` silently disables the slot.
 
 Makes that slot the one the outbound anchor path uses.
 
-> [!IMPORTANT]
-> **A reboot is required before the new slot is actually live.** Provider selection is
-> boot-time-only: the running `_anchorClient` was chosen at startup and activation only
-> changes the persisted choice. Until the board restarts, the previously-active slot is
-> still the one placing calls, and
-> [`POST /api/telephony-config/<slot>/test`](#post-apitelephony-configslottest) will
-> refuse the newly-activated slot with *"this slot is not the active one — activate it
-> and reboot first"* (`RequestsHandler::testDialSlot`).
+A reboot is required before the new slot is actually live. Provider selection is boot-time-only: the running `_anchorClient` was chosen at startup and activation only changes the persisted choice. Until the board restarts, the previously-active slot is still the one placing calls, and [`POST /api/telephony-config/<slot>/test`](#post-apitelephony-configslottest) will refuse the newly-activated slot with *"this slot is not the active one — activate it and reboot first"* (`RequestsHandler::testDialSlot()`).
 
 * Request Parameters: none. The body is ignored; the slot is the path segment.
 * Response Status Codes:
@@ -2255,16 +2023,9 @@ Makes that slot the one the outbound anchor path uses.
   * `400 Bad Request`: `{"error":"Bad slot index"}`, or an NVS/persist failure string from `TelephonyApiConfig::setActiveSlot`.
   * `401`/`403`: gates 1-4 as in §0.1.
 
-> [!NOTE]
-> **Index `4` is accepted and means "no slot active".** `setActiveSlot` admits
-> `kNoActiveSlot`, which equals `kSlots` = `4` (`TelephonyApiConfig.cpp:184`), so
-> `POST /api/telephony-config/4/activate` persists "nothing active" and answers
-> `{"status":"ok","activeIndex":4}`. Index `5` and up are rejected `400`. This is
-> observed in the source and is the only way to deactivate all slots through the API;
-> nothing in the dashboard offers it, and it is not otherwise documented.
->
-> If the SIP engine is not attached, the handler skips the call entirely and still
-> answers `{"status":"ok","activeIndex":<n>}` having persisted nothing.
+Index `4` is accepted and means "no slot active". `TelephonyApiConfig::setActiveSlot()` admits `kNoActiveSlot`, which equals `kSlots` = `4`, so `POST /api/telephony-config/4/activate` persists "nothing active" and answers `{"status":"ok","activeIndex":4}`. Index `5` and up are rejected `400`. This is the only way to deactivate all slots through the API. The dashboard does not offer it, and it is not otherwise documented.
+
+If the SIP engine is not attached, the handler skips the call entirely and still answers `{"status":"ok","activeIndex":<n>}` having persisted nothing.
 
 ```bash
 curl -s -X POST "http://$DEV/api/telephony-config/0/activate" \
@@ -2273,17 +2034,7 @@ curl -s -X POST "http://$DEV/api/telephony-config/0/activate" \
 
 ### `POST /api/telephony-config/<slot>/test`
 
-> [!CAUTION]
-> **This endpoint is not read-only. It places a real outbound call.**
-> Despite the name, `POST .../test` is not a dry run, a ping, or a config check. It
-> calls `AnchorClient::makeCall()` against the slot's own `routeDn` through the live
-> provider connection and then immediately calls `dropCall()` on the resulting leg
-> (`RequestsHandler::testDialSlot`, `src/SIP/RequestsHandler.cpp:4583`). Against a
-> production PBX or carrier that means a real origination: it may ring a real DN,
-> appear in the provider's CDRs, and, depending on the provider, be billable. Do not
-> call it casually, do not put it in a health-check loop, and do not fire it at a
-> production slot to "see if the API is up". Use
-> [`GET /api/telephony-config`](#get-apitelephony-config) for that; it touches nothing.
+**Warning:** this endpoint is not read-only. It places a real outbound call. Despite the name, `POST .../test` is not a dry run, a ping, or a config check. It calls `AnchorClient::makeCall()` against the slot's own `routeDn` through the live provider connection and then immediately calls `dropCall()` on the resulting leg (`RequestsHandler::testDialSlot()`). Against a production PBX or carrier that means a real origination: it may ring a real DN, appear in the provider's CDRs, and, depending on the provider, be billable. Do not call it casually, do not put it in a health-check loop, and do not fire it at a production slot to "see if the API is up". Use [`GET /api/telephony-config`](#get-apitelephony-config) for that; it touches nothing.
 
 The dashboard Interconnect module's **Test Dial**. A connectivity probe, not a bridged
 call: no session, no `MediaBridge`, no caller. It is a mutating action and takes the
@@ -2308,7 +2059,7 @@ wrong connection or silently no-op.
 | Body | Meaning |
 | :--- | :--- |
 | `{"ok":true,"participantId":"<id>"}` | The call was placed **and then dropped**. `<id>` is the provider's id for the leg. This is the clean success. |
-| `{"ok":true,"participantId":""}` | **The call was placed and was NOT dropped.** The firmware only calls `dropCall()` `if (!ownLeg.empty())` (`RequestsHandler.cpp:4616`), so an empty id means `makeCall()` reported success but did not hand back a controllable leg; there was nothing to hang up with. Treat this as a warning, not a success: the origination happened and the firmware has no handle on it. What the provider then does with that leg is provider-side and not observable from here. |
+| `{"ok":true,"participantId":""}` | **The call was placed and was NOT dropped.** The firmware only calls `dropCall()` `if (!ownLeg.empty())` (in `RequestsHandler::testDialSlot()`), so an empty id means `makeCall()` reported success but did not hand back a controllable leg; there was nothing to hang up with. Treat this as a warning, not a success: the origination happened and the firmware has no handle on it. What the provider then does with that leg is provider-side and not observable from here. |
 | `{"ok":false,"error":"this slot is not the active one — activate it and reboot first"}` | The requested slot is not `activeSlot()`. Provider selection is boot-time-only. |
 | `{"ok":false,"error":"no anchor client connected"}` | No `_anchorClient`, or it reports not connected. Nothing was dialled. |
 | `{"ok":false,"error":"anchor declined makeCall"}` | The provider refused the origination. Nothing is left up. |
@@ -2349,13 +2100,9 @@ The inbound half: which extension an incoming call to a given DID should ring.
 ```
 
 The table is bounded at `POCKETDIAL_MAX_DID_MAPPINGS` = **8**
-(`src/SIP/PoolConfig.hpp:211`).
+(`POCKETDIAL_MAX_DID_MAPPINGS` in `src/SIP/PoolConfig.hpp`).
 
-> **`did` is matched as a literal string against the provider's route DN**, not parsed as
-> a phone number. There is no E.164 normalization and no suffix matching anywhere in the
-> firmware (`RequestsHandler.cpp:2388`). Enter exactly the DN string the provider
-> presents. An inbound call whose DN matches no mapping, or maps to an extension that is
-> not currently registered, falls back to ringing **every** registered extension.
+`did` is matched as a literal string against the provider's route DN, not parsed as a phone number. There is no E.164 normalization and no suffix matching anywhere in the firmware (`DidMapping::extensionForDid()`). Enter exactly the DN string the provider presents. An inbound call whose DN matches no mapping, or maps to an extension that is not currently registered, falls back to ringing **every** registered extension.
 
 * Auth: gated read (same-origin, session and completed setup), **no** `X-CSRF`.
 * Response Status Codes:
@@ -2378,23 +2125,9 @@ Creates or updates one mapping. Form-encoded.
   * `400 Bad Request`, with the literal body: `{"error":"missing did or extension parameter"}`; `{"error":"extension may contain only letters, digits, '#' and '*'"}`; `{"error":"cannot map a DID to a virtual/reserved extension"}` (`777`, `999`, `555`, `888` or `440`, none is a real endpoint a DID could usefully ring); or one of `DidMapping::setMapping`'s own strings, `{"error":"DID required"}`, `{"error":"Extension required"}`, `{"error":"Field too long"}` (over 32 characters), `{"error":"Field contains a control character"}`, `{"error":"DID mapping table full"}`. Updating an existing DID never consumes a slot, so it succeeds even on a full table.
   * `401`/`403`: gates 1-4 as in §0.1.
 
-> [!NOTE]
-> **`200` also means accepted and staged, not yet persisted** (#986). The whole table is
-> copied to the NVS writer task, which writes the eight slots to flash after the request
-> has been answered: a few milliseconds typically, longer if the write triggers a flash
-> page garbage collection or the writer is starved by media load. The mapping is live in
-> RAM at once and inbound routing and `GET`/export read it from there. A power cut, panic
-> or restart (OTA, reboot) inside that window brings the board back with the **previous**
-> persisted table; nothing is flushed before a planned restart. A table that could not be
-> staged is a `400` with `{"error":"DID table not persisted: ..."}` (a factory reset is
-> running, the writer is not running because its staging memory could not be reserved at
-> boot, or a field is longer than the writer's 33-byte cell, which only a hand-edited
-> store can produce); the in-RAM table has changed anyway. The on-flash form (the
-> `didmap` namespace, `m<N>did`/`m<N>ext`) is unchanged.
+`200` also means accepted and staged, not yet persisted (#986). The whole table is copied to the NVS writer task, which writes the eight slots to flash after the request has been answered: a few milliseconds typically, longer if the write triggers a flash page garbage collection or the writer is starved by media load. The mapping is live in RAM at once and inbound routing and `GET`/export read it from there. A power cut, panic or restart (OTA, reboot) inside that window brings the board back with the **previous** persisted table; nothing is flushed before a planned restart. A table that could not be staged is a `400` with `{"error":"DID table not persisted: ..."}` (a factory reset is running, the writer is not running because its staging memory could not be reserved at boot, or a field is longer than the writer's 33-byte cell, which only a hand-edited store can produce); the in-RAM table has changed anyway. The on-flash form (the `didmap` namespace, `m<N>did`/`m<N>ext`) is unchanged.
 
-Note the `PUT` verb. This is one of only three non-`GET`/`POST` routes in the API (the
-other two are `PUT`/`DELETE /api/telephony-config/<slot>`), and the body is still
-form-encoded, not JSON.
+The verb is `PUT`, and the body is still form-encoded, not JSON.
 
 ```bash
 curl -s -X PUT "http://$DEV/api/did-mapping" \
@@ -2462,7 +2195,7 @@ curl -s -X PUT "http://$DEV/api/multicast-paging"      -b "pd_session=$SESSION" 
 ```
 
 ### `POST /api/configuring`
-Tells the device a user is actively working through setup, pausing the captive-portal watchdog that would otherwise auto-switch the device back to Standalone AP mode. It mutates device state, so it takes the standard gate (same-origin, a `pd_session` cookie and an `X-CSRF` token), like every other mutating route (`HttpServer.cpp:606`).
+Tells the device a user is actively working through setup, pausing the captive-portal watchdog that would otherwise auto-switch the device back to Standalone AP mode. It mutates device state, so it takes the standard gate (same-origin, a `pd_session` cookie and an `X-CSRF` token), like every other mutating route (in `handleClient()`).
 
 * Requires Same-Origin Check: Yes
 * Requires `pd_session` cookie: Always (see §0)
@@ -2488,12 +2221,12 @@ observable.
 ```
 
 The em dash arrives on the wire as the six-character JSON escape `\u2014`, not as raw
-UTF-8 bytes (`HttpServer.cpp:2089`), so this particular response body is pure ASCII.
+UTF-8 bytes (in `sendApiConfiguring()`), so this particular response body is pure ASCII.
 
 Do not generalise from that. The API uses **both** encodings for the same character:
 `jsonEscape()` only escapes bytes below `0x20`, so anything ≥ `0x80` passes through
 untouched, and the `/test` failure string *"this slot is not the active one — activate
-it and reboot first"* (`src/SIP/RequestsHandler.cpp:4595`) carries a **raw UTF-8** em
+it and reboot first"* (`RequestsHandler::testDialSlot()`) carries a **raw UTF-8** em
 dash. Any conformant JSON parser handles both; a byte-comparison against an expected
 string will not.
 
@@ -2511,20 +2244,9 @@ the call-forward targets and the E911 settings (#450), and, on Wi-Fi builds, the
 Wi-Fi/mode NVS state; wipes the SD CDR and voicemail archives; answers; then, on every
 ESP build, erases the **whole NVS partition** (`nvs_flash_erase()`, #456) and reboots.
 
-> [!IMPORTANT]
-> **The whole-partition erase takes everything else in NVS too:** the dial plan, ring
-> groups, page zones, DND, the **adopted-device registry** and the registrar mode, so
-> the board boots as a fresh install (registrar `learn`). The per-key erases listed
-> above are what the response reports on; the whole-partition erase is what removes the
-> old bytes from flash (`nvs_erase_key()` leaves them readable until page GC). The keypad
-> door, `*<PIN>#999#1`, ends the same way. No CDR line or voicemail recording reaches the SD card after its wipe,
-> even while a 911/933 call holds the restart (#450).
->
-> **What survives:** the `cfgseed` partition (the browser flasher's install-time seed),
-> by design: the next boot re-applies it, so the board returns to how it was flashed.
-> If the whole-partition erase fails, or its task cannot start, the per-key erases still
-> stand and the next boot reports the reset as incomplete (`/api/status`
-> `resetIncomplete`): run it again.
+**Warning:** the whole-partition erase takes everything else in NVS too: the dial plan, ring groups, page zones, DND, the **adopted-device registry** and the registrar mode, so the board boots as a fresh install (registrar `learn`). The per-key erases listed above are what the response reports on; the whole-partition erase is what removes the old bytes from flash (`nvs_erase_key()` leaves them readable until page GC). The keypad door, `*<PIN>#999#1`, ends the same way. No CDR line or voicemail recording reaches the SD card after its wipe, even while a 911/933 call holds the restart (#450).
+
+The `cfgseed` partition (the browser flasher's install-time seed) survives, by design: the next boot re-applies it, so the board returns to how it was flashed. If the whole-partition erase fails, or its task cannot start, the per-key erases still stand and the next boot reports the reset as incomplete (`/api/status` `resetIncomplete`): run it again.
 
 * Requires Same-Origin Check: Yes
 * Requires `pd_session` cookie: Always (see §0), plus, as of Issue #173, an **owner**
@@ -2545,31 +2267,9 @@ ESP build, erases the **whole NVS partition** (`nvs_flash_erase()`, #456) and re
   * `403 Forbidden`: `{"error":"owner privilege required"}`. A sysop session, with an owner already provisioned.
   * `401`/`403`: gates 1-4 as in §0.1.
 
-> [!IMPORTANT]
-> **The response arrives on a connection that is already logged out.**
-> `AdminAuth::clearCredential()` wipes the session table (`AdminAuth.cpp:958`),
-> including the session that made this request, so the `200` is the last thing that
-> session will ever be told. There is no follow-up call to confirm with; treat the
-> `200` itself as the record that the wipe completed.
->
-> After the reboot the board comes back unprovisioned: the credential is the default
-> again, gate 4 (`setup_required`) applies, and on `wifi`/`eth`/`lan8720` the SIP
-> registrar stays down until a new admin credential is committed.
+The response arrives on a connection that is already logged out. `AdminAuth::clearCredential()` wipes the session table, including the session that made this request, so the `200` is the last thing that session will ever be told. There is no follow-up call to confirm with; treat the `200` itself as the record that the wipe completed.
 
-<details>
-<summary>Historical: this endpoint used to report failure after succeeding (fixed, #189)</summary>
-
-Before #189, only the `POCKETDIAL_HAS_WIFI` arm answered `200`. Every other build,
-including the `eth` and `lan8720` firmwares that ship on real hardware, fell through to
-`501 {"error":"factory reset not available on desktop"}`, **after** the unconditional
-wipes had already cleared the credential, the carrier OAuth secret, the DID table and
-the CDR ring. Those builds also never rebooted, leaving the device reset in flash but
-still running the old configuration in RAM.
-
-If you are reading logs or a runbook from before that fix: a `501` from this endpoint
-recorded a *completed* destructive reset, not a no-op.
-
-</details>
+After the reboot the board comes back unprovisioned: the credential is the default again, gate 4 (`setup_required`) applies, and on `wifi`/`eth`/`lan8720` the SIP registrar stays down until a new admin credential is committed.
 
 #### Response Examples (200 OK; the `message` is what varies by build)
 
@@ -2636,7 +2336,7 @@ Read-only OTA introspection: which partition is running/booting/staged next, and
 | `next` | String | Partition label a new OTA upload would target. |
 | `pendingVerify` | Boolean | `true` if the running image has not yet called `markValid()` (anti-rollback window; see `docs/OTA.md`). |
 | `otaSupported` | Boolean | Tracks `ESP_PLATFORM`, so it is `true` on **every** ESP transport including the Ethernet builds, and `false` only on the host/desktop build. It does **not** track `POCKETDIAL_HAS_WIFI`; a board reporting `otaSupported:true` may still have every `/api/wifi/*` route stubbed (§4.2). |
-| `error` | String | Reserved for a future error surface; currently the literal `""` on every response (`HttpServer.cpp:2623`). Do not branch on it. |
+| `error` | String | Reserved for a future error surface; currently the literal `""` on every response (in `sendApiOtaStatus()`). Do not branch on it. |
 
 ```bash
 curl -s "http://$DEV/api/ota/status"
@@ -2665,16 +2365,9 @@ Streams a firmware image body directly into the inactive OTA slot. **Not routed 
   * `411 Length Required`: `Content-Length` missing or `0`.
   * `422 Unprocessable Entity`: The image was fully received but failed validation (e.g. bad magic byte / signature).
   * `500 Internal Server Error`: OTA slot could not be opened, or activation failed after a valid image was written.
-  * `501 Not Implemented` (desktop only, `ESP_PLATFORM`, not `POCKETDIAL_HAS_WIFI`, so this route is real on `eth`/`lan8720`): `{"error":"OTA only available on device"}`. The body is still drained so the client's upload completes cleanly rather than being reset mid-stream. The host build deliberately does **not** simulate success, so CI cannot mistake it for a real update.
+  * `501 Not Implemented` (host/desktop build only; the route is real on every ESP build, including `eth`/`lan8720`): `{"error":"OTA only available on device"}`. The body is still drained so the client's upload completes cleanly rather than being reset mid-stream. The host build deliberately does **not** simulate success, so CI cannot mistake it for a real update.
 
-> [!IMPORTANT]
-> **This route is dispatched before the normal route table**, by a string probe on the
-> request line inside `handleClient()` (`HttpServer.cpp:300-353`), which is why it is
-> absent from the `if`/`else` chain. Two consequences: the whole header block must
-> arrive in the **first `recv()`** (4 KB, true of any real client, since only the body
-> is large), and the auth gate is applied to a request parsed from the header block
-> alone. It is the full `requireAdmin(…, needCsrf = true)` gate; flashing firmware is
-> the most consequential thing this server does.
+This route is dispatched before the normal route table, by a string probe on the request line in `handleClient()`, which is why it is absent from the `if`/`else` chain. Two consequences: the whole header block must arrive in the **first `recv()`** (4 KB, true of any real client, since only the body is large), and the auth gate is applied to a request parsed from the header block alone. It is the full `requireAdmin(…, needCsrf = true)` gate; flashing firmware is the most consequential thing this server does.
 
 #### Response Example (200 OK, ESP32)
 ```json
@@ -2702,7 +2395,7 @@ streams past the 16 KB buffered cap; a `413` there would mean the streaming bypa
 regressed) and TC-OTA-04 (`Content-Length: 0` → `411`).
 
 ### `POST /api/ota/reboot`
-Reboots into the image staged by a prior `/api/ota/upload`, or, with nothing staged (the boot and running partitions already match), does a plain restart (#645; this used to be a `409`). Desktop: always returns a simulated success without exiting the process, so the smoke-test harness keeps running.
+Reboots into the image staged by a prior `/api/ota/upload`, or, with nothing staged (the boot and running partitions already match), does a plain restart (#645). Desktop: always returns a simulated success without exiting the process, so the smoke-test harness keeps running.
 
 * Requires Same-Origin Check: Yes
 * Requires `pd_session` cookie: Always (see §0)
@@ -2748,7 +2441,7 @@ Covered by `test_api.sh` TC-OTA-05 (cross-origin → `403`), TC-OTA-06 (`200`
 same-origin), the host test `OtaReboot.NoStagedImageIsAPlainRestartNotA409` and TC-OTA-07 (the desktop stub must not exit the process).
 
 ### `POST /api/media-tx`
-**Experimental (#985).** The A/B switch for `TCP_NODELAY` on the anchor's audio POST socket. Nothing else sets it, so with Nagle on, each ~195 byte audio frame (well under the 1440 byte MSS) can wait for the previous segment's ACK, and the far end receives audio in bursts of one round trip. `send()` returns once bytes are buffered, so `mediaTx.write` cannot show this; the listener can. Flip it on the same call to compare.
+**Experimental (#985).** The A/B switch for `TCP_NODELAY` on the anchor's audio POST socket. Nothing else sets it, so with Nagle on, each ~320 byte audio chunk (20 ms of PCM16 at 8 kHz, well under the 1440 byte MSS) can wait for the previous segment's ACK, and the far end receives audio in bursts of one round trip. `send()` returns once bytes are buffered, so `mediaTx.write` cannot show this; the listener can. Flip it on the same call to compare.
 
 * Requires Same-Origin Check: Yes
 * Requires `pd_session` cookie: Always, **owner** role (like `/api/coredump`); `X-CSRF` required (it changes how a live call's audio is sent).
@@ -2780,10 +2473,8 @@ The shell alone discloses nothing; every field it renders is fetched client-side
 
 Current SMTP configuration, with both secrets redacted to a boolean: `hasPassword`
 and `hasGsaKey` report whether a value is stored, never the value itself. This is the
-same discipline `TelephonyApiConfig`'s `view()`/`secretSet` uses, for the same reason:
-issue #207's class of bug (an unauthenticated OR merely-authenticated read handing back a
-credential nothing legitimately needs to display) has bitten this project twice already
-(`/api/cdr`, the extension roster in `/api/status`).
+same discipline `TelephonyApiConfig`'s `view()`/`secretSet` uses. No secret is returned to any
+reader, authenticated or not, because nothing legitimately needs to display one (#207).
 
 ```json
 {
@@ -2836,13 +2527,9 @@ curl -s "http://$DEV/api/email" -b "pd_session=$SESSION"
 | `gsaEmail` | address | Service-account email (domain-wide delegation `iss`). |
 | `gsaKey` | PEM | Service-account private key. **Same "empty = keep stored" rule as `pass`.** Stored as an NVS *blob* (not `nvs_set_str`); a real RSA key PEM can exceed the ~4000 byte `nvs_set_str` cap. |
 | `caPem` | PEM | Optional custom server CA. Empty = use the built-in `esp_crt_bundle`. Same "empty = keep stored" rule, and also stored as a blob. |
-
-`gsaKey`/`caPem` are large-ish PEM text and go through `POST`'s ordinary **16 KB whole-body
-cap** (§1's payload limit) like every other field on this route; there is no streaming
-exception here the way OTA/MOH upload get one. A 2048-bit RSA key PEM percent-encoded is
-comfortably under that; a very large custom CA chain submitted alongside a large key in the
-same request could approach it. Submit them in separate saves if that ever matters.
 | `insecure` | `1`/`on` \| absent | Skip TLS certificate verification. See the `GET`'s field description. Absent/anything else = `false`. |
+
+`gsaKey`/`caPem` are large-ish PEM text and go through `POST`'s ordinary **16 KB whole-body cap** (§1's payload limit) like every other field on this route; there is no streaming exception here the way OTA/MOH upload get one. A 2048-bit RSA key PEM percent-encoded is comfortably under that; a very large custom CA chain submitted alongside a large key in the same request could approach it. Submit them in separate saves if that ever matters.
 
 Responds with the same redacted shape as the `GET` (`config` key).
 
@@ -2914,7 +2601,7 @@ for the full list.
 
 ## 5. What this API does not have
 
-Stated explicitly, because each of these has cost someone time:
+Things this API does not have:
 
 * **No JSON request bodies.** Every parameter on every route (`POST`, `PUT` and
   `DELETE` alike) is `application/x-www-form-urlencoded`, read by `getFormParam()`.
@@ -2923,7 +2610,7 @@ Stated explicitly, because each of these has cost someone time:
   method is a plain-text `404` (§1). CORS preflight cannot succeed, which is
   intentional; there are no CORS headers either.
 * **No pagination, filtering or `?query` parameters anywhere.** `parseRequest()` strips
-  the query string before routing (`HttpServer.cpp:731`), so `?since=…` on `/api/trace`
+  the query string before routing (`parseRequest()`), so `?since=…` on `/api/trace`
   or `/api/cdr` is silently discarded rather than honoured. Every list route returns
   its whole bounded table every time.
 * **No `GET` counterpart for DND, call-forward, ring groups, the dial plan or park
@@ -2989,8 +2676,7 @@ The following matrix audits every outbound HTTP and WebSocket interaction initia
 | **Downstream Audio Stream** | `/callcontrol/{dn}/participants/{id}/stream` | `GET` | **Doc** | None (Bearer header) | `200 OK`: chunked raw 16-bit PCM 8000 Hz mono stream.<br>`403 Forbidden`: backoff retry (#902). | Ingests PBX audio for playback/SIP bridge. Implements retry backoff when 3CX media endpoint responds 403 during leg startup negotiation race. |
 | **WebSocket Event Stream** | `/callcontrol/ws` | `GET` (Upgrade) | **Doc** | WebSocket Handshake (`101 Switching Protocols`), Bearer token in header or subprotocol. | Continuous JSON messages: `Upsert`, `Remove`, `DTMFstring`. | Event sink channel. Connects with exponential backoff and jitter. Monitored by watchdog for clean restart if connection drops or token expires (#336). |
 
-> [!NOTE]
-> **Live Verification Status**: All calls in the matrix above are verified against official 3CX published documentation and SDK ground-truth types. No live run against a production or testbed 3CX instance was performed during this pass (no live 3CX PBX is attached to this host build environment); live PBX checks remain recorded as **Not Verified** until exercised on a live testbed PBX.
+**Live verification status.** The 3CX documentation and SDK types cited in this section are not in this repository, so the "Doc" entries in the matrix were not re-checked here; they record the audit's reading of those sources. The endpoint paths were checked against `TelephonyAnchorClient.cpp`. No live run against a production or testbed 3CX instance was performed during this pass (no live 3CX PBX is attached to this host build environment); live PBX checks remain recorded as **Not Verified** until exercised on a live testbed PBX.
 
 ---
 
@@ -3003,19 +2689,18 @@ The following matrix audits every outbound HTTP and WebSocket interaction initia
 * **Behaviour on Unlicensed PBX**:
   * If the targeted 3CX instance lacks the required licence tier, the PBX refuses token generation at `POST /connect/token` with `400 Bad Request` or `401 Unauthorized`.
   * `TelephonyAnchorClient` logs the error, flags the anchor service as disconnected (`isConnected() == false`), and cleanly fails any inbound calls directed to anchor slots without crashing or wedging FreeRTOS tasks.
-* **Rule 5 Compliance (Emergency Call Exemption)**:
-  * > [!IMPORTANT]
-    > **Emergency routing (911, 933, 112, 999) NEVER traverses or depends upon the telephony anchor.**
-  * **Function Definition**: `pbx::classifyEmergencyDial(std::string_view dialed)` is defined in `src/SIP/EmergencyCall.hpp:93`.
-  * **Interception & Bypass Call Sites**:
-    * `src/SIP/RequestsHandler.cpp:2268`: In `onInvite()`, the very first destination check before any dial plan rule or anchor slot lookup evaluates `pbx::classifyEmergencyDial(destNumber)`. If true, the call is dispatched immediately to `routeEmergencyCall()`, bypassing anchor slots, 3CX tokens, and PBX reachability.
-    * `src/SIP/CallForker.cpp:369`: In `matchDialRule()`, wildcard dial-plan trunk transforms resulting in emergency numbers are intercepted (`pbx::classifyEmergencyDial(transformed).isEmergency`) to prevent operator dial-plan trunk rules from intercepting or redirecting emergency numbers.
-    * `src/SIP/RequestsHandler.cpp:5524` (`asyncMakeCall`): Guarantees that any dial-plan rule transformed into an emergency number cannot be handed to an anchor slot.
-    * `src/SIP/RequestsHandler.cpp:12822` (`startEmergencyFromDialPlan`): Routes emergency calls directly to trunk/emergency path when triggered via dial plan dispatch.
-    * `src/SIP/TelephonyAnchorClient.cpp:377, 581`: Disarms the bench probe on emergency destinations and loops over `pd::emergencySlotRetryContinues()` to wait out tearing-down slots.
-  * **Tests Pinning the Bypass**:
-    * `tests/EmergencyRoute_test.cpp:251` (`TEST(EmergencyRoute, ADialRuleCannotHandTheLoopbackAnEmergencyNumber)`): Pins that a dial rule transforming a dial to 911 refuses simulated or anchor treatment and forces emergency routing (503 if unroutable, never simulated).
-    * `tests/EmergencyRoute_test.cpp:276` (`TEST(EmergencyRoute, ADialRuleThatProducesAnEmergencyNumberTakesTheEmergencyPath)`): Pins that dialed rules producing 911 reach the trunk directly and alert the front desk.
+* **Rule 5 compliance (emergency call exemption)**: emergency routing (911, 933, 112, 999) never traverses or depends on the telephony anchor.
+  * **Function definition**: `pbx::classifyEmergencyDial(std::string_view dialed)` in `src/SIP/EmergencyCall.hpp`.
+  * **Interception and bypass call sites**:
+    * `RequestsHandler::onInvite()` in `src/SIP/RequestsHandler.cpp`: the first destination check, before any dial plan rule or anchor slot lookup, evaluates `pbx::classifyEmergencyDial(destNumber)`. If true, the call goes straight to `routeEmergencyCall()`, bypassing anchor slots, 3CX tokens, and PBX reachability. The 777 echo test is handled in the same function.
+    * `CallForker::matchDialRule()` in `src/SIP/CallForker.cpp`: wildcard dial-plan trunk transforms that produce emergency numbers are intercepted (`pbx::classifyEmergencyDial(transformed).isEmergency`), so an operator's trunk rule cannot redirect an emergency number.
+    * `RequestsHandler::dialRuleMakesEmergency()` in `src/SIP/RequestsHandler.cpp`: checks a dial-plan rule's transformed number with `pbx::classifyEmergencyDial()`.
+    * `RequestsHandler::originateAnchorCall()` in `src/SIP/RequestsHandler.cpp`: classifies the destination with `pbx::classifyEmergencyDial()` before the anchor path.
+    * `RequestsHandler::runTelCtl()` in `src/SIP/RequestsHandler.cpp`: classifies each queued job's destination with `pbx::classifyEmergencyDial(job.dest)`.
+    * `TelephonyAnchorClient::makeCall()` in `src/SIP/TelephonyAnchorClient.cpp`: loops over `pd::emergencySlotRetryContinues()` to wait out tearing-down slots for an emergency call.
+  * **Tests pinning the bypass**:
+    * `tests/EmergencyRoute_test.cpp`, `TEST(EmergencyRoute, ADialRuleCannotHandTheLoopbackAnEmergencyNumber)`: Pins that a dial rule transforming a dial to 911 refuses simulated or anchor treatment and forces emergency routing (503 if unroutable, never simulated).
+    * `tests/EmergencyRoute_test.cpp`, `TEST(EmergencyRoute, ADialRuleThatProducesAnEmergencyNumberTakesTheEmergencyPath)`): Pins that dialed rules producing 911 reach the trunk directly and alert the front desk.
     * `tests/EmergencyDialing_test.cpp` (Issue #166): Verifies that raw 911/933 dials always reach the trunk un-rewritten.
     * `tests/tools/test_anchor_emergency_slot_wait.py` (Issue #743): Pins that `makeCall()` keeps retrying tearing-down slots for emergency calls.
 
@@ -3023,7 +2708,7 @@ The following matrix audits every outbound HTTP and WebSocket interaction initia
 * **Token Lifetime**: 3CX bearer tokens carry an official lifetime of 3600 seconds (1 hour). Pocket-Dial inspects the standard JWT claims (`exp - iat`) upon receipt to determine actual token validity dynamically, defaulting to 300 seconds (5 minutes) if token claim parsing fails (#975). The fallback errs short on purpose: the token is installed either way, a 911 POSTs the cached token at once, and a short guess is renewed ahead of the next ordinary call or by the one fetch a 911 makes after a 401. The response's `expires_in` is logged, never used.
 * **Proactive Token Refresh**:
   * Scheduled at $T_{\text{refresh}} = T_{\text{exp}} - 300\text{ s}$ (`kRefreshMarginUs = 300,000,000` µs = 5 minutes prior to expiration).
-  * **Critical Streaming Guard**: 3CX immediately invalidates the prior bearer token when issuing a new token. If either anchor slot is actively streaming audio (`isStreamingActive()`), `ensureToken()` defers the refresh cycle until active streams conclude. Attempting to refresh mid-call immediately severs active chunked HTTP audio streams with `401 Unauthorized`.
+  * **Critical Streaming Guard**: 3CX immediately invalidates the prior bearer token when issuing a new token. If media streams are live (`mediaStreamsLive()` in `TelephonyAnchorClient`), `ensureToken()` defers the refresh cycle until they end. Attempting to refresh mid-call immediately severs active chunked HTTP audio streams with `401 Unauthorized`.
 * **401 Handling Mid-Call and Reconnection**:
   * If a `401 Unauthorized` is returned during WebSocket heartbeats or REST operations, `requestRestartIfTokenStale()` (Issue #336) flags the session as expired and schedules an orderly client cycle (`stop()` followed by `start()`) to fetch fresh credentials and re-establish the event sink.
 * **Token Grant Scope**:
@@ -3076,7 +2761,7 @@ The following matrix audits every outbound HTTP and WebSocket interaction initia
 
 | Dimension | 3CX TypeScript SDK (`@3cx/call-control-sdk-ts`) | Pocket-Dial Telephony Anchor | Rationale & Impact |
 | :--- | :--- | :--- | :--- |
-| **Token Request Encoding** | `multipart/form-data` with `scope=mcp xapi`<br>(Source: `@3cx/call-control-sdk-ts` at `src/auth/token-store.ts:40-52`) | `application/x-www-form-urlencoded` with `grant_type=client_credentials`<br>(Source: `TelephonyAnchorClient.cpp:468`) | 3CX's official Call Control API documentation ("Authentication" section) specifies `Content-Type: application/x-www-form-urlencoded` in strict conformance with RFC 6749 §4.4.2 (OAuth 2.0 Client Credentials Grant). The TypeScript SDK uses `FormData` (`multipart/form-data`) via `axios`. Pocket-Dial conforms to 3CX's published RFC 6749 form-urlencoded specification without requesting the administrative `xapi` scope. |
+| **Token Request Encoding** | `multipart/form-data` with `scope=mcp xapi`<br>(Source: `@3cx/call-control-sdk-ts` at `src/auth/token-store.ts:40-52`) | `application/x-www-form-urlencoded` with `grant_type=client_credentials`<br>(Source: the token request in `TelephonyAnchorClient.cpp`) | 3CX's official Call Control API documentation ("Authentication" section) specifies `Content-Type: application/x-www-form-urlencoded` in strict conformance with RFC 6749 §4.4.2 (OAuth 2.0 Client Credentials Grant). The TypeScript SDK uses `FormData` (`multipart/form-data`) via `axios`. Pocket-Dial conforms to 3CX's published RFC 6749 form-urlencoded specification without requesting the administrative `xapi` scope. |
 | **Naming Convention** | Wire format is `snake_case`; Web documentation displays `PascalCase` | Matches `snake_case` wire format (`event_type`, `entity`, `device_id`) | Documentation text displays PascalCase for readability, but PBX JSON wire responses match the SDK's snake_case properties. |
 | **Media Transport** | WebAudio / Node.js audio pipeline via chunked HTTP stream | Hardware I2S / SIP RTP bridge via chunked HTTP stream | Direct byte-level bridge between SIP G.711 / PCM stream and 3CX chunked HTTP socket without intermediate transcoders. |
 | **Call Flow Designer (CFD)** | Supports `ExternalCallFlowAppHookEvent` | Not used | Pocket-Dial acts as an autonomous SIP-to-CallControl bridge, requiring no CFD routing scripts. |
@@ -3150,7 +2835,7 @@ External / 3CX PBX                 Pocket-Dial Anchor                Local SIP H
      * `TelephonyAnchorClient` terminates the media streams (`stopMediaStreams`) and fires `CallEvent::Dropped`.
      * `RequestsHandler` intercepts the drop and immediately sends SIP `CANCEL` to all ringing handsets.
    * **Ring Timeout / No Answer / Extension Busy**:
-     * If all local extensions respond `486 Busy Here` or the 30-second ring timer expires (`pbx::kNoAnswerTimeout`), `RequestsHandler` invokes `asyncDropCall(participantId)`.
+     * If all local extensions respond `486 Busy Here` or the 20-second ring timer expires (`pbx::kNoAnswerTimeout`), `RequestsHandler` invokes `asyncDropCall(participantId)`.
      * Sends `POST /callcontrol/{dn}/participants/{id}/drop` to 3CX, cleanly clearing the RoutePoint call on the PBX.
    * **Local Handset Hangup**:
      * Winning handset sends SIP `BYE`.
@@ -3169,7 +2854,7 @@ External / 3CX PBX                 Pocket-Dial Anchor                Local SIP H
 * **Inbound & Routing Suite**:
   * Inbound call routing, DID mapping lookup, and synthetic session allocation verified in `tests/DidMapping_test.cpp`, `tests/InboundAnchorReinvite_test.cpp`, and `tests/TelCtlPool_test.cpp`.
 * **Python Tool & Mock Harness Verification**:
-  * Anchor maintenance, task counting, unread makecall, and own-leg inbound discrimination verified across `tests/tools/test_anchor_*.py` (194 unit tests pass).
-  * 5 scenario tests in `tests/tools/test_anchor_scenarios.py` require a physical hardware testbed board (`RING-REQUIRED`) as documented in `docs/TEST_HARNESS.md`.
+  * Anchor maintenance, task counting, unread makecall, and own-leg inbound discrimination verified across `tests/tools/test_anchor_*.py`. For the current count and result, run `python3 -m unittest discover -s tests/tools -p "test_anchor_*.py"`.
+  * Some scenario tests in `tests/tools/test_anchor_scenarios.py` require a physical hardware testbed board (`RING-REQUIRED`), as documented in `docs/TEST_HARNESS.md`.
 
 

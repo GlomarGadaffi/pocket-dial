@@ -1,97 +1,50 @@
 # Phone Auto-Provisioning
 
-Issue: #35, #177 (multi-vendor renderers), #178 (DHCP Option 66)
-Status: **Shipped, Yealink only, live.** `GET /config/<mac>.cfg` is implemented and served
-by every build (`HttpServer.cpp:437-445`, `:1166-1206`; renderer in
-`src/SIP/ProvisioningConfig.hpp`).
-Format: Yealink plain-text auto-provisioning keys (`key = value`) on the live route.
-Never confirmed against a physical handset: the key names follow Yealink's long-stable,
-widely-documented auto-provisioning key set, but no real phone has ever consumed this file.
+The board serves a phone its SIP account as a vendor config file over HTTP, so an installer does not have to type it into each handset by hand.
 
-**Issue #177 status: renderers shipped, wiring not.** `ProvisioningConfig.hpp` now also builds
-Grandstream, Polycom (two-file) and Cisco SPA/Linksys/Sipura configs, plus
-`detectVendorFromUserAgent()` / `renderProvisioningConfigForUserAgent()` to pick one, all pure,
-all host-tested (`tests/ProvisioningConfig_test.cpp`). **None of it is reachable over HTTP yet.**
-The live route still calls `yealinkConfigFor()` unconditionally, regardless of what phone asks.
-See [§2.5](#25-multi-vendor-renderers-issue-177-not-yet-wired) for what exists, what's missing
-to wire it up, and how confident to be in each vendor's field names.
+Issues #35, #177 (multi-vendor renderers), #178 (DHCP Option 66), #234 (multi-vendor wiring) and #826 (SIP Plug-and-Play and zero-touch) cover this work. The route `GET /config/<mac>.cfg` is served by every build (`HttpServer.cpp:1126-1134`). It returns a Yealink, Grandstream, Polycom, Cisco SPA or snom config, chosen by the requested filename and, for `<mac>.cfg`, by the phone's User-Agent (§2.1). The Yealink file is plain text (`key = value`). The other vendors' files are XML. The renderers live in `src/SIP/ProvisioningConfig.hpp` and are host-tested (`tests/ProvisioningConfig_test.cpp`). The Yealink key names follow Yealink's long-stable, widely documented auto-provisioning key set, but no real Yealink phone has consumed the file. Only the snom path has been run against a handset (§1.4). See [§2.5](#25-multi-vendor-renderers-issues-177-234-wired) for each renderer and how confident to be in its field names.
 
-**Issue #178 status: SoftAP injection not achievable in this repo without a much larger change;
-wired-LAN path is a config recipe, not code.** See [§1.1](#11-dhcp-option-66--option-43-the-real-zero-touch-path-not-implemented).
+Issue #178 has two halves. The SoftAP case needs a larger change than this repo makes, so it stays open ([§1.1](#11-dhcp-option-66--option-43-the-real-zero-touch-path-not-implemented)). The wired-LAN case is a DHCP-server recipe, not code ([§1.1a](#11a-wired-lan-with-your-own-dhcp-server-works-today-configure-it-there)).
 
-> [!IMPORTANT]
-> **Read §0.1 before planning a deployment around this.** The endpoint only serves a MAC that
-> is already in the Learn-mode adopted-device registry, and a device can only enter that
-> registry by *successfully registering* while the board is in Learn mode. On a
-> factory-default board, which ships in **Learn** mode (#502), a MAC is a structural `404`
-> until that phone has registered. This is **not** zero-touch bootstrap. It is
-> re-provisioning of phones you already brought up by hand.
+Read §0.1 before planning a deployment around this. The endpoint only serves a MAC that is already in the Learn-mode adopted-device registry, or one that a zero-touch window assigns (§3.1). A device enters the registry by registering successfully while the board is in Learn mode. On a factory-default board, which ships in Learn mode (#502), a MAC gets a `404` until that phone has registered, unless a window is open. Outside a window this is not zero-touch bootstrap. It is re-provisioning of phones you already brought up by hand.
 
-An earlier revision of this document was a forward-looking design spec headed *"Phase-1
-design (build-ready). No code merged yet."* That header was false by the time it was read:
-the endpoint shipped, but at a different URL, with a different file body, and without most of
-the surrounding machinery the spec described. §§1-5 below now describe **what exists**.
-[§6](#6-original-design-not-implemented) preserves the parts of the original design that were
-never built, clearly marked as such, because the analysis in them is still sound.
+[Section 6](#6-original-design-not-implemented) keeps the parts of the original Phase-1 design that were never built, marked as such, because the analysis in them is still sound. Sections 1 to 5 describe what exists.
 
 ## 0. What actually ships
 
-A desk phone fetches `http://<board-ip>/config/<mac>.cfg` and gets a Yealink config that
-sets its SIP account, server, transport and codec list. pocket-dial generates the file on the
-fly from the extension that MAC was adopted as (#820: a later REGISTER for another AOR never changes it).
+A desk phone fetches `http://<board-ip>/config/<mac>.cfg` and gets a Yealink config that sets its SIP account, server, transport and codec list. pocket-dial generates the file on the fly from the extension that MAC was adopted as (#820: a later REGISTER for another AOR never changes it). The other vendors' files are generated the same way from their own filenames (§2.1).
 
-* One route: `GET /config/<mac>.cfg`. Not session-gated, because a booting phone has no session
-  cookie to present (`HttpServer.cpp:439-441`).
-* **No new storage.** There is no `prov` NVS namespace. The MAC→extension mapping *is* the
-  registrar's adopted-device table, NVS namespace `pbxcfg`, key `devices`
-  (`Registrar.hpp:123-126`).
-* **No admin CRUD.** There are no `/api/provision/*` endpoints. The only device-management
-  routes are `GET /api/registrar`, `POST /api/registrar` (set mode) and
-  `POST /api/registrar/device` with `action=secure|forget` (`HttpServer.cpp:642-660`).
-  **There is no `adopt` action**; see §0.1.
-* **No password in the file.** See §4. This is the single biggest divergence from the
-  original design's threat model.
-* **No DHCP option, no token, no provisioning window, no auto-assign, no TLS.**
-* **Grandstream/Polycom/Cisco renderers exist (Issue #177) but nothing routes to them.** See
-  [§2.5](#25-multi-vendor-renderers-issue-177-not-yet-wired).
+* One route, `GET /config/...`, matching the seven filename shapes in §2.1. Not session-gated, because a booting phone has no session cookie to present (`HttpServer.cpp:1126-1134`).
+* **No new storage.** There is no `prov` NVS namespace. The MAC→extension mapping *is* the registrar's adopted-device table, NVS namespace `pbxcfg`, key `devices` (`Registrar.hpp:324-326`).
+* **No separate admin CRUD for provisioning.** There are no `/api/provision/*` endpoints. The device-management routes are `GET /api/registrar`, `POST /api/registrar` (set mode), `POST /api/registrar/device` with `action=secure|forget`, and `POST /api/registrar/forget-learned` (`HttpServer.cpp:1618-1667`). The zero-touch window has its own pair, `GET` and `POST /api/zero-touch` (§3.1). **There is no `adopt` action**; see §0.1.
+* **No password in the file.** See §4. This is the single biggest divergence from the original design's threat model.
+* **No DHCP option, no URL token, no TLS.** A timed zero-touch window can assign an extension to an unknown MAC (§3.1).
+* **Grandstream, Polycom, Cisco SPA and snom configs are served too,** selected by filename shape and User-Agent. See §2.5 and, for snom, §1.4.
 
 ### 0.1 The real limitation: a phone must register before it can be provisioned
 
-`sendProvisioningResponse()` calls `RequestsHandler::findProvisioningInfo(mac)`, which walks
-`Registrar::adoptedDevices()` and returns `std::nullopt`, a `404`, for any MAC that is not
-in it (`RequestsHandler.cpp:4406-4433`).
+`sendProvisioningResponse()` calls `RequestsHandler::findProvisioningInfo(mac)`, which walks `Registrar::adoptedDevices()` and returns `std::nullopt`, a `404`, for any MAC that is not in it (`RequestsHandler.cpp:9670`). A zero-touch assignment (§3.1) can add the row first.
 
-The **only** code path that inserts into that registry is `Registrar::admitLearn()`, on a
-successful REGISTER, in Learn mode, when ARP could resolve the source IP to a MAC
-(`Registrar.cpp:167-186`). Specifically:
+The adoption path is `Registrar::admitLearn()` (`Registrar.cpp:360`). It runs on a successful REGISTER, in Learn mode, when ARP can resolve the source IP to a MAC. The zero-touch window is the only other code path that adds a row. Specifically:
 
-* Open mode, which never recorded devices, is retired (#500); Learn is the shipped
-  default (`Registrar.cpp:42`).
-* **Secure mode** requires a valid digest to admit a REGISTER at all, and `admitSecure()`
-  does not adopt.
-* Even in Learn mode, a **first-packet ARP miss** accepts the REGISTER but defers the lock
-  and adopts nothing; the *next* REGISTER (by which time the 200 OK + beep + OPTIONS have
-  populated the ARP cache) is the one that adopts (`Registrar.cpp:145-153`).
+* Open mode, which never recorded devices, is retired (#500). Learn is the shipped default (`Registrar.cpp:43`).
+* **Secure mode** requires a valid digest to admit a REGISTER at all, and `admitSecure()` does not adopt.
+* Even in Learn mode, a **first-packet ARP miss** accepts the REGISTER but defers the lock and adopts nothing. The *next* REGISTER, by which time the 200 OK + beep + OPTIONS have populated the ARP cache, is the one that adopts (`Registrar.cpp:454-456`).
 
 So the working order of operations is:
 
-1. Put the board in **Learn** mode (`POST /api/registrar`, or the `cfgseed` record at flash
-   time, see [LEARN_MODE.md](LEARN_MODE.md)).
+1. Put the board in **Learn** mode (`POST /api/registrar`, or the `cfgseed` record at flash time, see [LEARN_MODE.md](LEARN_MODE.md)).
 2. Configure the phone's SIP account **by hand** far enough to register.
 3. Let it register (possibly twice, per the ARP note above). It is now adopted.
 4. *Now* `GET /config/<mac>.cfg` returns a config for it.
 
-That makes this feature useful for **fleet re-provisioning, config drift correction and
-factory-reset recovery** (a phone that has been wiped still has its MAC, so it can pull its
-line back), but it cannot configure a phone that has never spoken to the board.
+That makes this feature useful for **fleet re-provisioning, config drift correction and factory-reset recovery** (a phone that has been wiped still has its MAC, so it can pull its line back). Outside a zero-touch window (§3.1), it cannot configure a phone that has never registered with the board.
 
 ### 0.2 MAC format is strict
 
-`isProvisioningConfigPath()` (`HttpServer.cpp:1166-1180`) accepts the path only if it is
-**exactly** `/config/` + 12 characters + `.cfg`, where every one of the 12 is `0-9` or
-**lowercase** `a-f`. Uppercase hex, separators (`:` `-` `.`), a short MAC or a long one all
-fail the shape check and fall through to the router's `404`. There is no normalization step;
-what the phone puts in the URL must already be 12 lowercase hex digits.
+`isProvisioningConfigPath()` (`HttpServer.cpp:3516`) delegates to `parseProvisioningPath()` (`HttpServer.cpp:3432`), which recognises seven filename shapes (§2.1). For the Yealink shape, the path must be `/config/` + 12 characters + `.cfg`, and every one of the 12 must be `0-9` or **lowercase** `a-f`. Uppercase hex, separators (`:` `-` `.`), a short MAC or a long one all fail the shape check and fall through to the router's `404`. There is no normalization step.
+
+The other MAC-keyed shapes use the same 12-lowercase-hex rule, with one exception. snom alone accepts upper or lower case, because a snom's own `{mac}` template expands to uppercase. The lookup then uses the lowercase form.
 
 ## 1. Discovery: how a phone finds pocket-dial
 
@@ -99,7 +52,7 @@ A factory-fresh SIP phone has no idea pocket-dial exists. Three standard mechani
 it to learn a provisioning-server URL. This analysis still holds, and its conclusion is still
 the shipped behaviour: **the URL is typed in by hand.**
 
-### 1.1 DHCP Option 66 / Option 43 (the "real" zero-touch path): NOT implemented
+### 1.1 DHCP Option 66 / Option 43 (the "real" zero-touch path): Not implemented
 
 Enterprise phones request a provisioning URL via DHCP:
 
@@ -109,19 +62,12 @@ Enterprise phones request a provisioning URL via DHCP:
   Cisco/Polycom use it; encoding differs per vendor. More fragile.
 * Option 160: Polycom/Poly's dedicated provisioning-URL option.
 
-**The ESP-IDF feasibility constraint (Issue #178) is now confirmed by reading the SDK source,
-not just the header surface.** pocket-dial's SoftAP and (when it runs its own DHCP server on
-the wired side) Ethernet builds both use the bundled ESP-IDF `dhcpserver` component
-(`esp_netif_dhcps_start()`, `main/esp_main.cpp:135`, `main/esp_main_eth.cpp:619`, line numbers
-as of commit `78b399b`; they drift). Verified against an ESP-IDF **v6.0.2** checkout (CI pins v6.0.1; the "no case for 66" finding
-below is structural and very unlikely to be version-specific, but "114 is supported"
-specifically might not hold on 6.0.1; re-check if that distinction ever matters):
+**The ESP-IDF feasibility constraint (Issue #178) was confirmed by reading the SDK source, not just the header surface.** pocket-dial's SoftAP and (when it runs its own DHCP server on the wired side) Ethernet builds both use the bundled ESP-IDF `dhcpserver` component (`esp_netif_dhcps_start()`, `main/esp_main.cpp:161`, `main/esp_main_eth.cpp:766`; line numbers drift, so search for the call). The check used an ESP-IDF **v6.0.2** checkout. CI pins v6.0.1 (`.github/workflows/ci.yml`). The finding that there is no case for option 66 is structural and very unlikely to be version-specific. The "114 is supported" part might not hold on 6.0.1, so re-check that if the distinction ever matters:
 
 * **`esp_netif_dhcps_option()`** (`components/esp_netif/lwip/esp_netif_lwip.c`) takes an
   `esp_netif_dhcp_option_id_t`, a closed enum: subnet mask, DNS, router-solicitation flag,
   requested-IP pool, lease time, retry time, vendor class identifier, vendor-specific info, and
-  (new since the original version of this doc was written) **Captive-Portal URI, RFC 8910,
-  option 114**, `ESP_NETIF_CAPTIVEPORTAL_URI`. There is no `TFTP_SERVER_NAME` / option-66
+  **Captive-Portal URI, RFC 8910, option 114**, `ESP_NETIF_CAPTIVEPORTAL_URI`. There is no `TFTP_SERVER_NAME` / option-66
   entry in this enum.
 * Underneath that, **`dhcps_option_info()` / `dhcps_set_option_info()`**
   (`components/lwip/apps/dhcpserver/dhcpserver.c`), the actual per-option storage, has a
@@ -151,24 +97,14 @@ component of the ESP-IDF SDK, not in this repository. The only ways to actually 
    UDP server to write, test and keep correct (lease tracking, retransmits, the states
    `dhcpserver.c` already handles), a materially bigger undertaking than "add one option."
 
-Both are out of scope for a change confined to `main/esp_main.cpp` / `main/esp_main_eth.cpp`;
-scoping this work to those two files (per Issue #178's own text) was, in hindsight, scoping it
-to something that cannot be done in those two files. **Neither has been built.** Issue #178
-stays open for the SoftAP/Ethernet-DHCP-server case specifically; see
-[§1.1a](#11a-wired-lan-with-your-own-dhcp-server-works-today-configure-it-there) for the case
-that *is* actionable today.
+Both are out of scope for a change confined to `main/esp_main.cpp` and `main/esp_main_eth.cpp`, which is the scope Issue #178's text gives. Neither can be done in those two files. **Neither has been built.** Issue #178 stays open for the SoftAP and Ethernet-DHCP-server case specifically. See [§1.1a](#11a-wired-lan-with-your-own-dhcp-server-works-today-configure-it-there) for the case that *is* actionable today.
 
-* **Option 43 IS settable** via `ESP_NETIF_VENDOR_SPECIFIC_INFO`, but the payload must be a
+* **Option 43 is settable** via `ESP_NETIF_VENDOR_SPECIFIC_INFO`, but the payload must be a
   raw vendor TLV blob and each vendor decodes it differently. One blob that satisfies Yealink
   *and* Grandstream *and* Cisco simultaneously is brittle and firmware-version sensitive.
 * **Option 160** is likewise not in the enum.
 
-> Standing decision (unchanged by the #178 investigation): if SoftAP-side DHCP discovery is
-> ever built, do it by **forking `lwip`'s `dhcpserver.c` to inject Option 66** (single clean
-> string, widest vendor support) or by replacing the DHCP server outright, not by abusing
-> Option 43. Pick the fork if IDF-upgrade churn on one file is acceptable; pick the from-scratch
-> responder if it isn't. Neither is a small change; budget it as its own issue, not a follow-up
-> bullet.
+Standing decision: if SoftAP-side DHCP discovery is ever built, do it by **forking `lwip`'s `dhcpserver.c` to inject Option 66** (single clean string, widest vendor support) or by replacing the DHCP server outright, not by abusing Option 43. Pick the fork if IDF-upgrade churn on one file is acceptable; pick the from-scratch responder if it isn't. Neither is a small change, so budget it as its own issue, not a follow-up bullet.
 
 ### 1.1a Wired LAN with your own DHCP server: works today, configure it there
 
@@ -185,30 +121,18 @@ setting Option 66 on it is ordinary DHCP-server administration, not a firmware c
 | pfSense/OPNsense | Services → DHCP Server → the interface's **TFTP Server** field |
 | MikroTik RouterOS | `/ip dhcp-server option add name=opt66 code=66 value="'http://<board-ip>/config/'"`, then attach it to the DHCP server's option set |
 
-Point it at `http://<board-ip>/config/` (a directory, not a specific `.cfg` file) and let each
-phone append its own filename the way its firmware already does.
+Point it at `http://<board-ip>/config/` (a directory, not a specific `.cfg` file) and let each phone append its own filename the way its firmware already does.
 
-**Be honest with the installer about what actually 200s once the phone fetches that URL.**
-Today, only one shape reaches a working response:
+**What the installer should expect.** Option 66 only gets a phone to ask. The board answers with a config only when it knows the phone's MAC:
 
-* A **Yealink** phone requesting `<mac>.cfg` (its own MAC, 12 lowercase hex, no separators),
-  **and only if that MAC is already in the Learn-mode adopted-device registry** (§0.1). Every
-  other phone, on every vendor, gets a `404`:
-  * Grandstream's `cfg<mac>.xml`, Polycom's `<mac>-phone.cfg` / `000000000000.cfg`, and Cisco
-    SPA's `spa<model>.cfg` all fail `isProvisioningConfigPath()`'s shape check before
-    `findProvisioningInfo()` is ever called, see [§2.5](#25-multi-vendor-renderers-issue-177-not-yet-wired).
-  * Even a Yealink phone 404s if its MAC has never registered while the board was in Learn mode
-    (§0.1). Option 66 only gets the phone to *ask*; it does not make the board *know* the
-    phone yet.
+* A phone whose MAC is in the adopted-device registry (§0.1), or which a zero-touch window assigns (§3.1), gets a config in the shape of its own vendor: Yealink `<mac>.cfg`, Grandstream `cfg<mac>.xml`, Polycom `<mac>-phone.cfg`, Cisco SPA `spa<mac>.cfg` or snom `snom<mac>.xml` (§2.1). Polycom's `000000000000.cfg` and Cisco SPA's `spa<model>.cfg` are answered without adoption (§2.1).
+* Any other request gets a `404`. That includes a phone whose MAC has never registered while the board was in Learn mode, when no window is open (§0.1).
 
-So Option 66 alone does not deliver zero-touch bootstrap for a fleet with mixed vendors, or for
-any vendor before the multi-vendor wiring in §2.5 is finished. It does remove the one manual
-step §1.3 describes (typing the URL into the phone's web UI) for Yealink phones that have
-already registered once. Set expectations with whoever is deploying this accordingly.
+So Option 66 alone does not bootstrap a phone the board has not seen, except through a zero-touch window (§3.1). It does remove the one manual step §1.3 describes (typing the URL into the phone's web UI) for phones that have already registered once. Set expectations with whoever is deploying this accordingly.
 
 ### 1.2 mDNS: advertised, but not a provisioning-discovery path
 
-pocket-dial advertises mDNS (`SipServer.cpp:33-38`, `main/esp_main_display.cpp:901-904`):
+The SIP build advertises mDNS as follows (`SipServer.cpp:104-107`):
 
 ```c
 mdns_hostname_set(POCKETDIAL_HOSTNAME);          // -> pocketdial.local
@@ -216,7 +140,9 @@ mdns_service_add(NULL, "_sip",  "_udp", port,     NULL, 0);
 mdns_service_add(NULL, "_http", "_tcp", httpPort, NULL, 0);
 ```
 
-Both `mdns_service_add()` calls pass `NULL, 0` for the TXT slot; there is **no `provurl` TXT
+The display build differs. It sets the literal hostname `pocketdial` and advertises only `_http` on port 80, with no `_sip` (`main/esp_main_display.cpp:976-979`).
+
+Both `mdns_service_add()` calls in the SIP build pass `NULL, 0` for the TXT slot. There is **no `provurl` TXT
 record**, and adding one was never done. The practical value of mDNS here is that an installer
 can type `http://pocketdial.local/config/<mac>.cfg` instead of memorizing the IP. Commercial
 desk phones do not auto-provision from mDNS.
@@ -230,7 +156,7 @@ fork, no firmware-stack changes. Combined with §0.1, the installer is typing th
 phone they have *already* configured by hand, so the marginal effort saved is real but
 modest: it is the codec/NAT/expiry/line block that gets standardized, not the bootstrap.
 
-### 1.4 SIP Plug-and-Play (Issue #826): discovery shipped, answering limited to adopted phones
+### 1.4 SIP Plug-and-Play (Issue #826): discovery shipped, answers limited to known phones
 
 A factory-fresh phone with PnP on multicasts a `SUBSCRIBE` to `224.0.1.75:5060` with
 `Event: ua-profile;profile-type="device";vendor=…;model=…;version=…` and its MAC in the
@@ -268,9 +194,7 @@ Option 66 (§1.1), this needs no DHCP server change: only a socket.
   Yealink: `http://<ip>/config/` (the phone appends its own `<mac>.cfg`). The MAC is
   lowercased, so it passes §0.2's shape check. Other vendors are listed but not answered.
 
-**Not yet:** zero-touch assignment of an extension to a phone that has never registered
-(Issue #826 part B). Until then `provision` re-provisions known phones (factory-reset
-recovery), and `discover` shows what is on the network.
+Zero-touch assignment of an extension to a phone that has never registered (Issue #826 part B) is covered in §3.1. Without an open window, `provision` re-provisions known phones (factory-reset recovery), and `discover` shows what is on the network.
 
 **Bench, 2026-10-02 on `.195` (Waveshare W5500), snom370 8.7.5.48 at `.155`:**
 
@@ -307,30 +231,21 @@ GET /config/spa{model}.cfg       # Cisco SPA model-keyed (Profile_Rule bootstrap
 GET /config/snom{mac}.xml        # snom XML (Issue #826); {mac} may be upper or lower case
 ```
 
-`{mac}` is 12 **lowercase** hex digits, no separators (§0.2).
-When requesting `{mac}.cfg`, `User-Agent` is used to detect vendor (Grandstream, Polycom, Cisco SPA, or Yealink fallback). When requesting vendor-specific filename shapes, the vendor format is served directly.
+`{mac}` is 12 **lowercase** hex digits, no separators (§0.2). The exception is snom, which accepts upper or lower case.
+
+When requesting `{mac}.cfg`, `User-Agent` is used to detect the vendor (Grandstream, Polycom, Cisco SPA, snom, or Yealink fallback). When requesting a vendor-specific filename shape, that vendor's format is served directly.
 
 ### 2.2 Request handling
 
-`sendProvisioningResponse(sock, req)` (`HttpServer.cpp:2972`):
+`sendProvisioningResponse(sock, req)` (`HttpServer.cpp:3522`) handles a request as follows:
 
-1. `findProvisioningInfo(mac)` walks the adopted-device registry under the engine `_mutex`.
-   Miss → `404`.
-2. Re-validates the adopted extension against `isValidAor()` as defence in depth: the `.cfg`
-   interpolates the extension into `key = value\r\n` lines, so a CR/LF in it would inject
-   config lines nobody wrote (Issue #107). The same recheck also refuses an adopted extension
-   that is reserved, emergency, or PSTN-shaped (`pbx::isReservedOrPstnAor()`, Issue #163); the
-   REGISTER-time identity guard onRegister() applies is not the only gate provisioning depends
-   on. Either failure closes → `404` (`RequestsHandler.cpp::findProvisioningInfo`).
-3. Resolves the server IP the same way `/api/status` does; SIP port is hardcoded `5060`
-   (this codebase does not support a non-default SIP listen port).
-4. `provisioning::yealinkConfigFor(ext, ip, 5060, authRequired)`. If the builder refuses
-   (its own CR/LF backstop), that is a `404`, never a `200` with an empty body.
-5. `200 OK`, `text/plain`.
+1. The path is parsed by `parseProvisioningPath()` (`HttpServer.cpp:3432`). The Polycom master file (`000000000000.cfg`) returns `polycomBaseConfigFor()` directly, with no registry lookup. The Cisco SPA model-keyed shape (`spa<model>.cfg`) resolves the requesting host's MAC through ARP. If that gives a config, it is served. Otherwise the response is a `<Profile_Rule>` bootstrap, which is also a `200`.
+2. For every MAC-keyed shape, `findProvisioningInfo(mac)` walks the adopted-device registry under the engine `_mutex` (`RequestsHandler.cpp:9670`). If there is no record, a zero-touch assignment (§3.1) may add one, and the lookup runs again. A miss is a `404`.
+3. `findProvisioningInfo()` re-validates the adopted extension against `isValidAor()` as defence in depth. The config interpolates the extension into `key = value\r\n` lines, so a CR/LF in it would inject config lines nobody wrote (Issue #107). The same recheck refuses an adopted extension that is reserved, emergency or PSTN-shaped (`pbx::isReservedOrPstnAor()`, Issue #163). The REGISTER-time identity guard in `onRegister()` is not the only gate provisioning depends on. Either failure closes to a `404`.
+4. The server IP is the board's active IP, or the primary local IP when `_ip` is `0.0.0.0`. The SIP port is hardcoded `5060`, because this codebase does not support a non-default SIP listen port. Grandstream, Polycom, Cisco SPA and snom paths each call their own renderer with the adopted extension. A Yealink path calls `renderProvisioningConfigForUserAgent()`, which picks a renderer from the User-Agent and falls back to Yealink (§2.5). An empty render is a `404`, never a `200` with an empty body.
+5. `200 OK`. The content type is `text/plain` for Yealink and `application/xml` for the other vendors.
 
-`authRequired` is true when the device has been promoted to `DeviceState::Secured`, or the
-registrar is in Secure mode (`RequestsHandler.cpp:4427-4428`). It changes only the comment
-block in the file; see §2.4.
+`authRequired` is true when the device has been promoted to `DeviceState::Secured`, or the registrar is in Secure mode (`RequestsHandler.cpp:9698`). In the Yealink file it changes only the comment block; see §2.4.
 
 ### 2.3 What the config forces
 
@@ -343,17 +258,9 @@ block in the file; see §2.4.
 | Codec | PCMU (priority 1), PCMA (priority 2) | Two codecs are enabled and prioritized; the file does not disable others. |
 | NAT | `nat.udp_update_enable = 0` | Media on ordinary calls is peer-to-peer on one L2 segment. |
 
-> [!NOTE]
-> The renderer's own comments still justify the codec choice by reference to
-> `enforceG711()`. That function is **deprecated with no production callers**; the live
-> behaviour is `filterAudioCodecs()`, which admits PCMU/PCMA/**G.722** on relayed
-> peer-to-peer legs and PCMU only on server-terminated ones. See
-> [PHONE_COMPATIBILITY.md §1.2](PHONE_COMPATIBILITY.md). The generated file is therefore
-> *conservative*, not *required*: leaving G.722 enabled on the handset would also work for
-> internal calls.
->
-> Note also what the file does **not** set: registration expiry (the registrar caps to 3600 s
-> regardless) and the `telephone-event` payload type are left at the phone's defaults.
+The renderer's own comments still justify the codec choice by reference to `enforceG711()`. That function is **deprecated with no production callers**. The live behaviour is `filterAudioCodecs()`, which admits PCMU, PCMA and **G.722** on relayed peer-to-peer legs, and PCMU only on server-terminated ones (see [PHONE_COMPATIBILITY.md §1.2](PHONE_COMPATIBILITY.md)). The generated file is therefore *conservative*, not *required*: leaving G.722 enabled on the handset would also work for internal calls.
+
+The file also does **not** set registration expiry (the registrar caps it to 3600 s regardless) or the `telephone-event` payload type. Those stay at the phone's defaults.
 
 ### 2.4 The actual response
 
@@ -413,23 +320,18 @@ Notes:
 
 ### 2.5 Multi-vendor renderers (Issues #177, #234): wired
 
-`src/SIP/ProvisioningConfig.hpp` builds four vendor configs (`yealinkConfigFor()`,
-`grandstreamConfigFor()`, `polycomPhoneConfigFor()` / `polycomBaseConfigFor()`, and
-`ciscoSpaConfigFor()`), plus vendor detection and dispatch (`detectVendorFromUserAgent()`,
-`renderProvisioningConfigForUserAgent()`). All four are wired into the live HTTP server
-(`src/Helpers/HttpServer.cpp`) via Issue #234:
+`src/SIP/ProvisioningConfig.hpp` builds four vendor configs (`yealinkConfigFor()`, `grandstreamConfigFor()`, `polycomPhoneConfigFor()` / `polycomBaseConfigFor()`, and `ciscoSpaConfigFor()`), plus vendor detection and dispatch (`detectVendorFromUserAgent()`, `renderProvisioningConfigForUserAgent()`). All four are wired into the live HTTP server (`src/Helpers/HttpServer.cpp`) via Issue #234. The snom renderer, `snomConfigFor()`, is wired via Issue #826 (§1.4).
 
-1. **User-Agent is captured** in `HttpServer::HttpRequest::userAgent` during `parseRequest()`
-   and passed to `renderProvisioningConfigForUserAgent()` when `{mac}.cfg` is fetched.
-2. **Path-shape check (`isProvisioningConfigPath`)** accepts:
+1. **User-Agent is captured** in `HttpServer::HttpRequest::userAgent` during `parseRequest()` and passed to `renderProvisioningConfigForUserAgent()` when `{mac}.cfg` is fetched.
+2. **Path-shape check (`parseProvisioningPath`)** accepts:
    - Yealink/fallback: `/config/<mac>.cfg`
    - Grandstream: `/config/cfg<mac>.xml`
    - Polycom per-phone: `/config/<mac>-phone.cfg`
    - Polycom master: `/config/000000000000.cfg`
    - Cisco SPA macro: `/config/spa<mac>.cfg` (expanded `$MA`)
    - Cisco SPA model: `/config/spa<model>.cfg` (resolves via ARP if known, or serves `<Profile_Rule>` bootstrap redirect)
-3. **Polycom master file** (`000000000000.cfg`) routes directly to `polycomBaseConfigFor()`
-   before any device registry lookup.
+   - snom: `/config/snom<mac>.xml` (either case, Issue #826)
+3. **Polycom master file** (`000000000000.cfg`) routes directly to `polycomBaseConfigFor()` before any device registry lookup.
 
 **Renderer-by-renderer confidence** (all four share the CR/LF injection guard from Issue #107,
 and the three XML ones additionally XML-escape the extension. That escaping is defence in depth,
@@ -440,7 +342,7 @@ no validation of their own, and a future less-filtered caller would otherwise em
 | Vendor | Structure | Field names |
 | :--- | :--- | :--- |
 | Yealink | N/A (plain text) | Long-stable, widely documented; **never tested against real hardware** (§2.4). |
-| Grandstream | **Confirmed** against Grandstream's own [SIP Device Provisioning Guide](https://blog.grandstream.com/hubfs/Grandstream_Feb_2021/Pdf/gs_provisioning_guide_public.pdf) example (`<gs_provision version="1">` → `<mac>` → `<config version="1">` wrapping one `<PNNN>value</PNNN>` element per field, not a `"PNNN = value"` text-line shape). | P271/P270 confirmed against that same guide's example (numeric Active flag / string account name). P36 = SIP Authenticate ID and P34 = SIP Authenticate Password (an earlier draft had these two reversed, caught in review of PR #224, which would have handed the phone the extension as its password and an empty auth ID). The rest (P34/P35/P36/P47/P57/P58) come from a secondary [Grandstream P-Codes reference](https://support.ispsupplies.com/portal/en/kb/articles/grandstream-p-codes-31-10-2019) that **actively disagrees** with other secondary sources found during this change on which P-number means what; P-value assignments are documented per device generation, not universally. Confirm against the target model's own P-Value guide before deploying. P47 folds in a non-default port as `ip:port` rather than using a separate port field. Grandstream's own SIP-Server field is documented as taking address *and* port together, and there is no reliably-sourced separate port P-number. |
+| Grandstream | **Confirmed** against Grandstream's own [SIP Device Provisioning Guide](https://blog.grandstream.com/hubfs/Grandstream_Feb_2021/Pdf/gs_provisioning_guide_public.pdf) example (`<gs_provision version="1">` → `<mac>` → `<config version="1">` wrapping one `<PNNN>value</PNNN>` element per field, not a `"PNNN = value"` text-line shape). | P271/P270 confirmed against that same guide's example (numeric Active flag / string account name). P36 = SIP Authenticate ID and P34 = SIP Authenticate Password. Reversing these two would hand the phone the extension as its password and an empty auth ID. The rest (P34/P35/P36/P47/P57/P58) come from a secondary [Grandstream P-Codes reference](https://support.ispsupplies.com/portal/en/kb/articles/grandstream-p-codes-31-10-2019) that **actively disagrees** with other secondary sources found during this change on which P-number means what; P-value assignments are documented per device generation, not universally. Confirm against the target model's own P-Value guide before deploying. P47 folds in a non-default port as `ip:port` rather than using a separate port field. Grandstream's own SIP-Server field is documented as taking address *and* port together, and there is no reliably-sourced separate port P-number. |
 | Polycom | Two-file scheme (`polycomBaseConfigFor()` / `polycomPhoneConfigFor()`) cross-confirmed against multiple independent third-party UC Software config examples. | `reg.1.address`/`label`/`displayName`/`auth.userId`/`auth.password`/`server.1.address` cross-confirmed the same way. `reg.1.server.1.port`, `reg.1.server.1.transport` and `voice.codecPref.G711_Mu`/`G711_A` are standard, widely-cited UC Software parameter names, not independently re-confirmed for this change. The base file's `<APPLICATION>` element/attributes are likewise standard-but-unconfirmed, and deliberately omits `APP_FILE_PATH` (pocket-dial hosts no Polycom firmware image; whether a phone tolerates that omission is a hardware question). |
 | Cisco SPA / Linksys / Sipura | **Confirmed** against Cisco's own [SPA100/200-series Provisioning Guide](https://www.cisco.com/c/dam/en/us/td/docs/voice_ip_comm/csbpvga/spa100-200/provisioning/guide/SPA100-200_Provisioning.pdf): `<flat-profile>` root, trailing-underscore line-numbered tags (`Line_Enable_1_`, `Proxy_1_`, `User_ID_1_`, `Auth_ID_1_`, `Password_1_`), `G711u`/`G711a` codec value strings, and the `Proxy_1_` field folding address and port together (the guide's own worked example: `192.168.2.100:6060`). | `Use_Auth_ID_1_` is the standard field name from the same product family's admin-UI-derived naming convention, not independently re-confirmed in that specific guide. |
 
@@ -448,9 +350,7 @@ None of the four has been tested against a real handset of any vendor.
 
 ## 3. Extension assignment
 
-There is one mode, and it is not configurable: **the extension is the one that MAC was
-adopted as.** `admitLearn()` adopts `{mac, ext, Learned}` on first sight, and a later
-REGISTER under a different AOR never changes it (#820; see the re-sync bullet below).
+An adopted MAC gets the extension it was adopted as. `admitLearn()` adopts `{mac, ext, Learned}` on first sight, and a later REGISTER under a different AOR never changes it (#820; see the re-sync bullet below). The only other way an extension is assigned is a zero-touch window (§3.1), which gives the next free extension in a range to an unknown MAC.
 
 Consequences:
 
@@ -460,34 +360,10 @@ Consequences:
   roster, or `POST /api/registrar/device` with `action=forget&target=<MAC>`), then let it
   re-register: it is adopted afresh on the new extension. The registry does not follow on
   its own; see the re-sync bullet below and [LEARN_MODE.md](LEARN_MODE.md) §6.
-* The registry is bounded by `POCKETDIAL_MAX_CLIENTS` (32 by default): `admitLearn()`
-  refuses a new MAC with "Device Table Full" past that, so a flood of distinct MACs cannot
-  grow the heap without limit (`Registrar.cpp:171-178`). Because the registry is bounded by
-  the *same* constant as the client pool, the original design's "you can pre-map 50 phones
-  against a 32-slot pool" scenario does not arise here.
-* **Reserved and emergency extensions** (`777`, `999`, `440`, `555`, `888`, `911`, `933`) are
-  refused outright by `onRegister()`'s identity guard (`pbx::isReservedOrPstnAor()`, Issue
-  #163) with a `403`, before the registrar-mode branch runs at all, so the registry never adopts
-  one of these names in ANY mode, Learn included. Before #163 this section described a
-  weaker property ("shadowed by routing, not actually refused") that let a phone squat on
-  `911` with zero indication anything was wrong; that gap is what #163 closed. An AOR that is
-  `+`-prefixed (E.164) or otherwise looks like a direct-dial PSTN number (long, all-digit,
-  `POCKETDIAL_MIN_PSTN_AOR_DIGITS`, `PoolConfig.hpp`) is refused the same way. The park-orbit
-  (`700`-`709`) and page-zone (`980`-`989`) *ranges* are a separate mechanism (dial-plan
-  routing intercepts those, per the original note) and are unaffected by this guard.
-  Do not assign any of the above.
-* **No re-sync branch any more (#820).** A MAC already adopted under one extension that
-  REGISTERs under a different AOR keeps its stored extension: the other AOR is admitted as
-  TOFU, and an unlocked MAC is marked shared. Before #820 `admitLearn()` rewrote the stored
-  extension, so one REGISTER with a phone's source IP forged also changed the extension this
-  endpoint served to that phone. Now a phone moved to another extension by hand, without its
-  row being forgotten, gets its old extension back from its `.cfg`, and it holds no claim on
-  the new one: another device that registers the new extension twice, at least 30 s apart,
-  locks it, and the phone then gets `403` there. desmo accepted this residual on 2026-10-04
-  (#852). **Forget the phone's row when you move it** (above). The roster's State column
-  and `GET /api/registrar` show that row as `shared` (it was unlocked) or `locked` (#882).
-* **`forget` re-arms adoption.** `POST /api/registrar/device` with `action=forget` removes the
-  record; a later REGISTER in Learn mode re-learns it (`Registrar.hpp:83-85`).
+* The registry is bounded by `POCKETDIAL_MAX_CLIENTS` (32 by default), so a flood of distinct MACs cannot grow the heap without limit. When it is full, `admitLearn()` evicts an unlocked Learned row to admit a new MAC. It prefers an offline row and then the oldest, and an unclaimed zero-touch row (§3.1) goes first (`oldestEvictable()`, `Registrar.cpp:187`). It refuses with "Device Table Full" only when no row is evictable, that is, when every row is locked or Secured (`Registrar.cpp:476-486`). Because the registry is bounded by the *same* constant as the client pool, the original design's "you can pre-map 50 phones against a 32-slot pool" scenario does not arise here.
+* **Reserved and emergency extensions** (`777`, `999`, `440`, `555`, `888`, `911`, `933`, `796` and `997`, and any emergency dial code) are refused outright by `onRegister()`'s identity guard (`pbx::isReservedOrPstnAor()`, Issue #163, `PbxConfig.hpp:322`) with a `403`. The guard runs before the registrar-mode branch, so Learn and Secure refuse these names identically, and the registry never adopts one of them in any mode. An AOR that is `+`-prefixed (E.164) or otherwise looks like a direct-dial PSTN number (long, all-digit, `POCKETDIAL_MIN_PSTN_AOR_DIGITS`, `PoolConfig.hpp`) is refused the same way. The park-orbit (`700`-`709`) and page-zone (`980`-`989`) *ranges* are a separate mechanism (dial-plan routing intercepts those) and are unaffected by this guard. Do not assign any of the above.
+* **No re-sync branch (#820).** A MAC already adopted under one extension that REGISTERs under a different AOR keeps its stored extension. The other AOR is admitted as TOFU, and an unlocked MAC is marked shared. A REGISTER never rewrites the stored extension, so a REGISTER with a phone's source IP forged cannot change the extension this endpoint serves to that phone. A phone moved to another extension by hand, without its row being forgotten, gets its old extension back from its `.cfg`, and it holds no claim on the new one: another device that registers the new extension twice, at least 30 s apart, locks it, and the phone then gets `403` there. desmo accepted this residual on 2026-10-04 (#852). **Forget the phone's row when you move it** (above). The roster's State column and `GET /api/registrar` show that row as `shared` (it was unlocked) or `locked` (#882).
+* **`forget` re-arms adoption.** `POST /api/registrar/device` with `action=forget` removes the record (`Registrar::forget()`, `Registrar.cpp:698`). A later REGISTER in Learn mode re-learns it.
 
 ### 3.1 Zero-touch assignment (Issue #826 part B)
 
@@ -546,41 +422,25 @@ shipped file carries no password**, which changes the threat entirely.
 
 ### 4.1 Why there is no password in the file
 
-`Registrar`/`SipSecretStore` only ever store **HA1 = MD5(ext:realm:secret)**, a one-way
-hash. The server never holds the plaintext secret, so it has nothing to provision with even
-when one is required. `yealinkConfigFor()` therefore always emits
-`account.1.password = ` (blank) and, when the device needs a password, emits a comment
-telling the admin to type it in by hand (`ProvisioningConfig.hpp:26-33`, `:56-59`, `:66`).
+`Registrar`/`SipSecretStore` only ever store **HA1 = MD5(ext:realm:secret)**, a one-way hash. The server never holds the plaintext secret, so it has nothing to provision with even when one is required. `yealinkConfigFor()` therefore always emits `account.1.password = ` (blank) and, when the device needs a password, emits a comment telling the admin to type it in by hand (`ProvisioningConfig.hpp:101-108`, `:129-131`, `:138`).
 
-This is the right trade: it means an auto-provisioning fetch is **not** a credential
-disclosure, and the rest of the original design's mitigations (per-MAC URL token, timed
-provisioning window, HTTP Basic on the fetch) are not load-bearing and were not built.
+This is the right trade: it means an auto-provisioning fetch is **not** a credential disclosure. The per-MAC URL token and HTTP Basic on the fetch were not built, and they are not load-bearing. The timed window (§3.1) is not a credential control either. It only limits which unknown MACs can be given an extension.
 
 ### 4.2 What an unauthorized fetch does disclose
 
 Not nothing. A successful fetch tells the requester:
 
 * that this MAC is an adopted device on this board,
-* which extension it is: useful for targeting an INVITE, or for registering as that extension yourself: under
-  Learn an extension is locked only from its phone's next registration at least 30 s after
-  its first (#440, #515), and the
-  lock is checked against the ARP entry for the REGISTER's source address, so spoofing the
-  phone's MAC or its source IP on the same LAN passes it; a Secured one also needs its SIP
-  password,
+* which extension it is. That is useful for targeting an INVITE, or for registering as that extension yourself. Under Learn, an extension is locked only from its phone's next registration at least 30 s after its first (#440, #515). The lock is checked against the ARP entry for the REGISTER's source address, so spoofing the phone's MAC or its source IP on the same LAN passes it. A Secured extension also needs its SIP password.
 * the board's active IP and SIP port,
 * whether that extension requires digest auth (the comment block is a one-bit oracle for
   "this device is Secured / the registrar is in Secure mode").
 
 ### 4.3 The controls that actually exist
 
-1. **Adopted-MAC allowlist.** No record ⇒ `404`. The attack surface is exactly the set of
-   MACs that have registered in Learn mode.
-2. The MAC is the only credential, and it is a 2^48 space: not guessable, but also not
-   secret: anyone on the same L2 segment can read it off the wire. The in-code comment at
-   `HttpServer.cpp:442-444` frames this correctly as "an unrelated prober learns nothing by
-   guessing", which is true of a remote prober and false of a local sniffer.
-3. **Uniform `404`.** Bad MAC shape, unknown MAC, bad AOR and a refused render all return the
-   same `404` with no body distinction (`HttpServer.cpp:1186-1204`).
+1. **Adopted-MAC allowlist.** No record ⇒ `404`, with one exception. While a zero-touch window is open (§3.1), a fetch for an unknown MAC is assigned an extension only if the requesting host's ARP entry is that MAC and fewer than four unclaimed rows exist. Outside a window, the attack surface is exactly the set of MACs that have registered in Learn mode. During a window it also includes the fetching host's own MAC.
+2. The MAC is the only credential, and it is a 2^48 space: not guessable, but also not secret: anyone on the same L2 segment can read it off the wire. A remote prober learns nothing by guessing. A local sniffer does.
+3. **Uniform `404`.** Bad MAC shape, unknown MAC, bad AOR and a refused render all return the same `404` with no body distinction (`sendProvisioningResponse()`, `HttpServer.cpp:3522`).
 4. **Link-layer.** WPA2 on the SoftAP is implemented (NVS `ap_secure`, dashboard toggle, or
    set at flash time from the browser flasher) with a per-device generated passphrase; see
    [THREAT_MODEL.md](THREAT_MODEL.md) and
@@ -602,59 +462,41 @@ board nothing authenticates its first REGISTER. Do not describe it as a security
 
 ## 5. Sequence: boot → fetch cfg → REGISTER → call
 
-```
- PHONE (Yealink)          ESP32-S3 pocket-dial
-   @ MAC                     SoftAP/Eth + HTTP(:80) + SIP(:5060/UDP)
-      |                                  |
-      |  (0) MANUAL bring-up: installer types the SIP account into the phone's
-      |      web UI by hand, and the board is switched to Learn mode.
-      |      (Without this, step 3 is a 404 forever — §0.1.)
-      |                                  |
-      |  (1) Associate / link up         |
-      |--------------------------------->|
-      |  (2) DHCP DISCOVER / OFFER / ACK |  standard options only; no Option 66
-      |<-------------------------------->|
-      |                                  |
-      |  (3) REGISTER sip:1001@...:5060  |  admitLearn(): ARP -> MAC
-      |--------------------------------->|  first-packet ARP miss? accept, adopt
-      |   200 OK (expires<=3600)         |  NOTHING; next REGISTER adopts.
-      |<---------------------------------|  adopt {mac, "1001", Learned} -> NVS
-      |   + register beep INVITE         |  (signalling only, no server RTP)
-      |                                  |
-      |  (4) GET /config/<mac>.cfg       |  URL typed by the installer.
-      |--------------------------------->|--+ shape check: /config/ + 12 lowercase
-      |                                  |  | hex + .cfg, else 404
-      |                                  |  | findProvisioningInfo(mac) in the
-      |                                  |  | adopted-device registry, else 404
-      |                                  |  | isValidAor(ext) + reserved/emergency/
-      |                                  |  | PSTN-shaped re-check, else 404
-      |   200 OK  text/plain             |<-+ yealinkConfigFor(ext, ip, 5060, auth)
-      |   account.1.* = ...              |     password field BLANK
-      |<---------------------------------|
-      |                                  |
-      |  (5) (phone applies cfg, may reboot once, re-registers)
-      |                                  |
-      |  ...OPTIONS keepalive every 5s ->|  prune after 15s quiet
-      |<- - - 200 OK - - - - - - - - - --|
-      |                                  |
-      |  (6) INVITE sip:1002@...         |  onInvite(): relayed peer-to-peer;
-      |--------------------------------->|  filterAudioCodecs(allowWideband=true)
-      |   180 (relayed as-is), 200 + SDP |  narrows the codec list only --
-      |<---------------------------------|  the c= line is NEVER rewritten
-      |  (7) ACK                         |
-      |--------------------------------->|
-      |                                  |
-      |  (8) RTP audio <== peer-to-peer, phone<->phone, NOT via the board ==>
-      |                                  |
-      |  (9) BYE / 200 OK                |
-      |<-------------------------------->|
+The sequence for a Yealink phone, from boot to a call:
+
+```mermaid
+sequenceDiagram
+    participant P as Yealink phone
+    participant B as pocket-dial ESP32-S3
+    Note over P,B: SoftAP or Ethernet, HTTP on port 80, SIP on 5060 UDP
+    Note over P,B: (0) Manual bring-up. The installer types the SIP account into the phone's web UI by hand, and the board is switched to Learn mode. Without this, step 3 is a 404 forever (§0.1).
+    P->>B: (1) Associate and link up
+    P->>B: (2) DHCP DISCOVER, OFFER and ACK (standard options only, no Option 66)
+    P->>B: (3) REGISTER sip:1001@...:5060
+    Note right of B: admitLearn() maps the source IP to a MAC through ARP. On a first-packet ARP miss it accepts and adopts nothing, so the next REGISTER adopts. It adopts (mac, 1001, Learned) to NVS.
+    B-->>P: 200 OK (expires at most 3600)
+    B->>P: Register beep INVITE (signalling only, no server RTP)
+    P->>B: (4) GET /config/mac.cfg (URL typed by the installer)
+    Note right of B: Shape check: /config/ + 12 lowercase hex + .cfg, else 404. findProvisioningInfo(mac) in the adopted-device registry, else 404. isValidAor(ext) plus the reserved, emergency and PSTN-shaped re-check, else 404.
+    B-->>P: 200 OK, text/plain, account.1 settings, password field blank
+    Note over P: (5) Phone applies the config, may reboot once, and re-registers.
+    loop Every 5 s
+        P->>B: OPTIONS keepalive
+        B-->>P: 200 OK
+    end
+    Note over P,B: The board prunes the phone after 15 s quiet.
+    P->>B: (6) INVITE sip:1002@...
+    Note right of B: onInvite() relays the call peer to peer. filterAudioCodecs(allowWideband=true) narrows the codec list only. The c= line is never rewritten.
+    B-->>P: 180 (relayed as-is), 200 + SDP
+    P->>B: (7) ACK
+    Note over P,B: (8) RTP audio flows phone to phone, not via the board
+    P->>B: (9) BYE
+    B-->>P: 200 OK
 ```
 
-## 6. Original design, NOT implemented
+## 6. Original design, not implemented
 
-Everything below was specified in the Phase-1 design and **never built**. It is retained
-because the analysis is still sound and because anyone extending provisioning will re-derive
-it otherwise. Nothing in this section describes current behaviour.
+The items below were specified in the Phase-1 design and were **never built**. They are kept because the analysis is still sound and anyone extending provisioning would otherwise re-derive it. Nothing in this section describes current behaviour.
 
 ### 6.1 Routes that do not exist
 
@@ -670,10 +512,7 @@ POST   /api/provision/reset
 GET    /api/provision/list
 ```
 
-The exact filenames above are illustrative, not what a real phone requests; see §2.5 for the
-actual per-vendor filenames (`cfg<mac>.xml`, `<mac>-phone.cfg` / `000000000000.cfg`,
-`spa<model>.cfg`) and the three concrete gaps between "the renderer exists" and "the route
-exists."
+The exact filenames above are illustrative, not what a real phone requests. The filenames that ship are listed in §2.1 (`cfg<mac>.xml`, `<mac>-phone.cfg`, `000000000000.cfg`, `spa<model>.cfg`, `snom<mac>.xml`). The timed window that shipped is `POST /api/zero-touch` (§3.1), not `/api/provision/window`.
 
 ### 6.2 Storage that does not exist
 
@@ -688,13 +527,10 @@ sidesteps it entirely by serializing the whole device table into one `pbxcfg`/`d
 
 ### 6.3 Mechanisms that were designed and dropped
 
+The timed window and sequential auto-assign from the original design shipped in a different form. See §3.1. The mechanisms below were dropped.
+
 * **Per-MAC URL token** (`/provision/{mac}-{token}.cfg`) to defeat URL enumeration.
-* **Timed provisioning window** (`prov.window_until`): outside it, all provisioning `404`s.
-  The design's "single biggest open question" was whether this should default open or closed.
-  Moot: the endpoint is always open, and §4.1 removed the credential it was protecting.
-* **HTTP Basic on the fetch URL** (`http://user:pass@host/...`), rejected for MVP, never
-  added as an opt-in either.
-* **Sequential auto-assign** of extensions from a configured range to unknown MACs.
+* **HTTP Basic on the fetch URL** (`http://user:pass@host/...`), rejected for MVP, never added as an opt-in either.
 * **Per-MAC secret generation and storage.** The shipped design stores HA1 only (§4.1).
 * **mDNS TXT `provurl` hint.** One line, never added (§1.2).
 * **SoftAP client isolation** as a provisioning control. The caveat that killed it still
@@ -705,17 +541,8 @@ sidesteps it entirely by serializing the whole device table into one `pbxcfg`/`d
 
 * It described the codec lock in terms of `SipMessage::enforceG711()` rewriting every answer
   to `0 8 101`. That function is deprecated with no production callers; see §2.3.
-* It described the registrar as gated by a compile-time `POCKETDIAL_OPEN_REGISTRAR` mode and
-  a future "SEC-04 SIP-auth work". SIP digest auth **shipped**; the mode is a **runtime**
-  setting (`reg_mode` in NVS, `POST /api/registrar`), and the `POCKETDIAL_OPEN_REGISTRAR`
-  symbol is unconditionally defined and merely seeds the boot default;
-  `RequestsHandler.hpp:6-9` says in as many words *"Do not document this as a build knob; it
-  is not one."*
-* It flagged that `RequestsHandler`'s constructor hardcoded `32`/`8` instead of using the
-  `POCKETDIAL_MAX_CLIENTS` / `POCKETDIAL_MAX_SESSIONS` macros. Those macros are live now;
-  `Registrar` bounds its own device table with `POCKETDIAL_MAX_CLIENTS`
-  (`Registrar.cpp:173`, `:349`). Check `PoolConfig.hpp` and [SCALING.md](SCALING.md) for the
-  current caps rather than trusting the literals quoted in the old text.
+* It described the registrar as gated by a compile-time `POCKETDIAL_OPEN_REGISTRAR` mode and a future "SEC-04 SIP-auth work". SIP digest auth **shipped**. The mode is a **runtime** setting (`reg_mode` in NVS, `POST /api/registrar`), chosen at boot by `Registrar::chooseBootMode()` when none is stored. The `POCKETDIAL_OPEN_REGISTRAR` #define is gone (see the header comment in `RequestsHandler.hpp`).
+* It said `RequestsHandler`'s constructor hardcoded `32` and `8` instead of using the `POCKETDIAL_MAX_CLIENTS` and `POCKETDIAL_MAX_SESSIONS` macros. The macros are in use now. `Registrar` bounds its own device table with `POCKETDIAL_MAX_CLIENTS` (`Registrar.cpp:476`). Check `PoolConfig.hpp` and [SCALING.md](SCALING.md) for the current caps.
 
 Related: [PHONE_COMPATIBILITY.md](PHONE_COMPATIBILITY.md) · [LEARN_MODE.md](LEARN_MODE.md) ·
 [THREAT_MODEL.md](THREAT_MODEL.md) · [API.md](API.md) · [SCALING.md](SCALING.md)
