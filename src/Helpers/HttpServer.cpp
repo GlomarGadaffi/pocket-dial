@@ -56,6 +56,7 @@
 #endif
 #include "JsonReader.hpp"    // strict, dependency-free JSON reader for /api/config/import
 #include <cctype>
+#include <cinttypes>     // PRIxPTR: /api/status mutexHold.maxPc (#986)
 #include <cstdio>        // snprintf: sendStaticHtml's allocation-free head (#410)
 #include <cstdlib>
 #include <mutex>
@@ -2843,6 +2844,20 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	    .s(",\"psramFallbacks\":").n(psram::internalFallbacks().load(std::memory_order_relaxed))
 	    .s(",\"dynamicTaskCreates\":").n(psram::dynamicTaskCreates().load(std::memory_order_relaxed))   // #479
 	    .s("}");
+
+	// #986 slice 0: how long RequestsHandler::_mutex has been held since boot, in
+	// microseconds. `over` counts holds above 20 ms; `maxPc` is the lock site of the
+	// longest, a code address to addr2line against this image's ELF. Ungated like
+	// the heap figures: counters and one firmware address, no identities.
+	{
+		const pd::MutexHold mh = handler ? handler->getMutexHold() : pd::MutexHold{};
+		char pc[2 * sizeof(uintptr_t) + 3];
+		// The buffer holds "0x" and a full pointer, so it cannot truncate; the return value is
+		// read (cert-err33-c) and an encoding error leaves the field empty, not garbage.
+		if (std::snprintf(pc, sizeof pc, "0x%" PRIxPTR, mh.maxPc) < 0) pc[0] = '\0';
+		json.s(",\"mutexHold\":{\"max\":").n(mh.maxUs).s(",\"p99\":").n(mh.p99Us)
+		    .s(",\"over\":").n(mh.over).s(",\"maxPc\":\"").s(pc).s("\"}");
+	}
 #if POCKETDIAL_HTTP_DRAM_ACCOUNT
 	// #410/#328, bench only: docs/BENCH_PROBE.md. The probes' members go inside the
 	// httpDramAccount object, so the top-level key list is still main's plus that one.

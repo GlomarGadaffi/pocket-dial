@@ -159,6 +159,8 @@ namespace
 		uint16_t   port       = Syslog::kDefaultPort;
 #if SYSLOG_HAS_UDP
 		int        sock       = -1;
+#else
+		Syslog::HostSink hostSink = nullptr;
 #endif
 	};
 
@@ -462,18 +464,35 @@ namespace Syslog
 		}
 
 #if SYSLOG_HAS_UDP
-		// Fire-and-forget. One datagram on a connected UDP socket cannot block
-		// waiting for a peer, and the result is deliberately unchecked: there is
-		// nothing to do about a failure that would not cost the calling thread far
-		// more than the lost line is worth — and logging it would re-enter this
-		// function through the log drain (the RE-ENTRANCY RULE in Syslog.hpp).
+		// Fire-and-forget: one datagram, and the result is deliberately unchecked:
+		// there is nothing to do about a failure that would not cost the calling
+		// thread far more than the lost line is worth — and logging it would
+		// re-enter this function through the log drain (the RE-ENTRANCY RULE in
+		// Syslog.hpp). A connected UDP datagram needs no peer, but this socket is
+		// blocking-mode and s.mutex is held across the call: on lwIP ::send() can
+		// wait on the tcpip thread, and every other caller of send() waits behind
+		// it (#986).
 		::send(s.sock, frame, len, 0);
 #else
 		// Off-device there is no socket by design (Syslog.hpp's layering note).
 		// The frame was still built — that path is what tests/Syslog_test.cpp
-		// asserts against, through formatFrame() directly.
+		// asserts against, through formatFrame() directly. A test that wants to see
+		// what send() would have emitted installs a HostSink.
+		if (s.hostSink != nullptr)
+		{
+			s.hostSink(frame, len);
+		}
 #endif
 	}
+
+#if !SYSLOG_HAS_UDP
+	void setHostSink(HostSink sink)
+	{
+		SyslogState& s = state();
+		std::lock_guard<std::mutex> lock(s.mutex);
+		s.hostSink = sink;
+	}
+#endif
 
 	void send(Severity severity, const char* appName, const char* msg)
 	{

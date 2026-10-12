@@ -7,6 +7,7 @@
 #include <iostream>
 #include <sstream>
 #include <cctype>
+#include <cinttypes>   // #986: PRIxPTR in the slow-hold witness
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
@@ -468,7 +469,7 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 		if (!anchorIsSynchronous())
 		{
 			_anchorClient->setEventCallback([this](const AnchorClient::CallEvent& ev) {
-				std::lock_guard<std::mutex> lock(_mutex);
+				std::lock_guard<pd::TimedMutex> lock(_mutex);
 				if (ev.type == AnchorClient::CallEvent::Answered)
 				{
 					queueLog("[Telephony] Event: Answered, participantId=" + ev.participantId);
@@ -631,12 +632,12 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 				auto* sca = static_cast<StartClientArg*>(p);
 				if (sca->anchor->start())
 				{
-					std::lock_guard<std::mutex> lock(sca->handler->_mutex);
+					std::lock_guard<pd::TimedMutex> lock(sca->handler->_mutex);
 					sca->handler->queueLog("[Anchor] client started");
 				}
 				else
 				{
-					std::lock_guard<std::mutex> lock(sca->handler->_mutex);
+					std::lock_guard<pd::TimedMutex> lock(sca->handler->_mutex);
 					sca->handler->queueLog("[Anchor] failed to start anchor client", true);
 				}
 				delete sca;
@@ -646,12 +647,12 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 			_anchorStartThread = std::thread([this]() {
 				if (_anchorClient->start())
 				{
-					std::lock_guard<std::mutex> lock(_mutex);
+					std::lock_guard<pd::TimedMutex> lock(_mutex);
 					queueLog("[Anchor] client started");
 				}
 				else
 				{
-					std::lock_guard<std::mutex> lock(_mutex);
+					std::lock_guard<pd::TimedMutex> lock(_mutex);
 					queueLog("[Anchor] failed to start anchor client", true);
 				}
 			});
@@ -916,7 +917,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 
 	sockaddr_in arpRequest{};
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 
 		_packetsProcessed.fetch_add(1, std::memory_order_relaxed);
 		_outbox.clear();
@@ -1348,6 +1349,10 @@ void RequestsHandler::flushPass(
 	// moved into _onHandled above, so nothing here still pins a pooled message.
 	outScratch.clear();
 	logScratch.clear();
+	// #986: the pbx-911 Alert is staged by EmergencyNotifier::notify() under
+	// _mutex and sent here, unlocked, and after the call legs and the MESSAGEs
+	// above: its blocking syslog send must not sit in front of either.
+	_e911Notifier.flushStaged();
 }
 
 std::shared_ptr<Session> RequestsHandler::noteDialogCSeq(std::string_view callID, uint32_t cseq,
@@ -3475,7 +3480,7 @@ void RequestsHandler::sweepMulticastPage(std::chrono::steady_clock::time_point n
 #if POCKETDIAL_MULTICAST_PAGING
 pbx::MulticastPagingConfig RequestsHandler::getMulticastPaging()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _cfg.multicastPaging();
 }
 
@@ -3491,7 +3496,7 @@ std::string RequestsHandler::setMulticastPaging(const pbx::MulticastPagingConfig
 	}
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_cfg.setMulticastPaging(cfg);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -4307,7 +4312,7 @@ void RequestsHandler::releaseMohPreviewLocked()
 
 std::string RequestsHandler::mohPreviewExtension()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _mohPreview.active ? _mohPreview.extension : std::string{};
 }
 
@@ -4316,7 +4321,7 @@ bool RequestsHandler::startMohPreview(const std::string& extension)
 	// _mutex is NOT recursive, so this takes it once and every helper below is the
 	// *Locked variant. Calling the public stopMohPreview() from in here would
 	// self-deadlock the HTTP task.
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 
 	if (!_holdMusic.isLoaded() || _holdMusic.localPort() <= 0) return false;
 
@@ -4497,7 +4502,7 @@ bool RequestsHandler::handleMohPreviewEnd(const std::shared_ptr<SipMessage>& dat
 
 void RequestsHandler::stopMohPreview()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	stopMohPreviewLocked();
 }
 
@@ -4564,7 +4569,7 @@ bool RequestsHandler::startHoldMusic(const std::string& clipPath)
 	// log pushes take _mutex; loadClip()/start() read the SD card and must not
 	// run under it.
 	auto log = [this](std::string msg, bool isError = false) {
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		queueLog(std::move(msg), isError);
 	};
 	if (!_holdMusic.loadClip(clipPath))
@@ -5380,7 +5385,7 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 bool RequestsHandler::bindOutboundParticipant(const std::string& callId, const std::string& ownLeg)
 {
 	if (callId.empty() || ownLeg.empty()) return false;
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	auto it = _sessions.find(callId);
 	if (it != _sessions.end() && it->second && it->second->isAnchor())
 	{
@@ -5629,7 +5634,7 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 	{
 		if (!_anchorClient->answerCall(job.partId))
 		{
-			std::lock_guard<std::mutex> lock(_mutex);
+			std::lock_guard<pd::TimedMutex> lock(_mutex);
 			queueLog("[Telephony] Failed to answer inbound participant " + job.partId, true);
 		}
 		return;
@@ -5637,7 +5642,7 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 	std::string ownLeg;
 	if (!_anchorClient->makeCall(job.dest, &ownLeg))
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		queueLog("[Telephony] Failed to initiate outbound call to " + job.dest, true);
 		// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
 		refuseRingingAnchor(job.callId, _asyncOutbox);
@@ -5658,7 +5663,7 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 	// internally) so a later Answered/Dropped maps to the right call when
 	// several are in flight.
 	const bool bound = bindOutboundParticipant(job.callId, ownLeg);
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	if (!bound && !ownLeg.empty())
 	{
 		// Issue #379: the handset hung up while makeCall() was still on the
@@ -9331,7 +9336,7 @@ bool RequestsHandler::forceDisconnect(const std::string& extension)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
-		std::unique_lock<std::mutex> lock(_mutex);
+		std::unique_lock<pd::TimedMutex> lock(_mutex);
 		queueLog("Admin: force-disconnecting extension " + extension);
 		// Issue #228: tear down every dialog this extension is on the way every
 		// other server-initiated teardown does — BYE the phones, THEN endCall().
@@ -9650,20 +9655,20 @@ std::string RequestsHandler::getPcapCapture()
 	// _snapshot: it's populated directly under _mutex (handle()/drainOutbox()),
 	// and serializing up to POCKETDIAL_PCAP_RING_SIZE small entries is cheap
 	// enough to do inline rather than adding a second copy of the same data.
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _pcapCapture.toPcapFile(_localIp, static_cast<uint16_t>(_serverPort));
 }
 
 std::vector<PcapCapture::TraceRecord> RequestsHandler::getTraceRecords()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _pcapCapture.traceRecords();
 }
 
 std::optional<RequestsHandler::ProvisioningInfo> RequestsHandler::findProvisioningInfo(
 	const std::string& mac)
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	for (const auto& d : _registrar.adoptedDevices())
 	{
 		if (d.mac == mac)
@@ -9698,7 +9703,7 @@ std::optional<RequestsHandler::ProvisioningInfo> RequestsHandler::findProvisioni
 
 bool RequestsHandler::canProvisionMac(std::string_view mac)
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	std::string_view ext;
 	if (_registrar.extensionOf(mac, ext)) return isValidAor(ext) && !pbx::isReservedOrPstnAor(ext);
 	// #826 part B: not adopted. Answer only if a zero-touch fetch would get an
@@ -9762,7 +9767,7 @@ void RequestsHandler::noteZeroTouchRefusal(ZeroTouchRefusal r)
 bool RequestsHandler::autoAssign(const std::string& mac, bool peerMacVerified, std::string& outExt)
 {
 	const std::vector<std::string> secured = SipSecretStore::securedExtensions();   // its own lock, taken first
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	// Only count refusals while a window is open: an unknown MAC fetching with
 	// zero-touch off is the ordinary 404, not something to explain.
 	const bool windowOpen = _registrar.assignWindow(std::chrono::steady_clock::now()).open;
@@ -9800,20 +9805,20 @@ bool RequestsHandler::autoAssign(const std::string& mac, bool peerMacVerified, s
 bool RequestsHandler::openAutoAssign(uint32_t lo, uint32_t hi, uint32_t minutes)
 {
 	if (minutes == 0 || minutes > kMaxAssignMinutes) return false;
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	const auto now = std::chrono::steady_clock::now();
 	return _registrar.openAssignWindow(lo, hi, now, now + std::chrono::minutes(minutes));
 }
 
 void RequestsHandler::closeAutoAssign()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	_registrar.closeAssignWindow();
 }
 
 RequestsHandler::AutoAssignState RequestsHandler::autoAssignState()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	const auto now = std::chrono::steady_clock::now();
 	const Registrar::AssignWindow w = _registrar.assignWindow(now);
 	AutoAssignState s;
@@ -9838,7 +9843,7 @@ void RequestsHandler::setDnd(const std::string& extension, bool on)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_cfg.setDndLocked(extension, on);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -9857,7 +9862,7 @@ void RequestsHandler::setVoicemail(const std::string& extension, bool on)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_cfg.setVoicemailEnabledLocked(extension, on);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -9878,7 +9883,7 @@ void RequestsHandler::setForward(const std::string& extension, const std::string
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_cfg.setForwardLocked(extension, trigger, target);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -9900,7 +9905,7 @@ void RequestsHandler::setE911Config(const std::string& exts, const std::string& 
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_cfg.setE911Config(exts, callback, location);
 		refreshE911ConfiguredLocked();
 		localLogs = std::move(_logQueue);
@@ -9912,7 +9917,7 @@ void RequestsHandler::setE911Config(const std::string& exts, const std::string& 
 
 std::tuple<std::string, std::string, std::string> RequestsHandler::getE911Config()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	const pbx::E911Config& c = _cfg.e911Config();
 	return {pbx::joinMembers(c.notifyExts), c.callback, c.location};
 }
@@ -9921,7 +9926,7 @@ void RequestsHandler::setRingGroup(const std::string& groupExt, const std::strin
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_cfg.setRingGroup(groupExt, members, mode);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -9971,7 +9976,7 @@ void RequestsHandler::setDialRule(const std::string& pattern, const std::string&
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_cfg.setDialRule(pattern, action, target, stripDigits);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -9994,7 +9999,7 @@ std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHand
 
 std::vector<TelephonyApiConfig::SlotView> RequestsHandler::getTelephonyConfigSlots()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	std::vector<TelephonyApiConfig::SlotView> views;
 	views.reserve(TelephonyApiConfig::kSlots);
 	for (size_t i = 0; i < TelephonyApiConfig::kSlots; ++i)
@@ -10006,7 +10011,7 @@ std::vector<TelephonyApiConfig::SlotView> RequestsHandler::getTelephonyConfigSlo
 
 TelephonyApiConfig::SlotView RequestsHandler::getTelephonyConfigSlot(size_t idx)
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _tapiConfig.view(idx);
 }
 
@@ -10015,7 +10020,7 @@ RequestsHandler::TestDialResult RequestsHandler::testDialSlot(size_t idx)
 	AnchorClient* anchor = nullptr;
 	std::string destination;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		if (idx != _tapiConfig.activeSlot())
 		{
 			// Only the boot-selected slot has a live _anchorClient (provider
@@ -10052,25 +10057,25 @@ RequestsHandler::TestDialResult RequestsHandler::testDialSlot(size_t idx)
 
 std::string RequestsHandler::setTelephonyConfigSlot(size_t idx, const TelephonyApiConfig::Slot& s, bool keepSecret)
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _tapiConfig.setSlot(idx, s, keepSecret);
 }
 
 std::string RequestsHandler::setTelephonyConfigActiveSlot(size_t idx)
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _tapiConfig.setActiveSlot(idx);
 }
 
 std::string RequestsHandler::clearTelephonyConfigSlot(size_t idx)
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _tapiConfig.clearSlot(idx);
 }
 
 std::string RequestsHandler::clearAllTelephonyConfig()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _tapiConfig.clearAll();
 }
 
@@ -10078,7 +10083,7 @@ std::string RequestsHandler::clearAllTelephonyConfig()
 
 std::pair<bool, size_t> RequestsHandler::getSbcMode()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return {_cfg.sbcEnabled(), _cfg.sbcRoute()};
 }
 
@@ -10087,7 +10092,7 @@ std::string RequestsHandler::setSbcMode(bool enabled, size_t route)
 	std::vector<std::pair<bool, std::string>> localLogs;
 	std::string err;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		if (enabled)
 		{
 			// Validate + activate BEFORE persisting the toggle, so a bad slot
@@ -10118,13 +10123,13 @@ std::string RequestsHandler::setSbcMode(bool enabled, size_t route)
 
 bool RequestsHandler::getForward100rel()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _cfg.forward100rel();
 }
 
 void RequestsHandler::setForward100rel(bool on)
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	_cfg.setForward100rel(on);
 }
 
@@ -10133,43 +10138,43 @@ void RequestsHandler::setForward100rel(bool on)
 
 std::vector<DidMapping::Entry> RequestsHandler::getDidMappings()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _didMapping.list();
 }
 
 std::string RequestsHandler::setDidMapping(const std::string& did, const std::string& extension)
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _didMapping.setMapping(did, extension);
 }
 
 std::string RequestsHandler::removeDidMapping(const std::string& did)
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _didMapping.removeMapping(did);
 }
 
 std::string RequestsHandler::clearAllDidMappings()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _didMapping.clearAll();
 }
 
 void RequestsHandler::clearAllCallHistory()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	_cdr.clearAll();
 }
 
 bool RequestsHandler::clearAllForwards()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _cfg.clearForwardsLocked();
 }
 
 bool RequestsHandler::clearE911Config()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	const bool ok = _cfg.clearE911Locked();
 	refreshE911ConfiguredLocked();
 	return ok;
@@ -10181,7 +10186,7 @@ void RequestsHandler::setRegistrarMode(RegistrarMode mode)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_registrar.setMode(mode);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -10243,7 +10248,7 @@ bool RequestsHandler::secureDevice(const std::string& macOrExt)
 	std::vector<std::pair<bool, std::string>> localLogs;
 	bool changed = false;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		changed = _registrar.secure(macOrExt);
 		applyDeviceChange(_registrar.consumeDevicesChange());
 		localLogs = std::move(_logQueue);
@@ -10258,7 +10263,7 @@ bool RequestsHandler::forgetDevice(const std::string& macOrExt)
 	std::vector<std::pair<bool, std::string>> localLogs;
 	bool removed = false;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		removed = _registrar.forget(macOrExt);
 		applyDeviceChange(_registrar.consumeDevicesChange());
 		localLogs = std::move(_logQueue);
@@ -10273,7 +10278,7 @@ size_t RequestsHandler::forgetLearnedDevices()
 	std::vector<std::pair<bool, std::string>> localLogs;
 	size_t removed = 0;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		removed = _registrar.forgetLearned();
 		applyDeviceChange(_registrar.consumeDevicesChange());
 		localLogs = std::move(_logQueue);
@@ -10294,7 +10299,7 @@ bool RequestsHandler::sendMessageTo(const std::string& ext, const std::string& t
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
 	bool sent = false;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_noReplyInbound.reset();   // #424: no inbound message owns this drain
 
 		auto client = findClient(ext);
@@ -10362,7 +10367,7 @@ size_t RequestsHandler::getSessionCount()
 
 int RequestsHandler::getConferenceLegs()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _conference ? _conference->legCount() : 0;
 }
 
@@ -10455,13 +10460,13 @@ void RequestsHandler::drainDtmfInbox()
 
 size_t RequestsHandler::getClientTransactionCount()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _txLayer.activeClientTransactions();
 }
 
 size_t RequestsHandler::getServerTransactionCount()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _txLayer.activeServerTransactions();
 }
 
@@ -10475,7 +10480,7 @@ void RequestsHandler::tick()
 	_lastTick = now;
 
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_outbox.clear();
 		// No inbound message owns a tick() pass. Cleared here rather than only at
 		// the end of handle() because handle() has early returns between setting
@@ -11248,7 +11253,32 @@ void RequestsHandler::tick()
 	}
 
 	flushPass(_tickOutboxScratch, _tickLogScratch);
+	reportSlowMutexHolds();
 }
+
+// #986 slice 0. The hold is recorded by TimedMutex::unlock() and only RECORDED
+// there: a log line from inside the lock being measured (the console, or a syslog
+// send) is exactly the kind of cost this exists to find. So the line is written
+// here, after tick()'s lock scope and its flush, once per call site per boot.
+// The pc is the return address of lock(): addr2line it against the image's ELF.
+void RequestsHandler::reportSlowMutexHolds()
+{
+	pd::SlowSite s;
+	// Bounded by the table size: tick() must never spin on a site table that did not drain.
+	for (unsigned i = 0; i < pd::TimedMutex::kSites && pd::TimedMutex::takeSlowSite(s); ++i)
+	{
+		PD_WITNESS_W("pbx", "_mutex held %u ms (over 20 ms) by the lock site at 0x%" PRIxPTR " (#986)",
+			static_cast<unsigned>(s.maxUs / 1000), s.pc);
+	}
+}
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+void RequestsHandler::holdMutexForTest(std::chrono::milliseconds d)
+{
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
+	std::this_thread::sleep_for(d);
+}
+#endif
 
 std::optional<std::shared_ptr<SipClient>> RequestsHandler::findClientByAddress(const sockaddr_in& addr)
 {
@@ -11432,14 +11462,14 @@ void RequestsHandler::queueLog(std::string msg, bool isError)
 
 std::string RequestsHandler::getAdminExt()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _dtmf.adminExt();
 }
 
 bool RequestsHandler::setAdminExt(const std::string& ext)
 {
 	if (ext.size() > 31 || !pbx::isDialTokenSafe(ext)) return false;
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _dtmf.saveAdminExt(ext);
 }
 
@@ -12231,7 +12261,7 @@ void RequestsHandler::setPageZone(const std::string& zoneExt, const std::string&
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_cfg.setPageZone(zoneExt, members);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -12922,7 +12952,7 @@ namespace
 
 void RequestsHandler::setTrunkConfig(const SipTrunk::Config& cfg)
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	_sipTrunk.setConfig(cfg);
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
@@ -12931,7 +12961,7 @@ void RequestsHandler::setTrunkConfig(const SipTrunk::Config& cfg)
 
 SipTrunk::Config RequestsHandler::getTrunkConfig()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	// Safe to return by value: the digest password is deliberately NOT a member
 	// of Config (it lives in SipTrunk's own buffer), so this cannot leak it.
 	return _sipTrunk.config();
@@ -12939,7 +12969,7 @@ SipTrunk::Config RequestsHandler::getTrunkConfig()
 
 bool RequestsHandler::setTrunkCredentials(std::string_view password)
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return _sipTrunk.setCredentials(password);
 }
 
@@ -12982,7 +13012,7 @@ void RequestsHandler::applyStoredTrunkConfig()
 	//
 	// Note for future callers: this takes _mutex itself, so it must NOT be
 	// called with _mutex already held -- the mutex is non-recursive.
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	_sipTrunk.setConfig(cfg);
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
@@ -13016,7 +13046,7 @@ void RequestsHandler::applyStoredTrunkConfig()
 
 RequestsHandler::EmergencyRoute RequestsHandler::emergencyRoute()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	return emergencyRouteLocked();
 }
 
@@ -13039,7 +13069,7 @@ const char* RequestsHandler::emergencyRouteName(EmergencyRoute r)
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 size_t RequestsHandler::trunkRelaysInUseForTest()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	size_t n = 0;
 	for (int i = 0; i < static_cast<int>(POCKETDIAL_MAX_TRUNK_CALLS); ++i)
 	{
@@ -13050,7 +13080,7 @@ size_t RequestsHandler::trunkRelaysInUseForTest()
 
 void RequestsHandler::expireTrunkDeadlinesForTest()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	_sipTrunk.expireDeadlinesForTest();
 }
 
@@ -13059,7 +13089,7 @@ void RequestsHandler::fireRegisterBeepsForTest()
 	// Same shape as tick(): produce under _mutex, drain, send outside it.
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_outbox.clear();
 		_passThroughMsg = nullptr;
 		_beeper.firePendingNowForTest(std::chrono::steady_clock::now());
@@ -13073,7 +13103,7 @@ void RequestsHandler::fireRegisterBeepsForTest()
 
 TrunkResolver::Status RequestsHandler::trunkResolveStatusForTest()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	sockaddr_in out{};
 	return _trunkResolver.lookup(_sipTrunk.config().transportHost(),
 		_sipTrunk.config().transportPort(), out, std::chrono::steady_clock::now());

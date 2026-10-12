@@ -30,12 +30,14 @@
 // RequestsHandler::routeEmergencyCall() calls notify() only after
 // originateAnchorCall() has already taken the call, and everything here is
 // best-effort by construction: nothing returns an error the caller acts on,
-// nothing blocks, nothing retries. A test pins this by exhausting the message
-// pool and asserting the 911 leg still routes.
+// nothing waits on the network, nothing retries. A test pins this by
+// exhausting the message pool and asserting the 911 leg still routes.
 //
 // Because both the call leg and these notifications land in the same _outbox
 // and leave on the same drainOutbox() pass, "contemporaneous" is satisfied
-// literally rather than approximately.
+// literally rather than approximately. The syslog record leaves in that same
+// pass too, but last: flushPass() sends the call legs and the MESSAGEs first and
+// the Alert after them, so a slow syslog send never sits in front of a call.
 //
 // ── Fires even when the call FAILS ───────────────────────────────────────────
 //
@@ -57,7 +59,10 @@
 //     §506, a separate obligation, and it lives with the trunk provider rather
 //     than here.
 
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -121,7 +126,15 @@ std::string formatE911Notification(bool isTest, std::string_view fromExt,
 // RequestsHandler's own surface beyond one member and one call.
 //
 // Locking: notify() assumes the caller holds the engine's _mutex, matching
-// every other machine here. It takes no lock of its own and never blocks.
+// every other machine here. It does no network I/O under it: the syslog record
+// is STAGED in one fixed slot and flushStaged() sends it after the engine lock
+// is released (RequestsHandler::flushPass()). Syslog::send() holds the syslog
+// mutex across a blocking-mode UDP send(), which on lwIP waits on the tcpip
+// thread, and the log-drain task holds that same mutex for its own sends, so
+// calling it under _mutex put the SIP thread behind both (#986).
+//
+// The one lock notify() does take is the slot's own, held for a memcpy and never
+// across I/O. Order is _mutex -> slot lock; nothing takes them the other way.
 class EmergencyNotifier
 {
 public:
@@ -132,9 +145,12 @@ public:
 	// between a person and 911.
 	//
 	// Emits, in order:
-	//   1. a syslog record at Alert severity, app "pbx-911". Unconditional,
-	//      unconfigurable, and safe here (Syslog::send never blocks, never
-	//      throws and is a no-op when unconfigured).
+	//   1. a syslog record at Alert severity, app "pbx-911". Unconditional and
+	//      unconfigurable. Staged here, not sent: flushStaged() sends it. There is
+	//      one slot, so a second notify() before the flush replaces the first and
+	//      flushStaged() writes an "overwritten" witness; the replaced text is not
+	//      lost to the operator, because step 1b put it in the engine log.
+	//   1b. the same text into the engine's own log (UART / dashboard).
 	//   2. one SIP MESSAGE per configured, currently-registered notify
 	//      extension, enqueued onto the same outbox pass as the call leg.
 	//
@@ -144,7 +160,19 @@ public:
 		std::string_view fromExt, std::string_view dialed,
 		bool hadTrunkPrefix, bool routed, std::string_view note = {}, bool callUp = false);
 
+	// Send the staged Alert, if any. Call it with the engine lock RELEASED: this is
+	// the blocking syslog send. Safe from any thread, against notify() and against
+	// another flusher (handle() and tick() both end in flushPass()): the slot is
+	// emptied under its lock before the send, so a staged frame is sent once and
+	// never again. A flusher that finds another one mid-send returns at once rather
+	// than wait behind its UDP send; the sender looks again before it leaves. One
+	// atomic load when nothing is staged.
+	void flushStaged();
+
 private:
+	// formatE911Notification()'s 512-byte cap, plus the NUL.
+	static constexpr std::size_t kAlertBytes = 513;
+
 	// One MESSAGE to `ext`, or nullptr when the extension is not registered or
 	// the message pool is exhausted. Lock-free by construction: it builds and
 	// returns, and never touches the outbox itself.
@@ -152,6 +180,19 @@ private:
 		const std::string& text, sockaddr_in& addrOut);
 
 	PbxEnv& _env;
+
+	// The staged Alert. _slot, _slotOverwritten and every write of _staged are
+	// under _slotMutex; _staged is atomic only so flushStaged() can skip the lock
+	// when nothing is staged.
+	std::mutex        _slotMutex;
+	std::atomic<bool> _staged{false};
+	uint8_t           _slotOverwritten = 0;   // notify()s that replaced a staged frame; saturates
+	char              _slot[kAlertBytes] = {};
+
+	// What flushStaged() is sending. _sendMutex keeps two flushers off the buffer
+	// (it is only ever try_lock'd, so nothing waits on it); never taken with _mutex held.
+	std::mutex _sendMutex;
+	char       _sendBuf[kAlertBytes] = {};
 };
 
 #endif // EMERGENCY_NOTIFIER_HPP
