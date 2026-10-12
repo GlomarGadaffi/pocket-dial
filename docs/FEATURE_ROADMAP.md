@@ -1,61 +1,46 @@
 # pocket-dial: Technical Feature Roadmap
 
-Status: Living document | Last updated: 2026-09-27 (re-checked against `main` for #401) | Scope: Engineering / product-capability only
+Status: living document. Last updated: 2026-10-12. Scope: engineering and product capability only.
 
-This is a prioritized **engineering** roadmap for pocket-dial: what exists, what is proved,
-and what is worth building next. It is grounded in the current source tree. It deliberately
-stays inside the project's "fast and light" constraint, every proposal is sized against the
-ESP32/ESP32-S3 reality (static memory pools, no MMU or heap compaction, a single UDP
-listener, and a media path that is peer-to-peer except where it is explicitly not).
+This is a prioritized engineering roadmap for pocket-dial: what exists in the source tree, what has been observed on hardware, and what to build next. Every proposal is sized against the ESP32 and ESP32-S3 limits: static memory pools, no MMU or heap compaction, a single UDP listener, and a media path that is peer-to-peer except where it is explicitly not.
 
-Cross-references:
-[ARCHITECTURE.md](ARCHITECTURE.md) ·
-[SCALING.md](SCALING.md) ·
-[THREAT_MODEL.md](THREAT_MODEL.md) ·
-[PROVISIONING.md](PROVISIONING.md) ·
-[LEARN_MODE.md](LEARN_MODE.md) ·
-[OTA.md](OTA.md) ·
-[API.md](API.md) ·
-[../README.md](../README.md)
+Related documents: [ARCHITECTURE.md](ARCHITECTURE.md), [SCALING.md](SCALING.md), [THREAT_MODEL.md](THREAT_MODEL.md), [PROVISIONING.md](PROVISIONING.md), [LEARN_MODE.md](LEARN_MODE.md), [OTA.md](OTA.md), [API.md](API.md), [../README.md](../README.md).
 
-> **Framing, corrected 2026-09-13.** The original framing was that pocket-dial "never
-> touches RTP." That is still true of the **ordinary call**, and it is still the single
-> fact that decides what is cheap and what is expensive here. It is no longer true of the
-> product as a whole, and stating it as a blanket has begun to mislead.
->
-> **The peer-to-peer half.** An extension-to-extension call is brokered and then gets out
-> of the way: the two phones stream RTP directly to each other and the MCU never sees a
-> media packet. Hold and blind/attended transfer all preserve that property: the
-> SDP is relayed, and only the codec list is narrowed, never the `c=` line. **Park no
-> longer does, unconditionally:** with a music-on-hold clip loaded the board answers the
-> parked leg `sendonly` from its own port and streams the clip to it
-> (`src/SIP/ParkOrbit.cpp:64-84`), which puts the MCU in the media path one-way for the
-> duration of the park. With no clip loaded (the default), park still answers
-> `a=inactive` and sources nothing, which is the behaviour this paragraph used to
-> describe as unconditional. `777` echo is
-> in this half too, despite an in-code comment calling it "server-terminated": it is an
-> SDP loopback, answering with the caller's own body so the phone streams to itself
-> (`src/SIP/RequestsHandler.cpp:1755`). Nothing on the board carries that audio.
->
-> **The media-terminating half, which is now real and shipped.** `440` (tone), `555`
-> (anchor bridge), `888` (conference) and voicemail (deposit on no-answer/busy, retrieval
-> on `796`; `src/SIP/VoicemailLeg.hpp`) put the board in the path: it sends and/or
-> receives RTP for them. `888` decodes, mixes and re-encodes. An outbound **anchor** trunk
-> call crosses the board on **both** sides: RTP to and from the handset, chunked-HTTPS PCM16
-> to and from the provider, with `MediaBridge` shuttling PCM16 between them; the board
-> owns the handset-facing `RtpReceiver`/`RtpSender` pair for the life of that call
-> (`src/SIP/MediaBridge.hpp:17-18`). An outbound **SIP** trunk call (§1.3) crosses it too,
-> as a raw RTP relay pair with no PCM16 and no `MediaBridge`
-> (`src/SIP/RequestsHandler.cpp:10008-10030`). These are deliberate,
-> bounded, individually dialable exceptions, not a removal of the invariant for ordinary
-> LAN calls.
->
-> The cheap/expensive axis therefore still holds, and is now measurable rather than
-> hypothetical: signalling features are bounded by the pre-allocated pools and cost a few
-> hundred bytes; media features cost a leg's worth of RTP tasks and rings apiece, which is
-> why the conference is capped at 4 legs, the anchor trunk at **four** concurrent calls
-> (one on the default loopback provider), the SIP trunk at **two** and voicemail at **two**
-> legs (see §1.3 and §1.5).
+## The media boundary
+
+pocket-dial does not touch RTP on an ordinary call. That fact still decides what is cheap and what is expensive here. It no longer describes the product as a whole, so stating it as a blanket rule misleads.
+
+Three media paths are in use:
+
+```mermaid
+flowchart LR
+    subgraph ordinary["Ordinary extension-to-extension call"]
+        A["Phone A"] <-->|"RTP, direct"| B["Phone B"]
+        M1["Board: signalling only"]
+    end
+    subgraph anchor["Outbound anchor trunk call"]
+        H["Handset"] <-->|"RTP"| MB["Board: MediaBridge"]
+        MB <-->|"chunked HTTPS PCM16"| P["Provider"]
+    end
+    subgraph sip["Outbound SIP trunk call"]
+        H2["Handset"] <-->|"RTP"| R["Board: raw RTP relay pair"]
+        R <-->|"RTP"| C["Carrier"]
+    end
+```
+
+**The peer-to-peer half.** An extension-to-extension call is brokered and then gets out of the way: the two phones stream RTP directly to each other, and the MCU never sees a media packet. Hold and blind or attended transfer keep that property. The SDP is relayed, and only the codec list is narrowed, never the `c=` line.
+
+Park is not peer-to-peer in every case. With a music-on-hold clip loaded, the board answers the parked leg `sendonly` from its own port and streams the clip to it (`src/SIP/ParkOrbit.cpp:66-85`). That puts the MCU in the media path, one way, for the duration of the park. With no clip loaded (the default), park answers `a=inactive` and sources nothing.
+
+The `777` echo is in this half too, despite an in-code comment that calls it server-terminated. It is an SDP loopback: it answers with the caller's own body so the phone streams to itself (`src/SIP/RequestsHandler.cpp`, `onInvite`, the `777` branch). Nothing on the board carries that audio.
+
+**The media-terminating half is shipped.** `440` (tone), `555` (anchor bridge), `888` (conference) and voicemail (deposit on no-answer or busy, retrieval on `796`; `src/SIP/VoicemailLeg.hpp`) put the board in the path. It sends and/or receives RTP for them. `888` decodes, mixes and re-encodes.
+
+An outbound **anchor** trunk call crosses the board on **both** sides: RTP to and from the handset, and chunked-HTTPS PCM16 to and from the provider, with `MediaBridge` shuttling PCM16 between them. The board owns the handset-facing `RtpReceiver`/`RtpSender` pair for the life of that call (`src/SIP/MediaBridge.hpp:17-18`).
+
+An outbound **SIP** trunk call (§1.3) crosses the board too, as a raw RTP relay pair with no PCM16 and no `MediaBridge` (the trunk relay in `src/SIP/RequestsHandler.cpp`, `trunkRelayForward`). These are deliberate, bounded, individually dialable exceptions, not a removal of the invariant for ordinary LAN calls.
+
+The cheap/expensive axis still holds, and it is now measurable. Signalling features are bounded by the pre-allocated pools and cost a few hundred bytes. Media features cost a leg's worth of RTP tasks and rings apiece. That is why the conference is capped at 4 legs, the anchor trunk at four concurrent calls (one on the default loopback provider), the SIP trunk at two, and voicemail at two legs (see §1.3 and §1.5).
 
 ## 1. Current capabilities (shipped, in the tree today)
 
@@ -64,10 +49,10 @@ Cross-references:
 | Capability | Notes | Where |
 |-----------|-------|-------|
 | Registrar + back-to-back call broker | `REGISTER`, `INVITE`, `ACK`, `BYE`, `CANCEL`, `OPTIONS`, provisional/final responses | `src/SIP/RequestsHandler.cpp` |
-| **SIP digest auth (RFC 2617)** | Implemented and operable. The shipped default is `learn` (#441) and `open` is retired (#500/#502): Learn challenges Secured devices, Secure every extension; see §1.4. The bypasses found in review are fixed: #507 by #487 (an ARP miss no longer admits a Secured extension without digest), #560 by #562 (the relayed ACK and re-INVITE/UPDATE no longer carry the INVITE's credential), #525 by #570 (a reused nonce/`nc` is re-challenged) and #549 by #555. | `src/Helpers/SipDigest.*`, `src/SIP/Registrar.*` |
-| Blind transfer (REFER) | Source-authorized against the dialog's own legs (#133). Moves the **transferee**: a new dialog to the target carries B's media (`RequestsHandler.cpp:6270-6300`), the transferor A is BYEd (`:6474-6485`), and the A–B leg is kept (`:6533-6538`). The old inverted topology (#197) is fixed by #211 and the tests pin the corrected one (`tests/BlindTransfer_test.cpp:7-10`). Unresolvable targets no longer destroy the call (#203, fixed). Remaining: the NOTIFY reports `200` as soon as the INVITE is queued, with no `100 Trying` progress. | `onRefer` |
-| Attended transfer (REFER + Replaces, RFC 3891) | Splices B and C, BYEs A out of both, relays a later BYE across the bridge. The hardcoded `CSeq: 100` of #257 was removed by its own fix (#308, per-dialog floors), and #402 replaced those floors with `nextServerCSeq()` (`RequestsHandler.cpp:6149`). Only REFER `?Replaces=` is handled; an INVITE carrying `Replaces` (BLF pickup) is not. | `onRefer`, `handleTransferOk` |
-| Hold / resume | Re-INVITE relayed with its **SDP** untouched, so the SDP survives; `Contact` is rewritten on every relayed re-INVITE (#425, `RequestsHandler.cpp:9079-9090`) | `onReinvite`, `onOk` |
+| **SIP digest auth (RFC 2617)** | Implemented and operable. The default is `learn` (#441), and `open` is retired (#500/#502). Learn challenges Secured devices. Secure mode challenges every extension (see §1.4). Bypasses found in review are fixed: #507 by #487 (an ARP miss no longer admits a Secured extension without digest), #560 by #562 (the relayed ACK and re-INVITE/UPDATE no longer carry the INVITE's credential), #525 by #570 (a reused nonce or `nc` is re-challenged) and #549 by #555. | `src/Helpers/SipDigest.*`, `src/SIP/Registrar.*` |
+| Blind transfer (REFER) | Source-authorized against the dialog's own legs (#133). Moves the **transferee**: a new dialog to the target carries B's media, the transferor A is BYEd, and the A–B leg is kept. The old inverted topology (#197) is fixed by #211, and `tests/BlindTransfer_test.cpp` pins the corrected one. Unresolvable targets no longer destroy the call (#203). Remaining: the NOTIFY reports `200` as soon as the INVITE is queued, with no `100 Trying` progress. | `onRefer` |
+| Attended transfer (REFER + Replaces, RFC 3891) | Splices B and C, BYEs A out of both, relays a later BYE across the bridge. The hardcoded `CSeq: 100` of #257 was removed by its own fix (#308, per-dialog floors). #402 replaced those floors with `nextServerCSeq()` (`src/SIP/Session.hpp`). Only REFER `?Replaces=` is handled; an INVITE carrying `Replaces` (BLF pickup) is not. | `onRefer`, `handleTransferOk` |
+| Hold / resume | Re-INVITE relayed with its **SDP** untouched, so the SDP survives. `Contact` is rewritten on every relayed re-INVITE (#425; see the `Contact` comment in `onReinvite`). | `onReinvite`, `onOk` |
 | RFC 3311 `UPDATE` | | `onUpdate` |
 | RFC 4028 session timers | Advertises `Supported: timer` (#198). An initial INVITE with too small a `Session-Expires` gets `422` + `Min-SE` (#591), and PBX-authored 2xx answers name `refresher=uac` (#724). | `armSessionTimer`, `answerSessionTimer` |
 | Ring / hunt groups | ring-all or sequential hunt | `CallForker` |
@@ -76,14 +61,14 @@ Cross-references:
 | Paging / intercom | zones `980`–`989`, plus `999` all-page, with auto-answer header injection and race-to-answer | `startPaging`, `startBroadcastFork` |
 | Call forward | CFU / CFB / CFNA, per extension | `PbxFeatureConfig` |
 | Per-extension DND | | `PbxFeatureConfig` |
-| BLF / presence | `SUBSCRIBE`/`NOTIFY`, **`dialog` event package only** (RFC 4235); any other package gets `489`. No `presence`, no `message-summary`/MWI. | `BlfSubscriptions.cpp:146-155` |
-| Outbound email (SMTP client) | Issue #159 Phase 1: generic SMTP client over `esp_tls` (implicit TLS/STARTTLS/plain-LAN-relay, `AUTH PLAIN`/`LOGIN`/`XOAUTH2`, streaming DATA writer), configured at `/setup/email`. Gmail App Password and Google Workspace service-account (domain-wide delegation, RS256 JWT) paths. Standalone -- its own "Send test message" is the only consumer (`HttpServer.cpp:5150`). On-device voicemail now exists (§1.2), but **nothing emails a voicemail yet** (`SmtpDialogue.hpp:90`: "a later consumer, not built"). | `src/Helpers/SmtpDialogue.*`, `SmtpClient.*`, `GoogleServiceAuth.*`, `EmailConfigStore.*` |
-| DTMF star codes | `*60`, `*72`, `*73`, `*80`, `*69`, `*11`, plus the `*PIN#code` admin menu. Digits arrive over **SIP INFO** (RFC 6086) on any call except a voicemail leg (kept away from the star-code parser, `RequestsHandler.cpp:1057-1060`), and over **RFC 4733** telephone-event on a leg the board itself terminates: 888 conference and 555/anchor (`MediaBridge.cpp:112-115`), and the voicemail retrieval leg (`RequestsHandler.cpp:2951-2952`). Not decoded on park legs or the SIP-trunk relay. RFC 4733 cannot work on an ordinary extension-to-extension call: that RTP is peer-to-peer and never reaches this board. | `DtmfFeatureCodes.cpp`, `RtpReceiver::dispatchDtmf` |
+| BLF / presence | `SUBSCRIBE`/`NOTIFY` for the **`dialog` event package** (RFC 4235), and for `message-summary` (RFC 3842, MWI) when `POCKETDIAL_MWI` is on, which is the default. `SIP_CONSTRAINED` builds compile MWI out. Any other package gets `489`. There is no `presence` package. | `BlfSubscriptions.cpp` (`kAllowEvents`, `onSubscribe`) |
+| Outbound email (SMTP client) | Issue #159, phase 1: generic SMTP client over `esp_tls` (implicit TLS, STARTTLS or plain LAN relay; `AUTH PLAIN`, `LOGIN` or `XOAUTH2`; streaming DATA writer), configured at `/setup/email`. Gmail App Password and Google Workspace service-account paths (domain-wide delegation, RS256 JWT) are included. The client is standalone: its own "Send test message" (`POST /api/email/test`) is the only consumer. On-device voicemail exists (§1.2), but **nothing emails a voicemail yet** (`SmtpDialogue.hpp:90`: "a later consumer, not built"). | `src/Helpers/SmtpDialogue.*`, `SmtpClient.*`, `GoogleServiceAuth.*`, `EmailConfigStore.*` |
+| DTMF star codes | `*60`, `*72`, `*73`, `*80`, `*69`, `*11`, plus the `*PIN#code` admin menu. Digits arrive over **SIP INFO** (RFC 6086) on any call except a voicemail leg, which the `isDtmfRelay` guard in `RequestsHandler::handle` keeps away from the star-code parser. Digits also arrive over **RFC 4733** telephone-event on a leg the board itself terminates: 888 conference and 555/anchor (`MediaBridge.cpp:110-115`), and the voicemail retrieval menu (`_vmMenus[slot].onDigit`). Not decoded on park legs or the SIP-trunk relay. RFC 4733 cannot work on an ordinary extension-to-extension call: that RTP is peer-to-peer and never reaches this board. | `DtmfFeatureCodes.cpp`, `RtpReceiver::dispatchDtmf` |
 | Bounded dial plan | ordered `pattern → group\|page\|park\|trunk`, first match wins, cap `POCKETDIAL_MAX_DIAL_RULES` = 16 | `DialPlan.hpp` |
-| **Emergency dialing (#166)** | `911`, `9911` and the `933` test number are intercepted **before** the dial plan and before registrar call-setup policy (`RequestsHandler.cpp:1781-1785`), and a dial-plan rule that produces one takes the same path. `routeEmergencyCall()` (`:3831`) tries a real anchor provider first, then a configured SIP trunk (bare `sip:911@`), and otherwise answers `503 Emergency Call Not Routable` (`:3959`); the loopback simulator never answers an emergency number (`:4054-4057`, #521/#538). Every attempt triggers the Kari's Law on-site notification (`EmergencyNotifier.*`, configured at `/api/e911-config`) and `/api/status` reports `emergencyRoute`. **No location is conveyed to the PSAP, an emergency call does not pre-empt a busy anchor slot, and a live 911/933 route has not been proved on hardware** (#546: `trunk` means configured, not verified), see §5. | `EmergencyCall.hpp`, `EmergencyNotifier.*` |
-| Inbound DID → extension | route-DN match by **E.164 equivalence** (`pbx::e164SameNumber`, #165; `DidMapping.cpp:57-76`), so `+15551234567` and `(555) 123-4567` are the same DID; cap 8; unmapped falls back to ring-all | `DidMapping.*`, `E164.*` |
-| CDR ring + `GET /api/cdr` | 32-record ring persisted to NVS (namespace `cdrlog`, `CdrRing.cpp:27`), so it survives a reboot **while the serialized ring stays under NVS's 4,000-byte string cap**: it can reach 4,481 B, and the writer ignores the error, so history silently goes stale (#470, fix #476); on SD builds also appended to a per-day CSV archive `/sdcard/cdr/YYYY-MM-DD.csv` (#194, `CdrArchive.hpp:4-9`). Both are wiped by factory reset. `GET /api/cdr` (JSON, admin-gated) is the only read route; the archive has no download route. | `CdrRing.*`, `CdrArchive.*` |
-| Virtual `777` echo | SDP loopback, **no media on the board**; since #304 the echoed answer also drops PCMA | `RequestsHandler.cpp:1755` |
+| **Emergency dialing (#166)** | `911`, `9911` and the `933` test number are intercepted **before** the dial plan and before registrar call-setup policy (`onInvite`, via `pbx::classifyEmergencyDial`), and a dial-plan rule that produces one takes the same path. `routeEmergencyCall()` offers the call only to the real anchor, and only when the boot-selected provider places real calls. It never goes to a SIP trunk, and the loopback simulator is never offered one (#521, #538). Everything else is answered `503 Emergency Call Not Routable`. Every attempt, routed or not, triggers the Kari's Law on-site notification (`EmergencyNotifier.*`, configured at `/api/e911-config`), and `/api/status` reports `emergencyRoute` as `anchor` or `none`. **No location is conveyed to the PSAP, an emergency call does not pre-empt a busy anchor slot, and a live 911/933 route has not been proved on hardware** (see §5). | `EmergencyCall.hpp`, `EmergencyNotifier.*` |
+| Inbound DID → extension | route-DN match by **E.164 equivalence** (`pbx::e164SameNumber`, #165; `DidMapping::sameDid`), so `+15551234567` and `(555) 123-4567` are the same DID; cap 8; unmapped falls back to ring-all | `DidMapping.*`, `E164.*` |
+| CDR ring + `GET /api/cdr` | 32-record ring persisted to NVS (namespace `cdrlog`, `CdrRing.cpp`), so it survives a reboot **while the serialized ring stays under NVS's 4,000-byte string cap**: it can reach 4,481 B, and the writer ignores the error, so history silently goes stale (#470, fix #476); on SD builds also appended to a per-day CSV archive `/sdcard/cdr/YYYY-MM-DD.csv` (#194, `CdrArchive.hpp`). Both are wiped by factory reset. `GET /api/cdr` (JSON, admin-gated) is the only read route; the archive has no download route. | `CdrRing.*`, `CdrArchive.*` |
+| Virtual `777` echo | SDP loopback, **no media on the board**; since #304 the echoed answer also drops PCMA | `RequestsHandler.cpp`, `onInvite` (the `777` branch) |
 
 ### 1.2 Media: the part the board actually carries
 
