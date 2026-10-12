@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "AdminAuth.hpp"
+#include "ResetGuard.hpp"
 
 namespace
 {
@@ -97,6 +98,7 @@ namespace
 	protected:
 		void SetUp() override
 		{
+			resetguard::resetForTest();   // a factory-reset test elsewhere leaves the guard up on host
 			AdminAuth::clearCredential();
 			ASSERT_TRUE(AdminAuth::setLoginCredential(kUser, kPass));
 			ASSERT_TRUE(AdminAuth::setDtmfPin(kPin));
@@ -114,6 +116,7 @@ namespace
 			for (auto& t : _threads) t.join();
 			AdminAuth::setHashHookForTest(nullptr);
 			AdminAuth::clearCredential();
+			resetguard::resetForTest();   // never leave the guard begun for the next test
 		}
 
 		// Park the next hash that reaches `phase`, until release().
@@ -260,6 +263,20 @@ namespace
 			const std::string last = "10.0.1." + std::to_string(AdminAuth::kMaxAttemptBuckets);
 			for (int i = 0; i < AdminAuth::kMaxFailedAttempts - 2; ++i) EXPECT_FALSE(login(kWrong, last));
 			EXPECT_FALSE(locked(last)) << "client 0's miss was charged to another client's bucket";
+		}
+
+		// `setter` hashes, parked in the hook; a factory reset begins (either door's first step,
+		// resetguard::begin(), which takes no lock); the setter is released. Returns its result.
+		template <class Setter>
+		bool runSetterAcrossAReset(Setter setter, bool resetBegins)
+		{
+			parkNext(HashPhase::Running);
+			auto a = bg(setter);
+			if (!waitParked()) { ADD_FAILURE() << "the setter never reached its hash"; return false; }
+			if (resetBegins) resetguard::begin();
+			release();
+			if (!done(a)) { ADD_FAILURE() << "the setter never finished after the release"; return false; }
+			return a.get();
 		}
 	private:
 		std::vector<std::thread> _threads;
@@ -512,6 +529,65 @@ TEST_F(AdminLoginUnlocked, AnAuthenticateMissIsChargedToItsOwnClientEvenIfItsBuc
 TEST_F(AdminLoginUnlocked, AVerifyCredentialMissIsChargedToItsOwnClientEvenIfItsBucketWasRecycledMeanwhile)
 {
 	expectRecycledBucketIsNotMiscounted(verifySysop, verifyLocked);
+}
+
+// ── A factory reset begins while a setter hashes ────────────────────────────
+
+TEST_F(AdminLoginUnlocked, ASetLoginCredentialWhoseHashStraddlesAResetRefusesAndChangesNothing)
+{
+	EXPECT_FALSE(runSetterAcrossAReset([] { return AdminAuth::setLoginCredential(kUser, kNewPass); }, true));
+	EXPECT_TRUE(authSysop(kPass, "10.0.0.8")) << "the old password still works: nothing was committed";
+	EXPECT_FALSE(authSysop(kNewPass, "10.0.0.8"));
+}
+
+TEST_F(AdminLoginUnlocked, ASetOwnerCredentialWhoseHashStraddlesAResetRefusesAndChangesNothing)
+{
+	EXPECT_FALSE(runSetterAcrossAReset([] { return AdminAuth::setOwnerCredential(kOwner, kOwnerPass); }, true));
+	EXPECT_FALSE(AdminAuth::isOwnerProvisioned());
+	EXPECT_TRUE(AdminAuth::authenticate(kOwner, kOwnerPass, "10.0.0.8") == Role::None);
+}
+
+TEST_F(AdminLoginUnlocked, ASetDtmfPinWhoseHashStraddlesAResetRefusesAndChangesNothing)
+{
+	EXPECT_FALSE(runSetterAcrossAReset([] { return AdminAuth::setDtmfPin("9876"); }, true));
+	EXPECT_TRUE(dtmfEntry()) << "the old PIN still works: nothing was committed";
+	AdminAuth::DtmfPinTicket t;
+	ASSERT_TRUE(AdminAuth::beginDtmfPinVerify(t));
+	EXPECT_FALSE(AdminAuth::matchesDtmfPin(t, "9876", nullptr));
+}
+
+TEST_F(AdminLoginUnlocked, WithNoResetTheSameSetLoginCredentialSequenceCommits)
+{
+	EXPECT_TRUE(runSetterAcrossAReset([] { return AdminAuth::setLoginCredential(kUser, kNewPass); }, false));
+	EXPECT_TRUE(authSysop(kNewPass, "10.0.0.8"));
+	EXPECT_FALSE(authSysop(kPass, "10.0.0.8"));
+}
+
+TEST_F(AdminLoginUnlocked, WithNoResetTheSameSetOwnerCredentialSequenceCommits)
+{
+	EXPECT_TRUE(runSetterAcrossAReset([] { return AdminAuth::setOwnerCredential(kOwner, kOwnerPass); }, false));
+	EXPECT_TRUE(AdminAuth::isOwnerProvisioned());
+	EXPECT_TRUE(AdminAuth::authenticate(kOwner, kOwnerPass, "10.0.0.8") == Role::Owner);
+}
+
+TEST_F(AdminLoginUnlocked, WithNoResetTheSameSetDtmfPinSequenceCommits)
+{
+	EXPECT_TRUE(runSetterAcrossAReset([] { return AdminAuth::setDtmfPin("9876"); }, false));
+	AdminAuth::DtmfPinTicket t;
+	ASSERT_TRUE(AdminAuth::beginDtmfPinVerify(t));
+	EXPECT_TRUE(AdminAuth::matchesDtmfPin(t, "9876", nullptr));
+	EXPECT_FALSE(AdminAuth::matchesDtmfPin(t, kPin, nullptr));
+}
+
+TEST_F(AdminLoginUnlocked, NoSetterCommitsOnceAResetBegan)
+{
+	resetguard::begin();
+	EXPECT_FALSE(AdminAuth::setLoginCredential(kUser, kNewPass));
+	EXPECT_FALSE(AdminAuth::setOwnerCredential(kOwner, kOwnerPass));
+	EXPECT_FALSE(AdminAuth::setDtmfPin("9876"));
+	EXPECT_TRUE(authSysop(kPass, "10.0.0.8"));
+	EXPECT_FALSE(AdminAuth::isOwnerProvisioned());
+	EXPECT_TRUE(dtmfEntry());
 }
 
 // ── The digest ───────────────────────────────────────────────────────────────

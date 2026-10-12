@@ -16,6 +16,7 @@
 // not the production trust boundary — documented in docs/THREAT_MODEL.md).
 
 #include "AdminAuth.hpp"
+#include "ResetGuard.hpp"   // #986 slice 4: the setters refuse to commit while a factory reset runs
 
 #include <array>
 #include <atomic>
@@ -1222,6 +1223,20 @@ namespace AdminAuth
 		std::lock_guard<std::mutex> lock(s.mutex);
 		loadCredentialLocked(s);
 
+		// A factory reset runs: refuse, with nothing changed and nothing persisted. It is checked
+		// here, under s.mutex, because both reset doors call resetguard::begin() BEFORE
+		// clearCredential(), and clearCredential() takes s.mutex. This section either comes first,
+		// and the clear then wipes what it committed, or second, and begin() has already happened
+		// (the mutex orders them), so allowed() is false. Without it a setter whose hash straddled
+		// the reset would commit after the clear. The scope also lets the reset's
+		// waitForWritersIdle() wait out a persist already in flight (the DTMF door never calls
+		// clearCredential()); it lives to the end of the function, past persist*Locked().
+		resetguard::WriteScope resetWrite;
+		if (!resetWrite.allowed())
+		{
+			return false;
+		}
+
 		// Issue #173: the collision guard must be symmetric with
 		// setOwnerCredential()'s (found in review) — a sysop renaming
 		// themselves to the owner's username would route their own logins to
@@ -1371,6 +1386,13 @@ namespace AdminAuth
 		AuthState& s = state();
 		std::lock_guard<std::mutex> lock(s.mutex);
 		loadCredentialLocked(s);
+
+		// Refused while a factory reset runs, as in setLoginCredential() (see there).
+		resetguard::WriteScope resetWrite;
+		if (!resetWrite.allowed())
+		{
+			return false;
+		}
 
 		// The two principals must be distinguishable — see authenticate()'s
 		// principal-selection comment for why a shared username would make
@@ -1584,6 +1606,13 @@ namespace AdminAuth
 		AuthState& s = state();
 		std::lock_guard<std::mutex> lock(s.mutex);
 		loadCredentialLocked(s);
+
+		// Refused while a factory reset runs, as in setLoginCredential() (see there).
+		resetguard::WriteScope resetWrite;
+		if (!resetWrite.allowed())
+		{
+			return false;
+		}
 
 		std::string prevSalt = s.pinSalt;
 		std::string prevHash = s.pinHash;

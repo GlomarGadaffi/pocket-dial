@@ -176,5 +176,48 @@ class TheHashMutexIsTakenByHashersOnly(unittest.TestCase):
                 self.assertNotIn(bad, b, sig)
 
 
+class TheSettersRefuseWhileAResetRuns(unittest.TestCase):
+    """Both reset doors call resetguard::begin() before clearCredential(), and clearCredential()
+    takes state().mutex. A setter's check under that mutex therefore either runs first (and the
+    clear wipes what it committed) or second (and the guard is already up). Outside the mutex, or
+    after the commit, a setter whose hash straddled the reset could commit after the clear."""
+
+    def setUp(self):
+        self.auth = code("Helpers/AdminAuth.cpp")
+        with open(os.path.join(SRC, "Helpers", "AdminAuth.cpp"), encoding="utf-8") as f:
+            self.raw = f.read()
+
+    def test_the_guard_header_is_included(self):
+        self.assertIn('#include "ResetGuard.hpp"', self.raw)
+
+    def test_the_check_is_under_the_mutex_before_anything_is_changed_and_lives_past_the_persist(self):
+        for name, sig in SETTERS:
+            b = func_body(self.auth, sig)
+            self.assertEqual(b.count("resetguard::WriteScope resetWrite;"), 1, name)
+            self.assertEqual(b.count("if (!resetWrite.allowed())"), 1, name)
+            lock = b.index("std::lock_guard<std::mutex> lock(s.mutex);")
+            scope = b.index("resetguard::WriteScope resetWrite;")
+            check = b.index("if (!resetWrite.allowed())")
+            self.assertLess(b.index(HASH), lock, name + ": hash first, outside the mutex")
+            self.assertLess(lock, b.index("loadCredentialLocked(s);"), name)
+            self.assertLess(b.index("loadCredentialLocked(s);"), scope, name + ": under the mutex")
+            self.assertLess(scope, check, name)
+            self.assertIn("return false;", b[check:check + 80], name)
+            # nothing of the state is touched before the check, and the persist is after it
+            self.assertIsNone(re.search(r"\bs\.\w+\s*=[^=]", b[:check]), name + ": nothing assigned before the check")
+            self.assertLess(check, b.index("std::string prev"), name)
+            self.assertLess(check, b.index("persist"), name)
+            # declared at function level, so it is still held while persist*Locked() runs
+            before = b[:scope]
+            self.assertEqual(before.count("{"), before.count("}"), name + ": not inside an inner block")
+
+    def test_nothing_else_in_adminauth_touches_the_guard(self):
+        self.assertEqual(len(re.findall(r"\bresetguard::", self.auth)), 3, "one scope per setter")
+        for sig in (r"bool clearCredential\(", r"bool beginDtmfPinVerify\(", r"bool finishDtmfPinVerify\(",
+                    r"bool matchesDtmfPin\(", r"bool verifyCredential\(", r"Role authenticate\(",
+                    r"std::string hashSecretOneAtATime\("):
+            self.assertNotIn("resetguard", func_body(self.auth, sig), sig)
+
+
 if __name__ == "__main__":
     unittest.main()
