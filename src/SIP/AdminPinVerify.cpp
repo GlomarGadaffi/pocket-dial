@@ -5,6 +5,7 @@
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -18,14 +19,22 @@ namespace
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	constexpr const char* kTag = "pin_verify";
 
-	// What the worker's stack has to hold: pinVerifyTask, workOnce, matchesDtmfPin and
-	// hashSecretDigest, whose deepest frame is Sha256::transform's 64-word schedule
-	// (256 B) with a Sha256 (about 112 B) and the 32-byte digest above it; and
-	// vTaskDelay / ulTaskNotifyTake. The chain allocates nothing (the round loop reads
-	// views and writes a fixed digest) and logs nothing. About 1 KB by that count plus
-	// the task context; 3072 B is the same budget as conf_mix_tick and rtp_media_tx. A
-	// reasoned figure, unmeasured: stackHwm will show the real one.
-	constexpr uint32_t kStackBytes = 3072;
+	// What the worker's stack has to hold, and logging is included in the figure. The witness line
+	// (pinVerifyTask) goes esp_log_write -> the log hook (LogQueue's log_queue_vprintf, or the display
+	// build's screen_log_vprintf: a 256-byte buffer either way) -> vsnprintf, and that printf chain,
+	// not the hash, is the deepest thing the task does. The hash chain is pinVerifyTask, workOnce,
+	// matchesDtmfPin and hashSecretDigest, whose deepest frame is Sha256::transform's 64-word schedule
+	// (256 B) with a Sha256 (about 112 B) and the 32-byte digest above it: about 1 KB, plus
+	// vTaskDelay / ulTaskNotifyTake. The stack-depth gate charges a printf with no frame data 2048 B
+	// (tools/ci/task_stacks.json), so with the hook's buffer and the esp_log frames the log path is
+	// about 2.6 KB: 3072 B left no margin on it, 4096 does. Neither is a measurement. The task now
+	// measures: each witness line carries the stack high-water mark, read after the hash and BEFORE
+	// that line's own log call, so line n includes the depth of the log calls of lines 1..n-1 (the mark
+	// is a minimum over the task's life). Read the last of the lines, not the first.
+	constexpr uint32_t kStackBytes = 4096;
+
+	// Witness lines per boot: one per verify, the first 16 only.
+	constexpr unsigned kWitnessLines = 16;
 
 	struct Executor
 	{
@@ -78,11 +87,27 @@ namespace
 	void pinVerifyTask(void* arg)
 	{
 		auto* h = static_cast<Handoff<Executor>*>(arg);
+		unsigned logged = 0;   // a plain local: no function-local static on this chain either
 		for (;;)
 		{
 			// A give that lands while a check runs is not lost: the next take returns at once.
 			(void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-			(void)h->workOnce(realHash);
+			const int64_t t0 = esp_timer_get_time();
+			if (!h->workOnce(realHash)) continue;
+			// The witness line (#986): how long a check really takes with its yields, and how deep this
+			// stack really goes, so the 4096 B can be judged on the board. After the hash and outside
+			// everything it takes, holding nothing of ours. It carries no PIN, no length, and not the
+			// result. Capped, because it is only there to be read once. esp_log_write takes the log
+			// mutex for at most 10 ms to read the tag's level, and both log hooks only enqueue
+			// (xQueueSend with a timeout of 0); nothing on this path allocates.
+			if (logged < kWitnessLines)
+			{
+				const unsigned ms = static_cast<unsigned>((esp_timer_get_time() - t0) / 1000);
+				const unsigned hwm = static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)) * sizeof(StackType_t);
+				++logged;
+				ESP_LOGW(kTag, "check %u/%u: hash %u ms, stack high-water %u B free of %u B",
+					logged, kWitnessLines, ms, hwm, static_cast<unsigned>(kStackBytes));
+			}
 		}
 	}
 #endif

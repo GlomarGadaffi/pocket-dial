@@ -147,11 +147,11 @@ class TheWorkerReachesNoFlashAndNoSharedState(unittest.TestCase):
                  func_body(self.auth, r"void hashSecretDigest\(") +
                  func_body(self.auth, r"void hexInto\("))
         for bad in FLASH_CALLS + ("state()", "loadCredentialLocked", "lock_guard", "unique_lock", "mutex",
-                                  "new ", "malloc", "vector"):
+                                  "new ", "malloc", "vector", "ESP_LOG", "esp_timer"):
             self.assertNotIn(bad, chain, "the worker's hash must hold no lock, touch no AdminAuth state, allocate nothing")
         self.assertIsNone(re.search(r"std::string\b", chain), "std::string allocates; the chain uses views and arrays")
         w = func_body(self.logic, r"bool workOnce\(Hash&& hash\)")
-        for bad in ("lock", "mutex", "new "):
+        for bad in ("lock", "mutex", "new ", "ESP_LOG"):
             self.assertNotIn(bad, w)
         self.assertIsNone(re.search(r"std::string\b", w))
 
@@ -159,7 +159,7 @@ class TheWorkerReachesNoFlashAndNoSharedState(unittest.TestCase):
         start = func_body(self.src, r"void start\(\)")
         self.assertEqual(len(re.findall(r"xTaskCreate\w*\(|createTaskPreferPsram\(", self.src)), 1)
         self.assertRegex(start, r'createTaskPreferPsram\(pinVerifyTask, "pin_verify", kStackBytes, &h, 1, &task, 0\)')
-        self.assertRegex(self.src, r"constexpr uint32_t kStackBytes = 3072;")
+        self.assertRegex(self.src, r"constexpr uint32_t kStackBytes = 4096;")
         self.assertNotIn("PD_ASSERT_NOT_PSRAM_STACK", self.src, "that macro is for tasks that flash")
 
     def test_no_function_local_static_sits_on_the_task_call_chain(self):
@@ -172,10 +172,45 @@ class TheWorkerReachesNoFlashAndNoSharedState(unittest.TestCase):
         self.assertIn("matchesDtmfPin(j.ticket, std::string_view(j.pin), kYield)", self.src)
         self.assertIn("if (yield != nullptr && i % AdminAuth::kYieldEveryRounds == 0) yield();", self.auth)
 
+    def test_the_worker_logs_one_capped_witness_line_after_the_hash_and_never_the_result(self):
+        task = func_body(self.src, r"void pinVerifyTask\(void\* arg\)")
+        # one call site, a plain local counter, capped, and after the hash
+        self.assertEqual(len(re.findall(r"\bESP_LOG[EWIDV]\(", task)), 1, "one log call site in the task")
+        self.assertIn("unsigned logged = 0;", task)
+        self.assertNotIn("static ", task)
+        self.assertRegex(self.src, r"constexpr unsigned kWitnessLines = 16;")
+        self.assertLess(task.index("workOnce(realHash)"), task.index("logged < kWitnessLines"))
+        self.assertLess(task.index("logged < kWitnessLines"), task.index("ESP_LOGW("))
+        self.assertLess(task.index("esp_timer_get_time()"), task.index("workOnce(realHash)"), "timed from before the hash")
+        self.assertLess(task.index("uxTaskGetStackHighWaterMark"), task.index("ESP_LOGW("), "mark read before the line's own log call")
+        self.assertIn("++logged;", task)
+        self.assertLess(task.index("++logged;"), task.index("ESP_LOGW("))
+        # the arguments are the count, the cap, the time, the mark and the stack size: nothing else
+        call = re.search(r'ESP_LOGW\(kTag, "([^"]*)",([^;]*)\);', task, re.S)
+        self.assertIsNotNone(call)
+        fmt, args = call.group(1), [a.strip() for a in call.group(2).split(",")]
+        self.assertEqual(args, ["logged", "kWitnessLines", "ms", "hwm", "static_cast<unsigned>(kStackBytes)"])
+        self.assertEqual(fmt.count("%"), len(args))
+        for word in ("pin", "match", "candidate", "length", "result", "digit"):
+            self.assertNotIn(word, fmt.lower(), "the witness line must not name the PIN or the result")
+        for word in ("matched", "Job", "job", "ticket", "salt"):
+            self.assertNotIn(word, task, "the task body never touches the job's contents or the result")
+        # the log call is not inside the hash chain, nor anywhere that holds a lock of ours
+        self.assertEqual(len(re.findall(r"\bESP_LOG[EWIDV]\(", self.src)), 2, "the task's line and start()'s failure line")
+        self.assertNotIn("lock", task.lower())
+
+    def test_the_stack_figure_says_logging_is_included(self):
+        with open(os.path.join(SRC, "SIP", "AdminPinVerify.cpp"), encoding="utf-8") as f:
+            raw = f.read()
+        before = raw[:raw.index("constexpr uint32_t kStackBytes")]
+        self.assertIn("logging is included in the figure", before)
+        self.assertIn("BEFORE", before[before.rindex("What the worker's stack has to hold"):],
+                      "the comment says which high-water reading the line carries")
+
     def test_the_task_is_in_the_stack_budget_table(self):
         with open(os.path.join(REPO, "tools", "ci", "task_stacks.json"), encoding="utf-8") as f:
             rows = [r for r in json.load(f)["tasks"] if r.get("file") == "src/SIP/AdminPinVerify.cpp"]
-        self.assertEqual([(r["name"], r["bytes"]) for r in rows], [("pin_verify", 3072)])
+        self.assertEqual([(r["name"], r["bytes"]) for r in rows], [("pin_verify", 4096)])
         self.assertEqual(rows[0]["entry"], "\\bpinVerifyTask\\(")
 
     def test_the_file_is_in_both_builds(self):
