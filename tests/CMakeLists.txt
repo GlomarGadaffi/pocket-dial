@@ -763,6 +763,8 @@ add_executable(sip_parser_tests
     # AdminPinVerifyLogic.hpp; the host plays the worker), and its tests.
     ../src/SIP/AdminPinVerify.cpp
     AdminPinOffthread_test.cpp
+    # Issue #986 slice 4: the web login hashes with AdminAuth's mutex released.
+    AdminLoginUnlocked_test.cpp
     # The fork/group/dial-plan routing engine, extracted out of RequestsHandler
     # into its own translation unit.
     ../src/SIP/CallForker.cpp

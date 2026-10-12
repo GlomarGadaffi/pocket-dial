@@ -16,8 +16,10 @@
 // not the production trust boundary — documented in docs/THREAT_MODEL.md).
 
 #include "AdminAuth.hpp"
+#include "ResetGuard.hpp"   // #986 slice 4: the setters refuse to commit while a factory reset runs
 
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <mutex>
 #include <vector>
@@ -585,6 +587,9 @@ namespace
 				std::chrono::steady_clock::now().time_since_epoch().count());
 			return std::mt19937_64(seed);
 		}();
+		// The salts are drawn outside state().mutex now (#986 slice 4), so two threads can get here.
+		static std::mutex rngMutex;
+		std::lock_guard<std::mutex> rngLock(rngMutex);
 		for (size_t i = 0; i < len; ++i)
 		{
 			buf[i] = static_cast<uint8_t>(rng() & 0xFF);
@@ -732,6 +737,8 @@ namespace
 	struct AuthState
 	{
 		std::mutex mutex;
+		// One web-side hash at a time; see hashSecretOneAtATime() for what it is and its lock order.
+		std::mutex hashMutex;
 
 		// In-memory mirror of the stored credentials. On ESP this is loaded from
 		// NVS on first access; on host it IS the credential (host has no NVS).
@@ -787,6 +794,67 @@ namespace
 	{
 		static AuthState s;
 		return s;
+	}
+
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+	std::atomic<AdminAuth::HashHook> g_hashHook{nullptr};
+#endif
+
+	// Every web-side hash (the login, and the credential and PIN setters) goes through here.
+	//
+	// Why a mutex of its own: AdminAuth's mutex used to be held across the hash, which also kept
+	// them one at a time. The SIP/tick task takes that mutex inside RequestsHandler::_mutex
+	// (beginDtmfPinVerify, finishDtmfPinVerify) and a hash is 2.9 s on the S3, so it must not be
+	// held across one (#986 slice 4). Without this, HttpServer's three connections could run
+	// three software hashes at once.
+	//
+	// LOCK ORDER: hashMutex is taken with no other AdminAuth lock held, above all not
+	// state().mutex, and nothing is taken while it is held. A thread that waited here holding
+	// state().mutex would stall beginDtmfPinVerify for as many hashes as are queued ahead of it.
+	// Its callers are HttpServer's login and credential handlers, on http_conn threads. The SIP,
+	// tick and DTMF-worker paths never take it, and neither does clearCredential() (it runs on
+	// tick for a DTMF factory reset).
+	std::string hashSecretOneAtATime(const std::string& salt, const std::string& secret)
+	{
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+		if (AdminAuth::HashHook h = g_hashHook.load()) h(AdminAuth::HashPhase::Queued);
+#endif
+		std::lock_guard<std::mutex> oneAtATime(state().hashMutex);
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+		if (AdminAuth::HashHook h = g_hashHook.load()) h(AdminAuth::HashPhase::Running);
+#endif
+		return hashSecret(salt, secret);
+	}
+
+	// What a login needs of the stored credential, copied under state().mutex so the hash can run
+	// without it (#986 slice 4). `userOk` is the username compare, made at the same moment.
+	struct LoginSnapshot
+	{
+		std::string salt;       // hex
+		std::string hash;       // hex
+		bool        userOk = false;
+	};
+
+	// Caller must hold state().mutex. `owner` picks the owner credential, else the sysop's.
+	LoginSnapshot snapshotLoginLocked(const AuthState& s, bool owner, const std::string& username)
+	{
+		LoginSnapshot snap;
+		snap.salt = owner ? s.ownerPwSalt : s.pwSalt;
+		snap.hash = owner ? s.ownerPwHash : s.pwHash;
+		snap.userOk = constantTimeEquals(username, owner ? s.ownerUsername : s.username);
+		return snap;
+	}
+
+	// Caller must hold state().mutex. False when the credential `snap` was copied from has been
+	// cleared or replaced since. Every set draws a fresh salt, so salt and hash also cover a
+	// changed username.
+	bool loginSnapshotCurrentLocked(const AuthState& s, bool owner, const LoginSnapshot& snap)
+	{
+		if (owner)
+		{
+			return s.ownerProvisioned && s.ownerPwSalt == snap.salt && s.ownerPwHash == snap.hash;
+		}
+		return s.provisioned && s.pwSalt == snap.salt && s.pwHash == snap.hash;
 	}
 
 	// --- NVS-backed persistence (ESP only); no-ops on host. ---
@@ -1075,11 +1143,20 @@ namespace
 	}
 
 	// The DTMF PIN's two lockout gates (its own bucket, then the aggregate backstop),
-	// read by both halves of the check (#986 slice 3). Caller must hold state().mutex.
+	// read by both halves of the check (#986 slice 3). verifyCredential() reads the same two
+	// before and after its hash (#986 slice 4). Caller must hold state().mutex.
 	bool dtmfLockedOutLocked(const AuthState& s, const AttemptBucket& b)
 	{
 		return (b.lockoutUntilMs != 0 && nowMs() < b.lockoutUntilMs) ||
 		       (s.globalLockoutUntilMs != 0 && nowMs() < s.globalLockoutUntilMs);
+	}
+
+	// authenticate()'s two gates (the client's bucket, then the principal's aggregate backstop),
+	// read before its hash and again after it. Caller must hold state().mutex.
+	bool authLockedOutLocked(const AttemptBucket& b, const GlobalBackstop& gb)
+	{
+		return (b.lockoutUntilMs != 0 && nowMs() < b.lockoutUntilMs) ||
+		       (gb.lockoutUntilMs != 0 && nowMs() < gb.lockoutUntilMs);
 	}
 
 	// Caller must hold state().mutex.
@@ -1132,9 +1209,33 @@ namespace AdminAuth
 			return false;
 		}
 
+		// #986 slice 4: the salt and the hash first, with no AdminAuth lock held. They depend on
+		// nothing but the password, and the SIP/tick task takes state().mutex (see
+		// hashSecretOneAtATime()). A username the checks below refuse costs a hash for it.
+		std::string salt = randomHex(32);   // 128-bit salt
+		if (salt.empty())
+		{
+			return false;
+		}
+		std::string hash = hashSecretOneAtATime(salt, password);
+
 		AuthState& s = state();
 		std::lock_guard<std::mutex> lock(s.mutex);
 		loadCredentialLocked(s);
+
+		// A factory reset runs: refuse, with nothing changed and nothing persisted. It is checked
+		// here, under s.mutex, because both reset doors call resetguard::begin() BEFORE
+		// clearCredential(), and clearCredential() takes s.mutex. This section either comes first,
+		// and the clear then wipes what it committed, or second, and begin() has already happened
+		// (the mutex orders them), so allowed() is false. Without it a setter whose hash straddled
+		// the reset would commit after the clear. The scope also lets the reset's
+		// waitForWritersIdle() wait out a persist already in flight (the DTMF door never calls
+		// clearCredential()); it lives to the end of the function, past persist*Locked().
+		resetguard::WriteScope resetWrite;
+		if (!resetWrite.allowed())
+		{
+			return false;
+		}
 
 		// Issue #173: the collision guard must be symmetric with
 		// setOwnerCredential()'s (found in review) — a sysop renaming
@@ -1146,13 +1247,6 @@ namespace AdminAuth
 		{
 			return false;
 		}
-
-		std::string salt = randomHex(32);   // 128-bit salt
-		if (salt.empty())
-		{
-			return false;
-		}
-		std::string hash = hashSecret(salt, password);
 
 		std::string prevUsername = s.username;
 		std::string prevSalt = s.pwSalt;
@@ -1207,18 +1301,14 @@ namespace AdminAuth
 		const std::string& clientKey)
 	{
 		AuthState& s = state();
-		std::lock_guard<std::mutex> lock(s.mutex);
+		std::unique_lock<std::mutex> lock(s.mutex);
 		loadCredentialLocked(s);
 
-		AttemptBucket& b = acquireBucketLocked(s, clientKey);
+		AttemptBucket* b = &acquireBucketLocked(s, clientKey);
 
 		// Honor this client's lockout — and the aggregate backstop — without
 		// hashing while either is engaged.
-		if (b.lockoutUntilMs != 0 && nowMs() < b.lockoutUntilMs)
-		{
-			return false;
-		}
-		if (s.globalLockoutUntilMs != 0 && nowMs() < s.globalLockoutUntilMs)
+		if (dtmfLockedOutLocked(s, *b))
 		{
 			return false;
 		}
@@ -1237,13 +1327,33 @@ namespace AdminAuth
 			// Compute the password hash unconditionally (even if the username is
 			// already wrong) so a wrong username costs the same wall-clock time
 			// as a wrong password — no timing signal on which one was correct.
-			bool userOk = constantTimeEquals(username, s.username);
-			std::string candidate = hashSecret(s.pwSalt, password);
-			bool passOk = constantTimeEquals(candidate, s.pwHash);
-			ok = userOk && passOk;
+			//
+			// #986 slice 4: the hash runs with state().mutex released (the SIP/tick
+			// task takes it; the hash is 2.9 s on the S3). So what it needs is copied
+			// first, and everything is checked again once the mutex is back.
+			const LoginSnapshot snap = snapshotLoginLocked(s, false, username);
+			lock.unlock();
+			const std::string candidate = hashSecretOneAtATime(snap.salt, password);
+			lock.lock();
+
+			// The credential was cleared or replaced meanwhile, or a lockout engaged:
+			// refused, and nothing counted, a miss included (a miss recorded under an
+			// engaged lockout would escalate the next cooldown; the serial code refused
+			// it at the check above). Same rule as finishDtmfPinVerify().
+			if (!loginSnapshotCurrentLocked(s, false, snap))
+			{
+				return false;
+			}
+			b = &acquireBucketLocked(s, clientKey);   // the bucket held above may have been recycled
+			if (dtmfLockedOutLocked(s, *b))
+			{
+				return false;
+			}
+			bool passOk = constantTimeEquals(candidate, snap.hash);
+			ok = snap.userOk && passOk;
 		}
 
-		recordAttemptLocked(s, b, ok);
+		recordAttemptLocked(s, *b, ok);
 		return ok;
 	}
 
@@ -1264,9 +1374,25 @@ namespace AdminAuth
 			return false;
 		}
 
+		// #986 slice 4: the salt and the hash first, with no AdminAuth lock held (see
+		// setLoginCredential()).
+		std::string salt = randomHex(32);
+		if (salt.empty())
+		{
+			return false;
+		}
+		std::string hash = hashSecretOneAtATime(salt, password);
+
 		AuthState& s = state();
 		std::lock_guard<std::mutex> lock(s.mutex);
 		loadCredentialLocked(s);
+
+		// Refused while a factory reset runs, as in setLoginCredential() (see there).
+		resetguard::WriteScope resetWrite;
+		if (!resetWrite.allowed())
+		{
+			return false;
+		}
 
 		// The two principals must be distinguishable — see authenticate()'s
 		// principal-selection comment for why a shared username would make
@@ -1277,13 +1403,6 @@ namespace AdminAuth
 		{
 			return false;
 		}
-
-		std::string salt = randomHex(32);
-		if (salt.empty())
-		{
-			return false;
-		}
-		std::string hash = hashSecret(salt, password);
 
 		std::string prevUsername = s.ownerUsername;
 		std::string prevSalt = s.ownerPwSalt;
@@ -1321,7 +1440,7 @@ namespace AdminAuth
 		const std::string& clientKey)
 	{
 		AuthState& s = state();
-		std::lock_guard<std::mutex> lock(s.mutex);
+		std::unique_lock<std::mutex> lock(s.mutex);
 		loadCredentialLocked(s);
 
 		// Resolve the principal from the SUBMITTED username (public information
@@ -1333,27 +1452,16 @@ namespace AdminAuth
 		const Role principal = ownerAttempt ? Role::Owner : Role::Sysop;
 		const std::string bucketKey = clientKey + "\x1f" + principalName(principal);
 
-		AttemptBucket& b = acquireBucketLocked(s, bucketKey);
+		AttemptBucket* b = &acquireBucketLocked(s, bucketKey);
 		GlobalBackstop& gb = s.principalBackstop[principalIndex(principal)];
 
-		if (b.lockoutUntilMs != 0 && nowMs() < b.lockoutUntilMs)
-		{
-			return Role::None;
-		}
-		if (gb.lockoutUntilMs != 0 && nowMs() < gb.lockoutUntilMs)
+		if (authLockedOutLocked(*b, gb))
 		{
 			return Role::None;
 		}
 
 		bool ok;
-		if (ownerAttempt)
-		{
-			bool userOk = constantTimeEquals(username, s.ownerUsername);
-			std::string candidate = hashSecret(s.ownerPwSalt, password);
-			bool passOk = constantTimeEquals(candidate, s.ownerPwHash);
-			ok = userOk && passOk;
-		}
-		else if (!s.provisioned)
+		if (!ownerAttempt && !s.provisioned)
 		{
 			// No real sysop credential has ever been set: only the well-known
 			// default verifies — identical branch to verifyCredential()'s.
@@ -1361,10 +1469,26 @@ namespace AdminAuth
 		}
 		else
 		{
-			bool userOk = constantTimeEquals(username, s.username);
-			std::string candidate = hashSecret(s.pwSalt, password);
-			bool passOk = constantTimeEquals(candidate, s.pwHash);
-			ok = userOk && passOk;
+			// The owner's or the sysop's secret; the hash always runs, a wrong
+			// username included (see verifyCredential()). #986 slice 4: with
+			// state().mutex released for it, and the lockout, the credential and the
+			// bucket looked at again after it, exactly as verifyCredential() does.
+			const LoginSnapshot snap = snapshotLoginLocked(s, ownerAttempt, username);
+			lock.unlock();
+			const std::string candidate = hashSecretOneAtATime(snap.salt, password);
+			lock.lock();
+
+			if (!loginSnapshotCurrentLocked(s, ownerAttempt, snap))
+			{
+				return Role::None;
+			}
+			b = &acquireBucketLocked(s, bucketKey);   // the bucket held above may have been recycled
+			if (authLockedOutLocked(*b, gb))
+			{
+				return Role::None;
+			}
+			bool passOk = constantTimeEquals(candidate, snap.hash);
+			ok = snap.userOk && passOk;
 		}
 
 		// Bucket-only accounting (see recordBucketAttemptLocked's comment for
@@ -1373,7 +1497,7 @@ namespace AdminAuth
 		// verifyDtmfPin() own — reusing it here would leak an HTTP-login spray
 		// into the DTMF PIN's lockout state and back, defeating the whole
 		// point of per-principal keying).
-		recordBucketAttemptLocked(b, ok);
+		recordBucketAttemptLocked(*b, ok);
 		// This principal's OWN aggregate backstop, independent of the legacy
 		// shared one.
 		if (ok)
@@ -1470,16 +1594,25 @@ namespace AdminAuth
 			return false;
 		}
 
-		AuthState& s = state();
-		std::lock_guard<std::mutex> lock(s.mutex);
-		loadCredentialLocked(s);
-
+		// #986 slice 4: the salt and the hash first, with no AdminAuth lock held (see
+		// setLoginCredential()). This is the PIN the SIP/tick task checks, so it matters most here.
 		std::string salt = randomHex(32);
 		if (salt.empty())
 		{
 			return false;
 		}
-		std::string hash = hashSecret(salt, pin);
+		std::string hash = hashSecretOneAtATime(salt, pin);
+
+		AuthState& s = state();
+		std::lock_guard<std::mutex> lock(s.mutex);
+		loadCredentialLocked(s);
+
+		// Refused while a factory reset runs, as in setLoginCredential() (see there).
+		resetguard::WriteScope resetWrite;
+		if (!resetWrite.allowed())
+		{
+			return false;
+		}
 
 		std::string prevSalt = s.pinSalt;
 		std::string prevHash = s.pinHash;
@@ -1677,6 +1810,11 @@ namespace AdminAuth
 #if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
 	namespace { bool g_failNextErase = false; }
 	void failNextEraseForTest() { g_failNextErase = true; }
+	void setHashHookForTest(HashHook h) { g_hashHook.store(h); }
+	std::string loginHashForTest(const std::string& salt, const std::string& secret)
+	{
+		return hashSecretOneAtATime(salt, secret);
+	}
 #endif
 
 	bool clearCredential()

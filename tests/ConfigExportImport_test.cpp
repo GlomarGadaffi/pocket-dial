@@ -271,6 +271,7 @@ TEST_F(ConfigExportImportTest, PlaintextRoundTrip_DialPlanRingGroupsPageZonesDnd
 	AdminSession owner = loginOwner();
 	ASSERT_EQ(statusOf(httpRaw(_port, "POST", "/api/factory-reset", "confirm=ERASE",
 		"pd_session=" + owner.cookie, owner.csrf)), 200);
+	resetguard::resetForTest();   // the board restarts here and clears the guard; the host does not (#986: the setters honour it)
 
 	// Factory reset wiped the admin credential too -- log back in on the
 	// default and complete setup again before the import call, same as a
@@ -869,6 +870,7 @@ TEST_F(ConfigExportImportTest, EncryptedRoundTrip_RestoresTrunkEmailE911AdminExt
 
 	ASSERT_EQ(statusOf(httpRaw(_port, "POST", "/api/factory-reset", "confirm=ERASE",
 		"pd_session=" + owner.cookie, owner.csrf)), 200);
+	resetguard::resetForTest();   // the board restarts here and clears the guard; the host does not (#986: the setters honour it)
 	ASSERT_TRUE(TrunkConfigStore::load().host.empty()) << "the reset must have wiped the trunk";
 	ASSERT_TRUE(EmailConfigStore::load().host.empty());
 	ASSERT_TRUE(std::get<2>(_handler->getE911Config()).empty());

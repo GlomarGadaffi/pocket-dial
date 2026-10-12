@@ -32,6 +32,10 @@
 //   * Thread-safety: all shared state is guarded by an internal std::mutex. The
 //     HTTP server handles one client at a time per accept, but it detaches a
 //     thread per connection, so concurrent access is possible.
+//   * That mutex is never held across a 50000-round hash (#986 slice 4): the SIP/
+//     tick task takes it inside RequestsHandler::_mutex (beginDtmfPinVerify,
+//     finishDtmfPinVerify), and the hash is 2.9 s on the S3. Web-side hashes run
+//     one at a time on a second mutex that the SIP side never takes.
 
 #include <string>
 #include <string_view>
@@ -135,9 +139,18 @@ namespace AdminAuth
 	// aggregate backstop is tracked per principal for the same reason.
 	//
 	// This is the primary HTTP login path (sendApiAdminLogin) going forward.
-	// verifyCredential() below is kept, UNCHANGED, purely so existing sysop-
-	// only callers/tests keep working without churn — it does not know about
-	// the owner principal at all.
+	// verifyCredential() below is kept, with its contract as it was, purely so
+	// existing sysop-only callers/tests keep working without churn — it does not
+	// know about the owner principal at all.
+	//
+	// #986 slice 4: the hash runs with the credential mutex RELEASED (the lockout
+	// checks and a copy of the stored salt and hash come first, the compare and the
+	// accounting after). A credential cleared or replaced while the hash ran, or a
+	// lockout that engaged meanwhile, ends the login as a refusal that counts
+	// nothing: the same rule finishDtmfPinVerify() follows. verifyCredential() below
+	// does the same. Concurrent guesses from a client one miss short of lockout all
+	// pass the first check and each takes its turn at the hash before the second check
+	// refuses it; they are not counted, so they are no extra guesses.
 	Role authenticate(const std::string& username, const std::string& password,
 		const std::string& clientKey);
 
@@ -297,6 +310,20 @@ namespace AdminAuth
 	// Test-only: the next clearCredential() reports failure (the host store
 	// never fails on its own), so /api/factory-reset's error path is reachable.
 	void failNextEraseForTest();
+
+	// Test-only (#986 slice 4): where a web-side hash is. Every hash the login and the
+	// credential/PIN setters run calls the hook on its own thread, twice: Queued, holding
+	// nothing of ours, just before it waits its turn for the one-hash-at-a-time mutex; then
+	// Running, holding only that mutex (never the credential mutex), just before the rounds.
+	// A test parks a login mid-hash by blocking in the hook. The DTMF worker's hash does not
+	// go through it. nullptr: none.
+	enum class HashPhase { Queued, Running };
+	using HashHook = void (*)(HashPhase);
+	void setHashHookForTest(HashHook h);
+
+	// The hash the login and the setters store and compare (salted, 50000 rounds, hex),
+	// so a test can pin it against an independent computation.
+	std::string loginHashForTest(const std::string& salt, const std::string& secret);
 #endif
 
 	// True iff a REAL (non-default) login credential is persisted in NVS.
