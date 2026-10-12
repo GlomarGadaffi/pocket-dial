@@ -17,10 +17,10 @@ namespace EthAccess
 		s_eth_handle = static_cast<esp_eth_handle_t>(handle);
 	}
 
-	bool transmitL2(void* frame, size_t len)
+	TxStatus transmitL2(void* frame, size_t len)
 	{
-		if (s_eth_handle == nullptr) return false;
-		return esp_eth_transmit(s_eth_handle, frame, len) == ESP_OK;
+		if (s_eth_handle == nullptr) return TxStatus::NoHandle;
+		return esp_eth_transmit(s_eth_handle, frame, len) == ESP_OK ? TxStatus::Ok : TxStatus::DriverError;
 	}
 
 	bool getLocalIpInfo(uint32_t& ip, uint32_t& gw, uint32_t& netmask)
@@ -61,22 +61,24 @@ namespace EthAccess
 		std::array<uint8_t, 6> s_mockMac{};
 
 		bool s_mockTransmitResult = false;
+		bool s_mockEthHandle = true;
 		size_t s_mockTransmitCount = 0;
 		std::vector<uint8_t> s_lastTransmittedFrame{};
 	}
 
 	void setEthHandle(void* /*handle*/) {}
 
-	bool transmitL2(void* frame, size_t len)
+	TxStatus transmitL2(void* frame, size_t len)
 	{
-		if (!s_mockTransmitResult) return false;
+		if (!s_mockEthHandle) return TxStatus::NoHandle;
+		if (!s_mockTransmitResult) return TxStatus::DriverError;
 		++s_mockTransmitCount;
 		if (frame != nullptr && len > 0)
 		{
 			const uint8_t* p = static_cast<const uint8_t*>(frame);
 			s_lastTransmittedFrame.assign(p, p + len);
 		}
-		return true;
+		return TxStatus::Ok;
 	}
 
 	bool getLocalIpInfo(uint32_t& ip, uint32_t& gw, uint32_t& netmask)
@@ -114,8 +116,14 @@ namespace EthAccess
 		s_mockTransmitResult = success;
 	}
 
+	void setMockEthHandle(bool present)
+	{
+		s_mockEthHandle = present;
+	}
+
 	void resetMocks()
 	{
+		s_mockEthHandle = true;
 		s_mockIpAvailable = false;
 		s_mockIp = 0;
 		s_mockGw = 0;

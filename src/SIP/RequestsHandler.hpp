@@ -2843,6 +2843,9 @@ private:
 	// #986: one witness line per call site whose _mutex hold went over 20 ms, once
 	// per boot. Called by tick() after its lock scope; never with _mutex held.
 	void reportSlowMutexHolds();
+	// #985: one witness line per slow media event the media tasks left in pd::MediaTx's
+	// table (capped there). Called by tick() after its lock scope, never with _mutex held.
+	void reportMediaTxWitnesses();
 	// Print one drained log batch: errors to stderr, the rest to stdout. Used by
 	// flushPass() and by every config setter that drains _logQueue itself (#702).
 	static void printLogs(const std::vector<std::pair<bool, std::string>>& logs);

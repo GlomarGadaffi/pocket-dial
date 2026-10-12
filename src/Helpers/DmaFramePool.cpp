@@ -15,6 +15,20 @@ namespace
 	std::atomic<uint32_t> s_exhaustions{0};
 	std::atomic<uint32_t> s_allocations{0};
 
+	// #985: frames lent out right now, and the most that were out at once. The low-water
+	// mark of free frames is kPoolSize minus the second; unlike available() it cannot
+	// miss a dip between two samples. Counted instead of re-reading the queue depth so
+	// the hot path adds one relaxed add. release() subtracts BEFORE the frame goes back,
+	// so a racing acquire() can never push the count above the pool size.
+	std::atomic<uint32_t> s_inUse{0};
+	std::atomic<uint32_t> s_maxInUse{0};
+
+	void noteInUse(uint32_t n)
+	{
+		uint32_t cur = s_maxInUse.load(std::memory_order_relaxed);
+		while (n > cur && !s_maxInUse.compare_exchange_weak(cur, n, std::memory_order_relaxed)) {}
+	}
+
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	// Pool storage in internal SRAM with DMA attribute.
 	static DMA_ATTR FrameBuffer s_frames[DmaFramePool::kPoolSize];
@@ -88,9 +102,11 @@ DmaFramePool::Handle DmaFramePool::acquire()
 	if (q != nullptr && xQueueReceive(q, &buf, 0) == pdTRUE)
 	{
 		s_allocations.fetch_add(1, std::memory_order_relaxed);
+		noteInUse(s_inUse.fetch_add(1, std::memory_order_relaxed) + 1);
 		return Handle(buf);
 	}
 	s_exhaustions.fetch_add(1, std::memory_order_relaxed);
+	noteInUse(static_cast<uint32_t>(kPoolSize));
 	return Handle(nullptr);
 #else
 	std::lock_guard<std::mutex> lock(s_mutex);
@@ -103,9 +119,11 @@ DmaFramePool::Handle DmaFramePool::acquire()
 	{
 		--s_top;
 		s_allocations.fetch_add(1, std::memory_order_relaxed);
+		noteInUse(s_inUse.fetch_add(1, std::memory_order_relaxed) + 1);
 		return Handle(s_freeStack[s_top]);
 	}
 	s_exhaustions.fetch_add(1, std::memory_order_relaxed);
+	noteInUse(static_cast<uint32_t>(kPoolSize));
 	return Handle(nullptr);
 #endif
 }
@@ -123,12 +141,14 @@ void DmaFramePool::Handle::release() noexcept
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	if (QueueHandle_t q = s_poolQueue.load(std::memory_order_acquire))
 	{
+		s_inUse.fetch_sub(1, std::memory_order_relaxed);
 		(void)xQueueSend(q, &bufToReturn, 0);
 	}
 #else
 	std::lock_guard<std::mutex> lock(s_mutex);
 	if (s_top < DmaFramePool::kPoolSize)
 	{
+		s_inUse.fetch_sub(1, std::memory_order_relaxed);
 		s_freeStack[s_top++] = bufToReturn;
 	}
 #endif
@@ -159,10 +179,18 @@ size_t DmaFramePool::available() noexcept
 #endif
 }
 
+uint32_t DmaFramePool::getMinAvailable() noexcept
+{
+	const uint32_t most = s_maxInUse.load(std::memory_order_relaxed);
+	const uint32_t size = static_cast<uint32_t>(kPoolSize);
+	return size - (most < size ? most : size);
+}
+
 void DmaFramePool::resetStats() noexcept
 {
 	s_exhaustions.store(0, std::memory_order_relaxed);
 	s_allocations.store(0, std::memory_order_relaxed);
+	s_maxInUse.store(s_inUse.load(std::memory_order_relaxed), std::memory_order_relaxed);
 }
 
 }   // namespace l2rtp

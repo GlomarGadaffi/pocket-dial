@@ -88,6 +88,8 @@ void TelephonyAnchorClient::setRewarmIntervalSec(uint32_t)
 #include "EmergencyCall.hpp"        // #743: an emergency makeCall() waits out a tearing-down slot
 #include "SosStatusGet.hpp"         // #948: the sos lane's body arena, bounded claim and fallback witness
 #include "PsramAllocator.hpp"       // #948: the arena's allocator (psram::allocPreferPsram)
+#include "MediaTxStats.hpp"         // #985: the TCP_NODELAY A/B flag
+#include <cerrno>
 #include "esp_heap_caps.h"          // #948: start()'s heap witness
 #include "esp_system.h"
 #if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
@@ -999,6 +1001,28 @@ static bool armTokenOpTimeout(esp_http_client_handle_t client, int64_t deadlineU
 	if (ms == 0) return false;
 	esp_http_client_set_timeout_ms(client, ms);
 	return true;
+}
+
+// #985, the Nagle A/B lever: TCP_NODELAY on the audio POST socket. Nothing else sets it, so each
+// ~195 B frame under the MSS can wait for the previous segment's ACK and arrive in one-RTT bursts.
+// Called once per successful open of the audio stream (startMediaStreams) and nowhere else: the
+// socket is new on every open, and the token, control, status and GET handles are not audio senders.
+// Off by default (pd::MediaTx::nodelay(), runtime, never persisted); off, it does and logs nothing.
+// On the open path of an anchor worker, never in the 20 ms write loop.
+static void applyAudioNodelay(esp_http_client_handle_t client, int slotIdx)
+{
+	if (!pd::MediaTx::nodelay()) return;
+	const int fd = esp_http_client_get_socket(client);
+	const int one = 1;
+	const int rc = fd >= 0 ? setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) : -1;
+	if (rc == 0)
+	{
+		ESP_LOGI(TAG, "audio POST TCP_NODELAY set, slot %d", slotIdx);
+	}
+	else
+	{
+		ESP_LOGW(TAG, "audio POST TCP_NODELAY failed, slot %d, errno %d", slotIdx, fd >= 0 ? errno : EBADF);
+	}
 }
 
 // #862: only a token shaped like a JWT is installed (telephony::checkToken); an empty or garbled
@@ -3856,6 +3880,9 @@ bool TelephonyAnchorClient::startMediaStreams(const std::string& participantId)
 		const bool fullHandshake = (openMs > 400);
 		(fullHandshake ? _postFullHandshakes : _postResumedHandshakes).fetch_add(1, std::memory_order_relaxed);
 		ESP_LOGI(TAG, "POST open %lld ms -> %s handshake", (long long)openMs, fullHandshake ? "FULL" : "resumed");
+		// Both opens above (the first, and the retry on a rebuilt handle) reach here once, and only
+		// a successful one. The socket is new, so the option goes on now, before any write (#985).
+		applyAudioNodelay(slot->postClient, static_cast<int>(slot - _calls));
 		slot->postLive.store(true, std::memory_order_release);
 	}
 	ESP_LOGI(TAG, "POST (device->Telephony) audio stream OPEN: %s", postUrl.c_str());

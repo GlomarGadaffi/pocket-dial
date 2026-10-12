@@ -199,6 +199,9 @@ namespace l2rtp
 		// and transmits via EthAccess::transmitL2().
 		// Returns true if L2 transmit was successfully queued.
 		// Returns false if pool is empty or transmit failed (caller must fallback to socket).
+		// Each false return from a ready channel is counted once, by cause, in pd::MediaTx
+		// (#985: pool empty, zero-length frame, no eth handle, driver error); a not-ready
+		// channel is not a transmit attempt and counts nothing.
 		bool transmit(bool marker, uint8_t payloadType, uint16_t seq, uint32_t timestamp,
 		              const uint8_t* payload, size_t payloadLen);
 	};

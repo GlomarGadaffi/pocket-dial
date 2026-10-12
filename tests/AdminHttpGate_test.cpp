@@ -25,6 +25,7 @@
 #include "ArpLookup.hpp"     // Issue #826: the fetching host's MAC, for zero-touch
 #include "JsonReader.hpp"    // Issue #430: parse /api/status in the DropProbe tests
 #include "DmaFramePool.hpp"   // Issue #328: /api/status's l2Tx counters
+#include "MediaTxStats.hpp"   // #985: the TCP_NODELAY switch
 #include "SipSecretStore.hpp"
 #include "ArpLookup.hpp"      // #882: host ARP stub, to build locked and shared Learn rows
 #include "LoopbackAnchorClient.hpp"   // #652: the loopback emergency seam
@@ -1646,6 +1647,58 @@ TEST(OtaReboot, NoStagedImageIsAPlainRestartNotA409)
 	EXPECT_EQ(statusOf(resp), 200) << resp;
 	EXPECT_NE(bodyOf(resp).find("\"staged\":false"), std::string::npos) << resp;
 
+	AdminAuth::clearCredential();
+}
+
+// #985: POST /api/media-tx is the experimental switch for TCP_NODELAY on the anchor's audio
+// socket. It changes how a live call's audio is sent, so it sits behind the owner session and
+// the CSRF token, takes only 0 or 1, and lives in RAM: a reboot is always back to off.
+TEST(MediaTxNodelayRoute, TheSwitchIsGatedStrictAndReadBackFromStatus)
+{
+	pd::MediaTx::resetForTest();
+	AdminAuth::clearCredential();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	// No session at all.
+	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/media-tx", "nodelay=1")), 401);
+	EXPECT_FALSE(pd::MediaTx::nodelay());
+
+	AdminSession a = loginAndCompleteSetup(port);
+	const std::string cookie = "pd_session=" + a.cookie;
+
+	// A session without the CSRF token.
+	EXPECT_EQ(statusOf(httpPostRaw(port, "/api/media-tx", "nodelay=1", cookie)), 403);
+	EXPECT_FALSE(pd::MediaTx::nodelay());
+
+	// Only 0 and 1 are values; a refusal changes nothing.
+	for (const char* bad : { "", "nodelay=", "nodelay=2", "nodelay=on", "nodelay=10", "other=1" })
+	{
+		EXPECT_EQ(statusOf(httpPostRaw(port, "/api/media-tx", bad, cookie, a.csrf)), 400) << bad;
+		EXPECT_FALSE(pd::MediaTx::nodelay()) << bad;
+	}
+
+	const std::string on = httpPostRaw(port, "/api/media-tx", "nodelay=1", cookie, a.csrf);
+	EXPECT_EQ(statusOf(on), 200) << on;
+	EXPECT_NE(bodyOf(on).find("\"nodelay\":1"), std::string::npos) << on;
+	EXPECT_TRUE(pd::MediaTx::nodelay());
+	// The flag is read back on the ungated status route, where a capture is labelled by it.
+	EXPECT_NE(bodyOf(httpGetRaw(port, "/api/status")).find("\"mediaTx\":{\"nodelay\":1,"), std::string::npos);
+
+	const std::string off = httpPostRaw(port, "/api/media-tx", "nodelay=0", cookie, a.csrf);
+	EXPECT_EQ(statusOf(off), 200) << off;
+	EXPECT_FALSE(pd::MediaTx::nodelay());
+	EXPECT_NE(bodyOf(httpGetRaw(port, "/api/status")).find("\"mediaTx\":{\"nodelay\":0,"), std::string::npos);
+
+	// There is no GET: reading is /api/status.
+	EXPECT_EQ(statusOf(httpGetRaw(port, "/api/media-tx")), 404);
+
+	pd::MediaTx::resetForTest();
 	AdminAuth::clearCredential();
 }
 

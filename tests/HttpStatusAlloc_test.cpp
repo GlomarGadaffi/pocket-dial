@@ -19,7 +19,9 @@
 
 #include "AllocCounter.hpp"
 #include "ArpLookup.hpp"
+#include "DmaFramePool.hpp"     // #985: mediaTx.l2.poolMin
 #include "HttpServer.hpp"
+#include "MediaTxStats.hpp"     // #985: the mediaTx block
 #include "PoolConfig.hpp"       // POCKETDIAL_HTTP_DRAM_ACCOUNT (#410/#328)
 #include "PsramAllocator.hpp"   // #479: psram::dynamicTaskCreates()
 #include "RequestsHandler.hpp"
@@ -219,6 +221,48 @@ TEST(HttpStatusAlloc, LearnArpRequestsLimitedIsOnStatus)
 	EXPECT_NE(resp.find("\"learnArpRequestsLimited\":1,"), std::string::npos) << resp;
 }
 
+TEST(HttpStatusAlloc, TheMediaTxBlockIsOnStatusAsSummariesAndCarriesTheNagleFlag)
+{
+	// #985 slice 0: the media TX instrument on the ungated route. Summaries only, no bucket
+	// arrays, so the block stays small (the 16 KB no-PSRAM buffer has to hold an office body
+	// with it). The same keys on the host as on the board, real zeros here: the counters are
+	// platform-free statics. nodelay is the TCP_NODELAY A/B flag a bench capture is labelled by.
+	struct Reset { ~Reset() { pd::MediaTx::resetForTest(); } } reset;
+	pd::MediaTx::resetForTest();
+	l2rtp::DmaFramePool::resetStats();
+	StatusBench b;
+
+	auto zeroHist = [] { return std::string("{\"n\":0,\"p50\":0,\"p99\":0,\"p999\":0,\"max\":0}"); };
+	std::string legs;
+	for (unsigned i = 0; i < pd::MediaTx::kLegs; ++i) legs += (i ? ",0" : "0");
+	const std::string zeros =
+		"\"mediaTx\":{\"nodelay\":0,\"write\":{\"n\":0,\"p99\":0,\"max\":0,\"over\":0,\"legOver\":[" + legs + "]}"
+		",\"hold\":{\"miss\":0,\"maxOverrun\":0},\"feed\":{\"n\":0,\"late\":0,\"max\":0}"
+		",\"l2\":{\"build\":" + zeroHist() + ",\"tx\":" + zeroHist() +
+		",\"poolMin\":" + std::to_string(l2rtp::DmaFramePool::kPoolSize) +
+		",\"errPoolEmpty\":0,\"errZeroLen\":0,\"errNoHandle\":0,\"errDriver\":0,\"fallbackSendFail\":0}}";
+	for (bool authed : {false, true})
+	{
+		SCOPED_TRACE(authed ? "with session" : "anonymous");
+		const std::string resp = b.serve(authed);
+		EXPECT_NE(resp.find(zeros), std::string::npos) << resp;
+		EXPECT_LT(zeros.size(), 520u) << "added to every /api/status body";
+	}
+
+	pd::MediaTx::recordWrite(false, 1, 25000);
+	pd::MediaTx::recordTickMiss(7000);
+	pd::MediaTx::recordFeedFrame(0, 100, 100 + 50000);
+	pd::MediaTx::recordL2Fail(pd::MediaTx::L2Fail::Driver);
+	pd::MediaTx::recordFallbackSendFail();
+	pd::MediaTx::setNodelay(true);
+	const std::string live = b.serve(false);
+	EXPECT_NE(live.find("\"mediaTx\":{\"nodelay\":1,\"write\":{\"n\":1,\"p99\":25000,\"max\":25000,\"over\":1,\"legOver\":[0,1"),
+	          std::string::npos) << live;
+	EXPECT_NE(live.find("\"hold\":{\"miss\":1,\"maxOverrun\":7000}"), std::string::npos) << live;
+	EXPECT_NE(live.find("\"feed\":{\"n\":1,\"late\":1,\"max\":50000}"), std::string::npos) << live;
+	EXPECT_NE(live.find("\"errDriver\":1,\"fallbackSendFail\":1}}"), std::string::npos) << live;
+}
+
 TEST(HttpStatusAlloc, TheMutexHoldIsOnStatus)
 {
 	// #986 slice 0: how long RequestsHandler::_mutex has been held. The values
@@ -292,7 +336,7 @@ TEST(HttpStatusAlloc, TheStatusKeyListIsPinnedAndTheDramAccountGuardAddsOnlyItsO
 		"freeHeapInternal", "largestFreeBlockInternal", "freeHeapDma", "largestFreeBlockDma", "resetReason",
 		"stackHwm_sip_server_task", "stackHwm_udp_receiver_task", "stackHwm_rtp_media_tx", "stackHwm_rtp_media_rx",
 		"stackHwm_conf_mix_tick", "stackHwm_tel_ctl0", "stackHwm_tel_ctl1", "stackHwm_tel_drop", "stackHwm_tel_sos",
-		"stackHwm_http_conn", "httpConnWorstRoute", "coredump", "l2Tx", "memory", "mutexHold",
+		"stackHwm_http_conn", "httpConnWorstRoute", "coredump", "l2Tx", "memory", "mutexHold", "mediaTx",
 	};
 #if POCKETDIAL_HTTP_DRAM_ACCOUNT
 	want.push_back("httpDramAccount");

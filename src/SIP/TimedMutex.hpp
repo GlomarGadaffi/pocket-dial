@@ -31,6 +31,8 @@
 #include <cstdint>
 #include <mutex>
 
+#include "Log2Us.hpp"
+
 #if defined(ESP_PLATFORM)
 #include "esp_timer.h"
 #endif
@@ -82,7 +84,7 @@ namespace pd
 	{
 	public:
 		static constexpr uint32_t kOverUs   = 20000;   // 20 ms: an anchor worker takes the lock every 20 ms frame
-		static constexpr unsigned kBuckets  = 24;      // bucket b = [2^(b-1), 2^b) us; the last is open (>= 4.2 s)
+		static constexpr unsigned kBuckets  = log2us::kBuckets;   // bucket b = [2^(b-1), 2^b) us; the last is open (>= 4.2 s)
 		static constexpr unsigned kSites    = 8;       // ponytail: a ninth slow site counts in `over` and is never named
 
 		PD_TIMED_MUTEX_NOINLINE void lock()
@@ -106,12 +108,7 @@ namespace pd
 			_m.unlock();
 		}
 
-		static unsigned bucketOf(uint32_t us)
-		{
-			unsigned b = 0;
-			while (us != 0 && b < kBuckets - 1) { ++b; us >>= 1; }
-			return b;
-		}
+		static unsigned bucketOf(uint32_t us) { return log2us::bucketOf(us); }
 
 		// One finished hold. Writers must be serialised: unlock() holds the mutex.
 		static void record(int64_t holdUs, uintptr_t pc)
@@ -137,17 +134,7 @@ namespace pd
 			r.maxPc = s_.maxPc.load(kRelaxed);
 			r.over  = s_.over.load(kRelaxed);
 			for (unsigned b = 0; b < kBuckets; ++b) r.holds += s_.hist[b].load(kRelaxed);
-			const uint64_t rank = (uint64_t{r.holds} * 99 + 99) / 100;   // ceil(0.99 * holds)
-			uint64_t cum = 0;
-			r.p99Us = r.maxUs;
-			for (unsigned b = 0; b < kBuckets; ++b)
-			{
-				cum += s_.hist[b].load(kRelaxed);
-				if (cum < rank) continue;
-				const uint32_t top = b == 0 ? 0u : b == kBuckets - 1 ? r.maxUs : (1u << b) - 1;
-				r.p99Us = top < r.maxUs ? top : r.maxUs;
-				break;
-			}
+			r.p99Us = log2us::quantileUs([](unsigned b) { return s_.hist[b].load(kRelaxed); }, r.holds, 99, 100, r.maxUs);
 			return r;
 		}
 

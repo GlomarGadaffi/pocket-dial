@@ -104,6 +104,9 @@ add_executable(sip_parser_tests
     HttpStatusAlloc_test.cpp
     # Issue #986 slice 0: RequestsHandler::_mutex hold histogram, max hold + site, 20 ms witness.
     TimedMutex_test.cpp
+    # Issue #985 slice 0: the media TX instrument (anchor writeAudio and L2 TX timing,
+    # missed ticks, pool low-water, split TX errors, witness lines, the NODELAY flag).
+    MediaTx_test.cpp
     # Issues #410/#328: the per-connection read buffer is reserved per slot (PSRAM
     # where there is some), not allocated per request.
     HttpReadBuf_test.cpp
