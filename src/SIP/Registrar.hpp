@@ -300,7 +300,7 @@ private:
 	};
 
 	bool persistMode();   // false (and logged at ERROR) if any NVS step failed
-	bool persistDevices();   // false (and logged at error) if any NVS step failed
+	bool persistDevices();   // stages the table for the NVS writer (#986); false (logged) if it was not staged
 	// #440: the entry to forget when a new MAC needs room at POCKETDIAL_MAX_CLIENTS:
 	// an unclaimed zero-touch row first (#826), else the OLDEST plain Learned
 	// entry (offline ones first). Never a claimed locked or a Secured device;

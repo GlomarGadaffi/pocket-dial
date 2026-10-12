@@ -300,7 +300,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/trace`](#get-apitrace) | `GET` | Medium | Gated (no `X-CSRF`) | The same capture ring as JSON, for the dashboard's polling live SIP tracer. |
 | [`/config/<mac>.cfg`](#get-configmaccfg) | `GET` | Low | None (MAC is the bearer token) | Yealink auto-provisioning config for an already-adopted device. |
 | [`/api/dnd`](#post-apidnd) | `POST` | High | Gated (+ `X-CSRF`) | Sets or clears Do-Not-Disturb on an extension. |
-| [`/api/forward`](#post-apiforward) | `POST` | High | Gated (+ `X-CSRF`) | Configures call forwarding (`always`/`busy`/`noanswer`) for an extension. |
+| [`/api/forward`](#post-apiforward) | `POST` | High | Gated (+ `X-CSRF`) | Configures call forwarding (`always`/`busy`/`noanswer`) for an extension. `200` means accepted and staged for the NVS writer, not yet on flash (#986). |
 | [`/api/group`](#post-apigroup) | `POST` | High | Gated (+ `X-CSRF`) | Creates, updates, or deletes a ring/hunt group. |
 | [`/api/dialplan`](#post-apidialplan) | `POST` | High | Gated (+ `X-CSRF`) | Creates, updates, or deletes one dial-plan rule (pattern → action). Params: `pattern`, `action` (`group`\|`page`\|`park`\|`trunk`), `target`, and `stripDigits` (trunk only). Naming an `action` always means create/update; **omitting both `action` and `target` deletes the rule**. A `trunk` rule may carry an empty `target`, which means "strip the digits and prepend nothing". |
 | [`/api/telephony-config`](#get-apitelephony-config) | `GET` | Medium | Gated | Lists the four carrier/anchor credential slots. The stored secret is never returned, only `secretSet`. |
@@ -765,7 +765,7 @@ actions.
   * `confirm` (Required): must be the literal string `REPLACE`.
 * Response Content-Type: `application/json`
 * Response Status Codes:
-  * `200 OK`: `{"status":"ok","applied":[...],"skipped":[...]}`. **Deviates from a bare `204`**; see the followup note above. This feature cannot restore everything a plaintext-capable export can carry, and a bare `204` would tell the operator "fully restored" when it was not.
+  * `200 OK`: `{"status":"ok","applied":[...],"skipped":[...]}`. For `forwards`, `applied` means accepted and staged for the NVS writer, not yet on flash (see the note under [`POST /api/forward`](#post-apiforward) for the power-fail window); the burst of per-trigger writes an import makes coalesces into one flash write, the last table. **Deviates from a bare `204`**; see the followup note above. This feature cannot restore everything a plaintext-capable export can carry, and a bare `204` would tell the operator "fully restored" when it was not.
   * `400 Bad Request`: `{"error":"import requires confirm=REPLACE"}` / `"missing blob parameter"` / `"malformed export blob"` / `"export blob is missing a plaintext object"` / `"unsupported exportVer"` / `"malformed secretsEnc block"`.
   * `422 Unprocessable Entity`: `{"error":"bad password or corrupted secrets block"}`. A wrong password and a tampered/corrupted `secretsEnc` block are **deliberately indistinguishable** (the GCM tag check fails identically either way). A `400`/`422` leaves the device completely untouched; the whole blob is validated (and decrypted, if a password was given) before the first setter runs.
   * `401`/`403`: gates 1-3 as in §0.1.
@@ -1838,6 +1838,17 @@ Configures call forwarding for an extension.
 > extension once `POCKETDIAL_MAX_CLIENTS` = **32** extensions already have forwards.
 > `target` gets no charset validation at this layer at all. Read
 > [`GET /api/status`](#get-apistatus)'s `forwards[]` back to confirm.
+
+> [!NOTE]
+> **`200` also means accepted and staged, not yet persisted** (#986). The forward table
+> is copied to the NVS writer task, which writes it to flash after the request has been
+> answered: a few milliseconds typically, longer if the write triggers a flash page
+> garbage collection or the writer is starved by media load. The new forward is live in
+> RAM at once. A power cut, panic or restart (OTA, reboot) inside that window brings the
+> board back with the **previous** persisted table; nothing is flushed before a planned
+> restart. The same applies to the `*72`/`*73` keypad codes, which share this path. A table
+> too large for its 4000-byte slot is refused and logged, never truncated, and the `200`
+> does not change. While a factory reset is running nothing is staged.
 
 #### Response Example (200 OK)
 ```json

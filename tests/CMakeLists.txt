@@ -623,6 +623,10 @@ add_executable(sip_parser_tests
     # Issue #473: the factory-reset journal (host arm keeps the record in memory).
     ../src/Helpers/ResetJournal.cpp
     ResetJournal_test.cpp
+    # Issue #986 slice 2: the NVS writer (stage/overwrite/take policy on the host's
+    # depth-1 mailboxes) and the two callers that now stage instead of committing.
+    ../src/Helpers/NvsWriter.cpp
+    NvsWriter_test.cpp
     # Issue #363: the secrets a factory reset must erase.
     ../src/Helpers/FactoryReset.cpp
     # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2

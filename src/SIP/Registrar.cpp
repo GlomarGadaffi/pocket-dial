@@ -8,6 +8,7 @@
 #include "ArpLookup.hpp"
 #include "DeviceConfig.hpp"   // Issue #397: lastSchemaOutcome() decides the boot default
 #include "IDGen.hpp"
+#include "NvsWriter.hpp"   // #986: the device table is staged, not written here
 #include "PbxPersist.hpp"
 #include "PoolConfig.hpp"
 #include "SipDigest.hpp"
@@ -983,6 +984,7 @@ uint32_t Registrar::loadedSeq(const char* saved, uint32_t& nextSeq)
 
 void Registrar::loadDevices()
 {
+	nvswriter::start();   // #986: up before the first persistDevices(); idempotent, host no-op
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	nvs_handle_t h;
 	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
@@ -1033,42 +1035,35 @@ void Registrar::loadDevices()
 
 bool Registrar::persistDevices()
 {
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// #986 slice 2: serialise only. The table goes into the NVS writer's static
+	// staging slot and nvs_set_str + nvs_commit run on the nvs_writer task, so
+	// _mutex is no longer held across a flash write. Caller holds _mutex (the
+	// slot has one producer). Online state is NOT persisted (volatile).
 	// mac \t extension \t state(int) \t flags(int) \t seq(u32); the last two are
-	// #440's (see loadDevices()). Bounded by POCKETDIAL_MAX_CLIENTS, so the blob
-	// is fixed-footprint. Write-through after each adoption / secure / forget. Caller
-	// holds _mutex; online state is NOT persisted (it is volatile registration state).
-	std::string blob;
-	for (const auto& [mac, rec] : _devices)
+	// #440's (see loadDevices()). Bounded by POCKETDIAL_MAX_CLIENTS; a table that
+	// does not fit the slot is refused, never truncated.
+	const nvswriter::StageResult r = nvswriter::stage(nvswriter::Key::Devices,
+		[this](nvswriter::BlobWriter& w) {
+			for (const auto& [mac, rec] : _devices)
+			{
+				w.str(mac); w.ch('\t');
+				w.str(rec.extension); w.ch('\t');
+				w.uint(static_cast<uint32_t>(rec.state)); w.ch('\t');
+				w.uint(static_cast<uint32_t>(encodeRowFlags(RowFlags{rec.locked, rec.shared, rec.assigned}))); w.ch('\t');
+				w.uint(rec.seq); w.ch('\n');
+			}
+		});
+	// Crew's #487 review: the lock and shared flags live only in this blob, so a
+	// table that did not get staged is logged at error. Callers carry on (the
+	// in-RAM table is still right). A refusal for a running factory reset is
+	// silent, like every NVS writer's.
+	if (r == nvswriter::StageResult::TooBig)
 	{
-		blob += mac; blob += '\t';
-		blob += rec.extension; blob += '\t';
-		blob += std::to_string(static_cast<int>(rec.state)); blob += '\t';
-		blob += std::to_string(encodeRowFlags(RowFlags{rec.locked, rec.shared, rec.assigned})); blob += '\t';
-		blob += std::to_string(rec.seq); blob += '\n';
+		_env.log("Registrar: device table too large to persist (refused, not truncated)", true);
 	}
-	// Every NVS return is checked (Crew's #487 review): the lock and shared flags
-	// live only here, so a silently failed write would revert locks on the next
-	// reboot. Logged at error; callers carry on (the in-RAM table is still right).
-	nvs_handle_t h;
-	const esp_err_t openErr = nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h);
-	if (openErr != ESP_OK)
+	else if (r == nvswriter::StageResult::NotRunning)
 	{
-		_env.log(std::string("Registrar: persisting the device table failed at open (") +
-			esp_err_to_name(openErr) + ")", true);
-		return false;
+		_env.log("Registrar: NVS writer is not running, device table not persisted", true);
 	}
-	const esp_err_t setErr = nvs_set_str(h, "devices", blob.c_str());
-	const esp_err_t commitErr = (setErr == ESP_OK) ? nvs_commit(h) : setErr;
-	nvs_close(h);
-	if (setErr != ESP_OK || commitErr != ESP_OK)
-	{
-		_env.log(std::string("Registrar: persisting the device table FAILED (") +
-			esp_err_to_name(setErr != ESP_OK ? setErr : commitErr) + ")", true);
-		return false;
-	}
-	return true;
-#else
-	return true;
-#endif
+	return r == nvswriter::StageResult::Ok;
 }
