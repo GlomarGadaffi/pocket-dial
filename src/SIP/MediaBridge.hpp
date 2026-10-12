@@ -52,6 +52,11 @@ public:
 	// same fail-safe-to-silence philosophy as every other HoldMusic consumer).
 	void setHoldMusic(HoldMusic* moh) { _moh = moh; }
 
+	// #985: this bridge's index in RequestsHandler's pool, set once at wiring time like
+	// setHoldMusic(). It only names the leg in pd::MediaTx's counters and witness lines;
+	// 0xff (the default) is "unnamed".
+	void setStatsLeg(uint8_t leg) { _statsLeg = leg; }
+
 	// Issue #218: put the handset leg on/off hold. While held, onHandsetRtp()
 	// discards the handset's real audio instead of forwarding it to the
 	// anchor, and this bridge taps into `_moh` so the anchor hears hold music
@@ -293,6 +298,13 @@ private:
 	// atomic is sufficient since nothing here depends on it changing
 	// atomically WITH anything else.
 	std::atomic<bool> _held{false};
+	// #985: the pool index set by setStatsLeg(), and the stamp (low 32 bits of the us clock,
+	// 0 = none) taken when the previous handset frame left onHandsetRtp()'s hand-off to the
+	// anchor. Written by the rx task; cleared by startBridge() and setHeld() so a hold or a
+	// new call never reads as one long gap. Both are instrument state, never consulted by
+	// the media path itself.
+	uint8_t               _statsLeg = 0xff;
+	std::atomic<uint32_t> _feedEndUs{0};
 	std::atomic<uint32_t> _handsetRtpPackets{0};   // #604, see handsetRtpPackets()
 	std::atomic<uint32_t> _anchorRxChunks{0};      // #604, see anchorRxChunks()
 	// The tap id addTap() returned, or -1 when not tapped in. Only ever

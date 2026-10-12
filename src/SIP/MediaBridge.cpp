@@ -1,4 +1,5 @@
 #include "MediaBridge.hpp"
+#include "MediaTxStats.hpp"   // #985
 #include <cstring>
 #if defined(ESP_PLATFORM)
 #include "esp_log.h"   // #533 diag: syslog only carries esp_log output
@@ -84,6 +85,7 @@ bool MediaBridge::startBridge(const std::string& handsetIp, uint16_t handsetPort
 	// its "has this ever worked" flag) into a brand new one.
 	_consecutiveWriteFailures.store(0, std::memory_order_release);
 	_hasWrittenSuccessfully.store(false, std::memory_order_release);
+	_feedEndUs.store(0, std::memory_order_relaxed);   // #985
 
 	// ANCHOR mode: the anchor's inbound audio is delivered through RequestsHandler's
 	// single rx callback, which fans out to feedRx() on the bridge owning the
@@ -200,6 +202,10 @@ void MediaBridge::onHandsetRtp(const uint8_t* mulaw, size_t n)
 	// genuinely broken write path instead of pumping audio into it forever.
 	if (_anchor)
 	{
+		// #985: the frame has arrived; how long since the previous one left the hand-off
+		// below? (Our own write time is not in that figure, see MediaTxStats.hpp.)
+		pd::MediaTx::recordFeedFrame(_statsLeg, _feedEndUs.load(std::memory_order_relaxed), pd::MediaTx::nowUs());
+
 		// #701: snapshot _participantId under _mutex, as feedMohTick() and
 		// dtmfSinkTrampoline() do. stopBridge() stores _active=false and then
 		// clears the string, and startBridge() reassigns it, both under this
@@ -217,14 +223,20 @@ void MediaBridge::onHandsetRtp(const uint8_t* mulaw, size_t n)
 			if (participantIdLen >= sizeof(participantIdBuf)) return;   // refuse, never truncate
 			std::memcpy(participantIdBuf, _participantId.data(), participantIdLen);
 		}
-		recordWriteAudioResult(_anchor->writeAudio(
-			std::string_view(participantIdBuf, participantIdLen), decoded, decodedCount));
+		const uint32_t t0 = pd::MediaTx::nowUs();   // #985: the write, lock waits included
+		const bool ok = _anchor->writeAudio(
+			std::string_view(participantIdBuf, participantIdLen), decoded, decodedCount);
+		const uint32_t t1 = pd::MediaTx::nowUs();
+		pd::MediaTx::recordWrite(/*viaHold=*/false, _statsLeg, t1 - t0);
+		_feedEndUs.store(t1 != 0 ? t1 : 1, std::memory_order_relaxed);
+		recordWriteAudioResult(ok);
 	}
 }
 
 void MediaBridge::setHeld(bool held)
 {
 	if (held == _held.load(std::memory_order_acquire)) return;   // idempotent
+	_feedEndUs.store(0, std::memory_order_relaxed);   // #985: a hold or a resume is not a feed gap
 
 	if (held)
 	{
@@ -311,7 +323,10 @@ void MediaBridge::feedMohTick(const uint8_t* ulawTick, size_t n)
 	// Issue #280: same result-tracking as onHandsetRtp() above -- this is the
 	// OTHER of the two mutually-exclusive writers (this bridge is held, so
 	// onHandsetRtp() is discarding rather than writing right now).
-	recordWriteAudioResult(_anchor->writeAudio(std::string_view(participantIdBuf, participantIdLen), decoded, decodedCount));
+	const uint32_t t0 = pd::MediaTx::nowUs();   // #985
+	const bool ok = _anchor->writeAudio(std::string_view(participantIdBuf, participantIdLen), decoded, decodedCount);
+	pd::MediaTx::recordWrite(/*viaHold=*/true, _statsLeg, pd::MediaTx::nowUs() - t0);
+	recordWriteAudioResult(ok);
 }
 
 void MediaBridge::mohTapTrampoline(void* ctx, const uint8_t* ulawTick, size_t n)

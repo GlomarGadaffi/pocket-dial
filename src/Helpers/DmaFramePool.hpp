@@ -120,6 +120,9 @@ public:
 	static uint32_t getExhaustions() noexcept;
 	static uint32_t getAllocations() noexcept;
 	static size_t   available() noexcept;
+	// #985: the fewest frames that were free at any moment since boot or the last
+	// resetStats(). available() is a sample; this is the low-water mark between samples.
+	static uint32_t getMinAvailable() noexcept;
 	static void     resetStats() noexcept;
 };
 }   // namespace l2rtp

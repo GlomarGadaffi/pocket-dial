@@ -107,6 +107,7 @@ namespace
 		{"POST /api/dialplan",          "POST", "/api/dialplan", "pattern=6XX&action=group&target=600", true},
 		{"POST /api/syslog",            "POST", "/api/syslog", "host=", true},
 		{"POST /api/kill",              "POST", "/api/kill", "callId=none", true},
+		{"POST /api/media-tx",          "POST", "/api/media-tx", "nodelay=0", true},   // #985: leaves the flag off
 	};
 
 	// Routes that still allocate (see the file comment), with the most each may
@@ -120,7 +121,7 @@ namespace
 		{"GET /api/pcap", 3}, {"GET /api/coredump", 3}, {"GET /api/diagnostics/pcap", 3},
 		{"GET /api/ota/status", 3}, {"POST /api/dnd", 3}, {"POST /api/voicemail", 3},
 		{"POST /api/forward", 3}, {"POST /api/group", 3}, {"POST /api/syslog", 3},
-		{"POST /api/kill", 3},
+		{"POST /api/kill", 3}, {"POST /api/media-tx", 3},
 		{"GET /api/syslog", 4}, {"GET /api/trunk", 4}, {"GET /api/moh", 4},
 		{"GET /api/coredump/info", 4}, {"GET /api/e911-config", 4},
 		{"GET /api/registrar", 4},

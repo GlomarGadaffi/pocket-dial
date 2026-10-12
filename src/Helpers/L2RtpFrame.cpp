@@ -2,6 +2,7 @@
 #include "EthAccess.hpp"
 #include "ArpLookup.hpp"
 #include "DmaFramePool.hpp"
+#include "MediaTxStats.hpp"
 
 #include <cstring>
 
@@ -184,9 +185,13 @@ bool EgressChannel::transmit(bool marker, uint8_t payloadType, uint16_t seq, uin
 		return false;
 	}
 
+	// #985: three stamps, the middle one shared. build = acquire + template copy +
+	// patchTick; tx = the hand-off to the driver. Each failure below is one counter.
+	const uint32_t t0 = pd::MediaTx::nowUs();
 	auto frame = DmaFramePool::acquire();
 	if (!frame)
 	{
+		pd::MediaTx::recordL2Fail(pd::MediaTx::L2Fail::PoolEmpty);
 		return false;  // Pool exhausted -> fallback to socket
 	}
 
@@ -195,10 +200,22 @@ bool EgressChannel::transmit(bool marker, uint8_t payloadType, uint16_t seq, uin
 	                       seq, timestamp, payload, payloadLen, ipIdent++);
 	if (len == 0)
 	{
+		pd::MediaTx::recordL2Fail(pd::MediaTx::L2Fail::ZeroLength);
 		return false;
 	}
 
-	return EthAccess::transmitL2(frame.data(), len);
+	const uint32_t t1 = pd::MediaTx::nowUs();
+	const EthAccess::TxStatus status = EthAccess::transmitL2(frame.data(), len);
+	const uint32_t t2 = pd::MediaTx::nowUs();
+	pd::MediaTx::recordL2Build(t1 - t0);
+	pd::MediaTx::recordL2Tx(t2 - t1);
+	if (status == EthAccess::TxStatus::Ok)
+	{
+		return true;
+	}
+	pd::MediaTx::recordL2Fail(status == EthAccess::TxStatus::NoHandle ? pd::MediaTx::L2Fail::NoHandle
+	                                                                   : pd::MediaTx::L2Fail::Driver);
+	return false;
 }
 
 }   // namespace l2rtp

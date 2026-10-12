@@ -55,6 +55,7 @@
 #include "HttpDramAccount.hpp"   // #410/#328: bench-only per-consumer DRAM counters
 #endif
 #include "JsonReader.hpp"    // strict, dependency-free JSON reader for /api/config/import
+#include "MediaTxStats.hpp"  // #985: /api/status mediaTx, and the TCP_NODELAY A/B flag
 #include <cctype>
 #include <cinttypes>     // PRIxPTR: /api/status mutexHold.maxPc (#986)
 #include <cstdio>        // snprintf: sendStaticHtml's allocation-free head (#410)
@@ -1726,6 +1727,18 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 			sendApiOtaReboot(clientSock, req.body);
 		}
 	}
+	else if (req.method == "POST" && req.path == "/api/media-tx")
+	{
+		// #985: the experimental TCP_NODELAY A/B switch for the anchor's audio socket. It
+		// changes how a live call's audio is sent, so it is owner-gated and CSRF-checked like
+		// the bench probe's fault route; unlike that one it exists on a release image, because
+		// the operator flips it on the same call without a reflash. Reading it needs no route:
+		// /api/status carries mediaTx.nodelay.
+		if (requireAdmin(clientSock, req, true, AdminAuth::Role::Owner))
+		{
+			sendApiMediaTx(clientSock, req.body);
+		}
+	}
 #if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
 	else if ((req.method == "GET" || req.method == "POST") && req.path == "/api/bench/fault")
 	{
@@ -2313,6 +2326,49 @@ void HttpServer::recordConnStackHwm(const char* route)
 #endif
 }
 
+// #985 slice 0: the mediaTx block of /api/status. Summaries only (no bucket arrays), from the
+// atomics in pd::MediaTx, on both platforms: the host build reports zeros, not null, because
+// the counters are platform-free. Not inlined, so sendApiStatus's frame does not grow (#405).
+static void pdAppendMediaTxHist(JsonOut& json, const pd::MediaTx::Summary& s)
+{
+	json.s("{\"n\":").n(s.count).s(",\"p50\":").n(s.p50Us).s(",\"p99\":").n(s.p99Us)
+	    .s(",\"p999\":").n(s.p999Us).s(",\"max\":").n(s.maxUs).s("}");
+}
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+static void pdAppendMediaTx(JsonOut& json)
+{
+	const pd::MediaTx::Summary w = pd::MediaTx::writeSummary();
+	json.s(",\"mediaTx\":{\"nodelay\":").n(pd::MediaTx::nodelay() ? 1 : 0)
+	    .s(",\"write\":{\"n\":").n(w.count).s(",\"p99\":").n(w.p99Us).s(",\"max\":").n(w.maxUs)
+	    .s(",\"over\":").n(pd::MediaTx::writeOver()).s(",\"legOver\":[");
+	for (unsigned i = 0; i < pd::MediaTx::kLegs; ++i)
+	{
+		if (i != 0) json.s(",");
+		json.n(pd::MediaTx::legOver(i));
+	}
+	json.s("]},\"hold\":{\"miss\":").n(pd::MediaTx::tickMisses())
+	    .s(",\"maxOverrun\":").n(pd::MediaTx::tickMaxOverrunUs())
+	    .s("},\"feed\":{\"n\":").n(pd::MediaTx::feedFrames())
+	    .s(",\"late\":").n(pd::MediaTx::feedLate())
+	    .s(",\"max\":").n(pd::MediaTx::feedMaxGapUs())
+	    .s("},\"l2\":{\"build\":");
+	pdAppendMediaTxHist(json, pd::MediaTx::l2BuildSummary());
+	json.s(",\"tx\":");
+	pdAppendMediaTxHist(json, pd::MediaTx::l2TxSummary());
+	json.s(",\"poolMin\":").n(l2rtp::DmaFramePool::getMinAvailable())
+	    .s(",\"errPoolEmpty\":").n(pd::MediaTx::l2Fails(pd::MediaTx::L2Fail::PoolEmpty))
+	    .s(",\"errZeroLen\":").n(pd::MediaTx::l2Fails(pd::MediaTx::L2Fail::ZeroLength))
+	    .s(",\"errNoHandle\":").n(pd::MediaTx::l2Fails(pd::MediaTx::L2Fail::NoHandle))
+	    .s(",\"errDriver\":").n(pd::MediaTx::l2Fails(pd::MediaTx::L2Fail::Driver))
+	    .s(",\"fallbackSendFail\":").n(pd::MediaTx::fallbackSendFails())
+	    .s("}}");
+}
+
 char* HttpServer::leaseStatusBuf(std::atomic<bool>*& busy)
 {
 	for (int i = 0; i < kStatusBufCount; ++i)
@@ -2858,6 +2914,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		json.s(",\"mutexHold\":{\"max\":").n(mh.maxUs).s(",\"p99\":").n(mh.p99Us)
 		    .s(",\"over\":").n(mh.over).s(",\"maxPc\":\"").s(pc).s("\"}");
 	}
+	pdAppendMediaTx(json);   // #985 slice 0
 #if POCKETDIAL_HTTP_DRAM_ACCOUNT
 	// #410/#328, bench only: docs/BENCH_PROBE.md. The probes' members go inside the
 	// httpDramAccount object, so the top-level key list is still main's plus that one.
@@ -7624,6 +7681,22 @@ void HttpServer::sendApiBenchFault(int sock, const HttpRequest& req)
 	sendResponse(sock, 200, "OK", "application/json", std::string_view(s_body, n));
 }
 #endif
+
+// #985: POST /api/media-tx  nodelay=0|1. Sets pd::MediaTx's runtime flag; the anchor client
+// reads it after each successful open of an audio POST stream, so a call already up keeps the
+// socket it has until its stream is next opened. Held in RAM only: a reboot is always off.
+void HttpServer::sendApiMediaTx(int sock, const std::string& body)
+{
+	const std::string v = getFormParam(body, "nodelay");
+	if (v != "0" && v != "1")
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json", "{\"error\":\"nodelay must be 0 or 1\"}");
+		return;
+	}
+	pd::MediaTx::setNodelay(v == "1");
+	sendResponse(sock, 200, "OK", "application/json",
+	             pd::MediaTx::nodelay() ? "{\"status\":\"ok\",\"nodelay\":1}" : "{\"status\":\"ok\",\"nodelay\":0}");
+}
 
 void HttpServer::sendApiOtaReboot(int sock, const std::string& body)
 {

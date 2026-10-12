@@ -18,6 +18,7 @@
 #endif
 #include "IDGen.hpp"
 #include "Witness.hpp"        // one-line path witnesses (train/everything)
+#include "MediaTxStats.hpp"   // #985: the slow-media witness drain in tick()
 #include "RefillVector.hpp"   // #463: in-place snapshot refill
 #include <cstdio>             // #463: snprintf for the OPTIONS ping and snapshot ip:port
 #include "IPHelper.hpp"
@@ -434,6 +435,7 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 			// Issue #218: same wiring as ParkOrbit::setHoldMusic() below, so a
 			// held anchor/trunk call can tap the shared clip too.
 			_mediaBridges[i].setHoldMusic(&_holdMusic);
+			_mediaBridges[i].setStatsLeg(static_cast<uint8_t>(i));   // #985: names the leg in mediaTx
 			// Issue #199 item 3. On an anchored (555 / trunk) call the board IS
 			// the far end of the handset's media, so RFC 4733 is the only way a
 			// keypress reaches it short of SIP INFO — and this is the path #194's
@@ -11265,6 +11267,7 @@ void RequestsHandler::tick()
 
 	flushPass(_tickOutboxScratch, _tickLogScratch);
 	reportSlowMutexHolds();
+	reportMediaTxWitnesses();
 }
 
 // #986 slice 0. The hold is recorded by TimedMutex::unlock() and only RECORDED
@@ -11280,6 +11283,39 @@ void RequestsHandler::reportSlowMutexHolds()
 	{
 		PD_WITNESS_W("pbx", "_mutex held %u ms (over 20 ms) by the lock site at 0x%" PRIxPTR " (#986)",
 			static_cast<unsigned>(s.maxUs / 1000), s.pc);
+	}
+}
+
+// #985 slice 0. A slow media event is only RECORDED by the media task that saw it (a
+// fixed table, capped per slot and in all, see MediaTxStats.hpp); the line is written
+// here, from the tick task, after tick()'s lock scope. Logging from the 20 ms loops
+// being measured would put the console inside them.
+void RequestsHandler::reportMediaTxWitnesses()
+{
+	pd::MediaTx::Witness w;
+	// Bounded by the table size: tick() must never spin on a table that did not drain.
+	for (unsigned i = 0; i < (pd::MediaTx::kLegs + 1) * pd::MediaTx::kWitnessPerSlot && pd::MediaTx::takeWitness(w); ++i)
+	{
+		const int leg = w.leg == pd::MediaTx::kNoLeg ? -1 : static_cast<int>(w.leg);
+		switch (w.path)
+		{
+			case pd::MediaTx::Path::AnchorWrite:
+				PD_WITNESS_W("media", "anchor write took %u ms (over 20 ms), handset frame, leg %d, %u so far, uptime %u ms (#985)",
+					static_cast<unsigned>(w.us / 1000), leg, static_cast<unsigned>(w.total), static_cast<unsigned>(w.stampMs));
+				break;
+			case pd::MediaTx::Path::HoldWrite:
+				PD_WITNESS_W("media", "anchor write took %u ms (over 20 ms), hold-music tap, leg %d, %u so far, uptime %u ms (#985)",
+					static_cast<unsigned>(w.us / 1000), leg, static_cast<unsigned>(w.total), static_cast<unsigned>(w.stampMs));
+				break;
+			case pd::MediaTx::Path::HoldTick:
+				PD_WITNESS_W("media", "hold-music tick finished %u ms past its deadline, %u missed so far, uptime %u ms (#985)",
+					static_cast<unsigned>(w.us / 1000), static_cast<unsigned>(w.total), static_cast<unsigned>(w.stampMs));
+				break;
+			case pd::MediaTx::Path::FeedGap:
+				PD_WITNESS_W("media", "handset feed idle %u ms (over 40 ms), bridge leg %d, %u late so far, uptime %u ms (#985)",
+					static_cast<unsigned>(w.us / 1000), leg, static_cast<unsigned>(w.total), static_cast<unsigned>(w.stampMs));
+				break;
+		}
 	}
 }
 

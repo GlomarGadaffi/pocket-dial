@@ -21,10 +21,14 @@ namespace EthAccess
 	// Typically called once during boot (e.g., in app_main).
 	void setEthHandle(void* handle);
 
+	// Why a transmit did or did not queue (#985: a missing handle and a failing driver are
+	// different faults, and the caller counts them apart).
+	enum class TxStatus : uint8_t { Ok, NoHandle, DriverError };
+
 	// Transmit an L2 frame directly. The frame MUST be placed in internal,
 	// DMA-capable memory (e.g., using DMA_ATTR) and appropriately aligned.
-	// Returns true if transmission was successfully queued.
-	bool transmitL2(void* frame, size_t len);
+	// Ok means the transmission was successfully queued.
+	TxStatus transmitL2(void* frame, size_t len);
 
 	// Retrieve the local IP, Gateway, and Netmask (in host byte order).
 	// Used for determining whether a destination IP is on-subnet.
@@ -39,6 +43,9 @@ namespace EthAccess
 	void setMockIpInfo(bool available, uint32_t ip = 0, uint32_t gw = 0, uint32_t netmask = 0);
 	void setMockMac(bool available, const std::array<uint8_t, 6>& mac = {});
 	void setMockTransmitResult(bool success);
+	// false = no Ethernet handle was ever provided (setEthHandle never ran). The default
+	// is a handle, so setMockTransmitResult(false) still means "the driver failed".
+	void setMockEthHandle(bool present);
 	void resetMocks();
 	size_t getMockTransmitCount();
 	const std::vector<uint8_t>& getLastTransmittedFrame();

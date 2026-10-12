@@ -4,6 +4,7 @@
 #include "EthAccess.hpp"
 #include "ArpLookup.hpp"
 #include "DmaFramePool.hpp"
+#include "MediaTxStats.hpp"     // #985: missed 20 ms ticks
 #include "PsramAllocator.hpp"   // #479: psram::dynamicTaskCreates()
 
 #include <cmath>
@@ -573,6 +574,11 @@ void HoldMusic::runLoop()
 		// experience as a hold-music player: a brief gap, not a stutter.
 		if (xTaskDelayUntil(&next, pdMS_TO_TICKS(PTIME_MS)) == pdFALSE)
 		{
+			// #985: the call has already moved `next` to the deadline that passed, so
+			// now - next is how far past it this tick finished. Counted here and nowhere
+			// else: a tick that did delay costs the loop nothing extra.
+			pd::MediaTx::recordTickMiss(
+				static_cast<uint32_t>(xTaskGetTickCount() - next) * portTICK_PERIOD_MS * 1000u);
 			next = xTaskGetTickCount();
 		}
 

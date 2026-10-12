@@ -13,6 +13,7 @@
 #include "EthAccess.hpp"
 #include "ArpLookup.hpp"
 #include "DmaFramePool.hpp"
+#include "MediaTxStats.hpp"   // #985: a failed fallback sendto is counted
 #include "RtpTaskSlots.hpp"   // Issue #479: pd::rtpslots::kTxStackBytes / kTxSlots
 #include "PsramTask.hpp"      // Issue #479: pd::StaticTaskSlot / pd::reapParkedStaticTask
 #include "SlotPool.hpp"       // Issue #479: the shared tx stack pool
@@ -521,8 +522,11 @@ void RtpSender::runLoop()
 
 		if (!l2Success && sock >= 0)
 		{
-			sendto(sock, packet, sizeof(packet), 0,
-				reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
+			if (sendto(sock, packet, sizeof(packet), 0,
+				reinterpret_cast<sockaddr*>(&dest), sizeof(dest)) < 0)
+			{
+				pd::MediaTx::recordFallbackSendFail();   // #985
+			}
 		}
 
 		firstPkt   = false;
