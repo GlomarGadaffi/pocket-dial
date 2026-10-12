@@ -1,0 +1,77 @@
+name: Site-only change gate
+
+# Called by ci.yml, interop.yml, commit-hygiene.yml and codeql.yml. Answers one
+# question: does this PR or push touch anything outside the GitHub Pages site?
+#
+# The site is the web assets at the top of docs/ (the landing page and its
+# screenshot), the browser flasher, and the firmware images release.yml
+# publishes for it. Nothing compiles or tests those
+# files, so a change confined to them gets nothing from a firmware build matrix,
+# host tests, interop or CodeQL. The rest of docs/ is NOT site: tests/tools read
+# docs/API.md and docs/BENCH_PROBE.md.
+#
+# Why a job-level gate and not `paths-ignore` on the workflows: main requires
+# Host Build, Call-Graph Guard and the Interop Suite (see commit-hygiene.yml).
+# A workflow that paths-ignore filters out never reports those checks, and the
+# PR waits on them forever. A job skipped by its `if:` reports "skipped", which
+# satisfies a required check.
+#
+# Fails open: code=true unless the changed-file list was fetched and every file
+# in it is a site file. Callers test `!= 'false'` under `!cancelled()`, so a
+# gate that errors or never runs also means "run everything".
+on:
+  workflow_call:
+    outputs:
+      code:
+        description: "'false' only when every changed file is part of the Pages site"
+        value: ${{ jobs.gate.outputs.code }}
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Site-only change check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.check.outputs.code }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.event.after }}
+        run: |
+          set -u
+          # Top-level web assets of docs/ (never its .md, which tests read),
+          # plus the flasher and the firmware it serves.
+          SITE_RE='^docs/([^/]+\.(html|css|js|svg|png|jpg|jpeg|webp|ico)|flasher/.*|firmware/.*)$'
+          code=true
+          case "$EVENT" in
+            pull_request|push)
+              # A push that creates a ref has an all-zero `before`: no range.
+              if [ -n "$BASE" ] && [ -n "$HEAD" ] && [ -n "${BASE//0/}" ]; then
+                # Three-dot compare = changes since the merge base, i.e. this
+                # PR's own diff. The API lists at most 300 files; at that cap
+                # the list may be partial, so run everything.
+                if files=$(gh api "repos/$REPO/compare/$BASE...$HEAD" --jq '.files[].filename'); then
+                  n=$(printf '%s\n' "$files" | grep -c . || true)
+                  echo "$n changed file(s)"
+                  if [ "$n" -gt 0 ] && [ "$n" -lt 300 ] && ! printf '%s\n' "$files" | grep -Evq "$SITE_RE"; then
+                    code=false
+                  fi
+                else
+                  echo "::warning::Could not list changed files; running everything."
+                fi
+              fi
+              ;;
+          esac
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" = false ]; then
+            echo "Only GitHub Pages site files changed: code jobs will be skipped."
+          else
+            echo "Code jobs will run."
+          fi
