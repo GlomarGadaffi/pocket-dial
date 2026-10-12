@@ -1,13 +1,13 @@
 # Bench probe image (`POCKETDIAL_ANCHOR_BENCH_PROBE`)
 
-Issue #384, harness hook H1. A bench-only firmware image that injects one-shot
-faults into the 3CX anchor client and holds a controlled amount of internal DRAM,
-so a rig scenario can drive the paths behind #349, #279, #336, #518, #379 and the
-pressure runs for #350/#370 on purpose instead of waiting for them.
+This is issue #384, harness hook H1: a bench-only firmware image that injects one-shot
+faults into the 3CX anchor client and holds a controlled amount of internal DRAM. A rig
+scenario uses it to drive the paths behind #349, #279, #336, #518, #379 and the pressure
+runs for #350/#370 on purpose, instead of waiting for them.
 
-**Never ship it. Never leave it on a rig.** Every run that flashes it ends by
-putting a release image back, and CHECK-IN (#428) verifies the board reports a
-release stamp again. That check is the operator's job.
+**Warning:** never ship the probe image, and never leave it on a rig. Every run that
+flashes it ends by putting a release image back. CHECK-IN (#428) verifies that the board
+reports a release stamp again, but that check is the operator's job.
 
 A second, unrelated bench option, `POCKETDIAL_HTTP_DRAM_ACCOUNT` (#410, #328), is described
 at the end: [HTTP DRAM accounting](#http-dram-accounting-pocketdial_http_dram_account).
@@ -63,7 +63,7 @@ dead-man timer cannot be created.
 
 Each is **one-shot**: arming it once makes it fire once, and each firing logs one
 line `BENCHFAULT <name> fired` and bumps its `fired` counter. `fired` is the
-scenario's "path exercised" counter: a run whose fault shows `fired: 0` is INVALID.
+scenario's "path exercised" counter: a run whose fault shows `fired: 0` is `INVALID`.
 
 | Name | Value | Where it fires | Effect | Serves |
 |---|---|---|---|---|
@@ -92,8 +92,8 @@ Notes:
   end the client, cannot run from its event handler, and expose no socket. Variant A
   of `x336_ws_reauth` needs another way to cut the WS (for example, at the network).
 
-**Validity:** app-level faults are **not** evidence for #350. That bug lives in
-mbedTLS's failed-read state, and only ballast or a real network fault reaches it.
+App-level faults are **not** evidence for #350. That bug lives in mbedTLS's failed-read
+state, and only ballast or a real network fault reaches it.
 
 ### `ws_upsert` (#888)
 
@@ -103,7 +103,7 @@ builds the frame `{"event":{"event_type":0,"entity":"/callcontrol/<dn>/participa
 with `<dn>` the anchor's source DN, and hands it to `handleWsEvent()` as a text frame. The JSON parse, the DN
 check, `parseParticipantEntity()` and the classification are the real ones, not a copy. The participant id is
 the probe's own, `pdb-u<case>-<n>` (`n` counts injections since boot), so a witness line says which upsert made
-it (`part=pdb-u2-3`) and is the first sighting of its id, which is the one that logs.
+it (`part=pdb-u2-3`). The witness line is the first sighting of that id, so it is the line that gets logged.
 
 | Case | Waits for | The upsert | Branch it reaches | Witness line it makes |
 |---|---|---|---|---|
@@ -113,14 +113,14 @@ it (`part=pdb-u2-3`) and is the first sighting of its id, which is the one that 
 
 - **A case that cannot happen yet waits, still armed.** It is never forced: a case 2 armed with no call in
   flight fires when a call is, and a case 1 or 3 armed during an outbound call fires after it. `fired` counts
-  injections, so a case that never became possible shows `fired` unchanged and the scenario calls it INVALID.
+  injections, so a case that never became possible shows `fired` unchanged and the scenario calls it `INVALID`.
 - **Case 1 and the enqueue.** The work queue has no failure a probe can drive without also starving the
   workers (they drain it at once). So `enqueueWsWork()` refuses a work item whose participant is a `pdb-u` id
   and whose control leg is that participant itself, which is what an unknown participant with no call maps
   to, and answers false after freeing the item: the same `delete item; return false` a full queue takes. The
   `xQueueSend` failure itself is not exercised. The same rule means a synthetic participant is never queued as
   an inbound call, the one thing that would ring the route DN's phones, even if the call in case 2 ends between
-  the tick's check and the classification (the upsert then reads "not queued" and the case is INVALID, not a
+  the tick's check and the classification (the upsert then reads "not queued" and the case is `INVALID`, not a
   ring). Case 2's item is queued, mapped to the in-flight leg: the worker runs its status check on that leg
   (one extra participant-list GET on the real call), as it does for any upsert.
 - **Case 3 and the own-leg table.** The id is noted in `_ownLegs` (#379) before the injection and released
@@ -130,7 +130,7 @@ it (`part=pdb-u2-3`) and is the first sighting of its id, which is the one that 
   `emergencyDisarms`, as for every fault. Logs: `BENCHFAULT ws_upsert armed (value <case>)`, then on the tick
   `BENCHFAULT ws_upsert fired` and `BENCHFAULT ws_upsert case <case>: injecting part=<id>`, then the witness
   line. If the 256-line per-boot witness cap was already reached there is no witness line (`witness cap
-  reached`), and the case reads INVALID.
+  reached`), and the case reads `INVALID`.
 - **Refusal (rule 5, the same policy as every fault).** Arming while an emergency is live is answered `409`,
   counted in `refusedArms` and logged `BENCHFAULT ws_upsert arm refused: emergency call live`. A fire site
   reached while an emergency is live, or for an emergency destination, injects nothing, disarms every fault,
@@ -142,7 +142,7 @@ it (`part=pdb-u2-3`) and is the first sighting of its id, which is the one that 
   before the INVITE, and CANCELs 0.5 s after the `BENCHFAULT ws_upsert fired` line (or at 10 s if it never
   comes), so the far end rings once and briefly. Its call cap is 1. Cases 1 and 3 place no call. It counts
   the witness line of each case by the exact text above and the case's part id; a case with 0 lines is
-  INVALID, never PASS. Far end only: no owner extension, no test UA, no service number.
+  `INVALID`, never `PASS`. Far end only: no owner extension, no test UA, no service number.
 
 ## Ballast
 
@@ -184,21 +184,21 @@ transport failure (or at 10 s if there is none), and releases the ballast the mo
 
   | Witness | Lines |
   |---|---|
-  | transport failure (the path counter `get_transport_fail`; 0 is INVALID) | `GET stream transport failure (no HTTP response, status=-1), attempt k/N` or `GET stream open failed (...), attempt k/N` |
+  | transport failure (the path counter `get_transport_fail`; 0 is `INVALID`) | `GET stream transport failure (no HTTP response, status=-1), attempt k/N` or `GET stream open failed (...), attempt k/N` |
   | rebuilt | such a line at k, then any attempt line at k+1 of the same N |
   | fresh handshake answered | the k+1 line is `GET stream not ready (HTTP ...), attempt k+1/N`, a parsed answer |
   | `recreateGetClient()` returned false | `GET stream: could not rebuild client after transport failure`: a handle that would not init, or a teardown racing the loop (`:3764`); the log cannot tell which, and no handshake ran, so it is not a witness |
   | third in a row | `GET stream: 3 consecutive transport failures`: gives up without a rebuild (`:3888-3894`) |
 
   A failure with no next attempt (a lost UDP line, or the CANCEL came first) and a "could not rebuild" line with
-  no rebuild beside it are INVALID, never PASS; the counts stay in the summary. `test_anchor_x370_pressure_rebuild.py`
+  no rebuild beside it are `INVALID`, never `PASS`; the counts stay in the summary. `test_anchor_x370_pressure_rebuild.py`
   pins every one of these lines, the `3`, and the absence of a `continue` in the loop to the source, and fails if a
   success line is added, so the witness can then be made direct. The line would go right after the
   `if (!recreateGetClient()) {... break;}` block at `:3895-3899` (no `else`: the `if` breaks).
-- **Verdicts.** PASS: both faults fired, exactly one anchored leg, a rebuild witness (a failure followed by the next attempt),
+- **Verdicts.** `PASS`: both faults fired, exactly one anchored leg, a rebuild witness (a failure followed by the next attempt),
   the board answered `/api/status` after the release with a later uptime and the same reset reason, no panic line,
-  no coredump, no `ORPHANED` line, one drop. FAIL: any of the last five, a hang or reboot after the release, a
-  second rx task on the leg (#370's shape), a CANCEL not answered 200. INVALID: no transport failure (the
+  no coredump, no `ORPHANED` line, one drop. `FAIL`: any of the last five, a hang or reboot after the release, a
+  second rx task on the leg (#370's shape), a CANCEL not answered 200. `INVALID`: no transport failure (the
   ballast did not bite), a failure with no next attempt, a lone "could not rebuild", no leg (the far end never rang; with the ballast held
   across `makeCall()`'s POST that can be the pressure itself), the ballast not taking (`held` false), a `409`, the
   dead-man releasing it first.
@@ -212,8 +212,8 @@ transport failure (or at 10 s if there is none), and releases the ballast the mo
   cap 30 s.
 - **Needs an OK.** Holding the ballast across `makeCall()` puts its POST and the reconcile list read under
   pressure: the #349 ORPHAN variant (a live billable leg on 3CX) is possible, which the approval excludes (see
-  `makecall_read_fail` above). An `ORPHANED` line is a FAIL with a note to check the route point. If the ballast
-  makes the POST fail instead, the run is INVALID (no leg); raise `ballast_bytes` to ease it.
+  `makecall_read_fail` above). An `ORPHANED` line is a `FAIL` with a note to check the route point. If the ballast
+  makes the POST fail instead, the run is `INVALID` (no leg); raise `ballast_bytes` to ease it.
 
 ## Rule 5: 911 and 933 come first
 
