@@ -10,7 +10,8 @@ putting a release image back, and CHECK-IN (#428) verifies the board reports a
 release stamp again. That check is the operator's job.
 
 A second, unrelated bench option, `POCKETDIAL_HTTP_DRAM_ACCOUNT` (#410, #328), is described
-at the end: [HTTP DRAM accounting](#http-dram-accounting-pocketdial_http_dram_account).
+below: [HTTP DRAM accounting](#http-dram-accounting-pocketdial_http_dram_account). A third,
+`POCKETDIAL_SHA_BENCH` (#986), is at the end: [SHA-256 timing](#sha-256-timing-pocketdial_sha_bench).
 
 ## Building it
 
@@ -489,3 +490,44 @@ The probes (this section's second half) add to that:
 - Not done: any run on a board, so no `memp`, `tcp` or `connCreate` value has been read; every number
   in the fix table above is arithmetic. The accept loop's 20 ms `select()` and the `tcpip_api_call`
   every 20 ms have not been timed.
+
+## SHA-256 timing (`POCKETDIAL_SHA_BENCH`)
+
+Issue #986. A bench-only measurement, not a fix. The admin PIN hash (`AdminAuth::hashSecret`,
+50000 rounds of a self-contained software SHA-256) took 2,872 ms on `.244`. This option runs it
+once at boot, next to the same 50000 rounds through IDF's SHA-256, and logs the times, so the
+decision to move `hashSecret` onto the SHA peripheral (which would also shorten the web login)
+rests on a number from the board.
+
+Build it like any release image, plus the option, in a separate build directory:
+
+```
+idf.py -B build-shabench -D SIP_TRANSPORT=<the board's transport> [-D PD_ETH_BOARD=<board>] \
+       -D POCKETDIAL_SHA_BENCH=1 set-target esp32s3
+idf.py -B build-shabench -D SIP_TRANSPORT=<the board's transport> [-D PD_ETH_BOARD=<board>] \
+       -D POCKETDIAL_SHA_BENCH=1 build
+```
+
+- With the option off, every line it adds is removed by the preprocessor and the hook
+  (`PD_SHA_BENCH_HOOK()`, on the existing `_dtmf.load();` line of `RequestsHandler`'s constructor)
+  expands to nothing: the image is the release image. The version stamp is **not** changed with it
+  on; the `sha_bench` lines in the boot log are how you tell. Flash a release image back afterwards.
+- It runs on `sip_server_task` before that task subscribes to the task watchdog, and takes about
+  20 s at boot. Each software run is one call (the idle-task watchdog is 5 s); the hardware loops
+  sleep a tick every 4096 rounds and leave that time out of the figure.
+- ESP-IDF v6.0.1 ships Mbed TLS 4.0, whose legacy `mbedtls_sha256_*` is a private header, so the
+  hardware figure is taken through the PSA API (`psa_hash_*`), which is what reaches the SHA
+  peripheral when `CONFIG_MBEDTLS_HARDWARE_SHA=y`. It is not set in `sdkconfig.defaults`; the IDF
+  default (`y`, `components/mbedtls/Kconfig`) applies, and a generated S3 `sdkconfig` has it on.
+  The first log line says which it was.
+
+What it logs, at WARN, tag `sha_bench`, two runs of each:
+
+| Line | Meaning |
+|---|---|
+| `software hashSecret, run N: <us> us` | The unchanged function the web login and `setDtmfPin()` run. |
+| `PSA multi-part ... run N: <us> us, ok=1, digest identical to software: 1` | Each round as `setup`, `update(salt)`, `update(previous digest)`, `finish`. This is the shape a drop-in replacement of the round loop has. With the SHA peripheral every `setup` allocates and every `finish` frees a DMA-capable internal-RAM context (`psa_crypto_driver_esp_sha.c`). |
+| `PSA one-shot ... run N: <us> us, ok=1, digest identical to software: 1` | Each round as one `psa_hash_compute` over `salt \|\| previous digest`: the cheapest the peripheral can be called from this API. |
+
+`digest identical to software: 0` or `ok=0` on any line means that variant is not a replacement
+for `hashSecret` at all, whatever its time.

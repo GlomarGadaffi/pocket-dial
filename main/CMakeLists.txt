@@ -412,6 +412,15 @@ if(POCKETDIAL_HTTP_DRAM_ACCOUNT)
     message(WARNING "SipServer: HTTP DRAM ACCOUNTING image -- bench only, httpDramAccount on /api/status (#410, #328)")
 endif()
 
+# Issue #986: BENCH-ONLY boot timing of the 50000-round admin PIN hash, software against IDF's
+# hardware SHA-256 (docs/BENCH_PROBE.md): one-shot log lines at boot, nothing on the wire. Any
+# transport. Never ship it; the version stamp is not changed. Without this plumbing `idf.py -D`
+# would only set a cache variable and the build would silently carry nothing.
+if(POCKETDIAL_SHA_BENCH)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_SHA_BENCH=1)
+    message(WARNING "SipServer: SHA BENCH image -- bench only, times the PIN hash at boot (#986)")
+endif()
+
 if(DEFINED POCKETDIAL_PCAP_RING_SIZE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
         POCKETDIAL_PCAP_RING_SIZE=${POCKETDIAL_PCAP_RING_SIZE})

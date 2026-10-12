@@ -1956,3 +1956,137 @@ namespace AdminAuth
 		return true;
 	}
 }
+
+// ── #986, BENCH-ONLY: boot timing of the 50000-round PIN hash (POCKETDIAL_SHA_BENCH) ────────────────
+// Not compiled unless the build says so (main/CMakeLists.txt). Runs once from RequestsHandler's
+// constructor, on sip_server_task before it subscribes to the task watchdog, and logs at WARN:
+//   * the unchanged software hashSecret(), as the web login and setDtmfPin() run it;
+//   * the same rounds through IDF's SHA-256 (PSA: ESP-IDF v6.0.1 ships Mbed TLS 4.0, whose legacy
+//     mbedtls_sha256_* is a private header, and with CONFIG_MBEDTLS_HARDWARE_SHA=y psa_hash_* is what
+//     reaches the SHA peripheral), one round at a time as setup, update(salt), update(previous
+//     digest), finish -- the multi-part shape a drop-in replacement of the loop would have;
+//   * the same rounds as one psa_hash_compute over salt || previous digest;
+//   * whether every digest is byte-identical to the software one.
+// Each software run is one call (about 3 s: no yield inside hashSecret, and the idle-task watchdog
+// is 5 s), with a sleep between runs. The hardware loops sleep a tick every 4096 rounds and that
+// time is left out of the figure.
+#if defined(POCKETDIAL_SHA_BENCH) && defined(ESP_PLATFORM)
+#include <inttypes.h>
+
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "psa/crypto.h"
+#include "sdkconfig.h"
+
+namespace
+{
+	constexpr size_t kBenchSaltLen = 32;   // what setDtmfPin() writes
+	constexpr int kBenchReps = 2;
+
+	// statics: this runs once, deep in a constructor, on an 8 KB task stack
+	psa_hash_operation_t s_benchOp;
+	uint8_t s_benchBuf[kBenchSaltLen + 32];
+	uint8_t s_benchOut[32];
+
+	bool benchMultipart(const std::string& salt, const std::string& pin, int64_t& us)
+	{
+		const uint8_t* saltB = reinterpret_cast<const uint8_t*>(salt.data());
+		size_t len = 0;
+		int64_t acc = 0;
+		int64_t t0 = esp_timer_get_time();
+		s_benchOp = psa_hash_operation_init();
+		bool ok = psa_hash_setup(&s_benchOp, PSA_ALG_SHA_256) == PSA_SUCCESS &&
+			psa_hash_update(&s_benchOp, saltB, salt.size()) == PSA_SUCCESS &&
+			psa_hash_update(&s_benchOp, reinterpret_cast<const uint8_t*>(pin.data()), pin.size()) == PSA_SUCCESS &&
+			psa_hash_finish(&s_benchOp, s_benchOut, sizeof(s_benchOut), &len) == PSA_SUCCESS;
+		for (uint32_t i = 1; ok && i < AdminAuth::kHashIterations; ++i)
+		{
+			ok = psa_hash_setup(&s_benchOp, PSA_ALG_SHA_256) == PSA_SUCCESS &&
+				psa_hash_update(&s_benchOp, saltB, salt.size()) == PSA_SUCCESS &&
+				psa_hash_update(&s_benchOp, s_benchOut, sizeof(s_benchOut)) == PSA_SUCCESS &&
+				psa_hash_finish(&s_benchOp, s_benchOut, sizeof(s_benchOut), &len) == PSA_SUCCESS;
+			if ((i & 4095u) == 0)
+			{
+				acc += esp_timer_get_time() - t0;
+				vTaskDelay(1);
+				t0 = esp_timer_get_time();
+			}
+		}
+		us = acc + (esp_timer_get_time() - t0);
+		return ok;
+	}
+
+	bool benchOneShot(const std::string& salt, const std::string& pin, int64_t& us)
+	{
+		size_t len = 0;
+		int64_t acc = 0;
+		std::memcpy(s_benchBuf, salt.data(), salt.size());
+		std::memcpy(s_benchBuf + salt.size(), pin.data(), pin.size());
+		int64_t t0 = esp_timer_get_time();
+		bool ok = psa_hash_compute(PSA_ALG_SHA_256, s_benchBuf, salt.size() + pin.size(), s_benchOut,
+			sizeof(s_benchOut), &len) == PSA_SUCCESS;
+		for (uint32_t i = 1; ok && i < AdminAuth::kHashIterations; ++i)
+		{
+			std::memcpy(s_benchBuf + salt.size(), s_benchOut, sizeof(s_benchOut));
+			ok = psa_hash_compute(PSA_ALG_SHA_256, s_benchBuf, salt.size() + sizeof(s_benchOut), s_benchOut,
+				sizeof(s_benchOut), &len) == PSA_SUCCESS;
+			if ((i & 4095u) == 0)
+			{
+				acc += esp_timer_get_time() - t0;
+				vTaskDelay(1);
+				t0 = esp_timer_get_time();
+			}
+		}
+		us = acc + (esp_timer_get_time() - t0);
+		return ok;
+	}
+}
+
+namespace AdminAuth
+{
+	void benchShaAtBoot()
+	{
+		static const char kTag[] = "sha_bench";
+		const std::string salt = "000102030405060708090a0b0c0d0e0f";
+		const std::string pin = "4321";
+		if (salt.size() != kBenchSaltLen || psa_crypto_init() != PSA_SUCCESS)
+		{
+			ESP_LOGE(kTag, "psa_crypto_init failed: no hardware figure");
+			return;
+		}
+#ifdef CONFIG_MBEDTLS_HARDWARE_SHA
+		ESP_LOGW(kTag, "CONFIG_MBEDTLS_HARDWARE_SHA=y, %u rounds of SHA-256 over a 32-byte salt and a 32-byte digest",
+			static_cast<unsigned>(kHashIterations));
+#else
+		ESP_LOGW(kTag, "CONFIG_MBEDTLS_HARDWARE_SHA is NOT set: the PSA figures below are software too");
+#endif
+		std::string sw;
+		for (int r = 0; r < kBenchReps; ++r)
+		{
+			const int64_t t0 = esp_timer_get_time();
+			sw = hashSecret(salt, pin);
+			const int64_t us = esp_timer_get_time() - t0;
+			ESP_LOGW(kTag, "software hashSecret, run %d: %" PRId64 " us", r + 1, us);
+			vTaskDelay(pdMS_TO_TICKS(100));   // the idle task feeds the task watchdog
+		}
+		for (int r = 0; r < kBenchReps; ++r)
+		{
+			int64_t us = 0;
+			const bool ok = benchMultipart(salt, pin, us);
+			const bool same = ok && toHex(s_benchOut, sizeof(s_benchOut)) == sw;
+			ESP_LOGW(kTag, "PSA multi-part (setup, update salt, update digest, finish per round), run %d: %" PRId64
+				" us, ok=%d, digest identical to software: %d", r + 1, us, ok ? 1 : 0, same ? 1 : 0);
+			vTaskDelay(pdMS_TO_TICKS(100));
+		}
+		for (int r = 0; r < kBenchReps; ++r)
+		{
+			int64_t us = 0;
+			const bool ok = benchOneShot(salt, pin, us);
+			const bool same = ok && toHex(s_benchOut, sizeof(s_benchOut)) == sw;
+			ESP_LOGW(kTag, "PSA one-shot (psa_hash_compute over salt||digest per round), run %d: %" PRId64
+				" us, ok=%d, digest identical to software: %d", r + 1, us, ok ? 1 : 0, same ? 1 : 0);
+			vTaskDelay(pdMS_TO_TICKS(100));
+		}
+	}
+}
+#endif

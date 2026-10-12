@@ -329,4 +329,17 @@ namespace AdminAuth
 		const std::string& aad, const std::string& ciphertextAndTag, std::string& outPlaintext);
 }
 
+// #986, BENCH-ONLY (POCKETDIAL_SHA_BENCH, docs/BENCH_PROBE.md): times the 50000-round PIN hash, software
+// and through IDF's PSA/hardware SHA-256, once at boot, and logs both. With the option off the hook
+// expands to nothing and this header declares nothing more than it did before.
+#if defined(POCKETDIAL_SHA_BENCH) && defined(ESP_PLATFORM)
+namespace AdminAuth
+{
+	void benchShaAtBoot();
+}
+#define PD_SHA_BENCH_HOOK() ::AdminAuth::benchShaAtBoot();
+#else
+#define PD_SHA_BENCH_HOOK()
+#endif
+
 #endif // ADMIN_AUTH_HPP

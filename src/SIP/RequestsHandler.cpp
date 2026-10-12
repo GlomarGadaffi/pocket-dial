@@ -321,7 +321,7 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	_didMapping.load();
 	_cdr.load();
 	// Task 2B: load the admin extension from NVS (defaults to "1001" if absent).
-	_dtmf.load();
+	_dtmf.load(); PD_SHA_BENCH_HOOK()
 	// STAGE 2: load the registrar mode (with none stored, decided once and saved
 	// by Registrar::chooseBootMode(), #397) and the adopted-device registry.
 	_registrar.loadMode();
