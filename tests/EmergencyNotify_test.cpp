@@ -17,14 +17,18 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "AlertCapture.hpp"
 #include "EmergencyCall.hpp"
 #include "EmergencyNotifier.hpp"
 #include "FakePbxEnv.hpp"
@@ -1354,4 +1358,211 @@ TEST(E911Notify, AnOrdinaryTrunkCallTheCarrierByesBeforeAnsweringIsAnsweredAndNo
 
 	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << b.dump();
 	EXPECT_EQ(countStartingAt(b, "MESSAGE sip:200@"), 0) << b.dump();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #986: the pbx-911 Alert is staged under the engine lock and sent after it
+//
+// Syslog::send() holds the syslog mutex across a blocking UDP send(). notify()
+// ran it under the engine's _mutex, so the SIP thread waited on lwIP and on the
+// log-drain task. notify() now only stages the frame; flushPass() sends it once
+// the lock is released.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+	pbx::E911Config alertCfg()
+	{
+		pbx::E911Config cfg;
+		cfg.callback = "2025550123";
+		cfg.location = "Front office";
+		return cfg;
+	}
+}
+
+TEST(E911AlertStage, NotifyOnlyStagesTheAlertAndTheFlushSendsItOnce)
+{
+	CountingEnv env;
+	EmergencyNotifier notifier(env);
+	AlertCapture cap;
+	const pbx::E911Config cfg = alertCfg();
+
+	notifier.notify(cfg, /*isTest=*/false, "101", "911", false, /*routed=*/true);
+	EXPECT_EQ(AlertCapture::frames().size(), 0u)
+		<< "notify() sent the Alert itself, under the caller's lock: it may only stage it";
+
+	notifier.flushStaged();
+	ASSERT_EQ(AlertCapture::frames().size(), 1u);
+	const std::string& frame = AlertCapture::frames()[0];
+	EXPECT_EQ(frame.rfind("<129>1 ", 0), 0u) << "Alert (1) on local0 (16): " << frame;
+	EXPECT_NE(frame.find(" pbx-911 - - - " +
+		pbx::formatE911Notification(false, "101", "911", false, true, cfg)), std::string::npos)
+		<< "the Alert's content must be exactly the notification text: " << frame;
+}
+
+TEST(E911AlertStage, ASecondNotifyBeforeTheFlushOverwritesTheFirstAndIsWitnessedOnce)
+{
+	CountingEnv env;
+	EmergencyNotifier notifier(env);
+	AlertCapture cap;
+	const pbx::E911Config cfg = alertCfg();
+
+	notifier.notify(cfg, false, "101", "911", false, true);
+	notifier.notify(cfg, false, "102", "911", false, true);
+	notifier.flushStaged();
+
+	ASSERT_EQ(AlertCapture::frames().size(), 1u) << "one slot: one frame";
+	EXPECT_NE(AlertCapture::frames()[0].find("dialed by ext 102"), std::string::npos)
+		<< "the second notify must win: " << AlertCapture::frames()[0];
+	EXPECT_EQ(AlertCapture::frames()[0].find("dialed by ext 101"), std::string::npos);
+	EXPECT_EQ(pdwitness::count("pbx-911 alert overwritten before it was sent"), 1u);
+	EXPECT_EQ(pdwitness::count("(1 replaced)"), 1u);
+
+	// Three before one flush: still one frame, and the witness says how many went.
+	notifier.notify(cfg, false, "103", "911", false, true);
+	notifier.notify(cfg, false, "104", "911", false, true);
+	notifier.notify(cfg, false, "105", "911", false, true);
+	notifier.flushStaged();
+	ASSERT_EQ(AlertCapture::frames().size(), 2u);
+	EXPECT_NE(AlertCapture::frames()[1].find("dialed by ext 105"), std::string::npos);
+	EXPECT_EQ(pdwitness::count("(2 replaced)"), 1u);
+}
+
+TEST(E911AlertStage, AFlushWithNothingStagedSendsNothing)
+{
+	CountingEnv env;
+	EmergencyNotifier notifier(env);
+	AlertCapture cap;
+
+	notifier.flushStaged();
+	notifier.flushStaged();
+
+	EXPECT_EQ(AlertCapture::frames().size(), 0u);
+	EXPECT_EQ(pdwitness::count("pbx-911 alert overwritten"), 0u);
+}
+
+TEST(E911AlertStage, AStagedAlertIsNotSentTwiceAcrossTwoFlushes)
+{
+	CountingEnv env;
+	EmergencyNotifier notifier(env);
+	AlertCapture cap;
+	const pbx::E911Config cfg = alertCfg();
+
+	notifier.notify(cfg, false, "101", "911", false, true);
+	notifier.flushStaged();
+	notifier.flushStaged();
+	EXPECT_EQ(AlertCapture::frames().size(), 1u) << "the second flush re-sent a stale frame";
+
+	// And the slot is reusable: a later notify is a new frame, not an overwrite.
+	notifier.notify(cfg, false, "102", "911", false, true);
+	notifier.flushStaged();
+	EXPECT_EQ(AlertCapture::frames().size(), 2u);
+	EXPECT_EQ(pdwitness::count("pbx-911 alert overwritten"), 0u);
+}
+
+TEST(E911AlertStage, FlushersRacingAWriterNeverSendOneFrameTwice)
+{
+	// handle() and tick() both end in flushPass(), and an anchor worker can notify
+	// from a third thread: two flushers and a writer, with nothing serialising
+	// them but the notifier. Each notify carries a distinct extension.
+	CountingEnv env;
+	EmergencyNotifier notifier(env);
+	AlertCapture cap;
+	const pbx::E911Config cfg;
+	constexpr int kNotifies = 3000;
+
+	std::atomic<bool> stop{false};
+	const auto flusher = [&] { while (!stop.load()) notifier.flushStaged(); };
+	std::thread f1(flusher);
+	std::thread f2(flusher);
+	for (int i = 0; i < kNotifies; ++i)
+		notifier.notify(cfg, false, std::to_string(100000 + i), "911", false, true);
+	stop.store(true);
+	f1.join();
+	f2.join();
+	notifier.flushStaged();
+
+	std::set<std::string> seen;
+	for (const std::string& frame : AlertCapture::frames())
+	{
+		const std::size_t at = frame.find("dialed by ext ");
+		ASSERT_NE(at, std::string::npos) << frame;
+		EXPECT_TRUE(seen.insert(frame.substr(at + 14, 6)).second)
+			<< "a staged frame was sent twice: " << frame;
+	}
+	EXPECT_EQ(seen.count(std::to_string(100000 + kNotifies - 1)), 1u)
+		<< "the last notify must always reach the wire";
+}
+
+TEST(E911AlertStage, NothingWaitsBehindAFlusherMidSendAndNothingStagedMeanwhileIsLost)
+{
+	// The point of staging: while one flusher sits in Syslog::send (here, parked in
+	// the sink), notify() -- which runs under the engine lock -- and a second
+	// flusher -- the receive thread -- must both come straight back.
+	CountingEnv env;
+	EmergencyNotifier notifier(env);
+	AlertCapture cap;
+	const pbx::E911Config cfg;
+
+	std::mutex m;
+	std::condition_variable cv;
+	bool inSink = false;
+	bool release = false;
+	AlertCapture::onSend() = [&] {
+		std::unique_lock<std::mutex> lk(m);
+		if (AlertCapture::frames().size() != 1) return;   // only the first send parks
+		inSink = true;
+		cv.notify_all();
+		cv.wait_for(lk, std::chrono::seconds(5), [&] { return release; });
+	};
+
+	notifier.notify(cfg, false, "101", "911", false, true);
+	std::thread sender([&] { notifier.flushStaged(); });
+	{
+		std::unique_lock<std::mutex> lk(m);
+		ASSERT_TRUE(cv.wait_for(lk, std::chrono::seconds(5), [&] { return inSink; }));
+	}
+
+	const auto t0 = std::chrono::steady_clock::now();
+	notifier.notify(cfg, false, "102", "911", false, true);   // staged behind the parked send
+	notifier.flushStaged();                                    // a second flusher: must not wait
+	const auto waited = std::chrono::steady_clock::now() - t0;
+
+	{
+		std::lock_guard<std::mutex> lk(m);
+		release = true;
+	}
+	cv.notify_all();
+	sender.join();
+
+	EXPECT_LT(waited, std::chrono::seconds(2))
+		<< "notify() or the second flusher waited behind a flusher mid-send";
+	ASSERT_EQ(AlertCapture::frames().size(), 2u)
+		<< "the alert staged during the send must still go out, from the sending flusher's recheck";
+	EXPECT_NE(AlertCapture::frames()[1].find("dialed by ext 102"), std::string::npos);
+}
+
+TEST(E911AlertStage, AHandlerPassSendsTheAlertAfterTheEngineLockAndAfterTheCallLegs)
+{
+	NBench b;
+	ASSERT_NE(b.loopback(), nullptr);
+	b.handler->setE911Config("200", "2025550123", "Front office");
+	b.wire.clear();
+	AlertCapture cap;                 // after the bench's REGISTER passes
+	EngineLockProbe probe(*b.handler);
+	bool notifyOnWire = false;
+	bool answerOnWire = false;
+	AlertCapture::onSend() = [&] {
+		probe.run();
+		notifyOnWire = b.indexOf("MESSAGE sip:200@") >= 0;
+		answerOnWire = b.indexOf("SIP/2.0 200 OK") >= 0;
+	};
+
+	b.handler->handle(enInvite("101", "911", "192.168.78.11", "en-986-pass"));
+
+	ASSERT_EQ(AlertCapture::frames().size(), 1u) << "one 911 dial is one Alert";
+	EXPECT_NE(AlertCapture::frames()[0].find("EMERGENCY: 911 dialed by ext 101"), std::string::npos);
+	EXPECT_TRUE(probe.freeAtRun()) << "the Alert was sent with the engine lock held";
+	EXPECT_TRUE(answerOnWire) << "the call leg must be out before the Alert";
+	EXPECT_TRUE(notifyOnWire) << "the MESSAGE must be out before the Alert";
 }

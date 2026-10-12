@@ -1,5 +1,7 @@
 #include "EmergencyNotifier.hpp"
 
+#include <algorithm>
+#include <cstring>
 #include <sstream>
 
 #include "IDGen.hpp"
@@ -148,6 +150,53 @@ std::shared_ptr<SipMessage> EmergencyNotifier::buildNotifyMessage(const std::str
 	return msg;
 }
 
+void EmergencyNotifier::flushStaged()
+{
+	while (_staged.load())
+	{
+		// try_lock, not lock: the flusher that holds _sendMutex is mid-send, and a
+		// second one (handle() on the receive thread) must not queue behind a UDP
+		// send. It can leave, because the holder looks at _staged again after it
+		// unlocks (the loop), so a frame staged before this try_lock failed is
+		// still picked up.
+		std::unique_lock<std::mutex> sending(_sendMutex, std::try_to_lock);
+		if (!sending.owns_lock())
+		{
+			return;
+		}
+
+		unsigned replaced = 0;
+		{
+			std::lock_guard<std::mutex> lock(_slotMutex);
+			if (!_staged.load())
+			{
+				// Another flusher took it between the loop test and here. Look again
+				// rather than leave: a notify that stages in the window before this
+				// unlock, whose flusher try_lock failed against our hold, would be
+				// stranded until the next pass.
+				continue;
+			}
+			// Taken and cleared in one step, before the send: whoever sends a frame
+			// has emptied the slot, so no other flusher can send it again.
+			std::memcpy(_sendBuf, _slot, sizeof(_sendBuf));
+			replaced = _slotOverwritten;
+			_slotOverwritten = 0;
+			_staged.store(false);
+		}
+
+		// The blocking part: Syslog::send holds the syslog mutex across a UDP send().
+		// No engine lock and no slot lock is held here, so notify() is never behind it.
+		Syslog::send(Syslog::Severity::Alert, "pbx-911", _sendBuf);
+
+		if (replaced != 0)
+		{
+			// After the send, off the engine lock: a witness is console I/O. The
+			// replaced alerts' text is in the engine log (notify() step 1b).
+			PD_WITNESS_W("e911", "pbx-911 alert overwritten before it was sent (%u replaced)", replaced);
+		}
+	}
+}
+
 std::size_t EmergencyNotifier::notify(const pbx::E911Config& cfg, bool isTest,
 	std::string_view fromExt, std::string_view dialed,
 	bool hadTrunkPrefix, bool routed, std::string_view note, bool callUp)
@@ -161,12 +210,26 @@ std::size_t EmergencyNotifier::notify(const pbx::E911Config& cfg, bool isTest,
 	//    "system is unusable", which this is not; Alert is "action must be taken
 	//    immediately", which this is exactly.
 	//
-	//    Syslog::send never blocks, never throws and no-ops when unconfigured,
-	//    so it is safe on the SIP thread under the engine mutex (Syslog.hpp).
-	Syslog::send(Syslog::Severity::Alert, std::string("pbx-911"), text);
+	//    STAGED, not sent: Syslog::send holds the syslog mutex across a blocking
+	//    UDP send() (and the log-drain task holds it for its own), and this runs
+	//    under the engine mutex. flushStaged() sends it after the lock is
+	//    released. One slot: a second notify() before the flush replaces this
+	//    text, and flushStaged() says so; the text below is the record of it.
+	{
+		std::lock_guard<std::mutex> lock(_slotMutex);
+		if (_staged.load() && _slotOverwritten < UINT8_MAX)
+		{
+			++_slotOverwritten;
+		}
+		const std::size_t n = std::min(text.size(), sizeof(_slot) - 1);
+		std::memcpy(_slot, text.data(), n);
+		_slot[n] = '\0';
+		_staged.store(true);
+	}
 
-	// Also into the engine's own log so it lands in the UART/dashboard record
-	// for a deployment with no syslog collector configured.
+	// 1b. Also into the engine's own log so it lands in the UART/dashboard record
+	//     for a deployment with no syslog collector configured, and so a text the
+	//     slot replaces is still on record.
 	_env.log(text, true);
 
 	// 2. The notifications. Every one is independent and every failure is
