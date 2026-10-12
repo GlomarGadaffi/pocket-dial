@@ -29,6 +29,13 @@ def body(path, signature):
     return m.group(1)
 
 
+def indented_body(path, signature):
+    """Body of a function nested one tab deep (inside a namespace): up to its closing tab-brace."""
+    m = re.search(signature + r"\s*\{(.*?)\n\t\}", code(path), re.S)
+    assert m, signature + " not found in " + path
+    return m.group(1)
+
+
 NVS_CALLS = ("nvs_commit", "nvs_open", "nvs_set_str", "nvs_set_blob", "nvs_set_u8")
 
 
@@ -114,6 +121,56 @@ class BoardWiring(unittest.TestCase):
         with open(os.path.join(REPO, "tools", "ci", "task_stacks.json"), encoding="utf-8") as f:
             rows = [r for r in json.load(f)["tasks"] if r.get("file") == "src/Helpers/NvsWriter.cpp"]
         self.assertEqual([(r["name"], r["bytes"]) for r in rows], [("nvs_writer", 6144)])
+
+
+class StagingSlotsAndStackPlacement(unittest.TestCase):
+    """The board reserves the two staging slots in PSRAM at init; the scratch the flash write
+    reads and the task's stack stay internal (PsramTask.hpp, the #277 rule)."""
+
+    def setUp(self):
+        self.src = code("Helpers/NvsWriter.cpp")
+        self.start = body("Helpers/NvsWriter.cpp", r"void start\(\)")
+
+    def test_the_staging_slots_come_from_psram_in_start_and_the_scratch_does_not(self):
+        self.assertRegex(self.start, r"s_devices = allocSlot<Slot<kDevicesCap>>\(\);")
+        self.assertRegex(self.start, r"s_forwards = allocSlot<Slot<kForwardsCap>>\(\);")
+        helper = indented_body("Helpers/NvsWriter.cpp", r"T\* allocSlot\(\)")
+        self.assertIn("psram::allocPreferPsram(sizeof(T))", helper)
+        self.assertEqual(self.src.count("allocPreferPsram("), 1, "the one allocation site is allocSlot()")
+        self.assertRegex(self.src, r"(?m)^	Slot<kScratchCap> s_scratch;", "the scratch is a static: internal RAM")
+        self.assertNotIn("allocSlot<Slot<kScratchCap>>", self.src)
+        self.assertNotIn("s_scratch =", self.src)
+        self.assertRegex(self.src, r"#else\s+Slot<kDevicesCap> s_devices;\s+Slot<kForwardsCap> s_forwards;",
+                         "the host keeps static slots")
+
+    def test_the_writer_task_keeps_a_plain_internal_stack(self):
+        for bad in ("PD_TASK_STACK_CAPS", "createTaskPreferPsram", "xTaskCreatePinnedToCoreWithCaps",
+                    "xTaskCreateWithCaps", "xTaskCreateStaticPinnedToCore", "WithCaps(nvsWriterTask"):
+            self.assertNotIn(bad, self.src)
+        self.assertEqual(len(re.findall(r"xTaskCreate\w*\(", self.src)), 1, "one task, one plain create")
+        self.assertIn("xTaskCreatePinnedToCore(nvsWriterTask", self.src)
+        task = indented_body("Helpers/NvsWriter.cpp", r"void nvsWriterTask\(void\*\)")
+        self.assertIn("PD_ASSERT_NOT_PSRAM_STACK();", task)
+
+    def test_a_failed_slot_allocation_leaves_the_writer_not_running(self):
+        b = self.start
+        order = [b.index(m) for m in ("s_devices = allocSlot", "if (s_devices == nullptr || s_forwards == nullptr)",
+                                      "xQueueCreate", "xTaskCreatePinnedToCore(", "running().store(true")]
+        self.assertEqual(order, sorted(order), "allocate, check, queues, task, and only then running")
+        failed = b[order[1]:order[2]]
+        for needed in ("freeSlots();", "started = false;", "return;"):
+            self.assertIn(needed, failed)
+        self.assertNotIn("running().store(true", failed)
+        self.assertEqual(self.src.count("running().store(true"), 1)
+        # the later failures give the slots back too, like the queues
+        for marker in ("queue create failed", "xTaskCreate nvs_writer failed"):
+            seg = b[b.index(marker):]
+            self.assertIn("freeSlots();", seg[:seg.index("return;")])
+        # nothing reaches a slot unless the writer is running
+        stage = body("Helpers/NvsWriter.cpp", r"StageResult stage\(Key k, FunctionRef<void\(BlobWriter&\)> fill\)")
+        self.assertLess(stage.index("!running().load"), stage.index("stagerRef()"))
+        stats = body("Helpers/NvsWriter.cpp", r"Stats stats\(\)")
+        self.assertLess(stats.index("!running().load"), stats.index("stagerRef()"))
 
 
 if __name__ == "__main__":

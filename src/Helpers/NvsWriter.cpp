@@ -13,6 +13,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include <cstring>
+#include <new>
+
+#include "PsramAllocator.hpp"   // psram::allocPreferPsram -- the staging slots
 #include "PsramTask.hpp"   // PD_ASSERT_NOT_PSRAM_STACK -- issue #277
 #endif
 
@@ -21,17 +25,30 @@ namespace nvswriter
 namespace
 {
 	// The staging slots: serialised into under RequestsHandler::_mutex, then
-	// copied into the key's queue. Namespace-scope statics (BSS, internal RAM on
-	// every profile), never stack-locals: the callers run on the SIP thread.
+	// copied into the key's queue. Never stack-locals: the callers run on the SIP
+	// thread. On the board they are reserved once in start(), in PSRAM where the
+	// build has it (the writer never reads them: it reads its own scratch below);
+	// the host has no writer task and keeps them static.
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	Slot<kDevicesCap>* s_devices = nullptr;
+	Slot<kForwardsCap>* s_forwards = nullptr;
+#else
 	Slot<kDevicesCap> s_devices;
 	Slot<kForwardsCap> s_forwards;
+#endif
 	// The writer's own copy of whatever it took, sized to the largest key. The
 	// writer is one task and takes one item at a time, so one scratch serves all.
+	// A static, so it is internal RAM: it is the buffer the flash write reads, and
+	// PSRAM is unreadable while the cache is off (cdr_persist's `blob`, #315).
 	Slot<kScratchCap> s_scratch;
 
 	std::array<SlotRef, kKeyCount> slotRefs()
 	{
-		return {refOf(s_devices), refOf(s_forwards)};   // index order == Key
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		return {refOf(*s_devices), refOf(*s_forwards)};   // index order == Key
+#else
+		return {refOf(s_devices), refOf(s_forwards)};
+#endif
 	}
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
@@ -40,6 +57,25 @@ namespace
 	const char* nvsKeyName(Key k)
 	{
 		return (k == Key::Devices) ? "devices" : "forwards";
+	}
+
+	// One zeroed slot from PSRAM, or internal heap if PSRAM is absent or full
+	// (allocPreferPsram counts that fallback). Boot only: never on a hot path.
+	template <class T>
+	T* allocSlot()
+	{
+		void* p = psram::allocPreferPsram(sizeof(T));
+		if (p == nullptr) return nullptr;
+		std::memset(p, 0, sizeof(T));
+		return ::new (p) T();
+	}
+
+	void freeSlots()
+	{
+		psram::freePreferPsram(s_devices);
+		psram::freePreferPsram(s_forwards);
+		s_devices = nullptr;
+		s_forwards = nullptr;
 	}
 
 	// One length-1 FreeRTOS queue per key. A queue copies the whole item in under
@@ -161,7 +197,17 @@ void start()
 	static bool started = false;   // boot is single-threaded: loadDevices / loadPbxConfig
 	if (started) return;
 	started = true;
-	(void)stagerRef();   // build the function-static now, not under _mutex on the first *72 (CdrRing's boot-time reasoning)
+	// Reserved once, here; any failure below unwinds everything and leaves the
+	// writer NotRunning, so a stage() can never reach a null slot.
+	s_devices = allocSlot<Slot<kDevicesCap>>();
+	s_forwards = allocSlot<Slot<kForwardsCap>>();
+	if (s_devices == nullptr || s_forwards == nullptr)
+	{
+		ESP_LOGE(kTag, "staging slot allocation failed -- device table and forwards will not persist");
+		freeSlots();
+		started = false;
+		return;
+	}
 	Transport& t = transport();
 	const std::array<SlotRef, kKeyCount> refs = slotRefs();
 	for (size_t i = 0; i < kKeyCount; ++i)
@@ -182,6 +228,7 @@ void start()
 		{
 			ESP_LOGE(kTag, "queue create failed -- device table and forwards will not persist");
 			deleteQueues(t);
+			freeSlots();
 			started = false;
 			return;
 		}
@@ -191,9 +238,14 @@ void start()
 	{
 		ESP_LOGE(kTag, "xTaskCreate nvs_writer failed -- device table and forwards will not persist");
 		deleteQueues(t);
+		freeSlots();
 		started = false;
 		return;
 	}
+	// Build the function-static now, not under _mutex on the first *72 (CdrRing's
+	// boot-time reasoning). The task is parked in ulTaskNotifyTake until the first
+	// stage() notifies it, which needs running == true, so it cannot reach this early.
+	(void)stagerRef();
 	writerHandle().store(handle, std::memory_order_release);
 	running().store(true, std::memory_order_release);
 #endif
@@ -216,6 +268,9 @@ StageResult stage(Key k, FunctionRef<void(BlobWriter&)> fill)
 
 Stats stats()
 {
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	if (!running().load(std::memory_order_acquire)) return Stats{};   // the Stager does not exist yet
+#endif
 	return stagerRef().stats();
 }
 

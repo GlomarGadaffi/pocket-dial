@@ -8,7 +8,8 @@
 // _mutex (the 20 ms anchor workers, the 911 lane) waits behind it.
 //
 // The fix has the cdr_persist shape (CdrRing.cpp): the caller, still under
-// _mutex, only serialises the table into a static per-key staging slot and
+// _mutex, only serialises the table into a per-key staging slot (reserved at
+// boot, PSRAM where the build has it; static on the host) and
 // overwrites that key's depth-1 queue; a pinned task (NvsWriter.cpp) takes it
 // and does the nvs_* calls. Everything here is the part that is not FreeRTOS,
 // so the host suite runs the same code the board runs:
