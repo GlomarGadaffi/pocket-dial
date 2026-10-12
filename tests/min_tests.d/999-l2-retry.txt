@@ -1,0 +1,2 @@
+# MediaTx_test.cpp: MediaTxL2Test.{ADriverErrorIsRetriedOnceWithTheSameFrameAndTheRescueIsCounted,ARetryThatFailsTooCountsOneDriverErrorNotTwo,AFrameTheDriverAcceptsFirstTimeIsNotRetried,OnlyADriverErrorIsRetried,FirstAttemptFailuresAreErrDriverPlusRetryOkAndEveryFalseReturnCountsOnce} (5) + MediaTxTest.TheRetryCounterIsZeroedByTheResetLikeItsNeighbours (1). #999.
+6

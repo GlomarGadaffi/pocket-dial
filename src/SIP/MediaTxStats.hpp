@@ -38,8 +38,11 @@
 //    our own write time, so it is the idle time of the feed: upstream (phone, LAN)
 //    jitter, silence suppression, or the rx task not being scheduled.
 //  - L2: frame build (pool acquire, template copy, patchTick) and the esp_eth_transmit
-//    hand-off, each a histogram; the four ways EgressChannel::transmit() returns false,
-//    one counter each; a failed fallback sendto() in RtpSender.
+//    hand-off, each a histogram (the hand-off includes #999's one retry, when there was
+//    one); the four ways EgressChannel::transmit() returns false, one counter each; the
+//    retries that turned a driver error into a queued frame (they return true, so they are
+//    in none of the four: first attempts that failed = errDriver + retryOk); a failed
+//    fallback sendto() in RtpSender.
 
 #include <atomic>
 #include <chrono>
@@ -129,6 +132,7 @@ namespace pd
 		static void recordL2Build(uint32_t us) { s_.l2Build.add(us); }
 		static void recordL2Tx(uint32_t us) { s_.l2Tx.add(us); }
 		static void recordL2Fail(L2Fail why) { bump(s_.l2Fail[static_cast<unsigned>(why)]); }
+		static void recordL2RetryOk() { bump(s_.l2RetryOk); }
 		static void recordFallbackSendFail() { bump(s_.fallbackSendFail); }
 
 		// ── reading: /api/status and tick(). No locks ──────────────────────────────
@@ -143,6 +147,7 @@ namespace pd
 		static uint32_t feedLate() { return s_.feedLate.load(kRelaxed); }
 		static uint32_t feedMaxGapUs() { return s_.feedMaxGapUs.load(kRelaxed); }
 		static uint32_t l2Fails(L2Fail why) { return s_.l2Fail[static_cast<unsigned>(why)].load(kRelaxed); }
+		static uint32_t l2RetryOk() { return s_.l2RetryOk.load(kRelaxed); }
 		static uint32_t fallbackSendFails() { return s_.fallbackSendFail.load(kRelaxed); }
 
 		// The next slow event not yet reported, marked reported; false when none is left.
@@ -186,6 +191,7 @@ namespace pd
 			s_.feedLate.store(0, kRelaxed);
 			s_.feedMaxGapUs.store(0, kRelaxed);
 			for (auto& a : s_.l2Fail) a.store(0, kRelaxed);
+			s_.l2RetryOk.store(0, kRelaxed);
 			s_.fallbackSendFail.store(0, kRelaxed);
 			s_.witnessTotal.store(0, kRelaxed);
 			for (WSlot& w : s_.slots)
@@ -249,6 +255,7 @@ namespace pd
 			Hist                  l2Build;
 			Hist                  l2Tx;
 			std::atomic<uint32_t> l2Fail[4];
+			std::atomic<uint32_t> l2RetryOk;
 			std::atomic<uint32_t> fallbackSendFail;
 			std::atomic<uint32_t> witnessTotal;
 			WSlot                 slots[kLegs + 1];   // one per bridge, and the last for the hold task
