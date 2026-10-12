@@ -2852,7 +2852,9 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	{
 		const pd::MutexHold mh = handler ? handler->getMutexHold() : pd::MutexHold{};
 		char pc[2 * sizeof(uintptr_t) + 3];
-		std::snprintf(pc, sizeof pc, "0x%" PRIxPTR, mh.maxPc);
+		// The buffer holds "0x" and a full pointer, so it cannot truncate; the return value is
+		// read (cert-err33-c) and an encoding error leaves the field empty, not garbage.
+		if (std::snprintf(pc, sizeof pc, "0x%" PRIxPTR, mh.maxPc) < 0) pc[0] = '\0';
 		json.s(",\"mutexHold\":{\"max\":").n(mh.maxUs).s(",\"p99\":").n(mh.p99Us)
 		    .s(",\"over\":").n(mh.over).s(",\"maxPc\":\"").s(pc).s("\"}");
 	}
