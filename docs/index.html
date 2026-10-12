@@ -7,38 +7,37 @@
 <title>pocket-dial: a SIP PBX on an ESP32-S3</title>
 <meta name="description" content="A self-contained SIP PBX that runs on a single ESP32-S3. No router, no server, no cloud. The same C++17 engine builds as a desktop binary.">
 <style>
-/* Same tokens as the Switchboard dashboard (src/Helpers/index_html.h). */
-:root{--bg:#14100C;--face:#221B15;--face-raised:#2B231C;--ink:#EAE1C8;--ink-dim:#A99A7B;--brass:#B08D52;--brass-hi:#D4AF6A;--brass-lo:#87714A;--line:rgba(176,141,82,.28);--alert:#D26F65;--ringing:#E8C43D;
- --mono:ui-monospace,"SF Mono","Cascadia Code","Consolas","Liberation Mono",monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Avenir Next",Roboto,sans-serif}
-/* Invert: the same palette on paper. */
-html.inverted{--bg:#EAE1C8;--face:#E2D7BA;--face-raised:#D9CDAD;--ink:#221B15;--ink-dim:#5E5341;--brass:#87714A;--brass-hi:#6E5A36;--brass-lo:#B08D52;--line:rgba(135,113,74,.35);--alert:#A8382E;--ringing:#8A6D00}
-html.contrast{--ink:#fff;--ink-dim:#D9CFB5;--brass-hi:#F0D466;--line:rgba(212,175,106,.6)}
-html.inverted.contrast{--ink:#000;--ink-dim:#3A3226;--brass-hi:#4A3A1C;--line:rgba(74,58,28,.6)}
+/* Layout and type borrowed from the Switchboard dashboard; the palette stays plain. */
+:root{--bg:#fefefe;--face:#f4f4f4;--face-raised:#f0f0f0;--ink:#454545;--ink-dim:#777;--brass:#07a;--brass-hi:#07a;--brass-lo:#999;--line:#ddd;--alert:#c0392b;--ringing:#941352;
+ --mono:ui-monospace,"SF Mono","Cascadia Code","Consolas","Liberation Mono",monospace;--sans:"Open Sans",Arial,sans-serif}
+/* Invert: the plain dark scheme. */
+html.inverted{--bg:#000;--face:#111;--face-raised:#000;--ink:#d9d9d9;--ink-dim:#999;--brass:#00a2e7;--brass-hi:#00a2e7;--brass-lo:#555;--line:#333;--alert:#d24637;--ringing:#ca1a70}
+html.contrast{--ink:#050505;--ink-dim:#333;--brass:#03f;--brass-hi:#03f;--line:#bbb;--alert:#800}
+html.inverted.contrast{--ink:#fff;--ink-dim:#ccc;--brass:#44c7ff;--brass-hi:#44c7ff;--line:#666;--alert:#db695d}
 html{background:var(--bg)}
 body{font-family:var(--sans);color:var(--ink);background:var(--bg);font-size:16px;margin:2em auto;max-width:800px;padding:1em;line-height:1.5;hyphens:auto;-webkit-hyphens:auto;overflow-wrap:break-word}
-a{color:var(--brass-hi);text-decoration-color:var(--brass-lo);text-underline-offset:.15em}a:visited{color:var(--brass)}a:hover{color:var(--ringing)}
+a{color:var(--brass);text-underline-offset:.15em}a:visited{color:var(--ringing)}
 h1{font-family:var(--mono);font-weight:700;font-size:1.9em;letter-spacing:.14em;text-transform:uppercase;color:var(--ink);line-height:1.2;margin-bottom:.2em}
-h1 .dot{font-style:normal;color:var(--brass-hi)}
-h1 span{color:var(--brass-hi);font-weight:400;font-size:.55em;letter-spacing:.2em;margin-left:.6em;vertical-align:middle}
-h2{font-family:var(--mono);font-weight:600;font-size:.85em;letter-spacing:.1em;text-transform:uppercase;color:var(--brass-hi);margin:2.4em 0 .8em;padding-bottom:.4em;border-bottom:1px solid var(--line)}
+h1 .dot{font-style:normal;color:var(--ink-dim)}
+h1 span{color:var(--ink-dim);font-weight:400;font-size:.55em;letter-spacing:.2em;margin-left:.6em;vertical-align:middle}
+h2{font-family:var(--mono);font-weight:600;font-size:.85em;letter-spacing:.1em;text-transform:uppercase;color:var(--ink);margin:2.4em 0 .8em;padding-bottom:.4em;border-bottom:1px solid var(--line)}
 p.st{margin-top:0;color:var(--ink-dim);font-style:italic}
 b{color:var(--ink)}
 code,pre{font-family:var(--mono);font-size:.9em}
-code{color:var(--brass-hi)}
-pre{overflow-x:auto;padding:.7em .9em;background:var(--face);border:1px solid var(--line);border-left:3px solid var(--brass);border-radius:2px}
+pre{overflow-x:auto;padding:.7em .9em;background:var(--face);border:1px solid var(--line);border-left:3px solid #ccc;border-radius:2px}
 pre code{color:var(--ink)}
 table{border-collapse:collapse;width:100%;font-size:.95em}
 th{font-family:var(--mono);font-weight:600;font-size:.75em;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-dim)}
 th,td{text-align:left;padding:.45em .8em .45em 0;border-bottom:1px solid var(--line);vertical-align:top}
-img{max-width:100%;height:auto;display:block;border:1px solid var(--line);border-radius:3px;box-shadow:0 2px 4px rgba(0,0,0,.5)}
+img{max-width:100%;height:auto;display:block;border:1px solid var(--line);border-radius:3px;box-shadow:0 1px 3px rgba(0,0,0,.15)}
 figure{margin:1.5em 0}
 figcaption{font-family:var(--mono);font-size:.75em;color:var(--ink-dim);margin-top:.6em}
 small{font-size:.75em}
 .wr{color:var(--alert);font-weight:600}
 nav{font-family:var(--mono);font-size:.8em;letter-spacing:.04em;color:var(--ink-dim)}
 footer{margin-top:3em;padding-top:1em;border-top:1px solid var(--line);font-size:.85em;color:var(--ink-dim)}
-button.ci{cursor:pointer;position:fixed;right:10px;font-family:var(--mono);font-size:.7em;letter-spacing:.1em;text-transform:uppercase;color:var(--brass-hi);background:var(--face-raised);border:1px solid var(--brass-lo);border-radius:2px;padding:4px 8px}
-button.ci:hover{color:var(--ringing);border-color:var(--brass-hi)}
+button.ci{cursor:pointer;position:fixed;right:10px;font-family:var(--mono);font-size:.7em;letter-spacing:.1em;text-transform:uppercase;color:var(--ink);background:var(--face-raised);border:1px solid var(--line);border-radius:2px;padding:4px 8px}
+button.ci:hover{border-color:var(--ink-dim)}
 #contrast{top:10px}#invmode{top:40px}
 @media screen and (max-width:1080px){button.ci{position:absolute}}
 @media screen and (max-width:500px){th,td{padding-right:.5em}h1{font-size:1.5em;letter-spacing:.1em}h1 span{display:block;margin:.3em 0 0}}
