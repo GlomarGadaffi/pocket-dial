@@ -63,6 +63,8 @@ namespace EthAccess
 		bool s_mockTransmitResult = false;
 		bool s_mockEthHandle = true;
 		size_t s_mockTransmitCount = 0;
+		size_t s_mockTransmitCalls = 0;
+		size_t s_mockFailNext = 0;
 		std::vector<uint8_t> s_lastTransmittedFrame{};
 	}
 
@@ -70,7 +72,13 @@ namespace EthAccess
 
 	TxStatus transmitL2(void* frame, size_t len)
 	{
+		++s_mockTransmitCalls;
 		if (!s_mockEthHandle) return TxStatus::NoHandle;
+		if (s_mockFailNext > 0)
+		{
+			--s_mockFailNext;
+			return TxStatus::DriverError;
+		}
 		if (!s_mockTransmitResult) return TxStatus::DriverError;
 		++s_mockTransmitCount;
 		if (frame != nullptr && len > 0)
@@ -121,6 +129,11 @@ namespace EthAccess
 		s_mockEthHandle = present;
 	}
 
+	void setMockTransmitFailNext(size_t n)
+	{
+		s_mockFailNext = n;
+	}
+
 	void resetMocks()
 	{
 		s_mockEthHandle = true;
@@ -132,12 +145,19 @@ namespace EthAccess
 		s_mockMac.fill(0);
 		s_mockTransmitResult = false;
 		s_mockTransmitCount = 0;
+		s_mockTransmitCalls = 0;
+		s_mockFailNext = 0;
 		s_lastTransmittedFrame.clear();
 	}
 
 	size_t getMockTransmitCount()
 	{
 		return s_mockTransmitCount;
+	}
+
+	size_t getMockTransmitCalls()
+	{
+		return s_mockTransmitCalls;
 	}
 
 	const std::vector<uint8_t>& getLastTransmittedFrame()

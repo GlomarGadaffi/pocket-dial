@@ -46,8 +46,15 @@ namespace EthAccess
 	// false = no Ethernet handle was ever provided (setEthHandle never ran). The default
 	// is a handle, so setMockTransmitResult(false) still means "the driver failed".
 	void setMockEthHandle(bool present);
+	// The next `n` transmitL2() calls that find a handle fail with DriverError whatever
+	// setMockTransmitResult says; after that the persistent result applies again (#999:
+	// "the first attempt fails, the retry is accepted").
+	void setMockTransmitFailNext(size_t n);
 	void resetMocks();
+	// Frames the mock queued (transmitL2 returned Ok).
 	size_t getMockTransmitCount();
+	// Every transmitL2() call, whatever it returned, a missing handle included.
+	size_t getMockTransmitCalls();
 	const std::vector<uint8_t>& getLastTransmittedFrame();
 #endif
 }

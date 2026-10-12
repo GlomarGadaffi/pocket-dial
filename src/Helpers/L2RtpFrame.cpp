@@ -205,12 +205,32 @@ bool EgressChannel::transmit(bool marker, uint8_t payloadType, uint16_t seq, uin
 	}
 
 	const uint32_t t1 = pd::MediaTx::nowUs();
-	const EthAccess::TxStatus status = EthAccess::transmitL2(frame.data(), len);
+	EthAccess::TxStatus status = EthAccess::transmitL2(frame.data(), len);
+	// #999: a driver error is retried once, at once, with the same frame, before the caller
+	// falls back to lwIP. No sleep and no yield: a yield only runs equal-priority tasks, and
+	// the tasks that share the W5500 with the media tasks (rtp_media_tx 6, moh_tx 5) are
+	// tcpip_thread (18) and the eth rx task (15), so it cannot help them finish. The one
+	// equal-priority case, a sibling rtp_media_tx (also 6, core 0) cut off mid-transmit by the
+	// 1 ms time slice, is not worth running that sibling's next frame first. The second
+	// driver call is bounded only by the driver. The MAC reads `frame` and never writes it.
+	// If the first attempt had already queued the frame (the W5500 MAC returns an error when
+	// its TX-done poll times out after SEND) the receiver gets a duplicate, as it already
+	// does from the fallback. Only DriverError is retried: NoHandle is permanent, and an empty
+	// pool or a zero-length frame returned before the hand-off.
+	const bool retried = (status == EthAccess::TxStatus::DriverError);
+	if (retried)
+	{
+		status = EthAccess::transmitL2(frame.data(), len);
+	}
 	const uint32_t t2 = pd::MediaTx::nowUs();
 	pd::MediaTx::recordL2Build(t1 - t0);
 	pd::MediaTx::recordL2Tx(t2 - t1);
 	if (status == EthAccess::TxStatus::Ok)
 	{
+		if (retried)
+		{
+			pd::MediaTx::recordL2RetryOk();
+		}
 		return true;
 	}
 	pd::MediaTx::recordL2Fail(status == EthAccess::TxStatus::NoHandle ? pd::MediaTx::L2Fail::NoHandle

@@ -2365,6 +2365,7 @@ static void pdAppendMediaTx(JsonOut& json)
 	    .s(",\"errZeroLen\":").n(pd::MediaTx::l2Fails(pd::MediaTx::L2Fail::ZeroLength))
 	    .s(",\"errNoHandle\":").n(pd::MediaTx::l2Fails(pd::MediaTx::L2Fail::NoHandle))
 	    .s(",\"errDriver\":").n(pd::MediaTx::l2Fails(pd::MediaTx::L2Fail::Driver))
+	    .s(",\"retryOk\":").n(pd::MediaTx::l2RetryOk())
 	    .s(",\"fallbackSendFail\":").n(pd::MediaTx::fallbackSendFails())
 	    .s("}}");
 }

@@ -22,6 +22,7 @@
 #include <atomic>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -400,6 +401,140 @@ TEST_F(MediaTxL2Test, TheFourCausesSumToTheCallersOwnAggregate)
 	EXPECT_GT(MediaTx::l2Fails(MediaTx::L2Fail::PoolEmpty), 0u);
 	EXPECT_GT(MediaTx::l2Fails(MediaTx::L2Fail::NoHandle), 0u);
 	EXPECT_GT(MediaTx::l2Fails(MediaTx::L2Fail::Driver), 0u);
+}
+
+// ── #999: a driver error is retried once, at once, before the caller's fallback ───
+
+TEST_F(MediaTxL2Test, ADriverErrorIsRetriedOnceWithTheSameFrameAndTheRescueIsCounted)
+{
+	for (size_t i = 0; i < sizeof(payload); ++i) payload[i] = static_cast<uint8_t>(i ^ 0x5A);
+	EthAccess::setMockTransmitFailNext(1);
+
+	EXPECT_TRUE(send(7));
+	EXPECT_EQ(EthAccess::getMockTransmitCalls(), 2u) << "the failed hand-off, then the retry";
+	EXPECT_EQ(EthAccess::getMockTransmitCount(), 1u) << "exactly one frame was queued";
+	EXPECT_EQ(MediaTx::l2RetryOk(), 1u);
+	EXPECT_EQ(sumOfCauses(), 0u) << "a rescued frame is not a failed transmit";
+
+	// What reached the wire is the frame built for this call.
+	std::array<uint8_t, l2rtp::kMaxFrameBytes> want{};
+	std::memcpy(want.data(), ch.hdrTemplate.data(), l2rtp::kHeaderBytes);
+	const size_t n = l2rtp::patchTick(want.data(), false, 0, 7, 7 * 160u, payload, sizeof(payload), 0);
+	const std::vector<uint8_t>& got = EthAccess::getLastTransmittedFrame();
+	ASSERT_EQ(got.size(), n);
+	EXPECT_EQ(std::memcmp(got.data(), want.data(), n), 0);
+
+	// One frame drawn and built, not two: the retry reuses the buffer it already holds.
+	EXPECT_EQ(l2rtp::DmaFramePool::getAllocations(), 1u);
+	EXPECT_EQ(ch.ipIdent, static_cast<uint16_t>(1));
+	EXPECT_EQ(l2rtp::DmaFramePool::available(), l2rtp::DmaFramePool::kPoolSize);
+	EXPECT_EQ(MediaTx::l2TxSummary().count, 1u) << "one hand-off, retry included";
+}
+
+TEST_F(MediaTxL2Test, ARetryThatFailsTooCountsOneDriverErrorNotTwo)
+{
+	EthAccess::setMockTransmitFailNext(2);
+	EXPECT_FALSE(send(1));
+	EXPECT_EQ(EthAccess::getMockTransmitCalls(), 2u) << "tried, retried once, and no more";
+	EXPECT_EQ(EthAccess::getMockTransmitCount(), 0u);
+	expectOnly(MediaTx::L2Fail::Driver, 1);
+	EXPECT_EQ(MediaTx::l2RetryOk(), 0u);
+	EXPECT_EQ(l2rtp::DmaFramePool::available(), l2rtp::DmaFramePool::kPoolSize);
+
+	// Both armed failures are spent: the next frame goes through first time.
+	EXPECT_TRUE(send(2));
+	EXPECT_EQ(EthAccess::getMockTransmitCalls(), 3u);
+	EXPECT_EQ(MediaTx::l2RetryOk(), 0u);
+	expectOnly(MediaTx::L2Fail::Driver, 1);
+
+	// A driver that keeps refusing: two calls and one count per frame.
+	EthAccess::setMockTransmitResult(false);
+	EXPECT_FALSE(send(3));
+	EXPECT_FALSE(send(4));
+	EXPECT_EQ(EthAccess::getMockTransmitCalls(), 7u);
+	expectOnly(MediaTx::L2Fail::Driver, 3);
+	EXPECT_EQ(MediaTx::l2RetryOk(), 0u);
+	EXPECT_EQ(l2rtp::DmaFramePool::available(), l2rtp::DmaFramePool::kPoolSize);
+}
+
+TEST_F(MediaTxL2Test, AFrameTheDriverAcceptsFirstTimeIsNotRetried)
+{
+	EXPECT_TRUE(send(1));
+	EXPECT_EQ(EthAccess::getMockTransmitCalls(), 1u);
+	EXPECT_EQ(EthAccess::getMockTransmitCount(), 1u);
+	EXPECT_EQ(MediaTx::l2RetryOk(), 0u);
+	EXPECT_EQ(sumOfCauses(), 0u);
+}
+
+TEST_F(MediaTxL2Test, OnlyADriverErrorIsRetried)
+{
+	// No Ethernet handle is permanent: one call, no retry, even with a driver failure armed.
+	EthAccess::setMockEthHandle(false);
+	EthAccess::setMockTransmitFailNext(1);
+	EXPECT_FALSE(send(1));
+	EXPECT_EQ(EthAccess::getMockTransmitCalls(), 1u);
+	expectOnly(MediaTx::L2Fail::NoHandle, 1);
+	EXPECT_EQ(MediaTx::l2RetryOk(), 0u);
+	EthAccess::setMockEthHandle(true);
+	EthAccess::setMockTransmitFailNext(0);
+	MediaTx::resetForTest();
+
+	// No free frame, and a payload patchTick refuses: neither gets as far as the driver.
+	{
+		std::vector<l2rtp::DmaFramePool::Handle> held;
+		for (size_t i = 0; i < l2rtp::DmaFramePool::kPoolSize; ++i) held.push_back(l2rtp::DmaFramePool::acquire());
+		EXPECT_FALSE(send(2));
+	}
+	uint8_t big[600] = {};
+	EXPECT_FALSE(ch.transmit(false, 0, 3, 480, big, sizeof(big)));
+	EXPECT_EQ(EthAccess::getMockTransmitCalls(), 1u) << "no further driver call";
+	EXPECT_EQ(MediaTx::l2Fails(MediaTx::L2Fail::PoolEmpty), 1u);
+	EXPECT_EQ(MediaTx::l2Fails(MediaTx::L2Fail::ZeroLength), 1u);
+	EXPECT_EQ(sumOfCauses(), 2u);
+	EXPECT_EQ(MediaTx::l2RetryOk(), 0u);
+}
+
+TEST_F(MediaTxL2Test, FirstAttemptFailuresAreErrDriverPlusRetryOkAndEveryFalseReturnCountsOnce)
+{
+	// The callers' aggregate (see TheFourCausesSumToTheCallersOwnAggregate) still equals the four
+	// causes, now that a driver error can be rescued: a rescued frame returns true, so it is in
+	// retryOk and in none of the four.
+	constexpr int kRounds = 40;
+	uint32_t falses = 0, wantDriver = 0, wantRescued = 0;
+	uint16_t seq = 0;
+	for (int round = 0; round < kRounds; ++round)
+	{
+		const bool handle = (round % 5 != 0);
+		const bool poolEmpty = (round % 7 == 3);
+		const size_t failures = static_cast<size_t>(round % 3);   // 0 clean, 1 rescued, 2 both attempts fail
+		EthAccess::setMockEthHandle(handle);
+		EthAccess::setMockTransmitFailNext(failures);
+		std::vector<l2rtp::DmaFramePool::Handle> held;
+		if (poolEmpty)
+		{
+			for (size_t i = 0; i < l2rtp::DmaFramePool::kPoolSize; ++i) held.push_back(l2rtp::DmaFramePool::acquire());
+		}
+		if (!send(++seq)) ++falses;
+		if (handle && !poolEmpty && failures == 1) ++wantRescued;
+		if (handle && !poolEmpty && failures == 2) ++wantDriver;
+		EthAccess::setMockTransmitFailNext(0);   // an arm the driver never saw must not leak into the next round
+	}
+	EXPECT_GT(wantRescued, 0u);
+	EXPECT_GT(wantDriver, 0u);
+	EXPECT_EQ(MediaTx::l2RetryOk(), wantRescued);
+	EXPECT_EQ(MediaTx::l2Fails(MediaTx::L2Fail::Driver), wantDriver);
+	EXPECT_EQ(sumOfCauses(), falses);
+	EXPECT_EQ(EthAccess::getMockTransmitCount(), static_cast<size_t>(kRounds) - falses);
+	EXPECT_EQ(l2rtp::DmaFramePool::available(), l2rtp::DmaFramePool::kPoolSize);
+}
+
+TEST_F(MediaTxTest, TheRetryCounterIsZeroedByTheResetLikeItsNeighbours)
+{
+	MediaTx::recordL2RetryOk();
+	MediaTx::recordL2RetryOk();
+	EXPECT_EQ(MediaTx::l2RetryOk(), 2u);
+	MediaTx::resetForTest();
+	EXPECT_EQ(MediaTx::l2RetryOk(), 0u);
 }
 
 TEST_F(MediaTxL2Test, AChannelThatIsNotReadyIsNotATransmitAttemptAndCountsNothing)
