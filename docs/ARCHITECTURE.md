@@ -152,7 +152,7 @@ Tasks the table above does not cover (name, stack, priority, core), from the `xT
 | `conf_mix_tick` | 3072 / 6 / Core 0 | The single `888` mix clock (`ConferenceRoom.cpp:252`) |
 | `moh_tx` | 6144 / 5 / Core 0 | Music-on-hold pacer (`HoldMusic.cpp:464`) |
 | `tel_media_rx` | 6144 / 6 / **Core 1** | Anchor-provider media receive (`TelephonyAnchorClient.cpp:2810`) |
-| `cdr_persist`, `cdr_archive`, `vm_archive` | 6144 / 1 / Core 0 | CDR NVS persist, SD CDR archive, voicemail archive writers |
+| `cdr_persist`, `cdr_archive`, `vm_archive`, `nvs_writer` | 6144 / 1 / Core 0 | CDR NVS persist, SD CDR archive, voicemail archive writers; `nvs_writer` (#986) writes the device table and the forwards, so a REGISTER adoption or a *72/*73 no longer holds `_mutex` across a flash write |
 | `log_drain` | 3072 / 1 / Core 0 | Log queue drain + syslog tee, headless builds only |
 | `dns_task` / `decay_task` | 4096 / 5 / Core 0; 3072 / 3 / Core 0 | Captive-portal DNS; captive-portal decay (display build) |
 | `http_conn` (pthread) | **4096** / – / unpinned | One per HTTP connection, at most 3 at once (§4) |

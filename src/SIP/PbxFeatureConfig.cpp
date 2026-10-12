@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 
+#include "NvsWriter.hpp"   // #986: forwards are staged, not written here
 #include "PbxPersist.hpp"
 #include "RefillVector.hpp"   // #463: in-place snapshot refill
 #include "ServiceExtensions.hpp"   // Issue #202: the engine-owned pseudo-AOR table
@@ -558,6 +559,7 @@ void PbxFeatureConfig::loadPbxConfig()
 		return;
 	}
 	_pbxConfigLoaded = true;
+	nvswriter::start();   // #986: up before the first persistForwards(); idempotent, host no-op
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	nvs_handle_t h;
@@ -720,23 +722,31 @@ bool PbxFeatureConfig::clearE911Locked()
 
 void PbxFeatureConfig::persistForwards()
 {
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	std::string blob;
-	for (const auto& [ext, cfg] : _forwards)
+	// #986 slice 2: serialise only. The table goes into the NVS writer's static
+	// staging slot and nvs_set_str + nvs_commit run on the nvs_writer task, so
+	// *72/*73 (and the HTTP setter, which funnels through setForwardLocked too) no
+	// longer hold _mutex across a flash write. Caller holds _mutex.
+	// ext \t always \t busy \t noAnswer \n, as loadPbxConfig() reads it. A table
+	// that does not fit the slot is refused, never truncated; the in-RAM table is
+	// right either way. A refusal for a running factory reset is silent.
+	const nvswriter::StageResult r = nvswriter::stage(nvswriter::Key::Forwards,
+		[this](nvswriter::BlobWriter& w) {
+			for (const auto& [ext, cfg] : _forwards)
+			{
+				w.str(ext); w.ch('\t');
+				w.str(cfg.always); w.ch('\t');
+				w.str(cfg.busy); w.ch('\t');
+				w.str(cfg.noAnswer); w.ch('\n');
+			}
+		});
+	if (r == nvswriter::StageResult::TooBig)
 	{
-		blob += ext; blob += '\t';
-		blob += cfg.always; blob += '\t';
-		blob += cfg.busy; blob += '\t';
-		blob += cfg.noAnswer; blob += '\n';
+		_env.log("Forward table too large to persist (refused, not truncated)", true);
 	}
-	nvs_handle_t h;
-	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) == ESP_OK)
+	else if (r == nvswriter::StageResult::NotRunning)
 	{
-		nvs_set_str(h, "forwards", blob.c_str());
-		nvs_commit(h);
-		nvs_close(h);
+		_env.log("NVS writer is not running, forward table not persisted", true);
 	}
-#endif
 }
 
 void PbxFeatureConfig::persistVoicemail()

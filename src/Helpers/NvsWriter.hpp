@@ -1,0 +1,50 @@
+#pragma once
+
+// NvsWriter -- the process-wide NVS writer (#986 slice 2). The policy is in
+// NvsWriterLogic.hpp; this is the sizes, the instance, and (board only) the
+// queues and the pinned task. First callers: Registrar::persistDevices() and
+// PbxFeatureConfig::persistForwards(), both under RequestsHandler::_mutex.
+
+#include <cstddef>
+
+#include "FunctionRef.hpp"
+#include "NvsWriterLogic.hpp"
+#include "PoolConfig.hpp"
+
+namespace nvswriter
+{
+	// nvs_set_str caps a string at 4000 B including the NUL (CdrRing.hpp makes the
+	// same point). The slots are sized to what nvs_set_str could ever have stored,
+	// so a blob that now does not fit is one that never persisted before either.
+	constexpr size_t kNvsStrMax = 4000;
+
+	// One devices row: mac(12) \t ext(<=64, isValidAor) \t state(1) \t flags(1)
+	// \t seq(<=10) \n. Bounded by POCKETDIAL_MAX_CLIENTS rows, plus the NUL.
+	constexpr size_t kDevicesRowMax = 12 + 1 + 64 + 1 + 1 + 1 + 1 + 1 + 10 + 1;
+	constexpr size_t kDevicesWorstCase = static_cast<size_t>(POCKETDIAL_MAX_CLIENTS) * kDevicesRowMax + 1;
+	constexpr size_t kDevicesCap = (kDevicesWorstCase < kNvsStrMax) ? kDevicesWorstCase : kNvsStrMax;
+
+	// Forward targets are not length-checked on the HTTP and config-import paths,
+	// so there is no smaller bound than the NVS limit itself.
+	constexpr size_t kForwardsCap = kNvsStrMax;
+
+	constexpr size_t kScratchCap = (kDevicesCap > kForwardsCap) ? kDevicesCap : kForwardsCap;
+
+	// Boot-time and idempotent (loadDevices / loadPbxConfig call it before any
+	// handler dispatches). Board: creates the queues and the task. Host: nothing.
+	void start();
+
+	// Serialises into the key's staging slot and overwrites the key's queue.
+	// Never blocks, never allocates. The caller holds _mutex, which is what makes
+	// the staging slot single-producer.
+	StageResult stage(Key k, FunctionRef<void(BlobWriter&)> fill);
+
+	Stats stats();
+
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+	// Host test seams: the writer task does not exist here, so a test plays it.
+	std::string_view stagedForTest(Key k);                                       // payload waiting, or empty
+	unsigned drainForTest(FunctionRef<bool(Key, const char*, size_t)> sink);     // one writer pass
+	void resetForTest();                                                         // empty queues, zero counters
+#endif
+}
