@@ -1,27 +1,14 @@
 # pocket-dial: Accessibility Guardrails (SSH Sysop TUI)
 
-> **Phase-A deliverable (Accessibility Auditor).** Audits the TUI defined in
-> [`tui-ia.md`](tui-ia.md) and rendered in [`tui-style.md`](tui-style.md) against the
-> non-negotiables in [`00-brief.md`](00-brief.md) §6 and the device palette in `main/ui/ui.cpp`
-> (lines 39–64). It does **not** redraw screens. It constrains how the locked screens render so
-> the product is usable by color-blind operators, screen-reader-over-SSH operators, low-vision
-> operators at 80×24, and keyboard-only operators with no escape hatch but the keyboard.
->
-> This file owns: (1) the color-blind-safe treatment of BRASS/PHOSPHOR with a per-state
-> glyph/label audit proving **no state is color-only**; (2) screen-reader-over-SSH behavior:
-> reading order, announced labels, and a **STATIC mode** that kills the 1 Hz cursor-jump churn;
-> (3) 80×24 legibility + focus-visibility rules; (4) keyboard-trap avoidance.
->
-> **Standard applied.** A TUI is not a web page, so WCAG 2.2 SC numbers are cited *by analogy*
-> where the intent transfers (1.4.1 Use of Color, 1.3.1 Info & Relationships, 2.1.2 No Keyboard
-> Trap, 2.4.3 Focus Order, 2.4.7 Focus Visible, 4.1.3 Status Messages, 1.4.10 Reflow,
-> 3.3.x error identification). The terminal *is* the assistive-tech surface; "screen reader" means
-> a software AT (NVDA/JAWS/Orca/VoiceOver) reading the SSH client window, or a refreshable Braille
-> display, or `TERM=dumb` line output piped to one.
+Phase-A deliverable from the Accessibility Auditor. It audits the TUI defined in [`tui-ia.md`](tui-ia.md) and rendered in [`tui-style.md`](tui-style.md) against the non-negotiables in [`00-brief.md`](00-brief.md) §6 and the device palette in `main/ui/ui.cpp` (lines 36–61). It does not redraw screens. It constrains how the locked screens render so the product is usable by color-blind operators, screen-reader-over-SSH operators, low-vision operators at 80×24, and keyboard-only operators with no escape hatch but the keyboard. The TUI was removed from the firmware, so this file is design history (see [`README.md`](README.md)).
 
-## 0. Audit verdict (read this first)
+This file owns: (1) the color-blind-safe treatment of BRASS/PHOSPHOR with a per-state glyph/label audit proving **no state is color-only**; (2) screen-reader-over-SSH behavior: reading order, announced labels, and a **STATIC mode** that kills the 1 Hz cursor-jump churn; (3) 80×24 legibility + focus-visibility rules; (4) keyboard-trap avoidance.
 
-**Conformance (by-analogy WCAG 2.2 AA): PARTIALLY CONFORMS, 2 BLOCKING issues, 4 serious.**
+Standard applied: a TUI is not a web page, so WCAG 2.2 SC numbers are cited *by analogy* where the intent transfers (1.4.1 Use of Color, 1.3.1 Info & Relationships, 2.1.2 No Keyboard Trap, 2.4.3 Focus Order, 2.4.7 Focus Visible, 4.1.3 Status Messages, 1.4.10 Reflow, 3.3.x error identification). The terminal *is* the assistive-tech surface; "screen reader" means a software AT (NVDA/JAWS/Orca/VoiceOver) reading the SSH client window, or a refreshable Braille display, or `TERM=dumb` line output piped to one.
+
+## 0. Audit verdict
+
+**Conformance (by-analogy WCAG 2.2 AA): PARTIALLY CONFORMS, 2 BLOCKING issues, 3 serious.**
 The glyph+label discipline locked in brand §4.5 / style §1.5 is genuinely excellent and clears the
 single biggest TUI accessibility trap (color-only state). The monochrome proof in style §1.5 is real
 and lossless. **But** two things will lock out real users today:
@@ -64,10 +51,10 @@ AT only if it is distinguishable **with the SGR column deleted**.
 | DND | `93` amber (both) | `93` amber (both) | `⊘`→`[/]` | `DND` | glyph+word unique | **PASS** |
 | FWD | `33` brass | `32` green | `↳`→`->` | `FWD`/`205` | glyph+word unique | **PASS** |
 | ALERT / destructive | `31` red | `31` red | `▲`→`/!\` | `ALERT` | glyph+word unique | **PASS** |
-| integrity flag | `31` red | `31` red | `⚠`→ **(see A11Y-4)** | `NOT AN EXTENSION` / `EXCEEDS CAP` | word unique | **PASS on word, FAIL on glyph fallback** |
+| integrity flag | `31` red | `31` red | `⚠`→ `[!]` (proposed) | `NOT AN EXTENSION` / `EXCEEDS CAP` | word unique | **PASS on word, FAIL on glyph fallback** |
 | none / unset | `90` grey | `90` grey | `·`→`.` | (none) | **glyph only, no word** | **WEAK** (see C2) |
 | idle channel | `90` grey | `90` grey | `○`→`( )` | `idle` | collides w/ UNREACH glyph | **PASS** (word disambiguates) |
-| CDR ✓ answered | `93`/`92` | `92` | `✓`→ **(see A11Y-4)** | `answered` | word unique | **PASS on word** |
+| CDR ✓ answered | `93`/`92` | `92` | `✓`→ `[ok]` (proposed) | `answered` | word unique | **PASS on word** |
 | CDR ⊘ busy | `93` amber | `93` amber | `⊘`→`[/]` | `busy` | shares `⊘` w/ DND | **PASS** (word + context) |
 | CDR … cancelled | `33` brass | `32` green | `…`→`...` | `cancelled` | word unique | **PASS** |
 | CDR ○ unavailable | `90` grey | `90` grey | `○`→`( )` | `unavailable` | shares `○` w/ UNREACH | **PASS** (word disambiguates) |
@@ -315,7 +302,7 @@ a low-vision or cognitively-loaded operator must learn all four:
 4. Radio/checkbox selection: `(•)` / `[x]`, which is *state*, not *focus*; a focused-but-unchosen
    radio looks identical to an unfocused-but-unchosen one.
 
-**F1 (serious): form-field focus is under-marked.** Tabbing between `Number / Name / PIN` fields, the
+**AF1 (serious): form-field focus is under-marked.** Tabbing between `Number / Name / PIN` fields, the
 *only* focus cue is the terminal text cursor's position. On a slow SSH link or a client that hides the
 cursor, the operator cannot tell which field is hot. Fix: give the focused field a non-color
 marker: a `▸` in the field's left gutter (mirroring table selection) **and/or** brighten the field's
@@ -323,13 +310,13 @@ label to bright-header. So `▸ Number .... [ 108_ ]` reads as focused in mono a
 precedes the field label, which the AT speaks). This makes the four focus languages share one glyph
 (`▸` = "here"), which is also a consistency win.
 
-**F2 (minor): radio focus vs selection conflation.** In a radio group, the operator needs to know
+**AF2 (minor): radio focus vs selection conflation.** In a radio group, the operator needs to know
 *which option the cursor is on* (focus) separately from *which is chosen* (`(•)`). Fix: when a
 radio group has focus, mark the **focused option** with the same `▸` gutter glyph; `(•)`/`( )` stays
 the chosen-state. So focused-but-unchosen = `▸ ( ) Standalone hotspot`; chosen = `(•)`. Spoken as
 "on Standalone hotspot, not selected" by AT once the `▸` is present.
 
-**F3 (good, keep): selection in tables already pairs marker+reverse.** With A11Y-2's spoken line
+**AF3 (good, keep): selection in tables already pairs marker+reverse.** With A11Y-2's spoken line
 added, table focus is the *best* of the four. Bring the other three up to it by adopting the `▸`
 gutter glyph everywhere a cursor can land. One focus glyph, every surface.
 
@@ -412,8 +399,8 @@ no-op), and `Ctrl-L` redraws to recover from any rendering corruption (IA §0), 
 
 ```
 COLOR-BLIND / USE-OF-COLOR
-[x] Every state = glyph + WORD; word is authoritative (verified §1.2, all 17 states)
-[ ] (A11Y-4) ⚠ ✓ … have ASCII fallbacks in the glyph table (⚠→/!\ or [!], ✓→[ok]/y, …→...)
+[x] Every state = glyph + WORD; word is authoritative (verified §1.2, all 16 states)
+[ ] (glyph fallbacks) ⚠ ✓ … need ASCII fallbacks added to the glyph table (proposed: ⚠→[!], ✓→[ok], …→...)
 [x] No color-only distinction anywhere; BRASS `93` carries 4 states — glyph/word mandatory (C1)
 [ ] (C2) bare `·` none/unset announced as the WORD "none" in AT/word table
 [ ] (K1) DIM (ESC[2m) used ONLY on chrome/panel, NEVER on readable text
@@ -429,8 +416,8 @@ SCREEN READER OVER SSH
 
 80x24 LEGIBILITY & FOCUS
 [x] Every screen 80x24, no horizontal scroll, content ends <= col 78 (margin preserved)
-[ ] (F1) Focused FORM FIELD marked with ▸ gutter glyph (not cursor-position alone)
-[ ] (F2) Focused RADIO/CHECKBOX option marked with ▸ (focus) separate from (•)/[x] (state)
+[ ] (AF1) Focused FORM FIELD marked with ▸ gutter glyph (not cursor-position alone)
+[ ] (AF2) Focused RADIO/CHECKBOX option marked with ▸ (focus) separate from (•)/[x] (state)
 [x] One focus glyph `▸` adopted across table rows, buttons, fields, radios (consistency)
 [ ] (2.2.2) STATIC mode is the global Pause/Stop/Hide for ALL auto-updating cells
 [ ] Whimsy/motion suppressed under static/reduced-motion; opt-in only
@@ -449,12 +436,9 @@ KEYBOARD TRAP
   renderer*, layered on the UI Designer's mockups without changing a single screen's geometry.
 - Defers to `tui-style.md` for the canonical glyph set, SGR mapping, and mockups (this file
   audits them, does not restate them) and `tui-ia.md` for the Esc/keyboard model (verified, not
-  redesigned). The persona doc (§422-424) flags this audit as the joint owner of the monochrome /
+  redesigned). The persona doc (`personas.md`, section 6, validation plan, item 3) flags this audit as the joint owner of the monochrome /
   color-blind-sim / screen-reader spot-check; this file is that spot-check, made normative.
-- Hands to the firmware implementer: the §5 checklist is the review gate; the four BLOCKING/serious
-  items (A11Y-1, A11Y-2, A11Y-3, F1/4.3) gate "accessible," not just "renders."
+- Hands to the firmware implementer: the §5 checklist is the review gate; the five BLOCKING/serious
+  items (A11Y-1, A11Y-2, A11Y-3, AF1/4.3) gate "accessible," not just "renders."
 
-*Accessibility Auditor · pocket-dial 3.x redesign · audits `tui-style.md` + `tui-ia.md` against*
-*`00-brief.md` §6 and `main/ui/ui.cpp` PALETTES[]. Conformance: PARTIALLY CONFORMS, 2 blocking*
-*(STATIC mode; spoken selection), 4 serious. Glyph+label architecture is sound; live-redraw and*
-*reverse-only selection are the blockers. No mockup geometry changes required; renderer constraints only.*
+Accessibility Auditor, pocket-dial 3.x redesign. This file audits `tui-style.md` and `tui-ia.md` against `00-brief.md` §6 and `main/ui/ui.cpp` PALETTES[]. Conformance: PARTIALLY CONFORMS, 2 blocking (STATIC mode; spoken selection), 3 serious. The glyph and label architecture is sound; live redraw and reverse-only selection are the blockers. No mockup geometry changes are required; these are renderer constraints only.
