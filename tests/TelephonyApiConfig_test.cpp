@@ -9,7 +9,7 @@
 // matters most for a credential store -- that view() (and therefore any
 // GET/dashboard/UI surface built on it) NEVER exposes the plaintext secret,
 // only bootSlot() (the engine-only, boot-time accessor) does. Also covers
-// the on-disk round trip on POSIX hosts; TelephonyApiConfig::persist()
+// the on-disk round trip on POSIX hosts; TelephonyApiConfig::persistNow()
 // documents that the _WIN32 fallback is honestly in-memory-only, so that
 // half is a GTEST_SKIP there rather than a silently-vacuous assertion.
 
@@ -353,10 +353,10 @@ TEST_F(TelephonyApiConfigTest, ClearAllPersistsAcrossReload)
 #else
 TEST_F(TelephonyApiConfigTest, PersistIsHonestlyInMemoryOnlyOnWindows)
 {
-	// TelephonyApiConfig::persist() documents this: no POSIX permission
+	// TelephonyApiConfig::persistNow() documents this: no POSIX permission
 	// model, so the host fallback stays in-memory rather than writing a
 	// world-readable file. GTEST_SKIP rather than silently dropping the
 	// round-trip assertion, so CI on this platform says so explicitly.
-	GTEST_SKIP() << "TelephonyApiConfig::persist() is in-memory only under _WIN32";
+	GTEST_SKIP() << "TelephonyApiConfig::persistNow() is in-memory only under _WIN32";
 }
 #endif

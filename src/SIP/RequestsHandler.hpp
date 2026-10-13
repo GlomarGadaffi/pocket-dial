@@ -744,6 +744,11 @@ public:
 	// backs DELETE /api/telephony-config/<slot> (wipes just that one slot);
 	// clearAllTelephonyConfig() backs /api/factory-reset (wipes every slot
 	// and the active-slot selection) -- see TelephonyApiConfig::clearAll().
+	//
+	// #997: the setters stage the table (minus the client secret) for the NVS
+	// writer, so "" means accepted and staged, not yet on flash; a changed secret
+	// is written synchronously, after the stage. Only clearAllTelephonyConfig()
+	// writes everything here and now (the reset has begun; a stage would be refused).
 	std::vector<TelephonyApiConfig::SlotView> getTelephonyConfigSlots();
 	TelephonyApiConfig::SlotView getTelephonyConfigSlot(size_t idx);
 	std::string setTelephonyConfigSlot(size_t idx, const TelephonyApiConfig::Slot& s, bool keepSecret);
@@ -762,6 +767,9 @@ public:
 	// case SBC mode is left exactly as it was). Disabling never touches the
 	// active slot: some other feature (the 555 anchor extension, a manual
 	// Trunk dial-plan rule) may still depend on it.
+	// #997: the activation is staged for the NVS writer like POST .../activate, so
+	// it is refused (and SBC mode stays off) while a factory reset runs or when the
+	// writer is not running; the active slot has changed in RAM all the same.
 	std::string setSbcMode(bool enabled, size_t route);
 
 	// ── RFC 3262 100rel on a forwarded call (Issue #172, step 3) ──────────────
@@ -862,6 +870,14 @@ public:
 		_tapiConfig.load();
 		_didMapping.setStorePath(didmapPath);
 		_didMapping.load();
+	}
+
+	// Test-only (#997): how many times a telephony persist wrote client secrets,
+	// as TelephonyApiConfig::secretWrites(). An import must leave it where it was.
+	uint32_t telephonySecretWritesForTest()
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		return _tapiConfig.secretWrites();
 	}
 
 	// Test-only: seed one CDR record directly (bypassing a real call flow) and

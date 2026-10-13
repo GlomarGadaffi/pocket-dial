@@ -1,9 +1,13 @@
 #include "TelephonyApiConfig.hpp"
 
+#include "NvsWriter.hpp"
+#include "ResetGuard.hpp"
+
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
+#include <string_view>
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	// Persisted in a DEDICATED NVS namespace ("tapicfg") so a factory-reset of
@@ -134,19 +138,26 @@ std::string TelephonyApiConfig::setSlot(size_t idx, const Slot& s, bool keepSecr
 	dst.routeDn  = s.routeDn;
 	if (!keepSecret)
 	{
+		// Pending only when the value really differs from the live one (compared
+		// BEFORE it is replaced): re-saving the same secret writes nothing. The flag,
+		// not a comparison at write time, is what a failed write is retried by.
+		if (s.secret != dst.secret)
+		{
+			_secretPending[idx] = true;
+		}
 		scrub(dst.secret);
 		dst.secret = s.secret;
 	}
 	return persist();
 }
 
-std::string TelephonyApiConfig::clearSlot(size_t idx)
+void TelephonyApiConfig::wipeSlot(size_t idx)
 {
-	if (idx >= kSlots)
-	{
-		return "Bad slot index";
-	}
 	Slot& s = _slots[idx];
+	if (!s.secret.empty())
+	{
+		_secretPending[idx] = true;   // the stored secret must be erased too
+	}
 	scrub(s.secret);
 	scrub(s.baseUrl);
 	scrub(s.clientId);
@@ -157,26 +168,36 @@ std::string TelephonyApiConfig::clearSlot(size_t idx)
 	{
 		_active = kNoActiveSlot;
 	}
+}
+
+std::string TelephonyApiConfig::clearSlot(size_t idx)
+{
+	if (idx >= kSlots)
+	{
+		return "Bad slot index";
+	}
+	wipeSlot(idx);
 	return persist();
 }
 
 std::string TelephonyApiConfig::clearAll()
 {
-	// Reuse clearSlot() itself (zeroize + persist + clear-active-if-needed)
-	// across every slot rather than duplicating its logic -- see this
-	// method's header comment. Keep going even if one slot's persist fails,
-	// so a factory reset always zeroizes every slot's in-memory secret;
-	// report the last error, if any.
-	std::string lastErr;
+	// Every slot wiped in RAM first (zeroize + clear-active-if-needed, the same
+	// wipeSlot() clearSlot() uses), then ONE synchronous write of the empty table:
+	// the factory reset runs this after resetguard::begin(), when a staged write is
+	// refused, and it reports whether the credentials are really gone. The
+	// in-memory secrets are zeroized whatever the write returns.
 	for (size_t i = 0; i < kSlots; ++i)
 	{
-		const std::string err = clearSlot(i);
-		if (!err.empty())
-		{
-			lastErr = err;
-		}
+		wipeSlot(i);
 	}
-	return lastErr;
+	_active = kNoActiveSlot;
+	const std::string err = persistNow();
+	if (err.empty())
+	{
+		std::fill(std::begin(_secretPending), std::end(_secretPending), false);   // every secret key was just written empty
+	}
+	return err;
 }
 
 std::string TelephonyApiConfig::setActiveSlot(size_t idx)
@@ -189,12 +210,116 @@ std::string TelephonyApiConfig::setActiveSlot(size_t idx)
 	return persist();
 }
 
+// ── Staged persistence (#986, #997) ───────────────────────────────────────────
+
+bool TelephonyApiConfig::anySecretPending() const
+{
+	return std::any_of(std::begin(_secretPending), std::end(_secretPending), [](bool p) { return p; });
+}
+
+// Fixed layout, built in the writer's staging slot: no heap, no stack buffer. A value
+// is taken as its C string (what nvs_set_str(value.c_str()) stored), then NUL-padded
+// to its cell; one longer than a cell is refused whole, never cut short. THE SECRET
+// IS NOT HERE and must never be: this runs under _mutex into a slot nothing zeroises.
+void TelephonyApiConfig::fillSnapshot(nvswriter::BlobWriter& w) const
+{
+	auto cell = [&w](const char* v) {
+		const size_t n = std::strlen(v);
+		if (n >= kCellLen)
+		{
+			w.fail();
+			return;
+		}
+		w.str(std::string_view(v, n));
+		for (size_t pad = n; pad < kCellLen; ++pad) w.ch('\0');
+	};
+	for (const Slot& s : _slots)
+	{
+		w.ch(static_cast<char>(static_cast<uint8_t>(s.type)));
+		w.ch(static_cast<char>(s.enabled ? 1 : 0));
+		cell(s.baseUrl.c_str());
+		cell(s.clientId.c_str());
+		cell(s.routeDn.c_str());
+	}
+	w.ch(static_cast<char>((_active < kSlots) ? static_cast<uint8_t>(_active) : 0xff));
+}
+
+bool TelephonyApiConfig::emitSnapshot(const char* blob, size_t len,
+	FunctionRef<bool(const char* key, uint8_t value)> putU8,
+	FunctionRef<bool(const char* key, const char* value)> putStr)
+{
+	// Whole or not at all: the length is exact and every string cell ends in a NUL,
+	// so no cell is read past its end and a payload that is not ours stores nothing.
+	if (blob == nullptr || len != kSnapshotLen) return false;
+	for (size_t i = 0; i < kSlots; ++i)
+	{
+		for (size_t c = 1; c <= 3; ++c)
+		{
+			if (blob[i * kSlotSnapshotLen + 2 + c * kCellLen - 1] != '\0') return false;
+		}
+	}
+	char key[16];
+	for (size_t i = 0; i < kSlots; ++i)
+	{
+		const char* p = blob + i * kSlotSnapshotLen;
+		slotKey(key, sizeof(key), i, "type");
+		if (!putU8(key, static_cast<uint8_t>(p[0]))) return false;
+		slotKey(key, sizeof(key), i, "en");
+		if (!putU8(key, static_cast<uint8_t>(p[1]))) return false;
+		slotKey(key, sizeof(key), i, "url");
+		if (!putStr(key, p + 2)) return false;
+		slotKey(key, sizeof(key), i, "id");
+		if (!putStr(key, p + 2 + kCellLen)) return false;
+		slotKey(key, sizeof(key), i, "dn");
+		if (!putStr(key, p + 2 + 2 * kCellLen)) return false;
+	}
+	return putU8("active", static_cast<uint8_t>(blob[kSlots * kSlotSnapshotLen]));
+}
+
+std::string TelephonyApiConfig::persist()
+{
+	// #997: stage everything but the secret, then write the secret if it changed. The
+	// snapshot is copied into the NVS writer's slot under the caller's _mutex and the
+	// nvs_set_* run on the nvs_writer task. A stage that was refused writes nothing at
+	// all, secret included (flash keeps the previous, consistent configuration); the
+	// edit is live in RAM either way and a changed secret stays pending.
+	const nvswriter::StageResult r = nvswriter::stage(nvswriter::Key::Telephony,
+		[this](nvswriter::BlobWriter& w) { fillSnapshot(w); });
+	switch (r)
+	{
+	case nvswriter::StageResult::Ok:
+		break;
+	case nvswriter::StageResult::Reset:
+		return "Telephony config not persisted: a factory reset is running";
+	case nvswriter::StageResult::TooBig:
+		return "Telephony config not persisted: a field is longer than the writer's cell";
+	case nvswriter::StageResult::NotRunning:
+		return "Telephony config not persisted: the NVS writer is not running";
+	}
+	const bool secrets = anySecretPending();
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	const std::string err = secrets ? writeSecretsNow() : std::string();
+#else
+	// Host: no writer task, and the 0600 file is the one store for everything, written
+	// from the table after the stage was accepted. Its secrets go with it.
+	const std::string err = writeSecretsNow();
+#endif
+	if (err.empty() && secrets)
+	{
+		std::fill(std::begin(_secretPending), std::end(_secretPending), false);
+		++_secretWrites;
+	}
+	return err;
+}
+
 // ── Persistence backends ──────────────────────────────────────────────────────
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 
 void TelephonyApiConfig::load()
 {
+	nvswriter::start();   // #997: up before the first persist(); idempotent, host no-op
+	std::fill(std::begin(_secretPending), std::end(_secretPending), false);   // RAM == store
 	nvs_handle_t h;
 	if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK)
 	{
@@ -242,7 +367,59 @@ void TelephonyApiConfig::load()
 	nvs_close(h);
 }
 
-std::string TelephonyApiConfig::persist()
+// The nvs_writer task's half of persist(): every slot's type, enabled flag, URL,
+// client id and route DN, then "active", and one commit only if every set worked. The
+// secret keys are not touched. `blob` is the writer's internal scratch (the flash
+// write must not read PSRAM, #315), never the staging slot.
+bool TelephonyApiConfig::writeSnapshot(const char* blob, size_t len)
+{
+	nvs_handle_t h;
+	if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+	{
+		return false;
+	}
+	bool ok = emitSnapshot(blob, len,
+		[&h](const char* key, uint8_t value) { return nvs_set_u8(h, key, value) == ESP_OK; },
+		[&h](const char* key, const char* value) { return nvs_set_str(h, key, value) == ESP_OK; });
+	ok = ok && nvs_commit(h) == ESP_OK;
+	nvs_close(h);
+	return ok;
+}
+
+// The secrets that changed, written here, now, by the caller (under _mutex): one
+// nvs_set_str per pending slot, passing the live std::string's c_str() straight in so
+// no copy of the secret is made, and one commit. It is a data write, so it is a
+// resetguard writer like the nvs_writer task: once a factory reset has begun it writes
+// nothing (and leaves the flags set), and the reset's waitForWritersIdle() covers it.
+std::string TelephonyApiConfig::writeSecretsNow()
+{
+	resetguard::WriteScope scope;
+	if (!scope.allowed())
+	{
+		return "Telephony config not persisted: a factory reset is running";
+	}
+	nvs_handle_t h;
+	if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
+	{
+		return "NVS open failed";
+	}
+	bool ok = true;
+	char key[16];
+	for (size_t i = 0; i < kSlots && ok; ++i)
+	{
+		if (!_secretPending[i]) continue;
+		slotKey(key, sizeof(key), i, "sec");
+		ok = nvs_set_str(h, key, _slots[i].secret.c_str()) == ESP_OK;
+	}
+	ok = ok && nvs_commit(h) == ESP_OK;
+	nvs_close(h);
+	return ok ? "" : "NVS write failed";
+}
+
+// The factory reset's erase (clearAll(), its one caller): the whole table, secrets
+// included, written here and now, because it runs inside resetguard::begin() where a
+// staged write is refused and its caller reports whether the credentials are gone.
+std::string TelephonyApiConfig::persistNow()
 {
 	nvs_handle_t h;
 	if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
@@ -278,6 +455,8 @@ std::string TelephonyApiConfig::persist()
 
 void TelephonyApiConfig::load()
 {
+	nvswriter::start();   // #997: up before the first persist(); idempotent, host no-op
+	std::fill(std::begin(_secretPending), std::end(_secretPending), false);   // RAM == store
 	std::ifstream f(_storePath);
 	if (!f.is_open())
 	{
@@ -319,7 +498,16 @@ void TelephonyApiConfig::load()
 	}
 }
 
-std::string TelephonyApiConfig::persist()
+// Host: there is one file, so "write the secrets" is "write the file" (the secrets are
+// in it). persist() calls this after every accepted stage, so the file always carries
+// the whole table; the pending flags (and the secretWrites() count) are what say
+// whether a secret was part of that write.
+std::string TelephonyApiConfig::writeSecretsNow()
+{
+	return persistNow();
+}
+
+std::string TelephonyApiConfig::persistNow()
 {
 #if defined(_WIN32)
 	// No POSIX permission model; honest in-memory only (the file would be
