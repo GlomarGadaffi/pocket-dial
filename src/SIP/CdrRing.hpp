@@ -16,7 +16,7 @@
 // comment for the exact arithmetic. Never allocates: this is what crosses
 // from persist() -- called from RequestsHandler::endCall(), on WHATEVER task
 // ended the call, including a PSRAM-stacked one (issues #273/#288) -- to the
-// dedicated, plain-stack writer task via a fixed-size FreeRTOS queue item.
+// plain-stack flash_writer task (#991) via a fixed-size FreeRTOS queue item.
 // The actual flash write happens only on that task; nothing here does I/O.
 //
 // Issue #470: stored with nvs_set_blob (limit ~508 KB), no longer nvs_set_str,
@@ -134,6 +134,12 @@ public:
 	static uint32_t persistSuppressedCount();
 	// #594: NVS read failures in load() (the ring then starts empty). For /api/status.
 	static uint32_t loadFailureCount();
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// #991: the ring's unit in the flash_writer task's pass (FlashWriter.hpp):
+	// writes the waiting snapshot, if any, without blocking. 1 if it wrote one.
+	// Called only by that task; 0 until load() started the writer.
+	static unsigned writePending();
+#endif
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only (#458): every slot, live or not, so a test can pin that
 	// clearAll() leaves none of them holding a record.
