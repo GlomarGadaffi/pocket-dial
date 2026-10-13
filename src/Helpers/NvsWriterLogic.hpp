@@ -10,8 +10,8 @@
 // The fix has the cdr_persist shape (CdrRing.cpp): the caller, still under
 // _mutex, only serialises the table into a per-key staging slot (reserved at
 // boot, PSRAM where the build has it; static on the host) and
-// overwrites that key's depth-1 queue; a pinned task (NvsWriter.cpp) takes it
-// and does the nvs_* calls. Everything here is the part that is not FreeRTOS,
+// overwrites that key's depth-1 queue; the flash_writer task (FlashWriter.cpp,
+// #991, shared with the CDR ring) takes it and does the nvs_* calls. Everything here is the part that is not FreeRTOS,
 // so the host suite runs the same code the board runs:
 //
 //   * stage():   refuse during a factory reset, refuse (never truncate) a blob
@@ -39,7 +39,9 @@
 // RAM the table is already right; on flash the previous snapshot stays valid
 // (an NVS commit is atomic per item) until the new one lands. The window is the
 // writer's wake latency (priority 1) plus the NVS write, longer if that write
-// triggers a page garbage collection.
+// triggers a page garbage collection, plus at most the unit in progress and one
+// unit of every other queue of the shared writer (#991: the CDR ring's blob and
+// the other keys).
 
 #include <array>
 #include <atomic>

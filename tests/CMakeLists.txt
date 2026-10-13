@@ -630,6 +630,9 @@ add_executable(sip_parser_tests
     # depth-1 mailboxes) and the two callers that now stage instead of committing.
     ../src/Helpers/NvsWriter.cpp
     NvsWriter_test.cpp
+    # Issue #991: the one flash-writer task's pass (passOnce, header only on the
+    # host) over the CDR ring's queue and the NVS writer's keys.
+    FlashWriter_test.cpp
     # Issue #986 slice 4: the DID table stages its snapshot for that writer (set,
     # remove and the import clear) instead of committing 16 keys under _mutex.
     DidMapStaging_test.cpp
