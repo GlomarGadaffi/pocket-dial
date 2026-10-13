@@ -376,6 +376,12 @@ host). It is deliberately **not** hung off the existing sender cadence: there ar
 one bus, so that would be N clocks racing to drain the same rings. `ConferenceRoom::tickOnce()`
 lets the host suite step the clock instead of running the driver.
 
+A leg whose phone vanishes without a BYE is reaped by `RequestsHandler::tick()` (#1003, the #604
+RTP-inactivity sweep). Each leg's `MediaBridge::handsetRtpPackets()` is its one received-packet
+counter, and 60 s with no change ends the call: BYE to the phone, then `endCall()` releases the
+room leg and its `MixBus` port. It counts PT 0 audio only, as the anchor bridge's handset counter
+does, so a phone that sends nothing for 60 s is dropped even while the others talk.
+
 The anchor leg is still outside the bus. A bussed `MediaBridge` holds exactly one port, its
 handset leg. `feedRx()` returns `false` in BUS mode rather than writing into a `_playoutBuffer`
 that the sender no longer reads. Giving the anchor its own port, and a pump for its return
