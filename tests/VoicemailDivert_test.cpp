@@ -140,6 +140,41 @@ namespace
 		return {};
 	}
 
+	// A final response to `invite` (a request the PBX sent, as captured), the way the
+	// phone that received it would answer: its Via/From/Call-ID/CSeq, To with a tag.
+	std::shared_ptr<SipMessage> responseTo(const std::string& invite, const std::string& status,
+		const std::string& toTag, const std::string& fromIp)
+	{
+		std::string out = "SIP/2.0 " + status + "\r\n";
+		size_t pos = invite.find("\r\n") + 2;
+		while (pos < invite.size())
+		{
+			size_t eol = invite.find("\r\n", pos);
+			if (eol == std::string::npos || eol == pos) break;
+			const std::string line = invite.substr(pos, eol - pos);
+			if (line.rfind("Via:", 0) == 0 || line.rfind("From:", 0) == 0 ||
+				line.rfind("Call-ID:", 0) == 0 || line.rfind("CSeq:", 0) == 0)
+				out += line + "\r\n";
+			else if (line.rfind("To:", 0) == 0)
+				out += line + ";tag=" + toTag + "\r\n";
+			pos = eol + 2;
+		}
+		out += "Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(out, addrFor(fromIp));
+	}
+
+	int countFinalsTo(const SentList& sent, const sockaddr_in& addr, const std::string& code, size_t from = 0)
+	{
+		int n = 0;
+		for (size_t i = from; i < sent.size(); ++i)
+		{
+			const auto& [a, msg] = sent[i];
+			if (!msg || a.sin_addr.s_addr != addr.sin_addr.s_addr || a.sin_port != addr.sin_port) continue;
+			if (msg->toString().rfind("SIP/2.0 " + code, 0) == 0) ++n;
+		}
+		return n;
+	}
+
 	class FakeSink : public vmarchive::Sink
 	{
 	public:
@@ -316,6 +351,118 @@ TEST(VoicemailDivert, CfnaToRegisteredTargetCancelsTheRingingCallee)
 		if (raw.rfind("CANCEL ", 0) == 0 && raw.find("Call-ID: " + callId) != std::string::npos) ++cancels;
 	}
 	EXPECT_EQ(cancels, 1) << "the original callee must be CANCELled once, not left ringing";
+}
+
+// #1011: the cancelled callee answers our CANCEL with 487. That 487 belongs to the
+// leg we abandoned, not to the forwarded call: relayed, it ended every CFNA forward
+// with 487 on .195. It must be ACKed by the PBX and kept from the caller, and the
+// forward to the target must still stand.
+TEST(VoicemailDivert, TheCancelledCalleesFinalIsAbsorbedAndTheForwardStands)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.40.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in calleeAddr = addrFor("192.168.40.19");
+	const sockaddr_in callerAddr = addrFor("192.168.40.29");
+	handler.handle(makeRegister("350", "192.168.40.19", "reg-350-g"));
+	handler.handle(makeRegister("351", "192.168.40.29", "reg-351-g"));
+	handler.handle(makeRegister("352", "192.168.40.39", "reg-352-g"));
+	handler.setForward("350", "noanswer", "352");
+
+	const std::string callId = "cfna-487-1011";
+	handler.handle(makeInvite("351", "350", "192.168.40.29", callId, "z9hG4bKcfna487"));
+	const std::string inviteToCallee = findSentTo(sent, calleeAddr, "Call-ID: " + callId);
+	ASSERT_FALSE(inviteToCallee.empty());
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+	ASSERT_FALSE(findSentTo(sent, addrFor("192.168.40.39"), "INVITE sip:352@").empty());
+
+	const size_t mark = sent.size();
+	handler.handle(responseTo(inviteToCallee, "487 Request Terminated", "t350", "192.168.40.19"));
+
+	EXPECT_EQ(countFinalsTo(sent, callerAddr, "487", mark), 0)
+		<< "the abandoned leg's 487 must not reach the caller";
+	bool acked = false;
+	for (size_t i = mark; i < sent.size(); ++i)
+	{
+		const auto& [a, msg] = sent[i];
+		if (!msg || a.sin_addr.s_addr != calleeAddr.sin_addr.s_addr) continue;
+		const std::string raw = msg->toString();
+		if (raw.rfind("ACK ", 0) == 0 && raw.find("Call-ID: " + callId) != std::string::npos) acked = true;
+	}
+	EXPECT_TRUE(acked) << "the PBX must ACK the 487 to its own CANCELled INVITE (RFC 3261 s17.1.1.3)";
+	EXPECT_TRUE(handler.getSession("Call-ID: " + callId).has_value())
+		<< "the forwarded call to 352 must still stand";
+}
+
+// The other side of the same rule: the forward TARGET's own 487 (the caller hung up
+// while it rang) is a real final for the caller and must still reach it.
+TEST(VoicemailDivert, TheForwardTargetsOwnFinalStillReachesTheCaller)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.40.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in callerAddr = addrFor("192.168.40.28");
+	const sockaddr_in targetAddr = addrFor("192.168.40.38");
+	handler.handle(makeRegister("360", "192.168.40.14", "reg-360-h"));
+	handler.handle(makeRegister("361", "192.168.40.28", "reg-361-h"));
+	handler.handle(makeRegister("362", "192.168.40.38", "reg-362-h"));
+	handler.setForward("360", "noanswer", "362");
+
+	const std::string callId = "cfna-target-487";
+	handler.handle(makeInvite("361", "360", "192.168.40.28", callId, "z9hG4bKcfnatgt"));
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+	const std::string inviteToTarget = findSentTo(sent, targetAddr, "INVITE sip:362@");
+	ASSERT_FALSE(inviteToTarget.empty());
+
+	const size_t mark = sent.size();
+	handler.handle(responseTo(inviteToTarget, "487 Request Terminated", "t362", "192.168.40.38"));
+	EXPECT_EQ(countFinalsTo(sent, callerAddr, "487", mark), 1)
+		<< "the target's own 487 is the caller's final and must be relayed";
+}
+
+// The voicemail branch has CANCELled the callee since #246: its 487 arrives after the
+// caller already has the voicemail leg's 200 and must not reach the caller either.
+TEST(VoicemailDivert, TheCancelledCalleesFinalNeverFollowsTheVoicemailAnswer)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.40.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in calleeAddr = addrFor("192.168.40.15");
+	const sockaddr_in callerAddr = addrFor("192.168.40.25");
+	handler.handle(makeRegister("370", "192.168.40.15", "reg-370-i"));
+	handler.handle(makeRegister("371", "192.168.40.25", "reg-371-i"));
+	handler.setVoicemail("370", true);
+
+	const std::string callId = "vm-487-1011";
+	handler.handle(makeInvite("371", "370", "192.168.40.25", callId, "z9hG4bKvm487"));
+	const std::string inviteToCallee = findSentTo(sent, calleeAddr, "Call-ID: " + callId);
+	ASSERT_FALSE(inviteToCallee.empty());
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	const size_t beforeTick = sent.size();
+	handler.tick();
+	ASSERT_EQ(countFinalsTo(sent, callerAddr, "200", beforeTick), 1) << "precondition: voicemail answered the caller";
+
+	const size_t mark = sent.size();
+	handler.handle(responseTo(inviteToCallee, "487 Request Terminated", "t370", "192.168.40.15"));
+	EXPECT_EQ(countFinalsTo(sent, callerAddr, "487", mark), 0)
+		<< "a 487 after the caller's 200 would be a second final on one INVITE";
 }
 
 // Issue #716: an explicit CFNA target that is not registered. redirectInvite()

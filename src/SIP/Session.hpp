@@ -295,6 +295,12 @@ public:
 	const std::string& getNoAnswerTarget() const { return _noAnswerTarget; }
 	void setNoAnswerTarget(const std::string& t) { _noAnswerTarget = t; }
 
+	// #1011: the extension whose ringing leg was CANCELled when this Call-ID was
+	// diverted (CFNA forward or voicemail). Its 487 answers our CANCEL, not the
+	// caller's INVITE, so onReqTerminated() ACKs it instead of relaying it.
+	const std::string& getCancelledLegExt() const { return _cancelledLegExt; }
+	void setCancelledLegExt(const std::string& ext) { _cancelledLegExt = ext; }
+
 	// ── Sequential hunt-group progression (Class A sweep) ─────────────
 	// _huntMembers is the ordered list; _huntIndex is the member currently ringing.
 	// _huntActive distinguishes a hunt session from an ordinary/broadcast one.
@@ -491,6 +497,7 @@ private:
 	std::chrono::steady_clock::time_point _ringDeadline;
 	bool _ringTimerArmed = false;
 	std::string _noAnswerTarget;
+	std::string _cancelledLegExt;
 
 	bool _huntActive = false;
 	std::vector<std::string> _huntMembers;
