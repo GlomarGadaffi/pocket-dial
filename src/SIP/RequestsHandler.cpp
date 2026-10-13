@@ -11003,8 +11003,13 @@ void RequestsHandler::tick()
 		// session, a relay pair and a billed carrier leg. End it once BOTH
 		// relayed legs have received nothing for kRtpInactivityTimeout; one
 		// quiet leg (VAD-silent listener, far-end hold, mute) is a live call.
-		// Only legs the board relays can be watched: a trunk call's two
-		// receivers and an anchor bridge's handset RTP + anchor audio. Exempt: Held calls
+		// Only calls whose RTP reaches the board can be watched: a trunk call's
+		// two receivers, an anchor bridge's handset RTP + anchor audio, and
+		// (#1003) an 888 conference leg's handset RTP, its only counter, so a
+		// silent participant is reaped while the others talk. Not watched: a
+		// peer-to-peer call, 777 (SDP loopback, no board RTP), and 440 or a
+		// parked call, which the board answers sendonly so the phone sends
+		// nothing; a park has its own timeout. Exempt: Held calls
 		// (a sendonly/inactive leg legitimately sends nothing; the watch
 		// restarts on resume). A 911/933 (Session::isEmergency()) gets the 4 h
 		// bound instead (#741): never cut while either leg carries audio.
@@ -11036,9 +11041,13 @@ void RequestsHandler::tick()
 				legA = b->handsetRtpPackets();
 				legB = b->anchorRxChunks();
 			}
+			else if (const MediaBridge* cb = _conference ? _conference->bridgeForCall(callID) : nullptr)
+			{
+				legA = legB = cb->handsetRtpPackets();   // #1003: one leg, one counter
+			}
 			else
 			{
-				continue;   // peer-to-peer media never passes through the board
+				continue;   // no board RTP to watch: peer-to-peer, 777, 440, park
 			}
 			const auto limit = session->isEmergency() ? std::chrono::steady_clock::duration(kEmergencyRtpInactivityTimeout)
 			                                           : std::chrono::steady_clock::duration(kRtpInactivityTimeout);
@@ -11088,7 +11097,9 @@ void RequestsHandler::tick()
 					" s -- ending " + callID, true);
 			}
 			const std::string handsetNum = handset ? handset->getNumber() : std::string();
-			const std::string farNum = session->isAnchor() ? session->getAnchorParticipantId() : std::string();
+			// A conference leg's far side is the room, as onBye() records it (#1003).
+			const std::string farNum = session->isAnchor() ? session->getAnchorParticipantId()
+				: (_conference && _conference->hasLeg(callID)) ? std::string(ConferenceRoom::EXT) : std::string();
 			if (inbound) endCall(callID, farNum, handsetNum, "rtp inactivity");
 			else         endCall(callID, handsetNum, farNum, "rtp inactivity");
 		}
