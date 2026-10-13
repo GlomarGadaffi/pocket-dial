@@ -2881,7 +2881,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	if (!cfna.empty() && cfna != destNumber)
 	{
 		newSession->setNoAnswerTarget(cfna);
-		newSession->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
+		newSession->armRingTimer(std::chrono::steady_clock::now() + _cfg.noAnswerTimeout(destNumber));
 	}
 	// Issue #246: no explicit CFNA target, but this extension has voicemail
 	// enabled -- arm the timer anyway with the voicemail sentinel, decided
@@ -2890,7 +2890,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	else if (cfna.empty() && _cfg.isVoicemailEnabled(destNumber))
 	{
 		newSession->setNoAnswerTarget(pbx::kVoicemailForwardSentinel);
-		newSession->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
+		newSession->armRingTimer(std::chrono::steady_clock::now() + _cfg.noAnswerTimeout(destNumber));
 	}
 
 	response->setContact(buildContact(caller.value()->getNumber()));
@@ -9894,7 +9894,22 @@ void RequestsHandler::setForward(const std::string& extension, const std::string
 	printLogs(localLogs);
 }
 
-std::vector<std::tuple<std::string, std::string, std::string, std::string>> RequestsHandler::getForwards()
+bool RequestsHandler::setNoAnswerSeconds(const std::string& extension, int seconds)
+{
+	std::vector<std::pair<bool, std::string>> localLogs;
+	bool ok = false;
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		ok = _cfg.setNoAnswerSecondsLocked(extension, seconds);
+		localLogs = std::move(_logQueue);
+		_logQueue.clear();
+	}
+
+	printLogs(localLogs);
+	return ok;
+}
+
+std::vector<pbx::ForwardRow> RequestsHandler::getForwards()
 {
 	std::lock_guard<std::mutex> lock(_snapshotMutex);
 	return _snapshot.forwards;

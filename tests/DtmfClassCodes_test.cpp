@@ -117,7 +117,7 @@ TEST(DtmfClassCodes, Star72NNNN_SetsForwardAndSnapshotReflectsItImmediately)
 	sendDtmfSequence(handler, "303", "192.168.5.52", "dtmf-72", "*725500");
 
 	bool found = false;
-	for (const auto& [ext, always, busy, noAnswer] : handler.getForwards())
+	for (const auto& [ext, always, busy, noAnswer, noAnswerSeconds] : handler.getForwards())
 	{
 		if (ext == "303")
 		{
@@ -138,14 +138,14 @@ TEST(DtmfClassCodes, Star73_ClearsForwardSetByStar72NNNN)
 
 	sendDtmfSequence(handler, "304", "192.168.5.53", "dtmf-73a", "*725501");
 	bool foundBefore = false;
-	for (const auto& [ext, always, busy, noAnswer] : handler.getForwards())
+	for (const auto& [ext, always, busy, noAnswer, noAnswerSeconds] : handler.getForwards())
 	{
 		if (ext == "304") foundBefore = true;
 	}
 	ASSERT_TRUE(foundBefore);
 
 	sendDtmfSequence(handler, "304", "192.168.5.53", "dtmf-73b", "*73");
-	for (const auto& [ext, always, busy, noAnswer] : handler.getForwards())
+	for (const auto& [ext, always, busy, noAnswer, noAnswerSeconds] : handler.getForwards())
 	{
 		EXPECT_NE(ext, "304") << "*73 must clear the entry entirely once no trigger remains set";
 	}
@@ -162,7 +162,7 @@ TEST(DtmfClassCodes, Star72NNNN_RejectsVirtualExtensionAsTheConfiguredExtension)
 
 	sendDtmfSequence(handler, "777", "192.168.5.54", "dtmf-virt", "*725502");
 
-	for (const auto& [ext, always, busy, noAnswer] : handler.getForwards())
+	for (const auto& [ext, always, busy, noAnswer, noAnswerSeconds] : handler.getForwards())
 	{
 		EXPECT_NE(ext, "777") << "virtual extension 777 must never get a forward entry";
 	}

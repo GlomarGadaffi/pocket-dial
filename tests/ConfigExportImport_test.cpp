@@ -305,6 +305,47 @@ TEST_F(ConfigExportImportTest, PlaintextRoundTrip_DialPlanRingGroupsPageZonesDnd
 	EXPECT_NE(std::find(dnd.begin(), dnd.end(), "101"), dnd.end());
 }
 
+// #1009: the per-extension ring time goes through /api/forward, the export,
+// a factory reset (which clears it) and the import (which restores it).
+TEST_F(ConfigExportImportTest, PlaintextRoundTrip_NoAnswerTimeout)
+{
+	auto setTimeout = [&](const std::string& value) {
+		return statusOf(httpRaw(_port, "POST", "/api/forward",
+			"extension=101&trigger=timeout&target=" + value,
+			"pd_session=" + _sysop.cookie, _sysop.csrf));
+	};
+	auto secondsOf = [&](const std::string& ext) {
+		for (const auto& row : _handler->getForwards())
+			if (std::get<0>(row) == ext) return std::get<4>(row);
+		return -1;
+	};
+	EXPECT_EQ(setTimeout("4"), 400);
+	EXPECT_EQ(setTimeout("121"), 400);
+	EXPECT_EQ(setTimeout("3x"), 400);
+	EXPECT_EQ(secondsOf("101"), -1);
+	ASSERT_EQ(setTimeout("45"), 200);
+	EXPECT_EQ(secondsOf("101"), 45);
+
+	std::string exportResp = httpRaw(_port, "GET", "/api/config/export", "",
+		"pd_session=" + _sysop.cookie);
+	ASSERT_EQ(statusOf(exportResp), 200) << exportResp;
+	const std::string blob = bodyOf(exportResp);
+	EXPECT_NE(blob.find("\"noAnswerSeconds\":45"), std::string::npos) << blob;
+
+	AdminSession owner = loginOwner();
+	ASSERT_EQ(statusOf(httpRaw(_port, "POST", "/api/factory-reset", "confirm=ERASE",
+		"pd_session=" + owner.cookie, owner.csrf)), 200);
+	resetguard::resetForTest();
+	EXPECT_EQ(secondsOf("101"), -1) << "a factory reset clears the ring time";
+
+	AdminSession freshSysop = loginSysop(_port);
+	std::string importResp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(blob) + "&confirm=REPLACE",
+		"pd_session=" + freshSysop.cookie, freshSysop.csrf);
+	ASSERT_EQ(statusOf(importResp), 200) << importResp;
+	EXPECT_EQ(secondsOf("101"), 45);
+}
+
 TEST_F(ConfigExportImportTest, Import_ReplaceNotMerge_DropsEntriesNotInTheBlob)
 {
 	// Two ring groups exist before the import...
