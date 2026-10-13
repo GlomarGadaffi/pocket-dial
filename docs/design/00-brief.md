@@ -1,8 +1,8 @@
-# pocket-dial Redesign. Shared Design Brief (canonical)
+# pocket-dial Redesign: Shared Design Brief
 
-> This is the single source of truth for the Phase-A design sprint. Every design agent reads
-> this first and stays consistent with the decisions, vocabulary, palette, and constraints below.
-> Deliverables land beside this file under `docs/design/`.
+Shared brief for the Phase-A design sprint: the vocabulary, palette and constraints that the design documents under `docs/design/` follow.
+
+This document is historical. It describes the SSH sysop terminal redesign, and that terminal was removed from the firmware (see CHANGELOG.md). Sections 1, 3, 4, 6, 7 and 8 describe the removed surface. Section 5 describes the on-device palettes, which still ship. For the admin surfaces that ship today, see section 5.5 of docs/THREAT_MODEL.md.
 
 ## 1. Product & mission
 
@@ -29,9 +29,9 @@ being a config surface and becomes a **passive live-status wallboard**.
   Hunt, already implemented in firmware); **minimal IVR** (DTMF menu → prompt playback, NO queues);
   call-forward / DND / blind-transfer / star-codes (already implemented); CDR/reports view; live call
   monitor; **display → passive monitor**. DHCP + mDNS (`pocketdial.local`) already work.
-- v2 (later): voicemail (needs a new RTP record path).
+- Voicemail: per-extension deposit and retrieval MVP, shipped in v1.5.0-rc.1 (#246, #261).
 - Out of scope: call queues, conferencing/mixing, transcoding, SD card (everything fits on-device
-  flash, there is a 3.88 MB unused `prompts` partition; do NOT design around an SD card).
+  flash: the `prompts` partition is about 3.75 MiB and its last sector holds the reset journal; do NOT design around an SD card).
 
 ## 4. Reference aesthetic (capture the vibe, don't copy verbatim)
 
@@ -63,7 +63,7 @@ mapping must feel like the same product. Exact RGB:
 - accent (live lamp) amber `#FFB020` · DND ring amber `#FFB020` · alert/destructive ember-red `#C84028`
 
 **PHOSPHOR (alt)**, charcoal board, dim-brass rails, green phosphor lamps:
-- bg `#10140F` · panel `#1C241C` · border `#96823C` · text `#AAD296` · highlight `#D2F0BE`
+- bg `#101410` · panel `#1C241C` · border `#96823C` · text `#AAD296` · highlight `#D2F0BE`
 - accent (live lamp) green `#40FF60` · DND amber `#FFB020` · alert `#DC4632`
 
 Design the ANSI TUI with selectable **BRASS** and **PHOSPHOR** themes mirroring these, mapped to the

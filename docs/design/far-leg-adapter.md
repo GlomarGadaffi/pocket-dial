@@ -1,10 +1,15 @@
 # Far-leg adapter: design for #691, #692, #693
 
-Status: proposed, for vote. Nothing here is decided, and no code changes with this file.
-Author: BigDog (Claude Sonnet 5.5). Written 2026-10-09 against origin/main 7bcf952f.
+Proposed design for #691, #692 and #693, for a vote. Nothing here is decided, and this file changes no code. Written 2026-10-09 by BigDog (Claude Sonnet 5.5) against origin/main 7bcf952f.
+
+## Conventions
+
 Every file:line is on 7bcf952f. The issues cite d210d21, and most of those lines have moved.
-`RH` = src/SIP/RequestsHandler.cpp, `RH.hpp` = its header, `TAC` = src/SIP/TelephonyAnchorClient.{hpp,cpp}.
-(The rest of docs/design/ is retired SSH-terminal design history. This file is unrelated to it.)
+
+- `RH` = src/SIP/RequestsHandler.cpp, `RH.hpp` = its header.
+- `TAC` = src/SIP/TelephonyAnchorClient.{hpp,cpp}.
+
+The rest of docs/design/ is retired SSH-terminal design history. This file is unrelated to it.
 
 ## 1. The problem
 
@@ -44,7 +49,7 @@ costs, what it must not touch (911, 933, PSAP callbacks), and asks for a vote.
 | Transport state | per slot: `outboundActive`, `outboundAnswered`, `ringing`, `ownLegHeld`, `farPartId`, `inboundSignaledPartId`, `getFailFast`; per handler: `_outboundPending`, `_ownLegs`. ESP-only | TAC.hpp:93,173-180,214,218,228; AnchorWedge.hpp:24 |
 | Hold | already recorded: `Session::State::Held` and `MediaBridge::setHeld` | RH:11460,11468 |
 
-### 2.2 Premises in the issues that have moved
+### 2.2 Issue premises that do not hold on main
 
 | Issue text | On main |
 |---|---|
@@ -52,12 +57,12 @@ costs, what it must not touch (911, 933, PSAP callbacks), and asks for a vote.
 | 30 branch lines (#693 command) | **38**: 20 `isAnchor()`, 27 `isAnchorInbound()`, 9 both. Run on 7bcf952f |
 | Per-call `new MakeCallArg` replaced by a fixed slot | Gone. It is `new TelCtlJob` from the #657 pool (RH:5400,5433,5586). A slot array does not remove it unless it also replaces the pool, which this design does not do |
 | The worker is ESP-only; #379 cannot be driven on the host | False since #657/#713. The host runs the pool (RH.hpp:2207-2219); `forceAsyncAnchorForTest` (:517) and `holdTelCtlForTest` (:541) drive #379 Case A with a real worker and count drops through `LoopbackAnchorClient::dropCallCount()` (TelCtlPool_test.cpp:211). The comments at AnchorRouting_test.cpp:249,285 are stale. **Still undrivable on the host: events.** The callback stays unwired under `forceAsyncAnchorForTest` (RH.hpp:513-515) |
-| Constrained build has "about 1.5 KB free (#689)" | Predates #731/#933, which compile `SipTrunk` out of the constrained build (main/CMakeLists.txt:321-349). #938 reports 168,752 B free on 3ee4aa6d. Not re-measured here |
+| Constrained build has "about 1.5 KB free (#689)" | Predates #731/#933, which compile `SipTrunk` out of the constrained build (main/CMakeLists.txt:321-349). #938 reports 168,752 B free on 3ee4aa6d ([issue body](https://github.com/GlomarGadaffi/pocket-dial/issues/938); GitHub-sourced, not in the repo). Not re-measured here |
 | "State { Free, Trying, Proceeding, Confirmed, Terminating }" | `SipTrunk::State` has a sixth value, `Cancelling` (SipTrunk.hpp:181) |
-| #942 as the committee verdict "design first, sequenced" | #942 covers #174, #168, #160, #179, #180, #208 and names none of these three. The design-first block is glomar-51's 2026-10-09 comment on each issue |
+| #942 as the committee verdict "design first, sequenced" | Not #942. [#942](https://github.com/GlomarGadaffi/pocket-dial/issues/942) covers #174, #168, #160, #179, #180 and #208, and names none of #691-#693 (GitHub-sourced). The design-first and sequencing text is glomar-51's 2026-10-09 comments on [#691](https://github.com/GlomarGadaffi/pocket-dial/issues/691#issuecomment-6083236774), [#692](https://github.com/GlomarGadaffi/pocket-dial/issues/692#issuecomment-6083237231) and [#693](https://github.com/GlomarGadaffi/pocket-dial/issues/693#issuecomment-6083237631) (GitHub-sourced) |
 | "Most of those branches disappear" (#381) | About 16 of 38 (next table) |
 
-### 2.3 The 38 branch lines, by what they decide (my reading, three lines of context each)
+### 2.3 The 38 branch lines, by what they decide (author's reading, three lines of context each)
 
 | Bucket | Lines | n |
 |---|---|---|
@@ -135,15 +140,32 @@ keeps doing the I/O on the existing #657 lanes. So the lanes (sos included), loc
   frees a slot stuck in Placing/Abandoned past a bound (set by measuring the worker's TLS timeout in the #691 PR;
   not measured here). A leaked slot is the new failure mode: today a missed transition leaves a stale flag, with
   fixed slots it also leaks capacity.
-- **Change to #691 (D).** The issue has `sweep` drop a slot past its deadline and report `onFailed(408)`. On a
+- **#691 (D) differs from the issue.** The issue has `sweep` drop a slot past its deadline and report `onFailed(408)`. On a
   ringing 911/933 that is forbidden: no PBX-side no-answer bound applies (#712, RH:10469-10470,
   AnchorRouting_test.cpp:1695). (D) is rewritten to test the leak guard; the 408 listener callback is not built.
   The listener (`onRinging`/`onAnswered`/`onFailed`/`onRemoteBye`) is also not built: the engine calls the
   adapter, and `Action` carries the result, which removes a callback re-entering `_mutex`.
 
+The slot transitions below are the ones the bullets above define. Transitions they do not define, such as `onPlaced` with `ok` false, are omitted.
+
+```mermaid
+stateDiagram-v2
+    Free --> Placing : placeCall
+    Placing --> Abandoned : hangup
+    Placing --> Ringing : onPlaced ok
+    Abandoned --> Free : onPlaced ok, emits Drop
+    Ringing --> Up : onAnswered
+    Ringing --> Free : hangup, emits Drop
+    Up --> Free : hangup, emits Drop
+    Ringing --> Free : onRemoteDropped
+    Up --> Free : onRemoteDropped
+    Placing --> Free : sweep
+    Abandoned --> Free : sweep
+```
+
 ### 4.1 #691: outbound, behind `POCKETDIAL_ANCHOR_FARLEG`
 
-**Step 0, before the flag (an amendment).** The issue's wiring list (`onAnchorInvite`, `endCall`, Answered/Dropped)
+**Step 0, before the flag (amends #691).** The issue's wiring list (`onAnchorInvite`, `endCall`, Answered/Dropped)
 misses the other outbound drop sites: tick no-answer (RH:10532-10552), degraded sweep (:10804), MediaNeverOpened
 (:5457-5462), orphan-bridge reap (:11002-11003), worker orphan (:5647). At flag 1 each would drop without telling the
 adapter, and `endCall`'s `hangup` would drop again. So first, at flag 0 and with no behaviour change, replace the
@@ -151,7 +173,7 @@ adapter, and `endCall`'s `hangup` would drop again. So first, at flag 0 and with
 helper, `releaseFarLeg(Session&)`, plus a no-drop form for :5475 (3CX already dropped it). Flag 1 then changes one
 function body, not six sites. The existing suite is the net. Step 0 pays off on its own (poll option C).
 
-| | |
+| Item | Detail |
 |---|---|
 | Files | AnchorFarLeg.hpp (new); RH `originateAnchorCall` async arm :5283-5352, `runTelCtl` Make :5608-5652, event callback :472/:578/:582, `endCall` :8831-8909, the helper; RH.hpp (member, test hooks); PoolConfig.hpp; tests/CMakeLists.txt; tests/AnchorFarLeg_test.cpp; tests/min_tests.d/<N>-anchor-farleg-outbound.txt |
 | Wiring (flag 1) | `placeCall` before the job is posted (false -> `refuseBeforeDispatch`); `runTelCtl` calls `onPlaced` in place of `bindOutboundParticipant`, and a `Drop(leg)` replaces :5633-5648; `endCall` calls `hangup(callID)` and posts `Drop` on the drop lane; Answered/Dropped call `onAnswered`/`onRemoteDropped` |
@@ -162,7 +184,7 @@ function body, not six sites. The existing suite is the net. Step 0 pays off on 
 
 ### 4.2 #692: inbound
 
-| | |
+| Item | Detail |
 |---|---|
 | Files | RH `routeInboundAnchorCall` :5784-5933, `onInboundAnchorOk` :6229-6255, the busy/unavailable/no-answer/Dropped sites through the helper; RH.hpp; tests/min_tests.d/<N>-anchor-farleg-inbound.txt |
 | Wiring (flag 1) | After the session exists and `setEmergency` is computed (:5909-5913), if not emergency: `adoptInbound(callID, part)` -> `Ringing`. `answer(callID)` returns `Answer(part)` once -> `asyncAnswerCall`. Every teardown goes through the helper. Pre-session drops (:5799-5906) stay a bare drop of the participant: no slot exists |
@@ -171,12 +193,12 @@ function body, not six sites. The existing suite is the net. Step 0 pays off on 
 | Behaviour, flag 0 | None |
 | Rollback | Flag off, or revert |
 
-### 4.3 Step E (new) and #693
+### 4.3 Step E and #693
 
 911/933 and PSAP callbacks bypass the adapter in #691 and #692, and #693 deletes the path they use. So they move
 first, as step E, with its own vote (section 5). Without it the sequence cannot end.
 
-| | Step E: emergency onto the adapter | #693: delete the old path |
+| Item | Step E: emergency onto the adapter | #693: delete the old path |
 |---|---|---|
 | Files | AnchorFarLeg.hpp (emergency field; `sweep` skips it; reclaim a stale slot before refusing); RH `emergency` guards :5086, :5909-5913; golden-trace test; floor file | RH (direct calls, helper, `_anchorLegReleased`); PoolConfig.hpp (flag removed); tests; floor file. TAC and AnchorWedge.hpp only if (c) is overruled |
 | Behaviour | Flag 1 only: 911/933 and callbacks use the adapter and must be indistinguishable from legacy (section 5). Flag 0 unchanged | **The default build changes**: it becomes what flag 1 carried after #692 and step E. Nothing new, but the flag-0 path is gone |
@@ -195,7 +217,7 @@ first, as step E, with its own vote (section 5). Without it the sequence cannot 
   after the window the classifier needs (#349), so it cannot replace `outboundActive`. It would also have the WS task
   read engine-owned state: the wrong dependency direction. The transport already tells the engine what it knows
   (Answered, Dropped, MediaNeverOpened). So: one record per layer, engine -> transport never. #693's count (23
-  lines in TAC.cpp, 2 in AnchorWedge.hpp) still holds, and nothing is deleted there.
+  lines in TelephonyAnchorClient.cpp, 2 in AnchorWedge.hpp, from `grep -c 'outboundActive\|outboundAnswered'`) still holds, and nothing is deleted there.
 - (d) `Held` in the adapter: **recommend dropping** until a reader exists. Session and MediaBridge already record it
   (RH:11460,11468); an unread third copy is speculative. BLF/presence is out of scope (#381).
 - Constrained build: with 168,752 B reported free, "net negative" is no longer a byte constraint. Keep "the PR
@@ -221,7 +243,10 @@ NOT ROUTED on an anchor drop (:5524-5543). The adapter holds no reference to `Si
 
 ## 6. Test plan
 
-**Host (this is what can be proven).**
+### Host
+
+This is what can be proven.
+
 - `AnchorFarLeg_test.cpp`: the bare class, no engine, no threads, every count from a hook. (A) hangup in Placing then
   `onPlaced(ok)`: one `Drop`, slot Free, no event. (B) bound, hangup before Answered: one `Drop`. (C) Dropped vs
   hangup in both orders: at most one `Drop`. (D) the leak guard frees a stuck slot and does not 408. (E) a 127-character
@@ -237,7 +262,10 @@ NOT ROUTED on an anchor drop (:5524-5543). The adapter holds no reference to `Si
 - Per PR: floor file (tests/min_tests.d/README.md), zero new `cert-err33-c` / member-init warnings (in-class
   initialisers), full WSL host suite.
 
-**Bench (needs hardware and a ring; operator-arbitrated; not run for this file).**
+### Bench
+
+Needs hardware and a ring, is operator-arbitrated, and was not run for this file.
+
 - #691: flag-0 and flag-1 images side by side on .244. tests/load/anchor_scenarios.py `x4` (CANCEL about 1 s into
   ringing), `x379` (CANCEL during `makeCall`), `x349`. Each CANCEL gets a 487, exactly one "Successfully dropped
   participant" and one 3CX "Participant Remove", and 3CX lists 0 legs after. `tests/run.py board-smoke` green on both.
@@ -271,7 +299,7 @@ and because step E is a Rule 5 decision that deserves its own vote. A becomes ri
 shows up after step 0 lands; C becomes right if the bench for #691 is not available soon. B2 is not part of this
 vote: it is asked after the bench run.
 
-Sub-decisions, with the default I assume: the flag stays compile-time (a runtime toggle would put both paths in one
+Sub-decisions, with the default assumed: the flag stays compile-time (a runtime toggle would put both paths in one
 image, make the flag-0 "unchanged" claim untestable, and put a field-flippable switch on the 911 path; #933 chose
 configure-time refusal over a runtime path for the same reason; the 168 KB free reading removes the byte argument,
 not this one); the class keeps the name `AnchorFarLeg`; (c) and (d) of #693 are dropped.

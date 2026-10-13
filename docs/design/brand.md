@@ -1,11 +1,8 @@
-# pocket-dial. Brand & Identity (SSH Sysop Terminal)
+# pocket-dial Brand & Identity (SSH Sysop Terminal)
 
-> **Brand Guardian deliverable.** Reads from `docs/design/00-brief.md` (canonical) and the on-device
-> palette in `main/ui/ui.cpp`. Defines the product identity for the SSH-first sysop terminal: name
-> treatment, ASCII logo, the SSH login banner (first thing shown on connect), voice & tone, and the
-> consistency rules every downstream design doc and string must obey.
->
-> One-line essence: **a brass-and-phosphor operator board you reach by SSH.**
+Brand Guardian deliverable. Reads from `docs/design/00-brief.md` and the on-device palette in `main/ui/ui.cpp`. Defines the product identity for the SSH-first sysop terminal: name treatment, ASCII logo, the SSH login banner (first thing shown on connect), voice & tone, and the consistency rules every downstream design doc and string must obey.
+
+One-line essence: **a brass-and-phosphor operator board you reach by SSH.**
 
 
 ## 1. Product name & treatment
@@ -22,7 +19,7 @@ README, mDNS (`pocketdial.local`), and CI, so we standardize, we do not rename.
 | Title-case label, proper noun in headings | `Pocket-Dial` | "Pocket-Dial Setup", artifact names |
 | ASCII logo / login banner / title bars | `POCKET-DIAL` (caps) | the operator-board lockup |
 | Hostname / mDNS / URLs / configs | `pocketdial` (one word, no hyphen) | `pocketdial.local`, NVS keys |
-| Code identifiers / macros | `POCKETDIAL_*`, `pocketdial` | `POCKETDIAL_OPEN_REGISTRAR` |
+| Code identifiers / macros | `POCKETDIAL_*`, `pocketdial` | `POCKETDIAL_MAX_CLIENTS` |
 
 **Never** introduce: `PocketDial`, `Pocket Dial` (space), `pocket dial`, `PD-PBX`, `MyPBX`, marketing
 sub-brands, or version-specific names. There is one product, one name, three casings.
@@ -57,7 +54,7 @@ degrades perfectly to monochrome.
 
 ### 2.1 Primary lockup, operator-board nameplate (used in the login banner)
 
-11 lines tall, 64 columns wide. The double rule evokes a brass rail; the `◖◗` are panel lamps; the
+8 lines tall, 68 columns wide. The double rule evokes a brass rail; the `◖◗` are panel lamps; the
 sub-rule carries the descriptor. This is the canonical logo, when in doubt, use this one.
 
 ```
@@ -115,20 +112,20 @@ for the login prompt the SSH server appends below it, and (d) never imply state 
 ```
  ╔════════════════════════════════════════════════════════════════════════════╗
  ║                                                                            ║
- ║     ____   ___   ____ _  _______ _____      ____  ___    _    _             ║
- ║    |  _ \ / _ \ / ___| |/ / ____|_   _|    |  _ \|_ _|  / \  | |            ║
+ ║     ____   ___   ____ _  _______ _____      ____  ___    _    _            ║
+ ║    |  _ \ / _ \ / ___| |/ / ____|_   _|    |  _ \|_ _|  / \  | |           ║
  ║    | |_) | | | | |   | ' /|  _|   | |_____ | | | || |  / _ \ | |           ║
  ║    |  __/| |_| | |___| . \| |___  | |_____|| |_| || | / ___ \| |___        ║
- ║    |_|    \___/ \____|_|\_\_____| |_|      |____/|___/_/   \_\_____|        ║
+ ║    |_|    \___/ \____|_|\_\_____| |_|      |____/|___/_/   \_\_____|       ║
  ║                                                                            ║
  ║   ◖▌  S Y S O P   T E R M I N A L  ▐◗     single-board SIP PBX             ║
- ║ ──────────────────────────────────────────────────────────────────────── ║
+ ║ ────────────────────────────────────────────────────────────────────────── ║
  ║   HOST · «pocketdial.local»            ◆ READY — operator on duty          ║
  ║   ADDR · «192.168.1.50»  ·  «AA:BB:CC:DD:EE:FF»                            ║
- ║   FW   · POCKET-DIAL «v3.0.0»  ·  up «4d 02:17»                            ║
- ║ ──────────────────────────────────────────────────────────────────────── ║
- ║   Authorized sysops only. All sessions are logged to the CDR.             ║
- ║   Press  ?  any time for help.   Esc backs out.   This is an ESP32-S3.    ║
+ ║   FW   · POCKET-DIAL «v3.0»  ·  up «4d 02:17»                              ║
+ ║ ────────────────────────────────────────────────────────────────────────── ║
+ ║   Authorized sysops only. Completed calls are logged to the CDR.           ║
+ ║   Press  ?  any time for help.   Esc backs out.   This is an ESP32-S3.     ║
  ║                                                                            ║
  ╚════════════════════════════════════════════════════════════════════════════╝
  login: _
@@ -141,25 +138,25 @@ This is what a `TERM=vt100` serial console or a `--no-color` client sees, no inf
 
 ```
  +============================================================================+
- |     ____   ___   ____ _  _______ _____      ____  ___    _    _             |
- |    |  _ \ / _ \ / ___| |/ / ____|_   _|    |  _ \|_ _|  / \  | |            |
+ |     ____   ___   ____ _  _______ _____      ____  ___    _    _            |
+ |    |  _ \ / _ \ / ___| |/ / ____|_   _|    |  _ \|_ _|  / \  | |           |
  |    | |_) | | | | |   | ' /|  _|   | |_____ | | | || |  / _ \ | |           |
  |    |  __/| |_| | |___| . \| |___  | |_____|| |_| || | / ___ \| |___        |
- |    |_|    \___/ \____|_|\_\_____| |_|      |____/|___/_/   \_\_____|        |
+ |    |_|    \___/ \____|_|\_\_____| |_|      |____/|___/_/   \_\_____|       |
  |   [#]  SYSOP TERMINAL    single-board SIP PBX                              |
  | -------------------------------------------------------------------------- |
- |   HOST . pocketdial.local           [*] READY -- operator on duty          |
+ |   HOST . pocketdial.local           <*> READY -- operator on duty          |
  |   ADDR . 192.168.1.50  .  AA:BB:CC:DD:EE:FF                                |
- |   FW   . POCKET-DIAL v3.0.0  .  up 4d 02:17                                |
+ |   FW   . POCKET-DIAL v3.0  .  up 4d 02:17                                  |
  | -------------------------------------------------------------------------- |
- |   Authorized sysops only. All sessions are logged to the CDR.              |
+ |   Authorized sysops only. Completed calls are logged to the CDR.           |
  |   Press ? any time for help.  Esc backs out.  This is an ESP32-S3.         |
  +============================================================================+
  login: _
 ```
 
 > Box-drawing → ASCII fallback map (firmware picks per `TERM`): `╔╗╚╝═║` → `+ + + + = |`,
-> `◆`→`[*]`, `◖▌ ▐◗`→`[#]`, `·`→`.`, `─`→`-`.
+> `◆`→`<*>`, `◖▌ ▐◗`→`[#]`, `·`→`.`, `─`→`-`.
 
 ### 3.4 Post-login prompt sigil
 
@@ -191,7 +188,7 @@ not a telecom engineer, and that the installer is in a hurry.
   Flavor lives in fixed places (the banner tagline, the boot line, opt-in easter eggs) not in error
   messages or field labels.
 - **Honest about the hardware.** "This is an ESP32-S3." We do not pretend to be a rack appliance. Limits
-  (2–8 calls, no voicemail in v1, no SD card) are stated plainly, never hidden.
+  (2–8 calls, voicemail limited to the per-extension MVP shipped in v1.5.0-rc.1, no SD card) are stated plainly, never hidden.
 - **Quietly confident, never alarmist.** Even destructive prompts stay level: `REBOOT now? phones drop
   for ~8s. [y/N]` — fact, consequence, safe default.
 
@@ -256,7 +253,7 @@ brand-level rules:
   the live monitor's pulse. Don't spend the accent on decoration.
 - **Red is rationed.** Ember-red (`#C84028` / `#DC4632`) means destructive/alert **only** (reboot,
   delete, ALERT). Never use red for emphasis or headers.
-- **DND stays amber in both themes** (it is amber in PHOSPHOR too, see `ui.cpp` line 61). Consistency
+- **DND stays amber in both themes** (it is amber in PHOSPHOR too, see `ui.cpp` lines 46 (BRASS) and 58 (PHOSPHOR)). Consistency
   across themes is itself a brand signal.
 - **Color is always the *third* layer.** Glyph + label first; color decorates. See §4.5.
 
@@ -284,11 +281,11 @@ These bind the UX Architect, UI Designer, Visual Storyteller, Whimsy Injector, a
    always-visible key-hint footer, `?` help, and Esc-to-back. The footer always shows the theme label.
 6. **Flavor is budgeted to two lines** (§4.4) plus opt-in easter eggs. Functional copy stays operator-terse.
 7. **Box-drawing must have an ASCII fallback** (§3.3 map). If a glyph has no fallback, don't use it.
-8. **Use real feature nouns only** (§4.3). If we don't ship it (trunks, queues, voicemail-in-v1), it does
+8. **Use real feature nouns only** (§4.3). If we don't ship it (trunks, queues, voicemail beyond the shipped MVP), it does
    not appear in any string, label, menu, or mockup.
 9. **Brass chrome, rationed accent, rationed red** (§5). The lamp and the red each mean one thing.
 10. **Honesty clause.** Surfaces may state real limits plainly ("This is an ESP32-S3", "2–8 calls",
-    "voicemail arrives in v2"). Never imply capabilities we don't have.
+    "voicemail is per-extension MVP only"). Never imply capabilities we don't have.
 
 ### 6.1 Quick brand checklist (paste into any new screen review)
 
@@ -311,14 +308,15 @@ These bind the UX Architect, UI Designer, Visual Storyteller, Whimsy Injector, a
 | Primary nameplate logo (§2.1) | this file | login banner, splash, README hero |
 | Compact wordmark (§2.2) | this file | panel title bars, narrow contexts |
 | Jack icon `(◉)` + prompt sigil `(◉)─▶` (§2.3/3.4) | this file | wallboard corner, shell prompt |
-| Full SSH login banner + mono fallback (§3.2/3.3) | this file → firmware `sshd` banner | every SSH connect |
+| Full SSH login banner + mono fallback (§3.2/3.3) | this file | planned SSH greeting (no SSH server in current firmware) |
 | Status lexicon (§4.5) | this file | UI Designer, every screen, firmware strings |
 | Voice & tone + word list (§4) | this file | all copy, all docs, firmware messages |
 | Theme identity rules (§5) | this file (RGB table → tui-style.md) | UI Designer |
 | Consistency rules + checklist (§6) | this file | all Phase-A agents, code review |
 
 
-**Brand Guardian** · pocket-dial 3.x redesign · brass/phosphor operator board
-Status: identity locked for Phase A. Banner ready to wire into the SSH server greeting.
-Protection: name treatment, banner composition, and status-lexicon are the protected core, 
-changes require a brand review against the §6.1 checklist.
+Brand Guardian · pocket-dial 3.x redesign · brass/phosphor operator board
+
+Status: identity locked for Phase A. Banner is the reference for the planned SSH greeting; no SSH server ships in current firmware.
+
+Protection: name treatment, banner composition, and status lexicon are the protected core. Changes require a brand review against the §6.1 checklist.

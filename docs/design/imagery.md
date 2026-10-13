@@ -1,21 +1,17 @@
-# pocket-dial: Raster Imagery Specs & Generation Prompts
+# pocket-dial: Raster Imagery Specs and Generation Prompts
 
-> Agent: Image Prompt Engineer + Inclusive Visuals (reduced role).
-> Why reduced: pocket-dial is a *pure-ANSI/TUI* product. The SSH terminal, login banner, hub,
-> panels, and live monitor are **text, not pictures**. They are owned by
-> [`brand.md`](brand.md) / [`tui-style.md`](tui-style.md) and are **not** raster assets. This file
-> covers only the three places a real bitmap exists:
->
-> | # | Asset | Surface | Canvas | Render path |
-> |---|---|---|---|---|
-> | 1 | **On-device SPLASH / boot art** | 3.5" passive wallboard (LVGL) | **320 × 480 px, portrait** | drawn on the panel; lives in flash |
-> | 2 | **Onboarding QR "card"** | same display, first-run | **320 × 480 px, portrait** | LVGL layout + 99×99 QR canvas |
-> | 3 | **README / marketing hero** | GitHub / web, not on-device | **2400 × 1350 px (16:9)** | external render, ships in repo |
->
-> Everything here inherits the locked brand from [`00-brief.md`](00-brief.md) §5 and
-> [`brand.md`](brand.md): name **pocket-dial**, tagline *operator on duty*, the **BRASS** (default) /
-> **PHOSPHOR** (alt) palettes, the jack mark `(◉)`, and the flavor budget (only *operator on duty*
-> and *Patching you through…* spend charm). No new copy, no new colors, no sub-brands.
+This file specs the three places a real bitmap exists in pocket-dial and gives the generation prompts for them. pocket-dial is a pure ANSI/TUI product: the hub, panels and live monitor are text, not pictures, and they are owned by [`brand.md`](brand.md) and [`tui-style.md`](tui-style.md).
+
+| # | Asset | Surface | Canvas | Render path |
+|---|---|---|---|---|
+| 1 | **On-device splash / boot art** | 3.5" passive wallboard (LVGL) | **320 × 480 px, portrait** | drawn on the panel; lives in flash |
+| 2 | **Onboarding QR "card"** | same display, first-run | **320 × 480 px, portrait** | LVGL layout + 99×99 QR canvas |
+| 3 | **README / marketing hero** | GitHub / web, not on-device | **2400 × 1350 px (16:9)** | external render, ships in repo |
+
+Everything here inherits the locked brand from [`00-brief.md`](00-brief.md) §5 and
+[`brand.md`](brand.md): name **pocket-dial**, tagline *operator on duty*, the **BRASS** (default) /
+**PHOSPHOR** (alt) palettes, the jack mark `(◉)`, and the flavor budget (only *operator on duty*
+and *Patching you through…* spend charm). No new copy, no new colors, no sub-brands.
 
 ## 0. Shared palette tokens (single source of truth)
 
@@ -36,7 +32,7 @@ references these by name so the splash, the card, and the hero read as **one pro
 ### PHOSPHOR (alt): charcoal board, dim-brass rails, green phosphor lamps
 | Token | Hex | RGB | Role |
 |---|---|---|---|
-| `PHOS.bg` | `#10140F` | 16,20,15 | board background |
+| `PHOS.bg` | `#101410` | 16,20,16 | board background |
 | `PHOS.panel` | `#1C241C` | 28,36,28 | recessed panel |
 | `PHOS.border` | `#96823C` | 150,130,60 | dim-brass rails / frame |
 | `PHOS.text` | `#AAD296` | 170,210,150 | phosphor label text |
@@ -49,7 +45,7 @@ and nameplate are `border`; the single hot accent (`accent`) is reserved for **l
 red is rationed to destructive/alert only. State is never color alone: every status is glyph +
 LABEL, the label authoritative, the glyph reinforcing, color the removable third layer.
 
-## 1. ON-DEVICE SPLASH / BOOT ART: 320 × 480, portrait
+## 1. On-device splash and boot art: 320 × 480, portrait
 
 ### 1.1 Purpose & viewing reality
 Shown for the ~3–6 s while firmware boots, *before* the wallboard goes live; the brand's first
@@ -64,11 +60,14 @@ physical impression. **Viewing distance is arms-length-to-across-the-room at 3.5
     bytes, recolors for free per theme, crisp at native res. This is the **default deliverable**.
   - Fallback: a single **flat-color PNG/`LV_IMG_CF_TRUE_COLOR`** ≤ ~24 KB. If raster, it must be a
     *flat vector-style* render (no photographic grain) so it compresses and stays sharp.
-- **No per-tick repaint** (`ui.cpp:192`, "Discrete state changes only"): the splash is drawn once,
-  then replaced by the wallboard. No animation budget assumed beyond an optional single lamp fade.
-- **Two theme variants required** (BRASS + PHOSPHOR), identical geometry, only token swaps. The panel's
-  `disp_on_off` inversion footgun (per device memory) means **never rely on subtle near-black
-  separation**: keep the board bg and panel a clear ≥2-step value apart.
+- **No per-tick repaint.** The panel runs in full-refresh mode, and the UI has no infinite animations.
+  The source comment reads "State changes are discrete, and ui_update_* only touches objects whose
+  content actually changed." (`main/ui/ui.cpp:168-169`). The splash is drawn once, then replaced by the
+  wallboard. No animation budget assumed beyond an optional single lamp fade.
+- **Two theme variants required** (BRASS + PHOSPHOR), identical geometry, only token swaps. The panel
+  driver's `disp_on_off` handler has inverted semantics: a `true` argument blanks the panel
+  (`main/esp_main_display.cpp:266-271`). Keep the board bg and panel a clear ≥2-step value apart, and
+  **never rely on subtle near-black separation**.
 
 ### 1.3 Layout spec (ASCII wireframe of the 320×480 frame)
 ```
@@ -102,7 +101,7 @@ sanctioned by the flavor budget).
   glyph/label pairing is *required*, but the `◆` before the boot line keeps the house style.
 
 ### 1.4 Generation prompt: BRASS variant
-> Use only if rendering a raster fallback. Platform-agnostic; tuned for Flux / SDXL / Midjourney.
+Use only if rendering a raster fallback. Platform-agnostic; tuned for Flux, SDXL and Midjourney.
 
 ```
 A flat vector-style boot splash for a retro telco "sysop terminal", portrait 320x480,
@@ -121,10 +120,10 @@ NEGATIVE: photorealism, skin, faces, people, busy texture, noise, drop shadows,
 ```
 
 ### 1.5 Generation prompt: PHOSPHOR variant
-Identical geometry; swap tokens: board `#10140F`, jack/lamp **green `#40FF60`**, rails `#96823C`,
+Identical geometry; swap tokens: board `#101410`, jack/lamp **green `#40FF60`**, rails `#96823C`,
 wordmark `#D2F0BE`, descriptor `#AAD296`. Same NEGATIVE list.
 ```
-…same composition as BRASS… background deep charcoal-green (#10140F); the jack icon and
+…same composition as BRASS… background deep charcoal-green (#101410); the jack icon and
 bottom diamond glow phosphor green (#40FF60); wordmark in pale phosphor (#D2F0BE);
 "SYSOP TERMINAL" and sub-text in green (#AAD296); thin dim-brass rule and 2px frame
 (#96823C). Green CRT monochrome-phosphor mood. --ar 2:3 --style raw
@@ -138,23 +137,26 @@ bottom diamond glow phosphor green (#40FF60); wordmark in pale phosphor (#D2F0BE
 - [ ] No photographic grain; flat enough to draw in LVGL primitives or compress < 24 KB.
 - [ ] Only flavor line present is `Patching you through…`; no extra copy.
 
-## 2. ONBOARDING QR "CARD": 320 × 480, portrait
+## 2. Onboarding QR card: 320 × 480, portrait
 
 ### 2.1 Purpose
-First-run / "how do I configure this?" screen on the device. The redesign is SSH-first: the box has
-no touch config, so the screen's job is to **hand the installer to the terminal**. The card shows brand
-+ host + one instruction + the QR. (Today `ui.cpp:586,813` renders a `WIFI:` QR into a 99×99 canvas via
-the `qrcode` lib at `ECC_LOW`, version 4; this card keeps that exact render path, only the payload and
-chrome change.)
+First-run screen on the device, the answer to "how do I configure this?". The box has no touch config,
+so the card's job is to **hand the installer to the terminal**. The card shows brand, host, one
+instruction and the QR. Whether an SSH entry point returns is an open decision (see §2.6). Today the
+onboarding overlay renders a `WIFI:` QR into a 99×99 canvas via the `qrcode` lib at `ECC_LOW`, version 4
+(`main/ui/ui.cpp:342`, `:367`, `:633`, `:639`). This card keeps that render path; only the payload and
+chrome change.
 
 ### 2.2 QR payload (locked)
 - Encode an `ssh://` URI to the host, not Wi-Fi creds:
   `ssh://sysop@pocketdial.local` (firmware substitutes the live host/IP if mDNS is unresolved).
 - Keep **`ECC_LOW`, version 4** to fit the existing 99×99 canvas buffer; the URI above is short enough.
   If a longer payload is ever needed, bump version and the canvas size together. Do **not** silently
-  overflow the 99×99 buffer (`ui.cpp:584`).
-- Quiet zone: the QR module render must keep ≥4-module white margin (`draw_qr` already paints a
-  white field). Scanners need it.
+  overflow the 99×99 buffer. The length guard is the `qrcode_initText` return check at
+  `main/ui/ui.cpp:342-343`, which logs and returns false when the payload does not fit version 4.
+- Quiet zone: the QR must keep a ≥4-module white margin. `draw_qr` (`main/ui/ui.cpp:337-358`) fills the
+  99×99 canvas white and draws all 33 modules into it, so the current render has no quiet-zone modules.
+  Scanners need the margin. See §2.6.
 
 ### 2.3 Layout spec (ASCII wireframe)
 ```
@@ -194,8 +196,8 @@ chrome change.)
   black-on-white in both themes**: never tint a QR, tinting breaks scanners and the contrast guarantee.
 
 ### 2.4 Generation prompt (reference layout; the card is built in LVGL, not generated)
-> This card is **drawn on-device** (it needs the live host/IP and a real QR). The prompt below is only
-> for producing a *design comp / README figure*, not the shipped asset.
+This card is **drawn on-device** (it needs the live host/IP and a real QR). The prompt below is only
+for producing a *design comp / README figure*, not the shipped asset.
 ```
 A flat retro telco onboarding card, portrait 320x480, deep warm charcoal (#161412) with a
 2px brass frame (#B08438). Top row: a small amber jack icon (◉) and the wordmark
@@ -219,7 +221,12 @@ NEGATIVE: photorealism, people, faces, busy texture, gradients (except faint amb
 - [ ] Host/Addr/User block is monospace, colon-aligned, fed from live device state.
 - [ ] Says "SSH", never "tap/click/scan-to-connect"; one flavor line only.
 
-## 3. README / MARKETING HERO: 2400 × 1350 (16:9)
+### 2.6 Open decisions
+
+- **Whether an SSH entry point returns.** None exists at HEAD. The SSH server was removed (`docs/THREAT_MODEL.md`, E-3; `CHANGELOG.md`, "Removed — SSH sysop terminal"), and no SSH server starts in `src/` or `main/`. The card copy ("SSH here to configure"), its `ssh sysop@…` fallback and the `ssh://` QR payload all assume one returns. If none returns, they change. The shipped reach strip still shows "SSH HERE TO CONFIGURE" (`main/ui/ui.cpp:516`), which is a stale user-facing string.
+- **The quiet zone.** The ≥4-module white margin in §2.2 is not met by the current render. `draw_qr` fills the 99×99 canvas and draws all 33 modules into it (`main/ui/ui.cpp:337-358`), and the onboarding modal behind the canvas uses the theme's dark background (`main/ui/ui.cpp:254-255`). Meeting the requirement means a change to the render or the layout; the choice is open.
+
+## 3. README and marketing hero: 2400 × 1350 (16:9)
 
 ### 3.1 Purpose
 The repo's front-door image and any web/marketing use. Goal: **sell the "sysop terminal" aesthetic and
@@ -278,7 +285,7 @@ NEGATIVE: rack of servers, data center, blue/cyan tech glow, cluttered desk, bus
 phones, people unless intentional, cartoon, lens dirt, heavy bloom, rainbow RGB lighting,
 text errors, gibberish on screen, exclamation marks, watermark, logos other than POCKET-DIAL.
 ```
-PHOSPHOR alt: swap amber for phosphor green `#40FF60`, board bg `#10140F`, rails `#96823C`, "green
+PHOSPHOR alt: swap amber for phosphor green `#40FF60`, board bg `#101410`, rails `#96823C`, "green
 CRT" mood; otherwise identical.
 
 ### 3.5 Acceptance checklist
@@ -305,7 +312,7 @@ small but real. Guardrails:
   - Every status glyph in any rendered image keeps its **label** (`◆ READY`, `◆ ACTIVE`), never a bare
     colored dot. Validated against the brief's "never color alone" rule.
   - The splash/card must pass a grayscale check: convert to luminance; all text must still separate
-    from background ≥ value-step the panel uses. (Guards the `disp_on_off` inversion footgun.)
+    from background ≥ value-step the panel uses. (Guards the `disp_on_off` inversion noted in §1.2.)
   - QR contrast is **non-negotiable black-on-white**, the single most accessibility-sensitive bitmap;
     never themed, never tinted, always with quiet zone.
 - Honest representation: marketing must not imply trunks, queues, conferencing, a rack, an SD card,
@@ -320,16 +327,15 @@ small but real. Guardrails:
 | Onboarding QR card | 320×480 | BRASS + PHOSPHOR (QR mono in both) | LVGL layout + 99×99 QR canvas, live payload | firmware (`ui.cpp` draw_qr path) |
 | README / hero | 2400×1350 | BRASS canonical (+PHOSPHOR alt) | PNG/WebP in `/docs` or repo root | repo (external render) |
 
-Out of scope (text, not raster): login banner, hub, all config panels, live monitor, help screens,
-owned by `brand.md` / `tui-style.md`. Do not generate these as images.
+Out of scope (text, not raster): the hub, all config panels, live monitor and help screens, owned by
+`brand.md` / `tui-style.md`. Do not generate these as images.
 
 ## Inclusive review
 
-> Reviewer: Inclusive Visuals Specialist. This section does not replace the prompts in §1 through §4;
-> it tightens them. The existing §4 guardrails are correct in spirit but under-specified for the way
-> foundational image models actually fail. Below: (a) where bias would creep in, (b) drop-in tightened
-> prompt language, (c) a reusable negative library, (d) a review gate. Apply these fragments on top of
-> the prompts already written; do not rewrite the originals.
+This section tightens the prompts in §1 through §4 and does not replace them. It covers where bias
+enters the prompts (IR.1), tightened hero language (IR.2), a reusable negative library (IR.3),
+cultural-neutrality notes (IR.4) and a review gate (IR.5). Add the fragments to the prompts already
+written; do not rewrite the originals.
 
 ### IR.1 Bias surface assessment (what these prompts will actually trigger)
 
@@ -352,9 +358,9 @@ competent hands.
 
 ### IR.2 Tightened hero language: the "hands at the keyboard" variant (append to §3.4)
 
-> Use **only** if the hero includes a human. Append this block to the §3.4 BRASS prompt (and the PHOSPHOR
-> swap). It replaces the vague `people unless intentional` with an explicit, dignified, non-stereotyped
-> human spec. Faces and full figures remain **out**.
+Use **only** if the hero includes a human. Append this block to the §3.4 BRASS prompt (and the PHOSPHOR
+swap). It replaces the vague `people unless intentional` with an explicit, dignified, non-stereotyped
+human spec. Faces and full figures remain **out**.
 
 ```
 [OPTIONAL HUMAN — HANDS ONLY]: If a person is shown, show ONLY a pair of adult hands resting
@@ -449,7 +455,7 @@ A render passes only if **all** are true; any failure is a re-prompt, not a touc
       stays glyph + label, never a bare colored dot (mirrors §4 + `accessibility.md`).
 - [ ] Honesty pass: no rack/trunk/queue/SD/voicemail implied; on-screen UI is real and correctly spelled.
 
-### IR.6 What did NOT need changing (so the next agent doesn't "fix" it)
+### IR.6 What stays as written
 
 - §1 Splash and §2 QR card are **correctly people-free**; do **not** add humans to them for "warmth."
 - The §4 guardrails (skin-tone variance, no-menace, glyph+label, QR contrast, honesty) are **right** and are

@@ -1,10 +1,24 @@
 # Federation design for #174: site-to-site peer bridging
 
-Status: PROPOSED, for vote. No code, no PR. Part of #174.
-Every file:line is at main `7bcf952f`. Abbreviations: RH = src/SIP/RequestsHandler, CF = src/SIP/CallForker.cpp,
-DP = src/SIP/DialPlan.hpp, PC = src/SIP/PoolConfig.hpp, REG = src/SIP/Registrar.cpp, SRC = src/SIP/SipRegistrationClient,
-TRK = src/SIP/SipTrunk, PFC = src/SIP/PbxFeatureConfig.cpp, HS = src/Helpers/HttpServer.cpp, EC = src/SIP/EmergencyCall.hpp,
-EDT = tests/EmergencyDialing_test.cpp.
+Proposed design for #174, site-to-site peer bridging, for a vote. No code and no PR exist yet.
+
+## Conventions
+
+Every file:line is at main `7bcf952f`.
+
+| Abbreviation | Path |
+|---|---|
+| RH | src/SIP/RequestsHandler |
+| CF | src/SIP/CallForker.cpp |
+| DP | src/SIP/DialPlan.hpp |
+| PC | src/SIP/PoolConfig.hpp |
+| REG | src/SIP/Registrar.cpp |
+| SRC | src/SIP/SipRegistrationClient |
+| TRK | src/SIP/SipTrunk |
+| PFC | src/SIP/PbxFeatureConfig.cpp |
+| HS | src/Helpers/HttpServer.cpp |
+| EC | src/SIP/EmergencyCall.hpp |
+| EDT | tests/EmergencyDialing_test.cpp |
 
 ## 1. Problem and use cases
 
@@ -94,7 +108,7 @@ cross-site audio works only when the phone subnets can reach each other.
 
 ## 4. Rule 5: 911 and 933 never reach a peer
 
-Statement: 911, 933, 9911 and 9933 are never sent to a peer, and no peer pattern can capture them.
+911, 933, 9911 and 9933 are never sent to a peer, and no peer pattern can capture them.
 
 - **C1, exists, runs first.** `classifyEmergencyDial(destNumber)` at RH.cpp:2322 is an exact match on those four strings
   (EC:93-128) and returns into `routeEmergencyCall` before the dial plan at RH.cpp:2751. Even a catch-all `*` never sees them
@@ -114,6 +128,20 @@ Statement: 911, 933, 9911 and 9933 are never sent to a peer, and no peer pattern
   the emergency branch (RH.cpp:2322), and routes as B's 101 dialing 911 under B's location. The source check sits after it by design
   (#454; EDT:234-248). Federation did not create this, but a peer link gives it a named source. The first branch of
   `isPsapCallbackTo` is also source-blind (RH.cpp:4984-4988). Any B-side slice is blocked on desmo's answer to poll 2.
+
+The order the gates run in for a dialed number, as C1 and C4 describe it. C2 and C3 act when a rule is saved, so they are not shown.
+
+```mermaid
+flowchart TD
+    A[Dialed number] --> B{C1: emergency number?}
+    B -- yes --> E[routeEmergencyCall]
+    B -- no --> C[Dial plan]
+    C --> D{Peer rule matched?}
+    D -- yes --> F{C4: emergency number?}
+    F -- yes --> E
+    F -- no --> G[Send to peer]
+    D -- no --> H[Other dial actions]
+```
 
 ## 5. Recommendation
 
@@ -137,7 +165,10 @@ Federation is a non-constrained feature: PC:332-334 says that slot has ~1.5 KB l
 
 ## 6. Test plan
 
-Host-testable (names follow EDT):
+### Host
+
+Names follow EDT.
+
 - DP: `Peer` name/parse round trip; unknown names still rejected; `peerPatternCapturesEmergency` table (refuse `*`, `9*`, `XXX`, `9XX`, `9XXX`, `X11`, `911`, `9933`; accept `8*`, `8XX`, `801`).
 - PFC: HTTP, `setDialRule` and NVS replay each refuse a capturing pattern and force `stripDigits` 0; a hand-edited blob cannot smuggle one.
 - CF/RH, with a loopback peer: with `8*` and a catch-all Peer rule, dialing 911/933/9911/9933 produces zero bytes to the peer and the existing emergency answer (cf. EDT:303, EDT:349 expects 503 with no trunk).
@@ -146,8 +177,11 @@ Host-testable (names follow EDT):
 - Digit-keeping builder: To and Request-URI user equal the dialed digits.
 - Credentials (Option 2 only): GET omits it, backup omits it, factory reset wipes it. `SipRegistrationClient` is already host-tested; `PeerLink` adds fake-clock re-arm tests.
 
-Bench (hardware, operator allocates boards). For Rule 5 steps: no trunk, no anchor and no emergency-notification recipients on either
-unit (an unrouted 933 still fires `notifyEmergencyNotRouted`, RH.cpp:13049-13061, TEST-tagged), 933 only and never 911, and desmo's go-ahead before any dial:
+### Bench
+
+Hardware; the operator allocates boards. For Rule 5 steps: no trunk, no anchor and no emergency-notification recipients on either
+unit (an unrouted 933 still fires `notifyEmergencyNotRouted`, RH.cpp:13049-13061, TEST-tagged), 933 only and never 911, and desmo's go-ahead before any dial.
+
 1. Both directions: two-way audio, RFC 4733 DTMF, hold/resume, BYE from each side, a call past the session timer.
 2. Media: phone subnets routed (direct) versus tunnel-only (shows whether a relay is needed).
 3. Faults: 20 s link drop idle and mid-call; peer reboot; peer IP change. Record time to recover.
@@ -158,13 +192,16 @@ unit (an unrouted 933 still fires `notifyEmergencyNotRouted`, RH.cpp:13049-13061
 
 ## 7. Decision asked
 
-**Poll 1, direction.**
+### Poll 1: direction
+
 - (a) Static peer first (Option 3); registration only if a moving address or authentication is proven needed. **Recommended.**
 - (b) Registration from the start (Option 2).
 - (c) Stop at this document until a second site is named; merge nothing.
 
-**Poll 2, gate for any B-side code (desmo only).** A peer-sourced INVITE to 911/933 with a From matching a B extension routes as that
-extension's emergency call today (#454).
+### Poll 2: gate for any B-side code (desmo only)
+
+A peer-sourced INVITE to 911/933 with a From matching a B extension routes as that extension's emergency call today (#454).
+
 - (i) Leave it; the peer is no worse than any LAN host.
 - (ii) Refuse it when the source is a configured peer. A peer never legitimately sends one (C1), so no real call is lost, but it is the first
   exception to "911 is never gated". **Recommended, but it moves the Rule 5 line, so it is his call.**
