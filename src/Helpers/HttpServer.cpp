@@ -2699,7 +2699,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 			json.s("{\"extension\":\"").e(std::get<0>(snap.forwards[i]))
 			    .s("\",\"always\":\"").e(std::get<1>(snap.forwards[i]))
 			    .s("\",\"busy\":\"").e(std::get<2>(snap.forwards[i]))
-			    .s("\",\"noanswer\":\"").e(std::get<3>(snap.forwards[i])).s("\"}");
+			    .s("\",\"noanswer\":\"").e(std::get<3>(snap.forwards[i]))
+			    .s("\",\"noAnswerSeconds\":").n(std::get<4>(snap.forwards[i])).s("}");
 		}
 		json.s("],");
 
@@ -3739,7 +3740,9 @@ void HttpServer::sendApiDnd(int sock, const std::string& body)
 
 void HttpServer::sendApiForward(int sock, const std::string& body)
 {
-	// Params: extension, trigger ("always"|"busy"|"noanswer"), target (empty=clear).
+	// Params: extension, trigger ("always"|"busy"|"noanswer"|"timeout"), target
+	// (empty=clear). For "timeout" (#1009) the target is the no-answer ring time in
+	// seconds, 5-120, and empty or 0 restores the 20 s default.
 	std::string ext     = getFormParam(body, "extension");
 	std::string trigger = getFormParam(body, "trigger");
 	std::string target  = getFormParam(body, "target");
@@ -3750,10 +3753,10 @@ void HttpServer::sendApiForward(int sock, const std::string& body)
 		             "{\"error\":\"missing extension or trigger parameter\"}");
 		return;
 	}
-	if (trigger != "always" && trigger != "busy" && trigger != "noanswer")
+	if (trigger != "always" && trigger != "busy" && trigger != "noanswer" && trigger != "timeout")
 	{
 		sendResponse(sock, 400, "Bad Request", "application/json",
-		             "{\"error\":\"trigger must be always|busy|noanswer\"}");
+		             "{\"error\":\"trigger must be always|busy|noanswer|timeout\"}");
 		return;
 	}
 	if (ext == "777" || ext == "999" || ext == "555")
@@ -3781,7 +3784,27 @@ void HttpServer::sendApiForward(int sock, const std::string& body)
 		return;
 	}
 
-	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	if (trigger == "timeout")
+	{
+		int seconds = 0;
+		const bool digits = target.size() <= 3 &&
+			std::all_of(target.begin(), target.end(), [](char c) { return c >= '0' && c <= '9'; });
+		if (digits && !target.empty()) seconds = std::atoi(target.c_str());
+		if (!digits || !pbx::isValidNoAnswerSeconds(seconds))
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"timeout must be 5-120 seconds, or empty for the default\"}");
+			return;
+		}
+		RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+		if (handler && !handler->setNoAnswerSeconds(ext, seconds))
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"timeout refused for this extension\"}");
+			return;
+		}
+	}
+	else if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
 		handler->setForward(ext, trigger, target);
 	}
@@ -5967,7 +5990,8 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 				pt << "{\"extension\":\"" << jsonEscape(std::get<0>(f))
 				   << "\",\"always\":\"" << jsonEscape(std::get<1>(f))
 				   << "\",\"busy\":\"" << jsonEscape(std::get<2>(f))
-				   << "\",\"noAnswer\":\"" << jsonEscape(std::get<3>(f)) << "\"}";
+				   << "\",\"noAnswer\":\"" << jsonEscape(std::get<3>(f))
+				   << "\",\"noAnswerSeconds\":" << std::get<4>(f) << "}";
 			}
 		}
 	}
@@ -6398,6 +6422,7 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 					handler->setForward(std::get<0>(f), "always", "");
 					handler->setForward(std::get<0>(f), "busy", "");
 					handler->setForward(std::get<0>(f), "noanswer", "");
+					handler->setNoAnswerSeconds(std::get<0>(f), 0);
 				}
 			}
 			for (const auto& f : pt->arrayOr("forwards"))
@@ -6406,6 +6431,8 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 				handler->setForward(ext, "always", f.stringOr("always"));
 				handler->setForward(ext, "busy", f.stringOr("busy"));
 				handler->setForward(ext, "noanswer", f.stringOr("noAnswer"));
+				// #1009: an export from before the field existed has none, so 0 (default).
+				handler->setNoAnswerSeconds(ext, f.intOr("noAnswerSeconds", 0));
 			}
 		}
 		applied.push_back("forwards");

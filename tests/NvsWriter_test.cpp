@@ -480,7 +480,7 @@ TEST_F(NvsWriterWiring, NothingIsStagedWhileAFactoryResetRunsButTheTableStaysRig
 	EXPECT_GE(nvswriter::stats().suppressed, 1u);
 	EXPECT_TRUE(staged(Key::Forwards).empty());
 	bool inRam = false;
-	for (const auto& [ext, always, busy, noAnswer] : _h->getForwards())
+	for (const auto& [ext, always, busy, noAnswer, noAnswerSeconds] : _h->getForwards())
 		if (ext == "305" && always == "5500") inRam = true;
 	EXPECT_TRUE(inRam) << "the live forward still works; only the flash copy is refused";
 }

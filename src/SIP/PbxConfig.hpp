@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 #include <utility>
 #include <unordered_map>
@@ -35,6 +36,15 @@ namespace pbx
 	// direct-call CFNA arm (onInvite) and CallForker::huntRingNext, which is why
 	// it lives here rather than file-local to either translation unit.
 	inline constexpr std::chrono::seconds kNoAnswerTimeout{20};
+
+	// Issue #1009: an extension may set its own no-answer timeout for direct calls.
+	// 0 means unset (kNoAnswerTimeout applies).
+	inline constexpr int kNoAnswerMinSeconds = 5;
+	inline constexpr int kNoAnswerMaxSeconds = 120;
+	inline bool isValidNoAnswerSeconds(int s)
+	{
+		return s == 0 || (s >= kNoAnswerMinSeconds && s <= kNoAnswerMaxSeconds);
+	}
 
 	// Issue #800: multicast paging (dial 997). Off by default. The group is held
 	// in host byte order; the default is 239.0.1.75:50000 (desmo, #800).
@@ -95,12 +105,16 @@ namespace pbx
 		std::string always;     // CFU  — forward unconditionally, before ringing
 		std::string busy;       // CFB  — forward when the callee returns 486 Busy
 		std::string noAnswer;   // CFNA — forward when the callee never answers
+		uint8_t noAnswerSeconds = 0;   // #1009: ring time before CFNA/voicemail; 0 = kNoAnswerTimeout
 
 		bool empty() const
 		{
-			return always.empty() && busy.empty() && noAnswer.empty();
+			return always.empty() && busy.empty() && noAnswer.empty() && noAnswerSeconds == 0;
 		}
 	};
+
+	// One dashboard/export row: extension, always, busy, noAnswer, noAnswerSeconds (0 = default).
+	using ForwardRow = std::tuple<std::string, std::string, std::string, std::string, int>;
 
 	// One ring/hunt group: an ordered member list plus the fan-out mode.
 	struct RingGroup
