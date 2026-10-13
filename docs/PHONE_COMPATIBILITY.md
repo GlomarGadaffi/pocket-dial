@@ -223,8 +223,10 @@ packet capture or a real phone (#800).
   past 60 s, so the reap lands 60 to 62 s after the last packet.
   * Not watched: a held call (the clock restarts on resume), `777` (an SDP loopback, the board
     sees no RTP), `440` and a call parked with hold music (the board answers `sendonly`, so the
-    phone is meant to send nothing; a parked call has its own timeout), and ordinary
-    extension-to-extension calls (peer-to-peer). A 911/933 gets a 4 h bound instead (#741).
+    phone is meant to send nothing; a parked call has its own timeout), ordinary
+    extension-to-extension calls (peer-to-peer), and the `997` page and voicemail legs (the page
+    has its own 5 s silence sweep above; voicemail is outside this one). A 911/933 gets a 4 h
+    bound instead (#741).
 
 Leave each phone's "answer OPTIONS / keep-alive" behavior at its default (on). The pruning
 decision for one registered client is:

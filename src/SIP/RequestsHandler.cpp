@@ -11009,7 +11009,8 @@ void RequestsHandler::tick()
 		// silent participant is reaped while the others talk. Not watched: a
 		// peer-to-peer call, 777 (SDP loopback, no board RTP), and 440 or a
 		// parked call, which the board answers sendonly so the phone sends
-		// nothing; a park has its own timeout. Exempt: Held calls
+		// nothing; a park has its own timeout. A 997 page has its own silence
+		// sweep and voicemail legs are outside this one. Exempt: Held calls
 		// (a sendonly/inactive leg legitimately sends nothing; the watch
 		// restarts on resume). A 911/933 (Session::isEmergency()) gets the 4 h
 		// bound instead (#741): never cut while either leg carries audio.
@@ -11047,7 +11048,7 @@ void RequestsHandler::tick()
 			}
 			else
 			{
-				continue;   // no board RTP to watch: peer-to-peer, 777, 440, park
+				continue;   // no counter wired here: peer-to-peer, 777, 440, park, 997, voicemail
 			}
 			const auto limit = session->isEmergency() ? std::chrono::steady_clock::duration(kEmergencyRtpInactivityTimeout)
 			                                           : std::chrono::steady_clock::duration(kRtpInactivityTimeout);
