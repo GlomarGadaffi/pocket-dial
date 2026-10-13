@@ -281,6 +281,43 @@ TEST(VoicemailDivert, ExplicitCfnaTargetWinsOverVoicemailFallback)
 		<< "an explicit CFNA target must still be used, not overridden by the voicemail fallback";
 }
 
+// Issue #1011: a CFNA to a REGISTERED target must CANCEL the still-ringing callee.
+// `dest` is null on the plain INVITE path, so the old `if (dest)` CANCEL never ran:
+// the callee kept ringing after the call was forwarded, and answering it gave the
+// caller a second 2xx for one INVITE (RFC 3261 S13.2.2.4).
+TEST(VoicemailDivert, CfnaToRegisteredTargetCancelsTheRingingCallee)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.40.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in calleeAddr = addrFor("192.168.40.17");
+	handler.handle(makeRegister("340", "192.168.40.17", "reg-340-f"));
+	handler.handle(makeRegister("341", "192.168.40.27", "reg-341-f"));
+	handler.handle(makeRegister("342", "192.168.40.18", "reg-342-f"));
+	handler.setForward("340", "noanswer", "342");
+
+	const std::string callId = "cfna-cancel-1011";
+	handler.handle(makeInvite("341", "340", "192.168.40.27", callId, "z9hG4bKcfna1011"));
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+
+	ASSERT_FALSE(findSentTo(sent, addrFor("192.168.40.18"), "INVITE sip:342@").empty())
+		<< "precondition: the call was forwarded to the registered target";
+	int cancels = 0;
+	for (const auto& [addr, msg] : sent)
+	{
+		if (!msg || addr.sin_addr.s_addr != calleeAddr.sin_addr.s_addr) continue;
+		const std::string raw = msg->toString();
+		if (raw.rfind("CANCEL ", 0) == 0 && raw.find("Call-ID: " + callId) != std::string::npos) ++cancels;
+	}
+	EXPECT_EQ(cancels, 1) << "the original callee must be CANCELled once, not left ringing";
+}
+
 // Issue #716: an explicit CFNA target that is not registered. redirectInvite()
 // sends nothing and returns false; the caller must still get a final response
 // and the still-ringing callee must be CANCELled.

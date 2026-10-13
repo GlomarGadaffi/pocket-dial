@@ -10802,30 +10802,23 @@ void RequestsHandler::tick()
 					}
 					else
 					{
-						if (dest)
+						// Issue #1011: CANCEL the still-ringing callee whichever way the
+						// redirect goes. `dest` is null on the plain INVITE path, so fall
+						// back to the retained INVITE's target, as the voicemail branch does.
+						std::string calleeExt(invite->getToNumber());
+						auto callee = dest ? std::optional<std::shared_ptr<SipClient>>(dest) : findClient(calleeExt);
+						if (callee.has_value())
 						{
-							auto cancel = _forker.buildCancel(invite, dest);
-							if (cancel) _outbox.emplace_back(dest->getAddress(), std::move(cancel));
+							auto cancel = _forker.buildCancel(invite, callee.value());
+							if (cancel) _outbox.emplace_back(callee.value()->getAddress(), std::move(cancel));
 						}
 						queueLog("CFNA: no answer, forwarding -> " + cfna);
-						endCall(callID, src->getNumber(), std::string(invite->getToNumber()), "no answer (CFNA)");
+						endCall(callID, src->getNumber(), calleeExt, "no answer (CFNA)");
 						if (!_forker.redirectInvite(invite, src, cfna))
 						{
 							// Issue #716: the forward target is not registered, so
 							// redirectInvite() sent nothing. Without this the caller
-							// gets no final response (the session is already gone) and
-							// the callee keeps ringing. `dest` is null on the plain
-							// INVITE path, so CANCEL via the retained INVITE's target.
-							std::string calleeExt(invite->getToNumber());
-							if (!dest)
-							{
-								auto callee = findClient(calleeExt);
-								if (callee.has_value())
-								{
-									auto cancel = _forker.buildCancel(invite, callee.value());
-									if (cancel) _outbox.emplace_back(callee.value()->getAddress(), std::move(cancel));
-								}
-							}
+							// gets no final response (the session is already gone).
 							if (_cfg.isVoicemailEnabled(calleeExt))
 							{
 								answerVoicemailDeposit(invite, src, calleeExt);
