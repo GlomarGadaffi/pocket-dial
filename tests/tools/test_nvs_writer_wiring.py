@@ -157,7 +157,7 @@ class StagingSlotsAndStackPlacement(unittest.TestCase):
     def test_a_failed_slot_allocation_leaves_the_writer_not_running(self):
         b = self.start
         order = [b.index(m) for m in ("s_devices = allocSlot",
-                                      "if (s_devices == nullptr || s_forwards == nullptr || s_didmap == nullptr)",
+                                      "if (s_devices == nullptr || s_forwards == nullptr || s_didmap == nullptr || s_telephony == nullptr)",
                                       "xQueueCreate", "xTaskCreatePinnedToCore(", "running().store(true")]
         self.assertEqual(order, sorted(order), "allocate, check, queues, task, and only then running")
         failed = b[order[1]:order[2]]

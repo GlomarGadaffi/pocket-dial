@@ -33,10 +33,12 @@ namespace
 	Slot<kDevicesCap>* s_devices = nullptr;
 	Slot<kForwardsCap>* s_forwards = nullptr;
 	Slot<kDidMapCap>* s_didmap = nullptr;
+	Slot<kTelephonyCap>* s_telephony = nullptr;
 #else
 	Slot<kDevicesCap> s_devices;
 	Slot<kForwardsCap> s_forwards;
 	Slot<kDidMapCap> s_didmap;
+	Slot<kTelephonyCap> s_telephony;
 #endif
 	// The writer's own copy of whatever it took, sized to the largest key. The
 	// writer is one task and takes one item at a time, so one scratch serves all.
@@ -47,17 +49,17 @@ namespace
 	std::array<SlotRef, kKeyCount> slotRefs()
 	{
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-		return {refOf(*s_devices), refOf(*s_forwards), refOf(*s_didmap)};   // index order == Key
+		return {refOf(*s_devices), refOf(*s_forwards), refOf(*s_didmap), refOf(*s_telephony)};   // index order == Key
 #else
-		return {refOf(s_devices), refOf(s_forwards), refOf(s_didmap)};
+		return {refOf(s_devices), refOf(s_forwards), refOf(s_didmap), refOf(s_telephony)};
 #endif
 	}
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	constexpr const char* kTag = "nvs_writer";
 
-	// The pbxcfg string keys. Key::DidMap has none: it is not one string, and
-	// nvsSink() hands it to DidMapping before this is ever asked.
+	// The pbxcfg string keys. Key::DidMap and Key::Telephony have none: they are not
+	// one string, and nvsSink() hands them to their own modules before this is ever asked.
 	const char* nvsKeyName(Key k)
 	{
 		switch (k)
@@ -65,6 +67,7 @@ namespace
 		case Key::Devices:  return "devices";
 		case Key::Forwards: return "forwards";
 		case Key::DidMap:   break;
+		case Key::Telephony: break;
 		}
 		return "?";
 	}
@@ -85,9 +88,11 @@ namespace
 		psram::freePreferPsram(s_devices);
 		psram::freePreferPsram(s_forwards);
 		psram::freePreferPsram(s_didmap);
+		psram::freePreferPsram(s_telephony);
 		s_devices = nullptr;
 		s_forwards = nullptr;
 		s_didmap = nullptr;
+		s_telephony = nullptr;
 	}
 
 	// One length-1 FreeRTOS queue per key. A queue copies the whole item in under
@@ -163,6 +168,21 @@ namespace
 			}
 			return ok;
 		}
+		if (k == Key::Telephony)
+		{
+			// The "tapicfg" table minus its secrets, unpacked in TelephonyApiConfig where
+			// the keys live. `blob` is the writer's internal scratch, never the slot.
+			const bool ok = TelephonyApiConfig::writeSnapshot(blob, len);
+			if (ok)
+			{
+				ESP_LOGI(kTag, "telephony config saved (%u bytes)", static_cast<unsigned>(len));
+			}
+			else
+			{
+				ESP_LOGW(kTag, "telephony config not saved (%u bytes)", static_cast<unsigned>(len));
+			}
+			return ok;
+		}
 		nvs_handle_t h = 0;
 		esp_err_t e = nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h);
 		if (e != ESP_OK)
@@ -225,9 +245,10 @@ void start()
 	s_devices = allocSlot<Slot<kDevicesCap>>();
 	s_forwards = allocSlot<Slot<kForwardsCap>>();
 	s_didmap = allocSlot<Slot<kDidMapCap>>();
-	if (s_devices == nullptr || s_forwards == nullptr || s_didmap == nullptr)
+	s_telephony = allocSlot<Slot<kTelephonyCap>>();
+	if (s_devices == nullptr || s_forwards == nullptr || s_didmap == nullptr || s_telephony == nullptr)
 	{
-		ESP_LOGE(kTag, "staging slot allocation failed -- device table, forwards and DID table will not persist");
+		ESP_LOGE(kTag, "staging slot allocation failed -- device table, forwards, DID table and telephony config will not persist");
 		freeSlots();
 		started = false;
 		return;
@@ -250,7 +271,7 @@ void start()
 		}
 		if (t.q[i] == nullptr)
 		{
-			ESP_LOGE(kTag, "queue create failed -- device table, forwards and DID table will not persist");
+			ESP_LOGE(kTag, "queue create failed -- device table, forwards, DID table and telephony config will not persist");
 			deleteQueues(t);
 			freeSlots();
 			started = false;
@@ -260,7 +281,7 @@ void start()
 	TaskHandle_t handle = nullptr;
 	if (xTaskCreatePinnedToCore(nvsWriterTask, "nvs_writer", 6144, nullptr, 1, &handle, 0) != pdPASS)
 	{
-		ESP_LOGE(kTag, "xTaskCreate nvs_writer failed -- device table, forwards and DID table will not persist");
+		ESP_LOGE(kTag, "xTaskCreate nvs_writer failed -- device table, forwards, DID table and telephony config will not persist");
 		deleteQueues(t);
 		freeSlots();
 		started = false;
@@ -311,8 +332,32 @@ unsigned drainForTest(FunctionRef<bool(Key, const char*, size_t)> sink)
 
 void resetForTest()
 {
-	transport().clear();
+	transport().clear();   // empties every queue and zeroes the items
+	// The slots and the scratch keep their last bytes otherwise, and #997's scans look at all of them.
+	auto wipe = [](auto& slot) { slot = {}; };
+	wipe(s_devices);
+	wipe(s_forwards);
+	wipe(s_didmap);
+	wipe(s_telephony);
+	wipe(s_scratch);
 	stagerRef().resetStats();
+}
+
+unsigned buffersHoldingForTest(std::string_view needle)
+{
+	// The raw object bytes, len and padding included: a copy anywhere in them counts.
+	auto in = [needle](const void* p, size_t n) {
+		return std::string_view(static_cast<const char*>(p), n).find(needle) != std::string_view::npos;
+	};
+	unsigned where = 0;
+	if (in(&s_devices, sizeof s_devices) || in(&s_forwards, sizeof s_forwards) ||
+	    in(&s_didmap, sizeof s_didmap) || in(&s_telephony, sizeof s_telephony))
+	{
+		where |= InSlot;
+	}
+	if (transport().holdsForTest(needle)) where |= InQueue;
+	if (in(&s_scratch, sizeof s_scratch)) where |= InScratch;
+	return where;
 }
 #endif
 }
