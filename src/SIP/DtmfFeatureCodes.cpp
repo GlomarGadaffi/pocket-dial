@@ -445,6 +445,10 @@ void DtmfFeatureCodes::runAdminCode(std::string_view code, char confirm)
 			// NVS, then restart -- the NVS erase is fast and unconditional,
 			// so putting the (possibly slower, card-dependent) SD sweep
 			// first means both wipes are attempted before power is cut.
+			// #993: this thread is sip_server_task since #992, under the 5 s
+			// task watchdog; both sweeps feed it per directory entry
+			// (resetguard::sweepTick()) so a slow card cannot panic the
+			// board here with the NVS still intact.
 			// Kept OUTSIDE the platform guard: on host wipeAll() reaches the
 			// test-installed Sink (or is a no-op with none), which is what
 			// makes this path's wipe contract host-testable -- see

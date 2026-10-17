@@ -37,6 +37,7 @@
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_task_wdt.h"   // #993: sweepTick() feeds the caller's TWDT subscription
 #else
 #include <chrono>
 #include <thread>
@@ -58,6 +59,27 @@ namespace resetguard
 
 	inline void begin() { flagRef().store(true, std::memory_order_seq_cst); }
 	inline bool inProgress() { return flagRef().load(std::memory_order_seq_cst); }
+
+	// #993: one tick per directory entry from the reset's SD sweeps (the CDR
+	// and voicemail archives' readdir loops). Since #992 the DTMF reset runs
+	// those sweeps on sip_server_task, which is subscribed to the 5 s task
+	// watchdog and feeds it once per 1 s tick() -- a slow card could trip it
+	// mid-sweep, before nvs_flash_erase(). On ESP this feeds the CALLING task's
+	// subscription; the HTTP reset door is not subscribed, so there the call
+	// returns ESP_ERR_NOT_FOUND and does nothing, which is the right outcome
+	// (a task may only feed its own subscription). On the host it counts, so a
+	// test can assert one tick per entry.
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	inline void sweepTick() { (void)esp_task_wdt_reset(); }
+#else
+	inline std::atomic<unsigned>& sweepTicksRef()
+	{
+		static std::atomic<unsigned> t{0};
+		return t;
+	}
+	inline void sweepTick() { sweepTicksRef().fetch_add(1, std::memory_order_relaxed); }
+	inline unsigned sweepTicksForTest() { return sweepTicksRef().load(std::memory_order_relaxed); }
+#endif
 
 #if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
 	// Host-only seam (#476 review): runs INSIDE WriteScope's constructor, between
@@ -122,6 +144,6 @@ namespace resetguard
 
 #if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
 	// Host tests share one process: clear the flag a test set.
-	inline void resetForTest() { flagRef().store(false); writersRef().store(0); betweenStepsHookForTest() = nullptr; beforeFirstEraseHookForTest() = nullptr; }
+	inline void resetForTest() { flagRef().store(false); writersRef().store(0); sweepTicksRef().store(0); betweenStepsHookForTest() = nullptr; beforeFirstEraseHookForTest() = nullptr; }
 #endif
 }
