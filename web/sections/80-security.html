@@ -1,0 +1,57 @@
+<h2>Security</h2>
+
+<div id="sec-login" hidden>
+  <h3>Operator login</h3>
+  <p class="hint">Admin controls stay locked until you log in. The board ships with a default login until you set a real one.</p>
+  <div class="btns"><button class="btn btn-primary" onclick="openLogin('')">Log in</button></div>
+</div>
+
+<div id="sec-admin" hidden>
+  <div class="row"><span class="st ok"><span class="g" aria-hidden="true">&#183;</span>Logged in</span> <span class="mono" id="sec-role"></span></div>
+  <div class="btns"><button class="btn" onclick="adminLogout()">Log out</button></div>
+
+  <h3>Admin login</h3>
+  <p class="hint">Change the admin username and password. Both are required.</p>
+  <div class="field"><label class="lbl" for="sec-cred-user">Username</label><input id="sec-cred-user" type="text" autocomplete="username"></div>
+  <div class="field"><label class="lbl" for="sec-cred-pass">New password (8+ characters)</label><input id="sec-cred-pass" type="password" autocomplete="new-password"></div>
+  <div class="btns"><button class="btn btn-primary" onclick="securityChangeCredential()">Save login</button></div>
+  <div class="msg" id="sec-cred-msg" role="status"></div>
+
+  <h3>DTMF admin PIN</h3>
+  <p class="hint">The phone-keypad admin menu stays off until a PIN is set. Enter 4 to 16 digits.</p>
+  <div class="field"><label class="lbl" for="sec-cred-pin">New DTMF PIN (4 to 16 digits)</label><input id="sec-cred-pin" type="password" inputmode="numeric" autocomplete="off"></div>
+  <div class="btns"><button class="btn btn-primary" onclick="securityChangeDtmfPin()">Save PIN</button></div>
+  <div class="msg" id="sec-pin-msg" role="status"></div>
+
+  <h3>Owner login</h3>
+  <p class="hint" id="sec-owner-state"></p>
+  <p class="hint">Owner-only: OTA upload, factory reset, coredump download, media TX, and backup export or import with a password. Once an owner login exists, Sysop sessions cannot use them.</p>
+  <div class="field"><label class="lbl" for="sec-owner-user">Owner username</label><input id="sec-owner-user" type="text" autocomplete="off"></div>
+  <div class="field"><label class="lbl" for="sec-owner-pass">Owner password</label><input id="sec-owner-pass" type="password" autocomplete="new-password"></div>
+  <div class="btns"><button class="btn btn-primary" id="sec-owner-save" aria-disabled="true" onclick="securitySetOwner()">Save owner login</button></div>
+  <div class="msg" id="sec-owner-msg" role="status"></div>
+
+  <div id="ap-security-section">
+    <h3>Wi-Fi access point security</h3>
+    <p class="hint">This board's own access point carries the dashboard, SIP signalling and call audio. Left open, anyone in radio range can join and record calls. WPA2 encrypts all three at once.</p>
+    <div class="hint" id="ap-break-note" role="status"><span class="st">· BREAKING CHANGE</span> Turning WPA2 on means every phone already on this access point must re-join using the passphrase below. Nothing changes until the access point next comes up.</div>
+    <div class="kv"><div class="kvrow"><span class="k">Current mode</span><span id="ap-mode" class="v">—</span></div></div>
+    <div class="field">
+      <label class="lbl" for="ap-psk">Access point passphrase (8&ndash;63 characters)</label>
+      <div class="row"><input id="ap-psk" class="mono" type="password" autocomplete="off"><button class="btn" id="ap-psk-reveal" aria-pressed="false" aria-controls="ap-psk" onclick="secTogglePsk()">Show</button></div>
+    </div>
+    <div class="row"><label><input type="checkbox" id="ap-secure"> Require WPA2 on the access point</label></div>
+    <div class="btns"><button class="btn btn-primary" id="ap-save" onclick="saveApSecurity()">Save</button><button class="btn" id="ap-regen" onclick="regenApPsk()">[ ARM ] Generate new passphrase</button></div>
+    <div class="msg" id="ap-msg" role="status"></div>
+  </div>
+
+  <p class="hint">Phone registration mode (Learn or Secure) is set in <a href="#devices">Devices</a>.</p>
+
+  <h3>E911 notification</h3>
+  <p class="hint">Who is told on site when somebody dials 911. A factory reset clears these.</p>
+  <div class="field"><label class="lbl" for="e911-exts">Notify extensions (spaces or commas)</label><input id="e911-exts" class="mono" type="text" autocomplete="off"></div>
+  <div class="field"><label class="lbl" for="e911-callback">Callback number</label><input id="e911-callback" class="mono" type="text" autocomplete="off"></div>
+  <div class="field"><label class="lbl" for="e911-location">Location</label><input id="e911-location" type="text" autocomplete="off"></div>
+  <div class="btns"><button class="btn btn-primary" id="e911-save" disabled onclick="saveE911()">Save</button></div>
+  <div class="msg" id="e911-msg" role="status"></div>
+</div>

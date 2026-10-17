@@ -1,0 +1,365 @@
+/* shared-theme.css - ISA-101 HMI console, dark only. UTF-8, no backslashes, no double quotes. */
+
+/* 1. TOKENS: solid hex. Grey when nominal; colour only for exceptions. */
+:root{
+color-scheme:dark;
+--chassis:#121212;
+--panel:#1c1c1c;
+--grid:#333333;
+--text:#a0a0a0;
+--dim:#666666;
+--well:#050505;
+--p1:#ff2200;
+--p2:#ffaa00;
+--live:#00aaff;
+--bevel-hi:#3a3a3a;
+--bevel-lo:#000000;
+--f-ui:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
+--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace;
+--row:24px;
+}
+
+/* 2. BASE */
+*,*::before,*::after{box-sizing:border-box;border-radius:0}
+[hidden]{display:none!important}
+html,body{margin:0;background:var(--chassis);color:var(--text)}
+body{font:12px/16px var(--f-ui);padding:30px 0 32px}
+a{color:var(--text);text-decoration:underline}
+:focus-visible{outline:1px solid var(--text);outline-offset:-1px}
+kbd,code,.mono,.num,td.num,td.mono,.kv dd,.st,.well,.unit,.tile,.fk{font-family:var(--f-mono);font-variant-numeric:tabular-nums}
+kbd{font-size:11px;padding:0 4px;color:var(--text);background:var(--chassis);border:1px solid var(--grid)}
+button,.btn{margin:0;min-height:var(--row);padding:4px 6px;font:inherit;color:var(--text);background:var(--panel);border-style:solid;border-width:1px;border-color:var(--bevel-hi) var(--bevel-lo) var(--bevel-lo) var(--bevel-hi);cursor:pointer}
+button:hover,.btn:hover{background:var(--grid)}
+button:active,.btn:active{background:var(--text);color:var(--chassis);border-color:var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo)}
+[disabled],[aria-disabled='true']{color:var(--dim);cursor:not-allowed}
+[disabled]:hover,[aria-disabled='true']:hover{background:var(--panel)}
+input,select,textarea{margin:0;min-height:var(--row);padding:4px 6px;font:inherit;color:var(--text);background:var(--well);border:1px solid var(--grid)}
+input[type=checkbox],input[type=radio]{appearance:none;-webkit-appearance:none;width:12px;height:12px;min-height:0;padding:0;margin:0 4px 0 0;vertical-align:-2px;background:var(--well);border:1px solid var(--bevel-hi)}
+input[type=checkbox]:checked,input[type=radio]:checked{background:var(--text)}
+table{border-collapse:collapse;width:100%}
+th,td{padding:4px 6px;border:1px solid var(--grid);text-align:left;vertical-align:top}
+th{background:var(--panel);color:var(--text);font-weight:normal;font-size:10px;letter-spacing:.08em;text-transform:uppercase}
+fieldset{margin:0;min-width:0;padding:4px 6px 6px;border:1px solid var(--grid);background:var(--panel)}
+legend{padding:0 4px;background:var(--panel);color:var(--text);font:10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase}
+
+/* 3. COMPONENTS */
+.alarm-bar{position:fixed;top:0;left:0;right:0;z-index:10;display:flex;align-items:stretch;height:30px;overflow:hidden;white-space:nowrap;background:var(--panel);color:var(--text);border-bottom:1px solid var(--grid);font:12px/16px var(--f-mono)}
+.alarm-bar>*{display:flex;align-items:center;padding:0 6px;border-left:1px solid var(--grid)}
+.fkey-bar{position:fixed;left:0;right:0;bottom:0;z-index:10;display:flex;height:32px;background:var(--panel);border-top:1px solid var(--grid)}
+.fkey-bar>*{flex:1 1 0;min-width:0;height:100%;padding:0 4px;overflow:hidden;white-space:nowrap;text-align:left}
+.fk{margin-right:4px;font-size:11px;font-weight:bold}
+.pane{margin:0 -1px -1px 0;padding:4px 6px;border:1px solid var(--grid);background:var(--panel)}
+.lbl{display:inline-block;margin:-6px 0 0 -2px;padding:0 4px;background:var(--panel);color:var(--text);font:10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase}
+.well{display:inline-block;min-width:8ch;padding:3px 6px;text-align:right;background:var(--well);color:var(--text);border-style:solid;border-width:1px;border-color:var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo)}
+.unit{margin-left:4px;color:var(--dim)}
+.annunciator{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:0;border-top:1px solid var(--grid);border-left:1px solid var(--grid)}
+.tile{min-width:0;padding:4px 6px;background:#181818;color:#5c5c5c;border-right:1px solid var(--grid);border-bottom:1px solid var(--grid);font:10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase;overflow-wrap:anywhere}
+.st{display:inline-block;padding:0 4px;border:1px solid var(--panel);color:var(--text);white-space:nowrap}
+.st.live{border-color:var(--live)}
+.btn-arm.armed{color:var(--p2);border-width:4px;border-style:solid;border-image:repeating-linear-gradient(45deg, #ffaa00 0 6px, #000 6px 12px) 4}
+.btn-exec,.btn-exec:hover{background:var(--p1);color:#000;font-weight:bold}
+.btn-arm.armed.btn-exec,.btn-arm.armed.btn-exec:hover{background:var(--p1);color:#000}
+.bus-h{display:block;height:0;border-top:2px solid var(--dim)}
+.bus-v{display:block;width:0;min-height:var(--row);margin:0 auto;border-left:2px solid var(--dim)}
+.bus-h.live,.bus-v.live{border-color:var(--live)}
+.nav{margin:0;padding:0;list-style:none;border-top:1px solid var(--grid)}
+.nav a,.nav button{display:flex;align-items:center;justify-content:space-between;width:100%;min-height:var(--row);margin:0;padding:4px 6px;border:0;border-bottom:1px solid var(--grid);background:var(--chassis);color:var(--text);text-align:left;text-decoration:none}
+.nav a:hover:not([aria-current]),.nav button:hover:not([aria-current]){background:var(--grid)}
+.nav .kbd{margin-left:auto;padding-left:6px;font-size:11px;color:var(--text)}
+.nav [aria-current] .kbd{color:var(--chassis)}
+.tabs{display:flex;flex-wrap:wrap;margin:0;padding:0;border-top:1px solid var(--grid);border-left:1px solid var(--grid)}
+.tabs button{margin:0;min-height:var(--row);border:0;border-right:1px solid var(--grid);border-bottom:1px solid var(--grid);background:var(--chassis)}
+.nav [aria-current],.tabs [aria-current],.tabs [aria-selected='true'],.fkey-bar [aria-current]{background:var(--text);color:var(--chassis)}
+.nav [aria-current]:hover,.tabs [aria-current]:hover,.tabs [aria-selected='true']:hover,.fkey-bar [aria-current]:hover{background:var(--text);color:var(--chassis)}
+.toast{position:sticky;bottom:32px;z-index:5;min-height:var(--row);padding:4px 6px;background:var(--panel);color:var(--text);border-top:1px solid var(--grid);font:12px/16px var(--f-mono)}
+.kv{display:grid;grid-template-columns:minmax(8em,max-content) minmax(0,1fr);gap:0;margin:0;border-top:1px solid var(--grid);border-left:1px solid var(--grid)}
+.kv dt,.kv dd{margin:0;min-height:var(--row);padding:4px 6px;border-right:1px solid var(--grid);border-bottom:1px solid var(--grid)}
+.kv dd{overflow-wrap:anywhere}
+@media (max-width:480px){.kv{grid-template-columns:1fr}}
+
+/* Off-normal modifiers last, so they win over component backgrounds. */
+.p1,.p1:hover{background:var(--p1);color:#000;font-weight:bold}
+.p2,.p2:hover{background:var(--p2);color:#000}
+.p1.unack{animation:blink 1s steps(1) infinite}
+@keyframes blink{0%,49%{background:#ff2200;color:#000}50%,100%{background:#000000;color:#ff2200}}
+@media (prefers-reduced-motion:reduce){.p1.unack{animation:none}}
+.tile.p1,.tile.p2{outline:1px solid #000;outline-offset:-2px}
+
+/* ===== product rules (brief 7b). Tokens come from the shared block above; no new tokens. ===== */
+
+/* product delta: the pagebar sits at top:30px under the 30px top bar, so the body reserves 60px at the top (shared block: 30px). */
+body{padding:60px 0 32px}
+
+/* fieldset delta: the shared block pads fieldsets 4px 6px 6px; product cells cap at 4px 6px. */
+fieldset{padding:4px 6px}
+
+/* annunciator delta: 4 columns (shared block: 5). 7 tiles on the ESP build and 5 on the host build both fill 2 rows. */
+.annunciator{grid-template-columns:repeat(4,minmax(0,1fr))}
+
+/* alarm bar delta: the state chip and ACK never shrink; the text cell takes the rest and each alarm ellipsizes
+   inside it (the span's title carries the full text), so a long alarm is never cut by the viewport. */
+.alarm-bar>.st,.alarm-bar>.btn{flex:none}
+.alarm-bar>.alarm-text{flex:1 1 auto;min-width:0;overflow:hidden}
+.alarm-bar .alarm{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.alarm-bar .alarm+.alarm{margin-left:6px}
+
+/* shell: fixed top bar and fixed function bar; body padding above reserves both */
+.wrap{min-width:0}
+html{-webkit-text-size-adjust:100%}
+h1,p,dl,dd,figure,ul,ol{margin:0}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.skip:focus{position:fixed;top:30px;left:6px;z-index:20;width:auto;height:auto;clip:auto;display:inline-block;padding:0 6px;background:var(--text);color:var(--chassis)}
+.fill{flex:1 1 auto}
+.build{flex:none;font:400 11px/16px var(--f-mono);color:var(--dim);white-space:nowrap}
+.pagebar{position:fixed;top:30px;left:0;right:0;z-index:10;display:flex;align-items:center;gap:6px;height:30px;padding:0 6px;background:var(--panel);border-bottom:1px solid var(--grid);overflow-x:auto;scrollbar-width:none;white-space:nowrap}
+.pagebar::-webkit-scrollbar{display:none}
+.pagebar .pb-title{flex:none;font:400 10px/12px var(--f-mono);text-transform:uppercase;letter-spacing:.08em}
+.pagebar .tag{flex:none}
+.status-strip{display:flex;align-items:stretch;gap:0;height:var(--row);padding:0 6px;background:var(--panel);border-bottom:1px solid var(--grid);white-space:nowrap;overflow-x:auto;scrollbar-width:none;font:400 11px/16px var(--f-ui);color:var(--dim)}
+.status-strip::-webkit-scrollbar{display:none}
+.status-strip b{display:inline-block;margin-left:4px;padding:0 4px;background:var(--well);border-top:1px solid #000000;border-left:1px solid #000000;border-right:1px solid var(--bevel-hi);border-bottom:1px solid var(--bevel-hi);color:var(--text);font:600 11px/14px var(--f-mono);font-variant-numeric:tabular-nums}
+footer.status-strip{position:fixed;left:0;right:0;bottom:0;z-index:10;height:32px;border-top:1px solid var(--grid);border-bottom:0}
+.status-strip>span{display:inline-flex;align-items:center;gap:4px;padding:0 6px;border-right:1px solid var(--grid)}
+
+/* shell: nav column and content in one bordered grid; single column below 600px */
+.app{display:grid;grid-template-columns:minmax(0,1fr);min-width:0;background:var(--panel)}
+#main{min-width:0;display:flex;flex-direction:column}
+#main>section{display:flex;flex-direction:column;min-width:0}
+#main>section:focus{outline:0}
+.tree{min-width:0;background:var(--panel);border-bottom:1px solid var(--grid)}
+.tree ul{list-style:none;margin:0;padding:0;display:flex;overflow-x:auto;scrollbar-width:none}
+.tree ul::-webkit-scrollbar{display:none}
+.tree li{flex:none}
+.tn{display:flex;align-items:center;justify-content:space-between;gap:6px;height:var(--row);padding:0 6px;border-left:2px solid var(--panel);color:var(--text);text-decoration:none;white-space:nowrap;min-width:0}
+.tn:hover{background:var(--grid)}
+.tn[aria-current='page']{background:var(--text);color:var(--chassis);font-weight:600;border-left-color:var(--text)}
+.tn kbd{display:none}
+/* under 600px nothing in the fixed bars or the status strip may clip (the desktop layout above 600px is unchanged):
+   the top bar becomes a two-row grid (row 1: product, firmware, connection; row 2: session, role, Log in/out),
+   so the body reserves 90px; the status strip wraps two cells per row; the F-key bar stacks the key over its code
+   in 10px mono (nine keys fit 400px: 6ch at 6px plus 2px padding and 1px bevels is 42px of 44) and scrolls, never
+   clips, if a font runs wider. */
+@media (max-width:599px){
+  body{padding-top:90px}
+  .pagebar{display:grid;grid-template-columns:auto minmax(0,1fr) auto;grid-template-rows:1fr 1fr;height:60px;align-items:center;overflow:visible}
+  .pagebar .fill{display:none}
+  .pagebar .build{min-width:0;overflow:hidden;text-overflow:ellipsis}
+  .pagebar #build{grid-area:1/2}
+  .pagebar #conn{grid-area:1/3}
+  .pagebar #sess{grid-area:2/1}
+  .pagebar #role{grid-area:2/2;justify-self:start}
+  .pagebar #auth-btn{grid-area:2/3}
+  .status-strip{flex-wrap:wrap;height:auto;padding:0;border-bottom:0;overflow:visible}
+  .status-strip>span{flex:1 1 50%;min-width:0;min-height:var(--row);border-bottom:1px solid var(--grid)}
+  .status-strip>span:nth-child(2n){border-right:0}
+  .fkey-bar{overflow-x:auto;scrollbar-width:none}
+  .fkey-bar::-webkit-scrollbar{display:none}
+  .fkey-bar>*{flex:1 0 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 2px;overflow:visible;font:10px/12px var(--f-mono)}
+  .fkey-bar .fk{margin:0;font-size:10px}
+}
+@media (min-width:600px){
+  .app{grid-template-columns:176px minmax(0,1fr)}
+  .app.setup{grid-template-columns:minmax(0,1fr)}
+  .tree{border-bottom:0;border-right:1px solid var(--grid)}
+  .tree ul{display:block;overflow:visible}
+  .tn kbd{display:inline-block}
+}
+
+/* section heads and inlaid labels (headings are styled by the shared block) */
+.sec-head,.ov-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px;padding:0 6px 0 0;background:var(--chassis);border-bottom:1px solid var(--grid)}
+h2,h3{margin:0;padding:3px 6px;background:var(--chassis);color:var(--dim);border-top:1px solid var(--grid);border-bottom:1px solid var(--grid);font:400 10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase}
+h2{color:var(--text)}
+#main>section>:first-child,#view-setup>:first-child{border-top:0}
+.ov-head h2,.sec-head h2,.row>h2{padding:0;background:none;border:0}
+.row>h2{flex:1 1 auto}
+hr,.hr{margin:0;border:0;border-top:1px solid var(--grid);height:0}
+.sec-title,.sect-t,.subhead{margin:0}.sect{display:block}
+.bay-title{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:3px 6px;background:var(--chassis);color:var(--dim);border-bottom:1px solid var(--grid);font:600 10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase}
+.lbl-s{display:inline-block;padding:0 4px;background:#000000;color:var(--text);font:600 10px/16px var(--f-mono);letter-spacing:.08em;text-transform:uppercase;white-space:nowrap}
+.field>label{color:var(--text);font:400 12px/16px var(--f-ui)}
+.muted{color:var(--dim)}
+.hint,.note{color:var(--dim);overflow-wrap:anywhere}
+.hint,.note,.msg,.field,.btns,.row,.opt,.callout,.rep-row,.linkrow,.gempty,.term,.form{padding:4px 6px}
+.card :is(.hint,.note,.msg,.field,.btns,.row,.opt,.rep-row),.btns :is(.hint,.note,.msg,.field,.btns,.row,.opt,.rep-row),.row :is(.hint,.note,.msg,.field,.btns,.row,.opt,.rep-row),.rep-row :is(.hint,.note,.msg,.field,.btns,.row,.opt,.rep-row),.rep :is(.hint,.note,.msg,.field,.btns,.row,.opt,.rep-row),.callout :is(.hint,.note,.msg,.field,.btns,.row,.opt,.rep-row),.form :is(.hint,.note,.msg,.field,.btns,.row,.opt,.rep-row),.dz :is(.hint,.note,.msg,.field,.btns,.row,.opt,.rep-row),.term :is(.hint,.note,.msg,.field,.btns,.row,.opt,.rep-row),.gempty :is(.hint,.note,.msg,.field,.btns,.row,.opt,.rep-row),.gdlg-body :is(.hint,.note,.msg,.field,.btns,.row,.opt,.rep-row){padding:0}
+.grp{display:flex;flex-direction:column;min-width:0}
+.row{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:center;min-width:0}
+.btns{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:flex-end;min-width:0}
+.linkrow{display:flex;gap:8px;align-items:center;min-width:0}
+
+/* messages: glyph in brackets plus text. Solid warn and err fills are for device faults only; progress, permission and validation text stays plain grey. */
+.msg{min-height:16px;overflow-wrap:anywhere}
+.msg:empty{min-height:0;height:0;padding:0;overflow:hidden}
+.msg:not(:empty)::before{content:'[ · ] '}
+.msg.warn:not(:empty)::before,.msg.warning:not(:empty)::before{content:'[ ▲ ] '}
+.msg.err:not(:empty)::before{content:'[ ◆ ] '}
+.msg.warn:not(:empty),.msg.warning:not(:empty){background:var(--p2);color:#000000}
+.msg.err:not(:empty){background:var(--p1);color:#000000;font-weight:bold}
+
+/* status: shared .st gives the chip; brackets come from here. Nominal is grey. */
+.st::before{content:'[ '}
+.st::after{content:' ]'}
+.g{display:inline-block;min-width:1ch;margin-right:1ch;text-align:center;font:400 12px/16px var(--f-mono)}
+.ok,.ok .g,.g.ok{color:var(--text)}
+.standby,.off,.g.standby,.g.off{color:var(--dim)}
+.g.warning{color:var(--p2)}
+.g.critical{color:var(--p1)}
+.st.warning{background:var(--p2);border-color:var(--p2);color:#000000}
+.st.critical{background:var(--p1);border-color:var(--p1);color:#000000;font-weight:bold}
+
+/* buttons: bevelled, 0ms. Variants set fill and colour only, so the shared four-sided bevel survives. Press inverts. */
+.btn-primary,.btn.primary,.btn-primary:hover,.btn.primary:hover{background:var(--text);color:var(--chassis)}
+.btn-primary:active,.btn.primary:active{background:var(--chassis);color:var(--text);border-color:var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo)}
+.btn-danger,.btn-danger:hover{background:var(--p1);color:#000000;font-weight:bold}
+.btn-danger:active{background:var(--chassis);color:var(--p1);border-color:var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo)}
+.btn-outline-danger,.btn-outline-danger:hover{background:var(--panel);color:var(--p2)}
+.btn-outline-danger:active{background:var(--p2);color:#000000;border-color:var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo)}
+.btn-text-danger,.btn-text-danger:hover{background:var(--chassis);color:var(--p2)}
+.btn-text-danger:active{background:var(--p2);color:#000000;border-color:var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo)}
+.btn-primary[disabled],.btn-primary[aria-disabled='true'],.btn-danger[disabled],.btn-danger[aria-disabled='true'],.btn-outline-danger[disabled],.btn-outline-danger[aria-disabled='true'],.btn-text-danger[disabled],.btn-text-danger[aria-disabled='true']{background:var(--panel);color:var(--dim);font-weight:normal}.rbtn{min-height:var(--row);max-width:100%;white-space:nowrap}
+.lnk{display:inline-block;min-height:var(--row);padding:0 2px;margin:0;background:none;border:0;color:var(--text);text-decoration:underline;cursor:pointer;font:inherit;text-align:left;white-space:nowrap}
+.lnk:hover{background:var(--grid)}
+.lnk[aria-disabled='true']{color:var(--dim);cursor:not-allowed}
+
+/* fields */
+.field{display:flex;flex-direction:column;gap:2px;min-width:0;max-width:480px}
+input:not([type=checkbox]):not([type=radio]):not([type=file]):not([type=range]),select{width:100%;min-width:0;height:var(--row);padding:0 6px;font:400 12px/16px var(--f-ui)}
+input.mono,input[inputmode=numeric]{font-family:var(--f-mono);font-variant-numeric:tabular-nums}
+textarea{width:100%;min-width:0;font:400 12px/16px var(--f-mono)}
+input::placeholder{color:var(--dim)}
+input[readonly]{color:var(--dim)}
+input[aria-invalid='true']{border-color:var(--p1)}
+input[type=file]{max-width:100%;color:var(--text)}
+input[type=file]::file-selector-button{margin:0 6px 0 0;padding:4px 6px;border-radius:0;border-style:solid;border-width:1px;border-color:var(--bevel-hi) var(--bevel-lo) var(--bevel-lo) var(--bevel-hi);background:var(--panel);color:var(--text);font:inherit;cursor:pointer}
+input[type=file]::file-selector-button:active{background:var(--text);color:var(--chassis);border-color:var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo)}
+progress{appearance:none;-webkit-appearance:none;width:160px;height:12px;margin:0;border:1px solid var(--grid);background:var(--well);color:var(--text)}
+progress::-webkit-progress-bar{background:var(--well)}
+progress::-webkit-progress-value{background:var(--text)}
+progress::-moz-progress-bar{background:var(--text)}
+.req{color:var(--text);font-weight:bold}
+.opt{display:flex;align-items:center;gap:6px;min-height:var(--row);cursor:pointer;min-width:0}
+.rep{display:flex;flex-direction:column;min-width:0}
+/* SBC profile (app/05-sbc.js sets body.sbc): 3CX owns forwarding and DND, so the per-extension controls are hidden */
+.sbc .card .rep,.sbc .card .opt-dnd{display:none}
+.rep-row{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:flex-end;min-width:0}
+.rep-row>.field{flex:1 1 110px;min-width:0}
+.form{display:grid;gap:4px 8px;grid-template-columns:minmax(0,1fr);max-width:520px}
+#view-setup .form{border-top:1px solid var(--grid)}
+.form.two{grid-template-columns:repeat(2,minmax(0,1fr));max-width:none}
+@media (max-width:599px){.form.two{grid-template-columns:minmax(0,1fr)}}
+
+/* data tables share the shared hairline grid. Data-table cells (durations, counts, ages) are table data and are exempt from the sunken-well rule; both products apply this. */
+.scroll,.tbl-wrap{overflow-x:auto;max-width:100%;background:var(--panel)}
+table.data caption{text-align:left}
+table.data th{font:600 10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase;color:var(--dim);background:var(--chassis);white-space:nowrap}
+table.data td{font-family:var(--f-mono);font-variant-numeric:tabular-nums;white-space:nowrap;vertical-align:middle}
+table.data td[colspan]{white-space:normal;color:var(--dim);font-family:var(--f-ui)}
+table.data tbody tr:hover>td{background:var(--grid)}
+table.data .btn,table.data .lnk{min-height:20px;height:20px}
+.row-actions,.row-btns{display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+td.row-actions{display:table-cell;white-space:nowrap}
+.badge,.tag,.count{display:inline-block;padding:0 4px;border:1px solid var(--dim);background:var(--chassis);color:var(--text);font:500 11px/14px var(--f-mono);white-space:nowrap}
+.count{border:0;background:none;color:var(--dim)}
+.plain{list-style:none;display:flex;flex-direction:column;padding:0}
+.plain li{display:flex;align-items:center;gap:6px;min-height:var(--row);padding:2px 6px;border-top:1px solid var(--grid);min-width:0}
+.plain li>span:first-child{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
+
+/* key/value rows: each row spans the shared two-column grid. A value is plain text or a .st chip; only a number
+   sits in a .well, with its unit outside (wells hold numbers only). */
+.kv>.kvrow{grid-column:1/-1}
+.kvrow,.kv-row{display:flex;flex-wrap:wrap;align-items:center;gap:2px 12px;min-height:var(--row);min-width:0;border-top:1px solid var(--grid)}
+.kvrow>div{display:flex;flex:1 1 auto;flex-wrap:wrap;align-items:center;gap:2px 12px;min-width:0}
+.kvrow dt,.kv-row dt,.k{color:var(--dim)}
+.kvrow dt{min-width:10em}
+.kvrow dd,.kv-row dd,.v{flex:1 1 auto;margin:0;min-width:0;padding:3px 6px;overflow-wrap:anywhere;font-family:var(--f-mono);font-variant-numeric:tabular-nums;text-align:right}
+.stat{display:flex;flex-direction:column;gap:2px;min-width:0;padding:4px 6px;border-right:1px solid var(--grid);border-bottom:1px solid var(--grid)}
+.stat .k{font:600 10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase}
+.stat .v{overflow-wrap:anywhere}
+.rail-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:0;border-top:1px solid var(--grid)}
+.spark{display:inline-flex;align-items:center;gap:6px}
+#sparkline{fill:none;stroke:var(--text);stroke-width:1}
+#sparkline.live{stroke:var(--live)}
+.tile.p1 .st,.tile.p2 .st{color:#000000}
+
+/* overview: jack board, bays, legend */
+.bay-face{position:relative;border-top:1px solid var(--grid)}
+.panel{border-top:1px solid var(--grid)}
+#board-wrap{position:relative}
+/* signal path: three panes on a shared 2px bus; the bus turns cyan only while its traffic is live */
+.sigpath{display:grid;grid-template-columns:minmax(0,1fr) 2px minmax(0,1fr) 2px minmax(0,1fr);gap:0;align-items:stretch;border-top:1px solid var(--grid)}
+.bus-w{min-width:0;background:var(--dim)}
+.bus-w.live{background:var(--live)}
+.jacks{position:relative;display:grid;grid-template-columns:repeat(auto-fill,minmax(76px,1fr));gap:0;padding:0;border-left:1px solid var(--grid)}
+.jack{display:flex;flex-direction:column;align-items:center;gap:2px;min-width:0;padding:4px;background:var(--panel);border:0;border-right:1px solid var(--grid);border-bottom:1px solid var(--grid);color:var(--text);cursor:pointer;font:inherit}
+.jack:hover{background:var(--grid)}
+.ring{position:relative;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:1px solid var(--dim)}
+.led{display:block;width:10px;height:10px;background:var(--dim)}
+.state-idle .led{background:var(--text)}
+.state-ringing .led{background:var(--live)}
+.state-active .led{background:var(--live)}
+.state-parked .led{background:var(--dim)}
+.state-alert .led{background:var(--p1)}
+.state-unreg .led{background:var(--grid)}
+.state-active .ring{border-color:var(--live)}
+.state-ringing .ring{border-color:var(--live)}
+.jack .label{font:600 12px/16px var(--f-mono)}
+.jack .sublabel{font:400 11px/14px var(--f-mono)}
+.jack .sublabel:not(.live):not(.p1):not(.p2){color:var(--dim)}
+.jack .sublabel.p1,.jack .sublabel.p2{color:#000000}
+.legend{display:flex;flex-wrap:wrap;gap:4px 12px;padding:4px 6px;border-top:1px solid var(--grid);color:var(--dim)}
+.legend .item,.item{display:inline-flex;align-items:center;gap:4px}
+.swatch{display:inline-block;width:10px;height:10px;border:1px solid var(--dim)}
+.sw-idle{background:var(--text)}
+.sw-ringing{background:var(--live)}
+.sw-active{background:var(--live)}
+.sw-parked{background:var(--dim)}
+.sw-alert{background:var(--p1)}
+.empty-board{grid-column:1/-1;padding:4px 6px;color:var(--dim)}
+
+/* extension cards: one shared grid */
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:0;border-top:1px solid var(--grid);border-left:1px solid var(--grid)}
+.cards.as-list{grid-template-columns:minmax(0,1fr)}
+.card{display:flex;flex-direction:column;gap:4px;min-width:0;padding:4px 6px;border-right:1px solid var(--grid);border-bottom:1px solid var(--grid)}
+.pcard-top{display:flex;align-items:center;gap:6px}
+.pname{font-weight:600}
+
+/* callouts, empty states, console */
+.callout{display:flex;gap:6px;align-items:flex-start;background:var(--chassis);border-top:1px solid var(--grid);border-bottom:1px solid var(--grid);overflow-wrap:anywhere}
+.gempty{display:flex;align-items:center;justify-content:center;color:var(--dim);text-align:center;min-width:0}
+.gempty p{overflow-wrap:anywhere}
+.term{display:flex;flex-direction:column;max-width:100%;max-height:320px;overflow:auto;background:var(--well);border-top:1px solid var(--grid);border-bottom:1px solid var(--grid);color:var(--text);font:400 12px/16px var(--f-mono);min-width:0}
+.term p{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}
+.term .trace{border-left:2px solid var(--live);padding-left:6px}
+.term .prompt{font-weight:bold;color:var(--text)}
+.wifi-net{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;min-height:var(--row);padding:0 6px;border:0;border-top:1px solid var(--grid);background:var(--panel);color:var(--text);cursor:pointer;text-align:left;min-width:0}
+.wifi-net:hover{background:var(--grid)}
+.wifi-net[aria-pressed='true'],.wifi-net[aria-selected='true']{background:var(--text);color:var(--chassis)}
+.dz{display:flex;flex-direction:column;gap:4px;padding:4px 6px;background:var(--panel);border:1px solid var(--grid);border-left:1px solid var(--grid);min-width:0}
+
+/* banners: setup (P2), E911 notify (P2), emergency route none (P1) */
+.e911{display:flex;flex-wrap:wrap;gap:2px 8px;align-items:baseline;padding:4px 6px;background:var(--p2);color:#000000;border-bottom:1px solid #000000;min-width:0}
+.e911 a{color:#000000}
+.e911 .txt{flex:1 1 160px;min-width:0;overflow-wrap:anywhere}
+#e911-route-banner{background:var(--p1);font-weight:bold}
+
+/* dialogs: flat panel, hairline frame, solid backdrop */
+.gdlg{margin:auto;width:min(400px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow:auto;padding:0;border:1px solid var(--text);background:var(--panel);color:var(--text)}
+.gdlg::backdrop{background:#000000}
+.gdlg-body{display:flex;flex-direction:column;gap:4px;padding:0 6px 4px;margin:0}
+.gdlg-body>h3{margin:0 -6px}
+.gdlg-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:4px}
+#confirm-d{white-space:pre-line;overflow-wrap:anywhere}
+
+/* toasts: persistent live regions above the function bar; status chips fill for warn and err */
+.toasts{position:fixed;left:6px;right:6px;bottom:36px;z-index:50;display:flex;flex-direction:column;align-items:flex-end;gap:0;pointer-events:none}
+.toasts>div{width:min(420px,100%)}
+.toasts .toast{position:static;z-index:auto;display:flex;align-items:flex-start;gap:6px;margin:0;min-height:var(--row);padding:4px 6px;border:1px solid var(--dim);font:400 12px/16px var(--f-ui);overflow-wrap:anywhere;white-space:normal;min-width:0;pointer-events:auto}
+.toasts .toast+.toast{border-top:0}
+.toast.st::before,.toast.st::after{content:none}
+.toast>.g::before{content:'[ '}
+.toast>.g::after{content:' ]'}
+.toast>span:nth-child(2){flex:1 1 auto;min-width:0}
+.toasts .toast .lnk{min-height:16px;height:16px;color:inherit}
+
+@media (forced-colors: active){
+  [aria-pressed='true'],[aria-current],.tn[aria-current='page']{outline:2px solid CanvasText;outline-offset:-2px}
+}

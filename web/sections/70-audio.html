@@ -1,0 +1,64 @@
+  <header class="sec-head">
+    <h2>Audio</h2>
+    <p class="note">Music on hold for parked callers, a preview that rings a handset, and the media transmit switch.</p>
+  </header>
+
+  <div class="msg" id="moh-gate-msg"></div>
+
+  <h3 class="subhead">Music on hold</h3>
+  <p class="note">Played to callers parked on an orbit (700&ndash;709), streamed from memory. Every listener hears the same position in the track.</p>
+  <dl class="kv">
+    <div class="kvrow"><dt>Clip</dt><dd id="moh-clip">—</dd></div>
+    <div class="kvrow"><dt>Clip length</dt><dd><span class="well" id="moh-len">—</span><span class="unit">h:m:s</span></dd></div>
+    <div class="kvrow"><dt>Listening now</dt><dd><span class="well" id="moh-listeners">—</span><span class="unit">callers</span> <span class="unit" id="moh-listeners-note"></span></dd></div>
+  </dl>
+  <div class="msg" id="moh-status-msg"></div>
+
+  <div class="field">
+    <label for="moh-file">Replace clip</label>
+    <input type="file" id="moh-file" accept=".wav,audio/wav,audio/wave">
+  </div>
+  <p class="note">Must be <strong>8 kHz mono &micro;-law WAV</strong> (G.711, copied straight through). <code>tools/gen_moh.py</code> converts anything else. 8 MB max; a failed upload leaves the existing clip untouched.</p>
+  <div class="row">
+    <button class="btn primary" id="moh-upload-btn" aria-disabled="true">Upload clip</button>
+  </div>
+  <div id="moh-prog-row" hidden>
+    <progress id="moh-prog" max="100" value="0" aria-label="Upload progress"></progress>
+    <span class="well" id="moh-pct">0</span><span class="unit">%</span>
+  </div>
+  <div class="msg" id="moh-msg"></div>
+
+  <hr class="hr">
+  <h3 class="subhead">Preview</h3>
+  <p class="note">Rings an extension and plays the clip to it. Answer to listen; hang up or press Stop to end it.</p>
+  <div class="field">
+    <label for="moh-preview-ext">Extension to ring</label>
+    <input type="text" id="moh-preview-ext" autocomplete="off">
+  </div>
+  <div class="row">
+    <button class="btn primary" id="moh-play-btn" aria-disabled="true">Play</button>
+    <button class="btn" id="moh-stop-btn" aria-disabled="true">Stop</button>
+  </div>
+  <dl class="kv">
+    <div class="kvrow"><dt>Preview</dt><dd id="moh-preview-state">—</dd></div>
+  </dl>
+  <div class="msg" id="moh-preview-msg"></div>
+
+  <hr class="hr">
+  <h3 class="subhead">Media transmit <span class="badge">experimental</span></h3>
+  <p class="note">Experimental (#985). Sets <code>TCP_NODELAY</code> on the anchor's audio POST socket for an A/B listening test. <code>0</code> leaves Nagle on (default); <code>1</code> turns it off. Off at every boot; applies when the next audio stream opens, not mid-call.</p>
+  <div class="field">
+    <label for="mtx-nodelay">nodelay</label>
+    <select id="mtx-nodelay" aria-disabled="true">
+      <option value="0">0: Nagle on (default)</option>
+      <option value="1">1: TCP_NODELAY on</option>
+    </select>
+  </div>
+  <div class="row">
+    <button class="btn primary" id="mtx-save" aria-disabled="true">Apply</button>
+  </div>
+  <div class="msg hint" id="mtx-hint"></div>
+  <dl class="kv">
+    <div class="kvrow"><dt>Set from this page</dt><dd id="mtx-current">—</dd></div>
+  </dl>
+  <div class="msg" id="mtx-msg"></div>

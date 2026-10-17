@@ -1,0 +1,17 @@
+<!-- 41-did.html: DID -> extension mapping. Spliced at <div id="did-slot"> in Trunks & numbers.
+     Guarded `@unless POCKETDIAL_PROFILE_SBC` in manifest.txt: 3CX owns the numbers on the SBC build. -->
+<div class="sect"><h3 class="sect-t">DID &rarr; extension</h3></div>
+<p class="hint">Only one route point is supported. A DID must match the Route DN of the active slot to ever match. Other DIDs are stored but never match. An unmatched call rings all, the same as with no mapping.</p>
+<div class="scroll">
+  <table class="data" id="tn-did-table">
+    <caption class="sr">DID to extension mappings</caption>
+    <thead><tr><th>DID</th><th>Extension</th><th><span class="sr">Actions</span></th></tr></thead>
+    <tbody id="tn-did-body"></tbody>
+  </table>
+</div>
+<div class="rep-row">
+  <div class="field"><label for="tn-did-new">DID</label><input type="text" id="tn-did-new" autocomplete="off" placeholder="Must match the route DN" readonly aria-disabled="true"></div>
+  <div class="field"><label for="tn-did-ext">Extension</label><input type="text" id="tn-did-ext" autocomplete="off" readonly aria-disabled="true"></div>
+  <button class="btn btn-primary" id="tn-did-add" aria-disabled="true" onclick="tnAddDid()">Add mapping</button>
+</div>
+<div class="msg" id="tn-did-msg"></div>

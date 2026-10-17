@@ -1,0 +1,18 @@
+<div class="tabs" role="group" aria-label="Extensions and devices"><button type="button" data-sec="extensions">Extensions</button><button type="button" data-sec="devices">Devices</button></div>
+<h2>Extensions</h2>
+<p class="hint">Extensions come from Learn or zero-touch. This page does not create, rename or delete them.</p>
+<div class="callout" id="ext-gate" hidden><span class="st">· VIEW ONLY</span> Log in to change extension settings.</div>
+<div class="cards as-list" id="ext-cards"></div>
+<div class="gempty" id="ext-empty"><p id="ext-empty-text">Loading extensions.</p></div>
+<div class="msg" id="ext-msg"></div>
+
+<h2>Registration and Learn</h2>
+<!-- .callout is a flex row (chip + text); this one is a single paragraph, so the <p> keeps the bold word inline. -->
+<div class="callout"><p>
+  <strong>Learn</strong> adopts an unknown phone on first contact and
+  locks the extension to that device on its next registration,
+  if no other phone claimed it first. Until then,
+  or if the phone is on another subnet or shares a router's MAC with other
+  phones, another phone can register on the same extension.
+</p></div>
+<p class="hint">The adopted-phone roster, Forget and Forget all learned are in <a href="#devices">Devices</a>.</p>
