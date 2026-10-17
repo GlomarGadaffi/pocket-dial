@@ -352,6 +352,18 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     POCKETDIAL_HAS_TRUNK=${_pd_has_trunk})
 message(STATUS "SipServer outside line: anchor=${_pd_has_anchor} trunk=${_pd_has_trunk}")
 
+# SBC profile (web UI build brief, section 9): a build profile, not a fork. The 3CX
+# anchor owns routing, call handling, audio and DID mapping, so the dashboard pages
+# for them are compiled out of the embedded page (web/manifest.txt marks them
+# `@unless POCKETDIAL_PROFILE_SBC`) and the SBC copy (web/app/05-sbc.js) is compiled
+# in. UI only in this pass: the backend is untouched. Flag macro, read with defined().
+#   idf.py -D POCKETDIAL_PROFILE_SBC=ON build
+option(POCKETDIAL_PROFILE_SBC "SBC profile: dashboard without routing, call handling, audio and DID mapping" OFF)
+if(POCKETDIAL_PROFILE_SBC)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_PROFILE_SBC)
+    message(STATUS "SipServer profile: SBC (dashboard without routing, call handling, audio and DID mapping)")
+endif()
+
 # PcapCapture.hpp has always advertised itself as "compile-time tunable
 # (-DPOCKETDIAL_PCAP_RING_SIZE=N)", but nothing translated that CMake variable
 # into a compiler define, so `idf.py -D POCKETDIAL_PCAP_RING_SIZE=8` silently
