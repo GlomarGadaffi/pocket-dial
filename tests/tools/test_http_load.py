@@ -1107,7 +1107,7 @@ class DriftTest(unittest.TestCase):
         for path, period, _ in hl.POLLS:
             self.assertIn(interval[path] % int(period * 1000), html, path)
             self.assertIn('fetch("%s"' % path, html, path)
-        self.assertIn('$("pbx-modal").classList.contains("show"))fetchMohStatus()', html)    # moh: panel open only
+        self.assertIn('nav.current==="audio")fetchMohStatus()', html)    # moh: Audio section shown only
         self.assertEqual([p for p, _, always in hl.POLLS if not always], ["/api/trace", "/api/moh"])
 
     def test_the_stack_and_per_source_constants_are_the_firmwares(self):

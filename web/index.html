@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pocket-dial</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<a class="sr skip" href="#main">Skip to content</a>
+
+<div class="alarm-bar" id="alarm-bar" role="region" aria-label="Unacknowledged alarms">
+  <span id="alarm-state" class="st">&middot; IDLE</span>
+  <button type="button" class="btn" id="alarm-ack">[ ACK ]</button>
+  <span id="alarm-text" class="alarm-text" role="status"></span>
+</div>
+
+<div class="wrap">
+
+<header class="pagebar">
+  <span class="pb-title" id="pb-title">pocket-dial</span>
+  <span class="build" id="build">fw -</span>
+  <span class="fill"></span>
+  <span class="st" id="conn" role="status"><span class="g" id="conn-g" aria-hidden="true">&middot;</span><span id="conn-txt">connecting</span></span>
+  <span class="build" id="sess">SESSION: LOGGED OUT</span>
+  <span class="tag" id="role" hidden></span>
+  <button type="button" class="btn" id="auth-btn">Log in</button>
+</header>
+
+<div class="e911" id="setup-banner" role="alert" style="display:none"></div>
+<div class="e911" id="e911-route-banner" role="alert" style="display:none"><span class="lbl-s">Emergency calling</span><span class="txt"><strong>Emergency calling is not configured.</strong> This system refuses 911 and 933 calls until a telephony provider (Interconnect) is set up. A SIP trunk never carries 911 or 933. Keep another way to call 911 near every phone. <a href="#trunks-numbers">Open Trunks &amp; numbers</a></span></div>
+<div class="e911" id="e911-banner" role="status" style="display:none"><span class="lbl-s">E911</span><span class="txt"><span id="e911-banner-text">A 911 call still routes out, but nobody on site is notified. No on-site notify extensions are set.</span> <a href="#security">Set the notify list in Security</a></span></div>
+
+<div class="status-strip" role="group" aria-label="System status">
+  <span>Uptime <span class="well" id="s-uptime">-</span><span class="unit">h:m:s</span></span>
+  <span>Address <span class="well" id="s-ip">-</span></span>
+  <span>Phones <span class="well" id="s-phones">-</span><span class="unit">phones</span></span>
+  <span>Calls <span class="well" id="s-calls">-</span><span class="unit">calls</span></span>
+</div>
+
+<div class="app" id="app">
+  <nav class="nav" id="nav" aria-label="Sections">
+    <ul class="nav">
+      <li><a href="#overview" data-sec="overview"><span>Overview</span></a></li>
+      <li><a href="#extensions" data-sec="extensions"><span>Extensions</span></a></li>
+      <li><a href="#trunks-numbers" data-sec="trunks-numbers"><span>Trunks &amp; numbers</span></a></li>
+      <li><a href="#routing" data-sec="routing"><span>Routing</span></a></li>
+      <li><a href="#call-handling" data-sec="call-handling"><span>Call handling</span></a></li>
+      <li><a href="#audio" data-sec="audio"><span>Audio</span></a></li>
+      <li><a href="#security" data-sec="security"><span>Security</span></a></li>
+      <li><a href="#maintenance" data-sec="maintenance"><span>Maintenance</span></a></li>
+      <li><a href="#console" data-sec="console"><span>Live console</span></a></li>
+    </ul>
+  </nav>
+
+  <main id="main" tabindex="-1">
+
+    <!-- Shown instead of every section while the board still has the factory login. -->
+    <div id="view-setup" hidden>
+      <h2>First-time setup</h2>
+      <p class="hint">Phones cannot register and SIP stays off until a real admin login is set. Step 1 signs in with the factory default login (<span class="mono">admin</span> / <span class="mono">admin</span>). Step 2 replaces it.</p>
+      <form id="setup-login-form" class="form grp" autocomplete="on">
+        <fieldset>
+          <legend>Step 1 of 2: sign in with the factory login</legend>
+          <div class="field"><label for="setup-login-user">Username</label><input id="setup-login-user" name="username" autocomplete="username" value="admin"></div>
+          <div class="field"><label for="setup-login-pass">Password</label><input id="setup-login-pass" name="password" type="password" autocomplete="current-password"></div>
+          <div class="btns"><button type="submit" class="btn btn-primary">Sign in</button></div>
+          <p class="msg" id="setup-login-msg"></p>
+        </fieldset>
+      </form>
+      <form id="setup-form" class="form grp" autocomplete="off" hidden>
+        <fieldset>
+          <legend>Step 2 of 2: set the admin login</legend>
+          <div class="field"><label for="setup-user">Username <span class="req" aria-hidden="true">*</span></label><input id="setup-user" name="username" autocomplete="username" value="admin" required></div>
+          <div class="field"><label for="setup-pass">Password, 8 or more characters <span class="req" aria-hidden="true">*</span></label><input id="setup-pass" name="password" type="password" autocomplete="new-password" minlength="8" required></div>
+          <div class="field"><label for="setup-pass2">Repeat password <span class="req" aria-hidden="true">*</span></label><input id="setup-pass2" type="password" autocomplete="new-password" required></div>
+          <div class="field"><label for="setup-pin">DTMF PIN, 4 to 16 digits (optional)</label><input id="setup-pin" name="dtmfPin" inputmode="numeric" autocomplete="off" pattern="[0-9]{4,16}"></div>
+          <div class="btns"><button type="submit" class="btn btn-primary">Save login</button></div>
+          <p class="msg" id="setup-msg"></p>
+        </fieldset>
+      </form>
+    </div>
+
+    <section id="sec-overview" hidden tabindex="-1" aria-label="Overview">
+      <!-- @section 10-overview -->
+    </section>
+    <section id="sec-extensions" hidden tabindex="-1" aria-label="Extensions">
+      <!-- @section 20-extensions -->
+    </section>
+    <section id="sec-devices" hidden tabindex="-1" aria-label="Devices">
+      <!-- @section 30-devices -->
+    </section>
+    <section id="sec-trunks-numbers" hidden tabindex="-1" aria-label="Trunks and numbers">
+      <!-- @section 40-trunks-numbers -->
+    </section>
+    <section id="sec-routing" hidden tabindex="-1" aria-label="Routing">
+      <!-- @section 50-routing -->
+    </section>
+    <section id="sec-call-handling" hidden tabindex="-1" aria-label="Call handling">
+      <!-- @section 60-call-handling -->
+    </section>
+    <section id="sec-audio" hidden tabindex="-1" aria-label="Audio">
+      <!-- @section 70-audio -->
+    </section>
+    <section id="sec-security" hidden tabindex="-1" aria-label="Security">
+      <!-- @section 80-security -->
+    </section>
+    <section id="sec-maintenance" hidden tabindex="-1" aria-label="Maintenance">
+      <!-- @section 85-maintenance -->
+    </section>
+    <section id="sec-console" hidden tabindex="-1" aria-label="Live console">
+      <!-- @section 90-console -->
+    </section>
+
+  </main>
+</div>
+
+</div>
+
+<nav class="fkey-bar" id="fkey-bar" aria-label="Function keys">
+  <button type="button" data-sec="overview" aria-keyshortcuts="F1"><span class="fk">F1</span>MAIN</button>
+  <button type="button" data-sec="extensions" aria-keyshortcuts="F2"><span class="fk">F2</span>EXT</button>
+  <button type="button" data-sec="trunks-numbers" aria-keyshortcuts="F3"><span class="fk">F3</span>TRUNKS</button>
+  <button type="button" data-sec="routing" aria-keyshortcuts="F4"><span class="fk">F4</span>ROUTES</button>
+  <button type="button" data-sec="call-handling" aria-keyshortcuts="F6"><span class="fk">F6</span>CALLS</button>
+  <button type="button" data-sec="audio" aria-keyshortcuts="F7"><span class="fk">F7</span>AUDIO</button>
+  <button type="button" data-sec="security" aria-keyshortcuts="F8"><span class="fk">F8</span>SEC</button>
+  <button type="button" data-sec="maintenance" aria-keyshortcuts="F9"><span class="fk">F9</span>MAINT</button>
+  <button type="button" data-sec="console" aria-keyshortcuts="F10"><span class="fk">F10</span>LIVE</button>
+</nav>
+
+<!-- Persistent live regions. They exist before any text is written to them. -->
+<div class="toasts" id="toasts">
+  <div id="toast-status" role="status" aria-live="polite"></div>
+  <div id="toast-alert" role="alert"></div>
+</div>
+
+<dialog id="confirm-dlg" class="gdlg" aria-labelledby="confirm-t" aria-describedby="confirm-d">
+  <form method="dialog" class="gdlg-body">
+    <fieldset>
+      <legend id="confirm-t"></legend>
+      <p id="confirm-d"></p>
+      <div class="gdlg-actions">
+        <button type="submit" class="btn" value="cancel" id="confirm-no" autofocus>Cancel</button>
+        <button type="submit" class="btn btn-primary" value="confirm" id="confirm-yes">Confirm</button>
+      </div>
+    </fieldset>
+  </form>
+</dialog>
+
+<dialog id="login-dlg" class="gdlg" aria-labelledby="login-t">
+  <form id="login-form" class="gdlg-body" autocomplete="on">
+    <fieldset>
+      <legend id="login-t">Log in</legend>
+      <div class="field"><label for="login-user">Username</label><input id="login-user" name="username" autocomplete="username"></div>
+      <div class="field"><label for="login-pass">Password</label><input id="login-pass" name="password" type="password" autocomplete="current-password"></div>
+      <p class="msg" id="login-msg"></p>
+      <div class="gdlg-actions">
+        <button type="button" class="btn" id="login-cancel">Cancel</button>
+        <button type="submit" class="btn btn-primary">Log in</button>
+      </div>
+    </fieldset>
+  </form>
+</dialog>
+
+<script src="app/00-core.js"></script>
+<script src="app/10-overview.js"></script>
+<script src="app/20-extensions.js"></script>
+<script src="app/30-devices.js"></script>
+<script src="app/40-trunks-numbers.js"></script>
+<script src="app/50-routing.js"></script>
+<script src="app/60-call-handling.js"></script>
+<script src="app/70-audio.js"></script>
+<script src="app/80-security.js"></script>
+<script src="app/85-maintenance.js"></script>
+<script src="app/90-console.js"></script>
+</body>
+</html>
