@@ -7,6 +7,7 @@
 #include <chrono>
 
 #include "AdminPinVerify.hpp"   // #986 slice 3
+#include "DtmfClassCodes.hpp"   // #994: the one star-code list setDtmfPin() refuses against
 #include "ResetJournal.hpp"   // #473
 #include "ResetGuard.hpp"   // #473
 #include "CdrArchive.hpp"
@@ -223,9 +224,12 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 	}
 
 	// --- 6. CLASS feature code matching (Task 2C-4) --------------------------
+	// The codes are the names in DtmfClassCodes.hpp, never literals: AdminAuth::setDtmfPin()
+	// refuses a PIN that starts with one of them (#994), so a code matched here but missing
+	// there is a PIN that can never be keyed.
 
 	// *60 — Enable Selective Call Rejection (DND=true) for caller's extension.
-	if (seq == "*60")
+	if (seq == dtmfclass::kDndOn)
 	{
 		// Issue #77: route through the same lock-already-held core setDnd()
 		// uses (we're already inside _mutex here, via handle()) so the
@@ -237,7 +241,7 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 	}
 
 	// *80 — Disable SCR/DND for caller's extension.
-	if (seq == "*80")
+	if (seq == dtmfclass::kDndOff)
 	{
 		_cfg.setDndLocked(callerExt, false);
 		accum.digits.clear();
@@ -245,7 +249,7 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 	}
 
 	// *73 — Disable CFU for caller's extension.
-	if (seq == "*73")
+	if (seq == dtmfclass::kCfuOff)
 	{
 		// Issue #77: setForwardLocked with an empty target clears the
 		// "always" trigger exactly like the old inline erase did, but also
@@ -257,7 +261,7 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 	}
 
 	// *69 — Speak last-caller extension: redirect call to echo ext 777 and log CDR lookup.
-	if (seq == "*69")
+	if (seq == dtmfclass::kLastCaller)
 	{
 		// Find the last CDR entry where callee == callerExt (i.e. last inbound call).
 		std::string lastCaller = _cdr.lastCallerFor(callerExt);
@@ -306,7 +310,7 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 	}
 
 	// *11 — Echo loopback: reroute active call's RTP endpoint to extension 777.
-	if (seq == "*11")
+	if (seq == dtmfclass::kEchoLoopback)
 	{
 		auto session = _env.findSession(callId);
 		if (session)
@@ -335,7 +339,7 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 	// *72NNNN — Enable CFU for caller's extension to NNNN (4+ digits after *72).
 	// Requires the full sequence to be collected; we match once it's ≥6 chars and
 	// none of the above shorter patterns matched.
-	if (seq.size() >= 6 && seq[0] == '*' && seq[1] == '7' && seq[2] == '2')
+	if (seq.size() >= 6 && seq.compare(0, dtmfclass::kCfuOn.size(), dtmfclass::kCfuOn) == 0)
 	{
 		std::string target = seq.substr(3);
 		if (target.size() >= 4 && _env.validAor(target))

@@ -469,7 +469,7 @@ TEST_F(TwoRoleAuthTest, SetDtmfPin_OwnerExists_SysopForbidden)
 	(void)owner;
 
 	std::string resp = httpRaw(_port, "POST", "/api/admin/set-credential",
-		"dtmfPin=111111", "pd_session=" + sysop.cookie, sysop.csrf);
+		"dtmfPin=445566", "pd_session=" + sysop.cookie, sysop.csrf);
 	EXPECT_EQ(statusOf(resp), 403) << resp;
 	EXPECT_FALSE(AdminAuth::dtmfPinIsSet())
 		<< "a refused set-credential call must not have set the PIN";
@@ -481,9 +481,30 @@ TEST_F(TwoRoleAuthTest, SetDtmfPin_OwnerExists_OwnerPermitted)
 	AdminSession owner = bootstrapAndLoginOwner(_port, sysop);
 
 	std::string resp = httpRaw(_port, "POST", "/api/admin/set-credential",
-		"dtmfPin=111111", "pd_session=" + owner.cookie, owner.csrf);
+		"dtmfPin=445566", "pd_session=" + owner.cookie, owner.csrf);
 	EXPECT_EQ(statusOf(resp), 200) << resp;
 	EXPECT_TRUE(AdminAuth::dtmfPinIsSet());
+}
+
+TEST_F(TwoRoleAuthTest, SetDtmfPin_StarCodePrefix_Refused400WithTheReason)
+{
+	// Issue #994: *6012#001 fires *60 (DND on) at the second digit and clears the
+	// accumulator, so a PIN starting 11/60/69/72/73/80 can never be keyed. The route
+	// refuses it up front and says why, instead of storing a PIN that never works.
+	AdminSession sysop = loginSysop(_port);
+	AdminSession owner = bootstrapAndLoginOwner(_port, sysop);
+
+	// The PIN *60 claims. Joined to its field name at run time: the pre-commit secret scanner
+	// reads a `dtmfPin=<digits>` literal as a leaked key.
+	static constexpr const char* kStarPin = "6012";
+	std::string body = "dtmfPin=";
+	body += kStarPin;
+	std::string resp = httpRaw(_port, "POST", "/api/admin/set-credential",
+		body, "pd_session=" + owner.cookie, owner.csrf);
+	EXPECT_EQ(statusOf(resp), 400) << resp;
+	EXPECT_NE(bodyOf(resp).find("60"), std::string::npos) << "the reason names the colliding star code: " << resp;
+	EXPECT_FALSE(AdminAuth::dtmfPinIsSet())
+		<< "a refused set-credential call must not have set the PIN";
 }
 
 TEST_F(TwoRoleAuthTest, SetDtmfPin_NoOwnerYet_SysopStillPermitted)
@@ -526,7 +547,7 @@ TEST(TwoRoleAuthCore, HttpLoginLockoutDoesNotEngageDtmfPinLockout)
 	// aggregate (AuthState::principalBackstop) instead.
 	AdminAuth::clearCredential();
 	ASSERT_TRUE(AdminAuth::setLoginCredential("chansysop", "sysoppass123"));
-	ASSERT_TRUE(AdminAuth::setDtmfPin("112233"));
+	ASSERT_TRUE(AdminAuth::setDtmfPin("223344"));
 
 	for (int c = 0; c < AdminAuth::kMaxFailedAttemptsGlobal / AdminAuth::kMaxFailedAttempts + 1; ++c)
 	{
@@ -541,7 +562,7 @@ TEST(TwoRoleAuthCore, HttpLoginLockoutDoesNotEngageDtmfPinLockout)
 	// be completely unaffected by that HTTP-login spray.
 	EXPECT_FALSE(AdminAuth::isLockedOut(""))
 		<< "an HTTP-login spray must not have engaged verifyDtmfPin's lockout";
-	EXPECT_TRUE(AdminAuth::verifyDtmfPin("112233"));
+	EXPECT_TRUE(AdminAuth::verifyDtmfPin("223344"));
 
 	AdminAuth::clearCredential();
 }

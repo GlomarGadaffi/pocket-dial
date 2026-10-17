@@ -488,8 +488,11 @@ login preamble (including setup completion) to have run first.
   stored credential unchanged.
 * TC-SET-06 (DTMF PIN is separate): POST `/api/admin/set-credential` with
   `dtmfPin=1234` alone → `200`. A 3-digit or non-numeric PIN → `400 {"error":"DTMF PIN must
-  be 4-16 digits"}`. Setting it must not alter the login credential, and not setting it must
-  leave the `*PIN#code` menu unreachable.
+  be 4-16 digits"}`. `dtmfPin=6012` (any PIN starting `11`, `60`, `69`, `72`, `73` or `80`) →
+  `400 {"error":"DTMF PIN must not start with 60: the *60 feature code would fire before the
+  PIN completes"}` naming the colliding code (Issue #994), and the PIN stays unset. Setting it
+  must not alter the login credential, and not setting it must leave the `*PIN#code` menu
+  unreachable.
 
 ### Edge Case & Boundary Validation Tests
 * TC-ED-01 (Payload Too Large): POST a body larger than 16 KB (16,384 bytes) to

@@ -17,6 +17,7 @@
 
 #include "AdminAuth.hpp"
 #include "ResetGuard.hpp"   // #986 slice 4: the setters refuse to commit while a factory reset runs
+#include "DtmfClassCodes.hpp"   // #994: the star codes a PIN must not start with
 
 #include <array>
 #include <atomic>
@@ -665,7 +666,10 @@ namespace
 				return false;
 			}
 		}
-		return true;
+		// #994: *PIN#code and the CLASS star codes share one digit accumulator, and the star
+		// codes match before any '#' arrives, so a PIN starting 60 fires *60 at its second
+		// digit and never completes. Refused here, at set time, for every setter.
+		return dtmfclass::claiming(p).empty();
 	}
 
 	uint64_t nowMs()
