@@ -5,6 +5,7 @@
 #include "BenchProbe.hpp"        // #384 H1: /api/bench/fault (docs/BENCH_PROBE.md)
 #endif
 #include "DialPlan.hpp"          // Issue #69: dial-rule validation shared with setDialRule
+#include "DtmfClassCodes.hpp"    // Issue #994: the star code a DTMF PIN must not start with
 #include "ServiceExtensions.hpp" // Issue #202: reserved engine-owned pseudo-AORs
 #include "TelephonyApiConfig.hpp"
 #include "DidMapping.hpp"
@@ -5689,6 +5690,22 @@ void HttpServer::sendApiAdminSetCredential(int sock, const HttpRequest& req)
 		{
 			sendResponse(sock, 403, "Forbidden", "application/json",
 			             "{\"error\":\"owner privilege required to set the DTMF admin PIN\"}");
+			return;
+		}
+		// Issue #994: *PIN#code and the CLASS star codes share one digit accumulator, and the
+		// star codes match before any '#' arrives, so a PIN starting 60 fires *60 at its
+		// second digit and can never authenticate. setDtmfPin() refuses it too (same table,
+		// DtmfClassCodes.hpp); this names the code so the operator can read why. Fixed buffer:
+		// the code is at most 3 chars and the message is constant, so no heap here.
+		const std::string_view claimed = dtmfclass::claiming(dtmfPin);
+		if (!claimed.empty())
+		{
+			char body[128];
+			snprintf(body, sizeof(body),
+			         "{\"error\":\"DTMF PIN must not start with %.*s: the %.*s feature code would fire before the PIN completes\"}",
+			         static_cast<int>(claimed.size() - 1), claimed.data() + 1,
+			         static_cast<int>(claimed.size()), claimed.data());
+			sendResponse(sock, 400, "Bad Request", "application/json", body);
 			return;
 		}
 		if (!AdminAuth::setDtmfPin(dtmfPin))

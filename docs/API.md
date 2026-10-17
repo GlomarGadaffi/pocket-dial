@@ -524,13 +524,14 @@ gates 1-3.
 * **Request Parameters** (all optional individually, but the request must change *something*):
   * `username`: 1-32 characters, no whitespace and no control characters. Must be sent **together with** `password`. Rejected (`400`) if it collides with the current **owner** username (Issue #173); the two principals must stay distinguishable.
   * `password`: 8-128 characters. Must be sent **together with** `username`.
-  * `dtmfPin`: 4-16 **digits**. Independent of the login credential; sending it alone changes only the DTMF PIN. Empty means "leave the DTMF PIN as it is".
+  * `dtmfPin`: 4-16 **digits**, not starting with the digits of a CLASS star code (`11`, `60`, `69`, `72`, `73` or `80`; the list is `src/SIP/DtmfClassCodes.hpp`). Issue #994: the keypad entry is `*PIN#code`, and the star codes are matched on the same digits before any `#` arrives, so such a PIN would fire the star code at its second digit and never complete. Independent of the login credential; sending it alone changes only the DTMF PIN. Empty means "leave the DTMF PIN as it is".
 * Response Content-Type: `application/json`
 * Response Status Codes:
   * `200 OK`: `{"status":"ok","provisioned":true,"needsSetup":false}`
   * `400 Bad Request`: `{"error":"username and password must both be provided together"}`. Exactly one of the two was sent.
   * `400 Bad Request`: `{"error":"invalid username or password"}`. A field is outside its length bounds, the username contains whitespace/control characters, or it collides with the owner username.
   * `400 Bad Request`: `{"error":"DTMF PIN must be 4-16 digits"}`
+  * `400 Bad Request`: `{"error":"DTMF PIN must not start with 60: the *60 feature code would fire before the PIN completes"}`, naming whichever star code the PIN collides with (Issue #994). Nothing is stored; an already-stored PIN is never re-checked.
   * `400 Bad Request`: `{"error":"nothing to change"}`. Neither a credential pair nor a PIN was supplied.
   * `403 Forbidden`: `{"error":"owner privilege required to set the DTMF admin PIN"}`. **Only for a non-empty `dtmfPin`**, and **only once an owner account exists** (Issue #173: the DTMF admin menu's `999` factory-reset code, see `DtmfFeatureCodes.cpp`, wipes the entire NVS flash, including the owner credential itself, so planting a PIN is an owner-only action once there is an owner to protect). Before any owner exists, the no-owner-yet fallback still lets the sysop doing initial setup set a PIN. `username`/`password` changes are unaffected, still sysop-level.
   * `401`/`403`: gates 1-3 as in §0.1.

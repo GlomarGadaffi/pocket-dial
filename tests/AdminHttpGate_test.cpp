@@ -445,6 +445,25 @@ TEST(AdminAuth, SetDtmfPinRejectsNonDigitsOrOutOfBoundsLength)
 	AdminAuth::clearCredential();
 }
 
+TEST(AdminAuth, SetDtmfPinRefusesAPinAClassStarCodeWouldSwallow)
+{
+	// Issue #994: the keypad entry is *PIN#code, and *11 *60 *69 *72 *73 *80 are matched on
+	// the same digit accumulator (DtmfFeatureCodes.cpp step 6) before a '#' has arrived. A
+	// PIN that starts with one of those pairs fires the star code at its second digit and the
+	// sequence is cleared, so it can never authenticate. Refuse it when it is set.
+	AdminAuth::clearCredential();
+	for (const char* pin : {"1123", "6012", "6912", "7212", "7312", "8012", "60000000"})
+	{
+		EXPECT_FALSE(AdminAuth::setDtmfPin(pin)) << pin << ": *" << pin << " is a CLASS star code before the PIN completes";
+		EXPECT_FALSE(AdminAuth::dtmfPinIsSet()) << pin << ": a refused PIN must not have been stored";
+	}
+	for (const char* pin : {"4321", "1601", "0600", "7121", "445566"})
+	{
+		EXPECT_TRUE(AdminAuth::setDtmfPin(pin)) << pin << ": only the first two digits matter";
+	}
+	AdminAuth::clearCredential();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CSRF tokens, the centralised gate, and the security headers.
 //
