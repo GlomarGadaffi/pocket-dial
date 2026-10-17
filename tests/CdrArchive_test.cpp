@@ -406,3 +406,30 @@ TEST(CdrArchiveSingleton, WipeAllWithNoSinkInstalledIsAHarmlessNoOp)
 	cdrarchive::wipeAll();   // must not crash
 	SUCCEED();
 }
+
+// #993: since #992 the DTMF factory reset (999) runs on sip_server_task, under
+// its 5 s task watchdog. The SD sweep behind wipeAll() feeds that watchdog once
+// per directory entry through resetguard::sweepTick(). The real readdir loop is
+// ESP-only (FatFsSink); this sink stands in for it and ticks once per entry,
+// which is what tests/tools/test_wipe_loop_feeds_wdt.py pins the real loops to.
+// On the host the tick is a counter; on ESP it is esp_task_wdt_reset().
+TEST(CdrArchiveSingleton, WipeAllFeedsTheWatchdogOncePerSweptEntry)
+{
+	constexpr unsigned kEntries = 7;
+	struct SweepingSink : cdrarchive::Sink
+	{
+		void append(const cdrarchive::QueuedLine&) override {}
+		void wipe() override
+		{
+			for (unsigned i = 0; i < kEntries; ++i) resetguard::sweepTick();
+		}
+	};
+	SweepingSink sink;
+	ScopedSink guard(&sink);
+	resetguard::resetForTest();
+	EXPECT_EQ(resetguard::sweepTicksForTest(), 0u);
+	cdrarchive::wipeAll();
+	EXPECT_EQ(resetguard::sweepTicksForTest(), kEntries)
+		<< "the sweep must feed the task watchdog once per entry it removes";
+	resetguard::resetForTest();
+}
