@@ -620,7 +620,7 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
         <div class="msg warn">&#9888; Still on the default login. Set a real username, password, and (optional) DTMF admin PIN before doing anything else.</div>
         <div class="field"><label for="adm-setup-user">New username</label><input type="text" id="adm-setup-user" autocomplete="username" value="admin"></div>
         <div class="field"><label for="adm-setup-pass">New password (min 8 chars)</label><input type="password" id="adm-setup-pass" autocomplete="new-password"></div>
-        <div class="field"><label for="adm-setup-dtmfpin">DTMF admin PIN (4-16 digits, optional: the phone-keypad admin menu stays disabled without one)</label><input type="password" id="adm-setup-dtmfpin" inputmode="numeric" autocomplete="off"></div>
+        <div class="field"><label for="adm-setup-dtmfpin">DTMF admin PIN (4-16 digits, optional: the phone-keypad admin menu stays disabled without one; must not start with 11, 60, 69, 72, 73 or 80, the star codes that would fire first)</label><input type="password" id="adm-setup-dtmfpin" inputmode="numeric" autocomplete="off"></div>
         <button class="btn primary" onclick="adminCompleteSetup()">Complete Setup</button>
       </div>
       <div id="admin-loggedin" style="display:none">
@@ -636,7 +636,7 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
           <button class="btn primary" onclick="adminChangeCredential()">Save</button>
         </div>
         <div id="admin-changedtmfpin" style="display:none;margin-top:8px">
-          <div class="field"><label for="adm-changedtmfpin-val">New DTMF PIN (4-16 digits)</label><input type="password" id="adm-changedtmfpin-val" inputmode="numeric" autocomplete="off"></div>
+          <div class="field"><label for="adm-changedtmfpin-val">New DTMF PIN (4-16 digits; must not start with 11, 60, 69, 72, 73 or 80, the star codes that would fire first)</label><input type="password" id="adm-changedtmfpin-val" inputmode="numeric" autocomplete="off"></div>
           <button class="btn primary" onclick="adminChangeDtmfPin()">Save</button>
         </div>
       </div>
