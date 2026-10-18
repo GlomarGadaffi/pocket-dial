@@ -422,7 +422,7 @@ std::string DidMapping::persistNow()
 #if defined(_WIN32)
 	// No POSIX permission model; honest in-memory only (the file would be
 	// world-readable). The table still works for the session — same
-	// trade-off TelephonyApiConfig::persist() documents for _WIN32.
+	// trade-off TelephonyApiConfig::persistNow() documents for _WIN32.
 	return "";
 #else
 	// Create/truncate with 0600 BEFORE any byte hits the disk.

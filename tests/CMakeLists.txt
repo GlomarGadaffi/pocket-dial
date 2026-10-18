@@ -635,6 +635,9 @@ add_executable(sip_parser_tests
     # Issue #986 slice 4: the DID table stages its snapshot for that writer (set,
     # remove and the import clear) instead of committing 16 keys under _mutex.
     DidMapStaging_test.cpp
+    # Issue #997: the telephony API config stages everything but the client secret for
+    # that writer; the secret is written synchronously, only when it changed.
+    TelephonyStaging_test.cpp
     # Issue #363: the secrets a factory reset must erase.
     ../src/Helpers/FactoryReset.cpp
     # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2

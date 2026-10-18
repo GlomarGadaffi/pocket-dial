@@ -6594,6 +6594,10 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		// routeDn are gated, applied further below if a password was given).
 		// keepSecret=true always: the plaintext half never carries the
 		// secret, so this pass must never clear an existing one.
+		// #997: each call below only STAGES the table (without any secret) for the
+		// NVS writer, so the burst of them leaves the writer one snapshot, and with
+		// keepSecret=true none of them writes a secret either: the import holds
+		// _mutex for no telephony flash I/O at all. A "" means staged, not on flash.
 		for (const auto& slot : pt->arrayOr("telephonyConfig"))
 		{
 			int idxI = slot.intOr("index", -1);
