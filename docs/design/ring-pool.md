@@ -1,10 +1,12 @@
 # Design: jitter-ring storage and a static ring pool (#946)
 
+This document decides whether the jitter rings need a static pool. Nothing in it is measured on a board; sizes are arithmetic from the code.
+
 Status: Proposed, for vote. Design only: no code, no hardware, nothing posted to GitHub.
+
 Author: BigDog (Claude Sonnet 5.5), 2026-10-09. Source: #940 item 6 (committee 2-1 for "static ring pool at init").
 
-Every `file:line` below was read on `origin/main` 7bcf952f. #946 quotes c4960c7; main is 4 commits
-past it. Nothing in this document is measured on a board. Sizes are arithmetic from the code.
+Every `file:line` below was read at commit 7bcf952f, which is 4 commits after c4960c7, the commit #946 quotes.
 
 ## 0. The finding that changes the question
 
@@ -18,7 +20,7 @@ Every ring has an owner that is built once at boot, and a call only clears it.
 | `MAX_PORTS = 8` (MixBus.hpp:22) | `MAX_PORTS = POCKETDIAL_CONF_LEGS = 4` (MixBus.hpp:27, PoolConfig.hpp:204) |
 | ConferenceRoom: 20 ports x 3,200 B = 64 KB | 4 legs. "20 / 64 KB" survives only in the comment at PlayoutBuffer.hpp:49-54 |
 | the room is created lazily (also RequestsHandler.hpp:1891-1893) | built in the constructor at boot, RequestsHandler.cpp:240-246 (#479) |
-| "#428 #48's PSRAM allocator" is an alternative to a pool | already merged: PsramAllocator.hpp, used at PlayoutBuffer.hpp:55 |
+| "the PSRAM allocator" (discussion #428, comment 18581389) is an alternative to a pool | already merged: PsramAllocator.hpp, used at PlayoutBuffer.hpp:55 |
 
 So the committee voted on a premise that is stale. Section 10 puts the vote again with the facts.
 
@@ -53,7 +55,7 @@ why a whole-`startBridge` allocation test is the wrong test (section 8).
 
 ## 2. The goal
 
-No ring allocation after init, on any task (#427). On main this already holds, by construction. What is left:
+No ring allocation after init, on any task (discussion #427). On main this already holds, by construction. What is left:
 
 1. Nothing pins it. A change that constructs a `MediaBridge` or `MixBus` per call would pass today's tests.
 2. 12,800 B of rings (4 conference-leg bridges) are allocated and never read. PSRAM on S3, absent on constrained.

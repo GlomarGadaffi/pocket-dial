@@ -1,8 +1,16 @@
 # HTTPS for the dashboard (#179): design for vote, no code
 
-Status: Proposed, for vote. Nothing here is built or decided. Baseline: `main` at 7bcf952f (2026-10-09); every `file:line`
-is at that commit. `HS.cpp`/`HS.hpp` = `src/Helpers/HttpServer.{cpp,hpp}`, `SD` = `sdkconfig.defaults`,
-`TM` = `docs/THREAT_MODEL.md`, `CF` = `CONTRIBUTING_FIRMWARE.md`. "IDF" paths are the local `~/esp/esp-idf-v6.0.1/components/`.
+Proposed design for TLS on the dashboard (#179), for a vote. Nothing here is built or decided.
+
+## Conventions
+
+The baseline is `main` at 7bcf952f (2026-10-09). Every `file:line` is at that commit.
+
+- `HS.cpp` and `HS.hpp` are `src/Helpers/HttpServer.{cpp,hpp}`.
+- `SD` is `sdkconfig.defaults`.
+- `TM` is `docs/THREAT_MODEL.md`.
+- `CF` is `CONTRIBUTING_FIRMWARE.md`.
+- "IDF" paths are the local `~/esp/esp-idf-v6.0.1/components/`. They are outside the repo.
 
 ## 1. Problem and the stated use case
 
@@ -15,7 +23,8 @@ RAM/CPU, cert provisioning, protects only the dashboard); the honest scope is "w
 requirement", because WPA2 is the lever for the SoftAP and the Ethernet builds have no AP (`TM:485-487`). The
 2026-10-09 comment: no PR on purpose, committee verdict DEFER (#942), blocker is design (PSRAM task + static pool).
 
-Real:
+### Real
+
 - **The gap.** No TLS in the server: "zero mbedtls/esp_tls references" (`HS.hpp:66-67`). It is a raw-socket server
   (`HS.cpp:157-194` socket/bind/listen, `:415` accept, `:492-505` thread per connection). Wired builds have no link-layer
   lever (`TM:485-487`), so HTTPS would be their only transport control.
@@ -24,7 +33,8 @@ Real:
   PII (`HS.cpp:4670`); they are written by `PUT /api/e911-config` (`HS.cpp:1232-1238`), and the form is pinned by
   `tests/DashboardE911Form_test.cpp:11-23`.
 
-Speculative:
+### Speculative
+
 - **"Some sites need HTTPS for policy."** No site, no policy text. The open question that decides the option: does that
   policy accept TLS terminated by a proxy in front of the board, or must the device terminate it? (Section 8.)
 - **Pinning by fingerprint.** A browser cannot pin a self-signed cert; only an API client can. And a fingerprint read
@@ -57,9 +67,10 @@ Speculative:
 - Handlers on those threads write flash: `PUT /api/e911-config` -> `PbxFeatureConfig.cpp:786-820` (`persistE911`),
   Wi-Fi credentials (`HS.cpp:4508-4511`), OTA (`OtaUpdater.cpp`, `esp_ota_write`).
 - Auth: `requireAdmin` = same-origin, session, CSRF (`HS.cpp:4278-4313`). `isSameOrigin` strips the scheme
-  (`:4177-4181`) and accepts only the device IP, `192.168.4.1`, `pocketdial.local`, `localhost` (`:4195-4203`).
+  (`:4490-4494`) and accepts only the device IP, `192.168.4.1`, `pocketdial.local`, `localhost` and `127.0.0.1`
+  (`:4508-4514`).
 - HTTP cannot be unbound: phone provisioning profiles point at `http://` (`HS.cpp:3268`), the captive-portal redirect is
-  `http://192.168.4.1/` (`:904`), `/metrics` is scraped ungated (`:944`).
+  `http://192.168.4.1/` (`:1115`), `/metrics` is scraped ungated (`:1155`).
 - mbedTLS: `MBEDTLS_DYNAMIC_BUFFER` and `EXTERNAL_MEM_ALLOC` are on (`SD:220-221`); the note that a 4th concurrent TLS
   context alloc-failed on internal RAM (`mbedtls_ssl_setup -0x008D`, drawbridge #94) is at `SD:211-217`.
 - TLS workers already in PSRAM (and they may never flash-write, `PsramTask.hpp:31-37`): `smtp_worker`, 12,288 B, one TLS session in flight (`SmtpClient.cpp:575-579`,
@@ -70,18 +81,23 @@ Speculative:
 
 ## 3. Memory budget
 
-**Internal DRAM (S3).** Most recent measurement: v1.5.0 release soak, 4.6 h, lowest free internal 110 KB, smallest
+### Internal DRAM (S3)
+
+Most recent measurement: v1.5.0 release soak, 4.6 h, lowest free internal 110 KB, smallest
 idle largest block 53 KB (`CHANGELOG.md:33`; "test rig", dashboard over plain HTTP, no TLS server). Older, on `.244`
 at #366/#368, before the PSRAM moves: ~27.7 KB total free, largest block 7.9-9.2 KB, and 8 concurrent connections at 8 KB
 stacks took the minimum to 7,412 B, 12 caused DMA allocation failures (`HS.hpp:55-64`, `:85-93`). The number moves
 by 4x between eras; the bench must measure the target. Release-soak floors: 16,384 B free, 8,192 B largest block
 (`tools/soak/soak_verdict.py:71-72`). Not used: `SCALING.md:106` (290-320 KB, plain ESP32), `BENCHMARKS.md:131-135` (modeled).
 
-**One TLS session.** The sdkconfig notes give a failure, not a byte count: the 4th concurrent context failed on
+### One TLS session
+
+The sdkconfig notes give a failure, not a byte count: the 4th concurrent context failed on
 internal RAM before `DYNAMIC_BUFFER` + `EXTERNAL_MEM_ALLOC` (`SD:211-217`). Bytes are derived, not measured:
-- Record buffers: `IN_CONTENT_LEN` 16,384 + `OUT_CONTENT_LEN` 4,096 = 20,480 B. Source: a built S3 `sdkconfig`
-  (`~/w/c699-build-heap-poisoning/sdkconfig`, 2026-09-28, an old worktree, not main HEAD); IDF defaults match
-  (`mbedtls/Kconfig:209-225`). Browsers do not negotiate smaller fragments, so IN stays 16 KB.
+- Record buffers: `IN_CONTENT_LEN` 16,384 + `OUT_CONTENT_LEN` 4,096 = 20,480 B. Source: a built S3 `sdkconfig` that is
+  off-repo (`~/w/c699-build-heap-poisoning/sdkconfig`, 2026-09-28, an old worktree, not main HEAD). No committed
+  `sdkconfig.defaults*` file sets either key, so the figure cannot be checked from this checkout. IDF defaults match
+  (`mbedtls/Kconfig:209-225`, off-repo). Browsers do not negotiate smaller fragments, so IN stays 16 KB.
 - With `EXTERNAL_MEM_ALLOC`, every mbedTLS allocation is PSRAM-only (`mbedtls/port/esp_mem.c:18-19`).
 - Planning figure: **40 KB PSRAM per session** (2x the buffers, for context, handshake and cert chain). Unmeasured.
 - Internal cost per session: one TCB (`StaticTask_t` is always internal, `PsramTask.hpp:145`), one lwIP socket (pool of
@@ -90,10 +106,14 @@ internal RAM before `DYNAMIC_BUFFER` + `EXTERNAL_MEM_ALLOC` (`SD:211-217`). Byte
 - Stack: no handshake stack figure exists. Every TLS path in the tree gets 12 KB (`SmtpClient.cpp:575-579`,
   `HS.cpp:6735-6741`); the connection thread has 4 KB.
 
-**Pool size.** One session slot to start (section 5): 40 KB + 12 KB stack = ~52 KB PSRAM, 0.6% of 8 MB. Two: ~104 KB.
+### Pool size
+
+One session slot to start (section 5): 40 KB + 12 KB stack = ~52 KB PSRAM, 0.6% of 8 MB. Two: ~104 KB.
 Matching the plain cap of 4 is ~208 KB (2.5%) but allows 4 simultaneous software handshakes, which the S3 cannot afford.
 
-**Why a static pool is required.** Thread-per-connection (`HS.cpp:492-505`) means each TLS connection creates a task.
+### Why a static pool is required
+
+Thread-per-connection (`HS.cpp:492-505`) means each TLS connection creates a task.
 - Internal stack: 4 x 12 KB is ~49 KB of the 110 KB lowest-free, and it needs 12 KB contiguous when the largest block was
   7.9-9.2 KB (`HS.hpp:55-64`): the "pthread: Failed to create task!" failure already seen once.
 - PSRAM stack for the handler: forbidden, because these threads run NVS and OTA writers (section 2, `PsramTask.hpp:31-37`).
@@ -106,7 +126,8 @@ Matching the plain cap of 4 is ~208 KB (2.5%) but allows 4 simultaneous software
   (`SD:220`; IDF `Kconfig:227-242`), per record. A literal zero needs `DYNAMIC_BUFFER` off, which is global to the SMTP and
   anchor clients. Not proposed. If the vote wants the literal rule, say so.
 
-**Does it close?**
+### Does it close
+
 - **ESP32-S3 with PSRAM (S3R8): yes on RAM, conditionally.** PSRAM is ~1% for one slot (the S3 images require 8 MB OPI,
   `SD:14-52`). Internal closes only if the TLS task is a pump with a PSRAM stack, one handshake at a time, and the
   admission gate in section 5 holds. The binding limit is CPU, not memory: software ECDHE is ~1 s per handshake with no
@@ -139,8 +160,8 @@ Costs that apply to (b) and (c) alike:
   both collapse: one attacker's failed HTTPS logins lock out every HTTPS user. (b) can re-key only the login bucket, via a peer
   header `HttpServer` trusts only from loopback; `TlsFront` enforces its own per-source limit at its accept (trivial with a
   pool of 1), and `HttpServer` sees TLS as one source, which invariant 3 relies on. (c) can do neither; the proxy must rate-limit.
-- **Host and Origin.** `isSameOrigin` has a fixed host list (`HS.cpp:4195-4203`) and the captive check 302s any other
-  `Host` to `http://192.168.4.1/` (`:896-904`). A proxy at `dash.example.com` breaks every mutating call until it rewrites
+- **Host and Origin.** `isSameOrigin` has a fixed host list (`HS.cpp:4508-4514`) and the captive check 302s any other
+  `Host` to `http://192.168.4.1/` (`:1107-1115`). A proxy at `dash.example.com` breaks every mutating call until it rewrites
   both headers to a name the device accepts.
 - **Cleartext hop.** (c)'s proxy-to-board hop is plain HTTP, acceptable only on a protected segment; :80 stays open unless firewalled.
 
@@ -161,7 +182,9 @@ Invariants for (b), none optional:
    `PsramTask.hpp:64-72`), lazily on first enable (not at boot), and are refused while an emergency call is live, like
    factory reset and reboot (`HS.cpp:4573`, `:7387`).
 
-**The check that stops a handshake draining internal RAM during a call.** One pure function, `admit(state) -> Admit |
+### The admission check
+
+The check that stops a handshake draining internal RAM during a call. One pure function, `admit(state) -> Admit |
 Refuse(reason)`, evaluated on the terminator's accept thread before the slot is claimed and before any handshake bytes are
 read, and again between handshake steps (`mbedtls_ssl_handshake_step`; worst-case residual is one crypto step). In order:
 1. Flag on and the single slot is free (pool = 1), else refuse `busy`.
@@ -173,6 +196,21 @@ read, and again between handshake steps (`mbedtls_ssl_handshake_step`; worst-cas
    build refuses while any call session is live.
 4. `freeInternal >= 16,384 + measuredHandshakePeak` and `largestBlock(INTERNAL|DMA) >= 8,192 + measuredHandshakePeak`
    (floors from `soak_verdict.py:71-72`; the peak is a bench output), and PSRAM free >= 2 sessions, else refuse `heap`.
+
+The checks run in the order above, as this flowchart shows:
+
+```mermaid
+flowchart TD
+    A[Handshake requested] --> B{Flag on and single slot free?}
+    B -- no --> R1[Refuse: busy]
+    B -- yes --> C{No live emergency call?}
+    C -- no --> R2[Refuse: emergency]
+    C -- yes --> D{Anchor handshake headroom?}
+    D -- no --> R3[Refuse: cpu]
+    D -- yes --> E{Heap floors and PSRAM met?}
+    E -- no --> R4[Refuse: heap]
+    E -- yes --> F[Admit]
+```
 
 Refusal is a TCP close with no handshake (no 503 inside TLS), counted per reason in `/api/status`. Priority: the pump runs
 below the anchor workers and SMTP (prio 4) and SIP (prio 5, `main/esp_main.cpp:543`), at 3, never on core 1 on display builds
@@ -186,7 +224,8 @@ Reject (a).** Reasons: the stated use case is wired sites with an HTTPS policy, 
 Device-terminated self-signed TLS keeps TM section 6 objections 1 and 3 and buys only passive-sniffing protection while
 HTTP stays bound. (b) is designed here so the decision can flip without a new design round.
 
-**Smallest honest first slice.**
+### Smallest honest first slice
+
 - Slice 0 (recommended, docs only): a reverse-proxy recipe (`Host` and `Origin` rewrite, `Secure` cookie flag added at the
   proxy, firewall :80 to the proxy, own rate limits), linked from TM section 6 with "verdict unchanged, optional layer".
 - Slice 1 (only if the poll picks (b)): inert plumbing, host-tested. `https_enabled` u8 NVS key, default false, copied from
@@ -197,7 +236,9 @@ HTTP stays bound. (b) is designed here so the decision can flip without a new de
 
 ## 7. Test plan
 
-Host-testable (CMake gtest, per `CF:283` onward; HTTP test ports from a new disjoint block, `CF:348`):
+### Host
+
+CMake gtest, per `CF:283` onward. HTTP test ports come from a new disjoint block, `CF:348`.
 1. `admit()` table: emergency live refuses regardless of every other input; each refusal reason alone; slot busy; floors at
    boundary, one below, one above; refusal happens before slot claim.
 2. `formatFingerprint`: fixed 32 bytes -> exact 95-character string; all-zero and all-0xFF. `DeviceConfig`: `https_enabled`
@@ -205,12 +246,15 @@ Host-testable (CMake gtest, per `CF:283` onward; HTTP test ports from a new disj
 3. Cookie builder: `Secure` iff the connection is TLS; `HttpOnly` and `SameSite=Strict` always.
 4. Trusted peer header: honored only from `127.0.0.1`, ignored from any other source; re-keys the login bucket
    (`HS.cpp:657-676`) and nothing else.
-5. `isSameOrigin` with an `https://` origin and matching Host passes, wrong host fails (pins the scheme-blind behavior, `HS.cpp:4177-4181`).
+5. `isSameOrigin` with an `https://` origin and matching Host passes, wrong host fails (pins the scheme-blind behavior, `HS.cpp:4490-4494`).
 6. Invariant 1: flag on and pool refusing, `GET /` and `PUT /api/e911-config` on the plain port still succeed (extends
    `DashboardE911Form_test.cpp`). A static check that the key-persist path calls `PD_ASSERT_NOT_PSRAM_STACK`.
 Not host-testable: handshake, PSRAM placement, stack high-water, CPU, browser behavior.
 
-**Bench plan (later, after the poll; S3R8 rig; 933 only, never 911, never over a real trunk):**
+### Bench
+
+Later, after the poll. S3R8 rig; 933 only, never 911, never over a real trunk.
+
 - B1 baseline: idle `freeHeapInternal`, `largestFreeBlockInternal`, `freeHeapDma`, `minFreeHeapSpiram` (`docs/API.md:843-850`).
 - B2 one session: handshake wall time and CPU, internal and PSRAM delta at handshake and steady state, pump stack
   high-water. This replaces the 40 KB planning figure and the 12 KB stack assumption.
@@ -243,7 +287,8 @@ terminated by a proxy, or must the device terminate it?
   after a cert-warning click-through is untested. NVS headroom (partition 0x6000, `partitions.csv:94`) and the flash cost of
   X509 write support are unmeasured.
 - Nothing was built or run; no host test was executed; the slice 0 recipe is not written or tried.
-- Doc drift found, not fixed here: `SD:206-207` says anchor slots ship at 1 (`PoolConfig.hpp:292-294` says 4);
+- Stale references in other docs, not fixed here: `SD:206-207` says anchor slots ship at 1 (`PoolConfig.hpp:292-294` says 4);
   `SCALING.md:102-106` and `:191-197` disagree on whether the pools sit in PSRAM or internal DRAM; `TM` E-2 cites route
-  lines `:457`/`:471`, now `HS.cpp:911`/`:925`; `CF:26` cites `HttpServer.cpp:3115-3123` for `sendRedirect`, now `:7417-7426`.
+  lines `:457`/`:471`, which are `HS.cpp:911`/`:925` at this commit; `CF:26` cites `HttpServer.cpp:3115-3123` for
+  `sendRedirect`, which is at `:7750-7759`.
 - The #942 committee findings are model-written reviews, not measurements.
