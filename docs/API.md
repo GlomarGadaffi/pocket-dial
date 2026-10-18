@@ -250,7 +250,7 @@ Endpoints marked "None" are read-only and reachable without a session: `/`, `/in
 | [`/api/trace`](#get-apitrace) | `GET` | Medium | Gated (no `X-CSRF`) | The same capture ring as JSON, for the dashboard's polling live SIP tracer. |
 | [`/config/<mac>.cfg`](#get-configmaccfg) | `GET` | Low | None (MAC is the bearer token) | Auto-provisioning config for an already-adopted phone. Seven filename shapes are accepted; see the section. |
 | [`/api/dnd`](#post-apidnd) | `POST` | High | Gated (+ `X-CSRF`) | Sets or clears Do-Not-Disturb on an extension. |
-| [`/api/forward`](#post-apiforward) | `POST` | High | Gated (+ `X-CSRF`) | Configures call forwarding (`always`/`busy`/`noanswer`) for an extension. `200` means accepted and staged for the NVS writer, not yet on flash (#986). |
+| [`/api/forward`](#post-apiforward) | `POST` | High | Gated (+ `X-CSRF`) | Configures call forwarding (`always`/`busy`/`noanswer`) and the no-answer ring time (`timeout`, #1009) for an extension. `200` means accepted and staged for the NVS writer, not yet on flash (#986). |
 | [`/api/group`](#post-apigroup) | `POST` | High | Gated (+ `X-CSRF`) | Creates, updates, or deletes a ring/hunt group. |
 | [`/api/dialplan`](#post-apidialplan) | `POST` | High | Gated (+ `X-CSRF`) | Creates, updates, or deletes one dial-plan rule (pattern → action). Params: `pattern`, `action` (`group`\|`page`\|`park`\|`trunk`), `target`, and `stripDigits` (trunk only). Naming an `action` always means create/update; **omitting both `action` and `target` deletes the rule**. A `trunk` rule may carry an empty `target`, which means "strip the digits and prepend nothing". |
 | [`/api/telephony-config`](#get-apitelephony-config) | `GET` | Medium | Gated | Lists the four carrier/anchor credential slots. The stored secret is never returned, only `secretSet`. |
@@ -774,7 +774,7 @@ read back what you just wrote. It is also exempt from the captive-portal redirec
   "parkedCount": 0,
   "dnd": ["1003"],
   "forwards": [
-    { "extension": "1001", "always": "", "busy": "1002", "noanswer": "" }
+    { "extension": "1001", "always": "", "busy": "1002", "noanswer": "", "noAnswerSeconds": 0 }
   ],
   "groups": [
     { "extension": "610", "mode": "ringall", "members": "1001,1002,1003" }
@@ -889,7 +889,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `oldestSessionSec` | Integer | (#539) Age in seconds of the oldest active call, 0 when none. Always present; the #401 soak reads it to find a stuck leg without a credential. |
 | `dnd` | Array | Extension numbers (**strings**, not objects) currently in Do-Not-Disturb. |
 | `voicemail` | Array | (#246) Extension numbers (**strings**, not objects) that currently have voicemail enabled. |
-| `forwards` | Array | Per-extension call-forward targets: `{extension, always, busy, noanswer}`. An unset trigger is an empty string, never `null` or a missing key. |
+| `forwards` | Array | Per-extension call-forward targets: `{extension, always, busy, noanswer, noAnswerSeconds}`. An unset trigger is an empty string, never `null` or a missing key. `noAnswerSeconds` (#1009) is the extension's ring time for direct calls before the no-answer forward or voicemail takes over, 5-120; `0` means the default, 20 s. An extension with only a ring time set appears here with all three targets empty. |
 | `groups` | Array | Ring/hunt groups: `{extension, mode, members}`, where `mode` is `ringall` or `hunt`. |
 | `groups[].members` | String | **A comma-joined string, not an array**, e.g. `"1001,1002,1003"` (`pbx::joinMembers`). Split it on `,` client-side. It round-trips: this is exactly the format [`POST /api/group`](#post-apigroup) accepts back. |
 | `dialplan` | Array | The dial-plan rule table (Issue #69), **in evaluation order**, first match wins, so this array's order is load-bearing. Unlike the sets above, this one's order is meaningful. |
@@ -1687,13 +1687,15 @@ Configures call forwarding for an extension.
 * Request Content-Type: `application/x-www-form-urlencoded`
 * Request Parameters:
   * `extension` (Required): The extension to configure. Must not be `777`, `999` or `555` (in `sendApiForward()`).
-  * `trigger` (Required): Exactly one of `always`, `busy`, `noanswer`. Case-sensitive.
-  * `target` (Optional): The extension to forward to. **Empty clears the rule for that trigger**; that is the only way to unset one.
+  * `trigger` (Required): Exactly one of `always`, `busy`, `noanswer`, `timeout`. Case-sensitive.
+  * `target` (Optional): The extension to forward to. **Empty clears the rule for that trigger**; that is the only way to unset one. For `timeout` (#1009) it is the extension's no-answer ring time in seconds, `5`-`120`: how long a direct call to this extension rings before its `noanswer` forward, or voicemail, takes the call. Empty or `0` restores the 20 s default. Ring groups, hunt groups and inbound anchor calls keep their own timers.
 * Response Content-Type: `application/json`
 * Response Status Codes:
   * `200 OK`
   * `400 Bad Request`: `{"error":"missing extension or trigger parameter"}`
-  * `400 Bad Request`: `{"error":"trigger must be always|busy|noanswer"}`
+  * `400 Bad Request`: `{"error":"trigger must be always|busy|noanswer|timeout"}`
+  * `400 Bad Request`: `{"error":"timeout must be 5-120 seconds, or empty for the default"}`. `trigger=timeout` with a non-numeric or out-of-range `target`.
+  * `400 Bad Request`: `{"error":"timeout refused for this extension"}`. A reserved or service extension, or a new extension once the forward table is full. Unlike the other triggers, `timeout` reports these refusals.
   * `400 Bad Request`: `{"error":"cannot forward a virtual extension"}`. `extension` is `777`, `999` or `555`.
   * `401`/`403`: gates 1-4 as in §0.1.
 
@@ -1721,6 +1723,11 @@ curl -s -X POST "http://$DEV/api/forward" \
 curl -s -X POST "http://$DEV/api/forward" \
      -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" \
      -d "extension=1001&trigger=busy&target="
+
+# Let 1001 ring for 30 s before its no-answer forward or voicemail answers
+curl -s -X POST "http://$DEV/api/forward" \
+     -b "pd_session=$SESSION" -H "X-CSRF: $CSRF" \
+     -d "extension=1001&trigger=timeout&target=30"
 ```
 
 ### `POST /api/group`

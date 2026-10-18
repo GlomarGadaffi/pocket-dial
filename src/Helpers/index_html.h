@@ -593,6 +593,7 @@ R"html2(            <div class="field"><label for="grp-ext">Group extension</lab
       <div class="fwd-row"><label for="jd-fwd-always">Always</label><input type="text" id="jd-fwd-always" inputmode="numeric" placeholder="target ext"><button class="btn" onclick="jdSaveFwd('always')">Set</button></div>
       <div class="fwd-row"><label for="jd-fwd-busy">Busy</label><input type="text" id="jd-fwd-busy" inputmode="numeric" placeholder="target ext"><button class="btn" onclick="jdSaveFwd('busy')">Set</button></div>
       <div class="fwd-row"><label for="jd-fwd-noanswer">No answer</label><input type="text" id="jd-fwd-noanswer" inputmode="numeric" placeholder="target ext"><button class="btn" onclick="jdSaveFwd('noanswer')">Set</button></div>
+      <div class="fwd-row"><label for="jd-fwd-timeout">Ring time (s)</label><input type="text" id="jd-fwd-timeout" inputmode="numeric" placeholder="20" title="Seconds a direct call rings before the no-answer forward or voicemail takes it (5-120; blank = 20)"><button class="btn" onclick="jdSaveFwd('timeout')">Set</button></div>
       <div class="msg" id="jd-msg"></div>
       <div class="danger-zone">
         <div class="subhead">Danger Zone</div>
@@ -1092,6 +1093,7 @@ function openJack(ext){
   $("jd-fwd-always").value=fwd.always||"";
   $("jd-fwd-busy").value=fwd.busy||"";
   $("jd-fwd-noanswer").value=fwd.noanswer||"";
+  $("jd-fwd-timeout").value=fwd.noAnswerSeconds?String(fwd.noAnswerSeconds):"";
   setMsg("jd-msg","");
   openModal("jack-modal");
 }
@@ -1117,7 +1119,7 @@ function jdSaveFwd(trigger){
   if(!selectedJack||!gateCheck())return;
   var t=$("jd-fwd-"+trigger).value.trim();
   post("/api/forward","extension="+encodeURIComponent(selectedJack)+"&trigger="+trigger+"&target="+encodeURIComponent(t))
-    .then(function(){setMsg("jd-msg",trigger+" forward "+(t?("→ "+t):"cleared"),"ok");fetchStatus();})
+    .then(function(){setMsg("jd-msg",trigger==="timeout"?("Ring time "+(t?(t+" s"):"reset to 20 s")):(trigger+" forward "+(t?("→ "+t):"cleared")),"ok");fetchStatus();})
     .catch(function(err){setMsg("jd-msg",err.message,"err");});
 }
 function killJack(){
