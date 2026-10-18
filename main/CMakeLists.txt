@@ -112,8 +112,10 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/Helpers/DeviceConfig.cpp"
                             # Issue #473: "factory reset incomplete" journal (prompts' last sector).
                             "../src/Helpers/ResetJournal.cpp"
-                            # Issue #986 slice 2: NVS writer task for the device table and the forwards.
+                            # Issue #986 slice 2: NVS writer queues for the device table and the forwards.
                             "../src/Helpers/NvsWriter.cpp"
+                            # Issue #991: the one NVS-writing task (CDR ring + the NVS writer's keys).
+                            "../src/Helpers/FlashWriter.cpp"
                             "../src/Helpers/SipDigest.cpp"
                             "../src/Helpers/SipSecretStore.cpp"
                             "../src/Helpers/ArpLookup.cpp"

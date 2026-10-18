@@ -16,8 +16,8 @@
 #include <cstring>
 #include <new>
 
+#include "FlashWriter.hpp"   // #991: the task that drains the queues
 #include "PsramAllocator.hpp"   // psram::allocPreferPsram -- the staging slots
-#include "PsramTask.hpp"   // PD_ASSERT_NOT_PSRAM_STACK -- issue #277
 #endif
 
 namespace nvswriter
@@ -129,11 +129,6 @@ namespace
 		static std::atomic<bool> r{false};
 		return r;
 	}
-	std::atomic<TaskHandle_t>& writerHandle()
-	{
-		static std::atomic<TaskHandle_t> h{nullptr};
-		return h;
-	}
 #else
 	using Transport = DepthOneMailboxes;
 #endif
@@ -202,24 +197,6 @@ namespace
 		return true;
 	}
 
-	// PLAIN stack (no PD_TASK_STACK_CAPS): this task is the only place that
-	// touches flash for these keys -- see PsramTask.hpp. The blobs live in
-	// namespace-scope statics, so the frame is only the drain loop plus
-	// nvs_open/nvs_set_str/nvs_commit's own depth. 6144 B matches cdr_persist and
-	// cdr_archive, the closest precedents; like theirs it is a reasoned figure
-	// until stackHwm shows the real one.
-	void nvsWriterTask(void*)
-	{
-		for (;;)
-		{
-			// A give that lands while a pass runs is not lost: the next take returns
-			// at once and the pass looks at every key again.
-			(void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-			PD_ASSERT_NOT_PSRAM_STACK();
-			(void)stagerRef().drainOnce(nvsSink);
-		}
-	}
-
 	void deleteQueues(Transport& t)
 	{
 		for (size_t i = 0; i < kKeyCount; ++i)
@@ -278,23 +255,33 @@ void start()
 			return;
 		}
 	}
-	TaskHandle_t handle = nullptr;
-	if (xTaskCreatePinnedToCore(nvsWriterTask, "nvs_writer", 6144, nullptr, 1, &handle, 0) != pdPASS)
+	// #991: no task of its own any more. The flash_writer task (FlashWriter.cpp,
+	// a plain internal stack, the #277 rule) drains these queues in its pass,
+	// round robin with the CDR ring.
+	if (!flashwriter::start())
 	{
-		ESP_LOGE(kTag, "xTaskCreate nvs_writer failed -- device table, forwards, DID table and telephony config will not persist");
+		ESP_LOGE(kTag, "flash_writer task not started -- device table, forwards, DID table and telephony config will not persist");
 		deleteQueues(t);
 		freeSlots();
 		started = false;
 		return;
 	}
 	// Build the function-static now, not under _mutex on the first *72 (CdrRing's
-	// boot-time reasoning). The task is parked in ulTaskNotifyTake until the first
-	// stage() notifies it, which needs running == true, so it cannot reach this early.
+	// boot-time reasoning), and only once nothing above can fail any more: it
+	// keeps the slot pointers. The task may already be running a pass for the CDR
+	// ring, but writePending() does not reach the Stager until running is true.
 	(void)stagerRef();
-	writerHandle().store(handle, std::memory_order_release);
 	running().store(true, std::memory_order_release);
 #endif
 }
+
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+unsigned writePending()
+{
+	if (!running().load(std::memory_order_acquire)) return 0;   // not started (yet)
+	return stagerRef().drainOnce(nvsSink);
+}
+#endif
 
 StageResult stage(Key k, FunctionRef<void(BlobWriter&)> fill)
 {
@@ -305,7 +292,7 @@ StageResult stage(Key k, FunctionRef<void(BlobWriter&)> fill)
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	if (r == StageResult::Ok)
 	{
-		xTaskNotifyGive(writerHandle().load(std::memory_order_acquire));   // never blocks
+		flashwriter::wake();   // #991: never blocks
 	}
 #endif
 	return r;

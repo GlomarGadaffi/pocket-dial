@@ -3,8 +3,9 @@
 Host tests (NvsWriter_test.cpp) run the policy and the two callers on the host's
 queues. What they cannot see is (a) that the callers no longer touch NVS under
 RequestsHandler::_mutex, and (b) the FreeRTOS half: per-key queues written with
-xQueueOverwrite, a task woken by notification, created pinned at the cdr_persist
-size. This checks both at the source level.
+xQueueOverwrite and drained by the shared flash_writer task (#991,
+FlashWriter.cpp; tests/tools/test_one_flash_writer.py pins that task). This
+checks both at the source level.
 """
 import json
 import os
@@ -102,13 +103,13 @@ class BoardWiring(unittest.TestCase):
 
     def test_nothing_on_the_stage_path_can_block(self):
         self.assertRegex(self.src, r"xQueueReceive\(q\[indexOf\(k\)\], item, 0\)")
-        self.assertEqual(self.src.count("portMAX_DELAY"), 1, "only the writer's idle wait may block")
-        self.assertIn("ulTaskNotifyTake(pdTRUE, portMAX_DELAY)", self.src)
-        self.assertIn("xTaskNotifyGive(", self.src)
+        self.assertNotIn("portMAX_DELAY", self.src, "#991: the one idle wait is flash_writer's, in FlashWriter.cpp")
+        self.assertIn("flashwriter::wake();", self.src)
+        self.assertNotIn("xTaskNotifyGive(", self.src)
 
-    def test_the_task_is_the_cdr_persist_shape(self):
-        self.assertRegex(self.src, r'xTaskCreatePinnedToCore\(nvsWriterTask, "nvs_writer", 6144, nullptr, 1, &handle, 0\)')
-        self.assertIn("PD_ASSERT_NOT_PSRAM_STACK();", self.src)
+    def test_the_queues_are_drained_by_the_shared_flash_writer_task(self):
+        self.assertEqual(re.findall(r"xTaskCreate\w*\(", self.src), [], "#991: no task of its own")
+        self.assertIn("flashwriter::start()", self.src)
         self.assertIn("vQueueDeleteWithCaps(", self.src)
         self.assertIn("vQueueDelete(", self.src)
 
@@ -119,8 +120,10 @@ class BoardWiring(unittest.TestCase):
 
     def test_the_task_is_in_the_stack_budget_table(self):
         with open(os.path.join(REPO, "tools", "ci", "task_stacks.json"), encoding="utf-8") as f:
-            rows = [r for r in json.load(f)["tasks"] if r.get("file") == "src/Helpers/NvsWriter.cpp"]
-        self.assertEqual([(r["name"], r["bytes"]) for r in rows], [("nvs_writer", 6144)])
+            rows = json.load(f)["tasks"]
+        self.assertEqual([r for r in rows if r.get("file") == "src/Helpers/NvsWriter.cpp"], [])
+        self.assertEqual([(r["name"], r["bytes"]) for r in rows if r.get("file") == "src/Helpers/FlashWriter.cpp"],
+                         [("flash_writer", 6144)])
 
 
 class StagingSlotsAndStackPlacement(unittest.TestCase):
@@ -146,19 +149,23 @@ class StagingSlotsAndStackPlacement(unittest.TestCase):
                          "the host keeps static slots")
 
     def test_the_writer_task_keeps_a_plain_internal_stack(self):
-        for bad in ("PD_TASK_STACK_CAPS", "createTaskPreferPsram", "xTaskCreatePinnedToCoreWithCaps",
-                    "xTaskCreateWithCaps", "xTaskCreateStaticPinnedToCore", "WithCaps(nvsWriterTask"):
-            self.assertNotIn(bad, self.src)
-        self.assertEqual(len(re.findall(r"xTaskCreate\w*\(", self.src)), 1, "one task, one plain create")
-        self.assertIn("xTaskCreatePinnedToCore(nvsWriterTask", self.src)
-        task = indented_body("Helpers/NvsWriter.cpp", r"void nvsWriterTask\(void\*\)")
+        # #991: the task is flash_writer's (FlashWriter.cpp), shared with the CDR ring.
+        for src in (self.src, code("Helpers/FlashWriter.cpp")):
+            for bad in ("PD_TASK_STACK_CAPS", "createTaskPreferPsram", "xTaskCreatePinnedToCoreWithCaps",
+                        "xTaskCreateWithCaps", "xTaskCreateStaticPinnedToCore"):
+                self.assertNotIn(bad, src)
+        self.assertEqual(re.findall(r"xTaskCreate\w*\(", self.src), [])
+        fw = code("Helpers/FlashWriter.cpp")
+        self.assertEqual(len(re.findall(r"xTaskCreate\w*\(", fw)), 1, "one task, one plain create")
+        self.assertIn("xTaskCreatePinnedToCore(flashWriterTask", fw)
+        task = indented_body("Helpers/FlashWriter.cpp", r"void flashWriterTask\(void\*\)")
         self.assertIn("PD_ASSERT_NOT_PSRAM_STACK();", task)
 
     def test_a_failed_slot_allocation_leaves_the_writer_not_running(self):
         b = self.start
         order = [b.index(m) for m in ("s_devices = allocSlot",
                                       "if (s_devices == nullptr || s_forwards == nullptr || s_didmap == nullptr || s_telephony == nullptr)",
-                                      "xQueueCreate", "xTaskCreatePinnedToCore(", "running().store(true")]
+                                      "xQueueCreate", "flashwriter::start()", "running().store(true")]
         self.assertEqual(order, sorted(order), "allocate, check, queues, task, and only then running")
         failed = b[order[1]:order[2]]
         for needed in ("freeSlots();", "started = false;", "return;"):
@@ -166,7 +173,7 @@ class StagingSlotsAndStackPlacement(unittest.TestCase):
         self.assertNotIn("running().store(true", failed)
         self.assertEqual(self.src.count("running().store(true"), 1)
         # the later failures give the slots back too, like the queues
-        for marker in ("queue create failed", "xTaskCreate nvs_writer failed"):
+        for marker in ("queue create failed", "flash_writer task not started"):
             seg = b[b.index(marker):]
             self.assertIn("freeSlots();", seg[:seg.index("return;")])
         # nothing reaches a slot unless the writer is running
