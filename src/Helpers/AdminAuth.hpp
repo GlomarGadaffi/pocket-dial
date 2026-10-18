@@ -226,7 +226,9 @@ namespace AdminAuth
 
 	// Set/replace the DTMF admin PIN. Enforces kMinDtmfPinLength/
 	// kMaxDtmfPinLength and a digits-only charset (a keypad cannot send
-	// anything else). Same salted/iterated-hash/persist story as
+	// anything else), and refuses a PIN that starts with the digits of a CLASS
+	// star code (dtmfclass::claiming, #994): *60xx would fire *60 before the PIN
+	// completes, so such a PIN could never be keyed. Same salted/iterated-hash/persist story as
 	// setLoginCredential(), in its own NVS keys so clearing/rotating one never
 	// touches the other.
 	bool setDtmfPin(const std::string& pin);
