@@ -378,9 +378,12 @@ public:
 	// "busy" or "noanswer") for an extension; an empty target clears it (and the
 	// whole entry once all three are empty). Both are thread-safe (take _mutex /
 	// _snapshotMutex) and NVS-persisted, mirroring setDnd/getDndExtensions. The
-	// getter returns {extension, always, busy, noAnswer} tuples for the dashboard.
+	// getter returns {extension, always, busy, noAnswer, noAnswerSeconds} rows for the dashboard.
 	void setForward(const std::string& extension, const std::string& trigger, const std::string& target);
-	std::vector<std::tuple<std::string, std::string, std::string, std::string>> getForwards();
+	// Issue #1009: per-extension no-answer timeout, 5-120 s, 0 = default (20 s).
+	// False if the value or extension was refused.
+	bool setNoAnswerSeconds(const std::string& extension, int seconds);
+	std::vector<pbx::ForwardRow> getForwards();
 
 	// Ring/hunt groups. setRingGroup replaces a group's membership + mode; an empty
 	// member list deletes the group. Thread-safe and NVS-persisted. The getter
@@ -2983,7 +2986,7 @@ private:
 		std::vector<std::string> dnd;        // extensions currently in DND
 		std::vector<std::string> voicemail;  // extensions with voicemail enabled (Issue #246)
 		// Call-forward config: {extension, always, busy, noAnswer}.
-		std::vector<std::tuple<std::string, std::string, std::string, std::string>> forwards;
+		std::vector<pbx::ForwardRow> forwards;
 		// Ring/hunt groups: {groupExt, "ringall"|"hunt", "m1,m2,..."}.
 		std::vector<std::tuple<std::string, std::string, std::string>> ringGroups;
 		// Parked calls: {orbit, parkedExt, parker, secondsParked}.

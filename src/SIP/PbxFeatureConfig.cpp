@@ -216,17 +216,16 @@ void PbxFeatureConfig::setForwardLocked(const std::string& extension, const std:
 	_onChanged(Table::Forwards);
 }
 
-std::vector<std::tuple<std::string, std::string, std::string, std::string>> PbxFeatureConfig::forwardsSnapshot() const
+std::vector<pbx::ForwardRow> PbxFeatureConfig::forwardsSnapshot() const
 {
-	std::vector<std::tuple<std::string, std::string, std::string, std::string>> result;
+	std::vector<pbx::ForwardRow> result;
 	forwardsSnapshotInto(result);
 	return result;
 }
 
-void PbxFeatureConfig::forwardsSnapshotInto(
-	std::vector<std::tuple<std::string, std::string, std::string, std::string>>& out) const
+void PbxFeatureConfig::forwardsSnapshotInto(std::vector<pbx::ForwardRow>& out) const
 {
-	Refill<std::tuple<std::string, std::string, std::string, std::string>> rows(out);
+	Refill<pbx::ForwardRow> rows(out);
 	for (const auto& [ext, cfg] : _forwards)
 	{
 		auto& row = rows.next();
@@ -234,7 +233,43 @@ void PbxFeatureConfig::forwardsSnapshotInto(
 		std::get<1>(row).assign(cfg.always);
 		std::get<2>(row).assign(cfg.busy);
 		std::get<3>(row).assign(cfg.noAnswer);
+		std::get<4>(row) = cfg.noAnswerSeconds;
 	}
+}
+
+std::chrono::seconds PbxFeatureConfig::noAnswerTimeout(const std::string& extension) const
+{
+	auto it = _forwards.find(extension);
+	if (it == _forwards.end() || it->second.noAnswerSeconds == 0) return pbx::kNoAnswerTimeout;
+	return std::chrono::seconds(it->second.noAnswerSeconds);
+}
+
+bool PbxFeatureConfig::setNoAnswerSecondsLocked(const std::string& extension, int seconds)
+{
+	if (!pbx::isValidNoAnswerSeconds(seconds) || extension.empty() ||
+		pbx::isReservedExtension(extension) || pbx::isServiceName(extension))
+	{
+		_env.log("No-answer timeout ignored for " + extension, true);
+		return false;
+	}
+	auto it = _forwards.find(extension);
+	if (it == _forwards.end())
+	{
+		if (seconds == 0) return true;   // already the default
+		if (_forwards.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
+		{
+			_env.log("No-answer timeout ignored (table full) for extension " + extension, true);
+			return false;
+		}
+		it = _forwards.emplace(extension, pbx::ForwardConfig{}).first;
+	}
+	it->second.noAnswerSeconds = static_cast<uint8_t>(seconds);
+	if (it->second.empty()) _forwards.erase(it);
+	_env.log("No-answer timeout for " + extension +
+		(seconds == 0 ? " reset to default" : (" set to " + std::to_string(seconds) + " s")));
+	persistForwards();
+	_onChanged(Table::Forwards);
+	return true;
 }
 
 // ── Ring / hunt groups ───────────────────────────────────────────────────────
@@ -583,7 +618,8 @@ void PbxFeatureConfig::loadPbxConfig()
 		return buf;
 	};
 
-	// Forwards: ext \t always \t busy \t noAnswer
+	// Forwards: ext \t always \t busy \t noAnswer [\t noAnswerSeconds]. The 5th field
+	// (#1009) is optional so a blob written before it existed loads with the default.
 	for (const auto& rec : deserializeBlob(readBlob("forwards")))
 	{
 		if (rec.size() < 4 || rec[0].empty()) continue;
@@ -592,6 +628,11 @@ void PbxFeatureConfig::loadPbxConfig()
 		cfg.always = rec[1];
 		cfg.busy = rec[2];
 		cfg.noAnswer = rec[3];
+		if (rec.size() >= 5 && !rec[4].empty())
+		{
+			const int s = std::atoi(rec[4].c_str());
+			if (pbx::isValidNoAnswerSeconds(s)) cfg.noAnswerSeconds = static_cast<uint8_t>(s);
+		}
 		if (!cfg.empty()) _forwards[rec[0]] = std::move(cfg);
 	}
 
@@ -726,9 +767,11 @@ void PbxFeatureConfig::persistForwards()
 	// staging slot and nvs_set_str + nvs_commit run on the nvs_writer task, so
 	// *72/*73 (and the HTTP setter, which funnels through setForwardLocked too) no
 	// longer hold _mutex across a flash write. Caller holds _mutex.
-	// ext \t always \t busy \t noAnswer \n, as loadPbxConfig() reads it. A table
-	// that does not fit the slot is refused, never truncated; the in-RAM table is
-	// right either way. A refusal for a running factory reset is silent.
+	// ext \t always \t busy \t noAnswer [\t noAnswerSeconds] \n, as loadPbxConfig()
+	// reads it. The 5th field (#1009) is written only when set, so an unset table
+	// is byte-identical to the older format. A table that does not fit the slot is
+	// refused, never truncated; the in-RAM table is right either way. A refusal for
+	// a running factory reset is silent.
 	const nvswriter::StageResult r = nvswriter::stage(nvswriter::Key::Forwards,
 		[this](nvswriter::BlobWriter& w) {
 			for (const auto& [ext, cfg] : _forwards)
@@ -736,7 +779,9 @@ void PbxFeatureConfig::persistForwards()
 				w.str(ext); w.ch('\t');
 				w.str(cfg.always); w.ch('\t');
 				w.str(cfg.busy); w.ch('\t');
-				w.str(cfg.noAnswer); w.ch('\n');
+				w.str(cfg.noAnswer);
+				if (cfg.noAnswerSeconds != 0) { w.ch('\t'); w.uint(cfg.noAnswerSeconds); }
+				w.ch('\n');
 			}
 		});
 	if (r == nvswriter::StageResult::TooBig)
