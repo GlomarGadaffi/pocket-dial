@@ -1,28 +1,19 @@
-# pocket-dial. Design System Index (SSH Sysop Terminal)
+# pocket-dial Design System Index (SSH Sysop Terminal)
 
-> **⚠️ HISTORICAL, describes a removed surface.** The SSH sysop terminal and its ANSI TUI
-> were deleted from pocket-dial (see `docs/THREAT_MODEL.md` §5.5: the admin plane is now
-> HTTP-only and dark by default). This folder is preserved as design history, the width
-> discipline, glyph lexicon, and accessibility rules remain good reference material, but
-> nothing in it describes current firmware behavior.
+This folder is historical. The SSH sysop terminal and its ANSI TUI were deleted from pocket-dial (see `docs/THREAT_MODEL.md` §5.5 for the two admin surfaces that ship today). The documents are kept as design history. The width discipline, glyph lexicon, and accessibility rules remain useful reference material, but nothing here describes current firmware behavior.
 
-> **Phase-A design sprint · Design-system index & locked decisions.** pocket-dial is a self-contained
-> SIP PBX on a single ESP32-S3 (Guition JC3248W535, 3.5" 320×480 touch display). The redesign reframes
-> it as an SSH-first "sysop terminal": all configuration happens over a retro telco/BBS ANSI TUI
-> reached by SSH, the 3.5" touchscreen becomes a **passive live-status wallboard**, and the entire
-> surface renders at a **80×24 minimum in 16-color ANSI that degrades cleanly to monochrome**, state
-> is **never signalled by color alone** (every status is glyph + label + color, in that order of
-> authority). This file is the entry point for the ten Phase-A deliverables, the single linked table of
-> contents, and the **locked-decisions** block every downstream doc, mockup, and firmware string must
-> obey. When in doubt, the canonical brief ([`00-brief.md`](00-brief.md)) wins; this README only indexes
-> and reconciles it.
+Design-system index and locked decisions for the Phase-A design sprint. pocket-dial is a self-contained SIP PBX on a single ESP32-S3 (Guition JC3248W535, 3.5" 320×480 touch display).
+
+The redesign reframes it as an SSH-first "sysop terminal": all configuration happens over a retro telco/BBS ANSI TUI reached by SSH, and the 3.5" touchscreen becomes a **passive live-status wallboard**. The surface renders at an **80×24 minimum in 16-color ANSI that degrades cleanly to monochrome**. State is **never signalled by color alone**: every status is glyph + label + color, in that order of authority.
+
+This file is the entry point for the nine Phase-A deliverables, the linked table of contents, and the **locked-decisions** block that every downstream doc, mockup, and firmware string must obey. When in doubt, the brief ([`00-brief.md`](00-brief.md)) wins; this README only indexes and reconciles it.
 
 
 ## Table of contents
 
 | # | Doc | Owner role | What it locks |
 |---|-----|------------|---------------|
-| 0 | [`00-brief.md`](00-brief.md) | (canonical) | Product, mission, scope, constraints, palette source, deliverables map |
+| 0 | [`00-brief.md`](00-brief.md) | (shared brief) | Product, mission, scope, constraints, palette source, deliverables map |
 | 1 | [`personas.md`](personas.md) | UX Researcher | Installer (Rivera) + Admin (Dana) personas, JTBD, **Task Inventory §3** (coverage checklist), design implications D1–D13 |
 | 2 | [`brand.md`](brand.md) | Brand Guardian | Name treatment, ASCII logo, **SSH login banner**, voice & tone, **status lexicon §4.5**, consistency rules |
 | 3 | [`tui-ia.md`](tui-ia.md) | UX Architect | Master hub, **full screen tree**, **global keybinding scheme**, panel/tab model, **onboarding wizard** |
@@ -36,7 +27,7 @@
 Reading order for a newcomer: brief → personas (the *why*) → brand (the *voice*) → tui-ia (the *map*) → tui-style (the *pixels*) → narrative/whimsy (the *feel*) → walkthrough/accessibility (the *audit*) → imagery (the *bitmaps*).
 
 
-## LOCKED DECISIONS
+## Locked decisions
 
 These four blocks are the protected core. A change to any of them is a design change requiring a review against `brand.md` §6.1; downstream docs cross-reference these, they do not redefine them.
 
@@ -54,17 +45,17 @@ Descriptor line: **`SYSOP TERMINAL` · *single-board SIP PBX***. Contextual mode
 
 ### 2. Palette. BRASS (default) + PHOSPHOR (alt), mirroring `main/ui/ui.cpp` `PALETTES[]`
 
-Two themes, same product, "a change of bench lighting, not a different product." Brass is the chrome; the lamp is the accent; red is rationed to destructive/alert; **DND stays amber in both themes** (`ui.cpp` L61). 16-color xterm mapping owned by `tui-style.md` §1.
+Two themes, same product, "a change of bench lighting, not a different product." Brass is the chrome; the lamp is the accent; red is rationed to destructive/alert; **DND stays amber in both themes** (`ui.cpp` L46 for BRASS, L58 for PHOSPHOR). 16-color xterm mapping owned by `tui-style.md` §1.
 
 | Role | BRASS RGB | PHOSPHOR RGB | xterm-16 → SGR |
 |---|---|---|---|
-| board bg | `#161412` | `#10140F` | `0` black → `40` |
+| board bg | `#161412` | `#101410` | `0` black → `40` |
 | panel face | `#28241E` | `#1C241C` | `0` black (dim chrome only) → `40` |
 | brass rail / border | `#B08438` | `#96823C` | `3` yellow → `33` |
 | text | `#D6B26E` | `#AAD296` | BRASS `3`→`33` / PHOS `2`→`32` |
 | highlight / header | `#F5D696` | `#D2F0BE` | BRASS `11`→`93` / PHOS `10`→`92` |
 | **accent, live lamp** | `#FFB020` amber | `#40FF60` green | BRASS `11`→`93` / PHOS `10`→`92` |
-| dim / UNREACH | `#1E1B17` | `#16201C` | `8` grey → `90` |
+| dim / UNREACH | `#1E1B17` | `#161C16` | `8` grey → `90` |
 | **DND ring** (both themes) | `#FFB020` amber | `#FFB020` amber | `11` → `93` |
 | **alert / destructive** | `#C84028` | `#DC4632` | `1` red → `31` |
 
@@ -113,14 +104,14 @@ SSH CONNECT
     │     └─ Features         read-only star-code reference (*60 *80 *72 *73 *69 *11)
     ├─(4) SECURITY            [P] change PIN · [K] SSH access · session info · [X] factory reset [A!]
     ├─(5) REPORTS/LOGS        two views ([Tab]): Recent Calls (CDR ring of 32) ◂▸ Event Log tail
-    ├─(6) ABOUT               honesty card: hardware · firmware · caps (32 ext / 8 calls) · "voicemail in v2"
+    ├─(6) ABOUT               honesty card: hardware · firmware · caps (32 ext / 8 calls) · "voicemail MVP shipped (#246)"
     ├─(R) REBOOT [A!]   ◇ confirm
     ├─(L) LOGOUT
     └─(?) HELP OVERLAY  (global, context-scoped)
    Cross-cutting overlays: ◇ confirm dialog (one shell for all [A!]) · ◇ modal editors · ? help overlay
 ```
 
-Hard caps surfaced as design objects (not error states): 32 extensions / 8 concurrent calls, shown ambiently (hub `ext 12/32 · 1/8 calls`) and predictively (pre-apply cap check). The 3.88 MB on-flash `prompts` partition backs IVR; **no SD card** anywhere.
+Hard caps surfaced as design objects (not error states): 32 extensions / 8 concurrent calls, shown ambiently (hub `ext 12/32 · 1/8 calls`) and predictively (pre-apply cap check). The on-flash `prompts` partition (about 3.75 MiB) is the intended home for IVR prompts, and its last sector already holds the reset journal. **No SD card** anywhere.
 
 
 ## Reconciled decisions (where docs differed, these are the rulings)
@@ -129,10 +120,9 @@ These were inconsistencies across the upstream docs; they are resolved here so e
 
 1. **Hub slot 6 = `ABOUT`, not `ADDONS`.** The brief's example matrix shows `[6] ADDONS`; pocket-dial ships no add-on surface, so `tui-ia.md` renames it `[6] ABOUT` (honesty clause). **`ABOUT` is canonical.**
 2. **CDR result vocabulary = the real `CdrResult` enum.** `personas.md` §3.7 said "answered / busy / no-answer / cancelled / failed"; the shipping enum is **`Answered · Busy · Cancelled · Unavailable · Failed`** (`tui-ia.md` §6.2). **The firmware enum wins;** there is no "no-answer" state.
-3. **Two missing modals must be drawn before build.** `tui-ia.md` promises an **Add-ring-group create** modal and a **forward-to-group** affordance that `tui-style.md` never rendered (`walkthrough.md` F3/F4). The walkthrough supplies provisional mockups; UI Designer owns finalizing them. **Open for engineering.**
+3. **Ring-group modals are drawn.** `tui-ia.md` promises an **Add-ring-group create** modal and a **forward-to-group** affordance. `tui-style.md` section 3.6.2 (Add Ring Group: CREATE modal) and section 3.7.2 (Forward-to-GROUP: target picker) render both, which closes walkthrough F3 and F4.
 4. **First-boot banner needs an un-provisioned branch.** The banner asks for a PIN that only exists after wizard `[2/5]` (`walkthrough.md` F1). The two-state banner (`◆ READY — UNPROVISIONED · first SSH session starts setup`) is the ruling. **Open for engineering.**
 5. **Accessibility adds renderer constraints, not geometry changes.** STATIC screen-reader mode and spoken selection (`accessibility.md` A11Y-1/-2) are **mandatory** and gate "accessible." They change the renderer, not a single mockup.
 
 
-*Design Lead · pocket-dial 3.x redesign · index + locked decisions for the Phase-A sprint. Canonical*
-*source: [`00-brief.md`](00-brief.md). Palette source of truth: `main/ui/ui.cpp` `PALETTES[]`.*
+*Design Lead, pocket-dial 3.x redesign. Index and locked decisions for the Phase-A sprint. Source brief: [`00-brief.md`](00-brief.md). Palette source: `main/ui/ui.cpp` `PALETTES[]`.*

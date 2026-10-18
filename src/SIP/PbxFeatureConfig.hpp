@@ -90,8 +90,14 @@ public:
 	// PREVIOUS site's. Callers surface "E911 not configured" instead of
 	// gating anything (a reset board must still dial 911). Caller holds _mutex.
 	bool clearE911Locked();
-	std::vector<std::tuple<std::string, std::string, std::string, std::string>> forwardsSnapshot() const;
-	void forwardsSnapshotInto(std::vector<std::tuple<std::string, std::string, std::string, std::string>>& out) const;
+	std::vector<pbx::ForwardRow> forwardsSnapshot() const;
+	void forwardsSnapshotInto(std::vector<pbx::ForwardRow>& out) const;
+	// Issue #1009: the ring time for a direct call to this extension before CFNA or
+	// voicemail takes over. Caller holds _mutex.
+	std::chrono::seconds noAnswerTimeout(const std::string& extension) const;
+	// 0 clears back to the default. False (nothing changed) for a value outside
+	// pbx::isValidNoAnswerSeconds() or a reserved/service extension. Caller holds _mutex.
+	bool setNoAnswerSecondsLocked(const std::string& extension, int seconds);
 
 	// ── Ring / hunt groups ────────────────────────────────────────────────────
 	// Internal lookup from onInvite(). Caller MUST already hold _mutex.

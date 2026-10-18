@@ -86,6 +86,13 @@ CONFIG_LV_TICK_CUSTOM_SYS_TIME_EXPR="esp_timer_get_time() / 1000"
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
 CONFIG_ETH_USE_SPI_ETHERNET=y
 CONFIG_ETH_SPI_ETHERNET_W5500=y
+# #999: serialise esp_eth_transmit. tcpip_thread (prio 18, unpinned) and the L2 RTP tasks
+# (rtp_media_tx, moh_tx, conf_mix_tick) all reach the W5500 MAC through it, and the MAC driver
+# uses one socket for every frame, so without the mutex two of them can be inside
+# emac_w5500_transmit at once (the suspected cause of errDriver). The IDF mutex waits up to
+# 250 ms (ESP_ETH_TX_TIMEOUT_MS) and then returns ESP_ERR_TIMEOUT. Only an existing sdkconfig
+# keeps its old value: build with a fresh build directory or delete sdkconfig.
+CONFIG_ETH_TRANSMIT_MUTEX=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 

@@ -491,6 +491,8 @@ add_executable(sip_parser_tests
     # locally-terminated voicemail leg, the mandatory CANCEL of the
     # still-ringing callee, and the #232-class BYE-teardown regression.
     VoicemailDivert_test.cpp
+    # Issue #1009: the per-extension no-answer timeout (default 20 s).
+    NoAnswerTimeout_test.cpp
     # Issue #256: onBusy()'s CFB lookup used to key off data->getFromNumber(),
     # which for an ordinary proxied call's 486 (RFC 3261 mirrors the original
     # INVITE's From/To) names the caller, not the busy callee.
@@ -636,6 +638,9 @@ add_executable(sip_parser_tests
     # Issue #986 slice 4: the DID table stages its snapshot for that writer (set,
     # remove and the import clear) instead of committing 16 keys under _mutex.
     DidMapStaging_test.cpp
+    # Issue #997: the telephony API config stages everything but the client secret for
+    # that writer; the secret is written synchronously, only when it changed.
+    TelephonyStaging_test.cpp
     # Issue #363: the secrets a factory reset must erase.
     ../src/Helpers/FactoryReset.cpp
     # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2
@@ -694,6 +699,8 @@ add_executable(sip_parser_tests
     # Issue #246, retrieval slice 3/3: ext-796 SIP dial-in wired to the
     # SD-I/O job machine and VoicemailMenu, driven through handle()/tick().
     VoicemailRetrieval_test.cpp
+    # Issue #168, host-only IVR digit menu (header-only, no call path reaches it yet).
+    IvrMenu_test.cpp
     # The fixed-size TelephonyProviderType registry/factory (name/implemented
     # lookups + registerProvider/select) that RequestsHandler's boot-time anchor
     # wiring now uses to select LoopbackAnchorClient. Pure C++17, no ESP dependency.

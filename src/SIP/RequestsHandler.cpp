@@ -1991,6 +1991,17 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 		ackInboundFinal(session.value(), data);
 		return;
 	}
+	// Issue #1011: the callee the no-answer sweep CANCELled before diverting this
+	// Call-ID (CFNA forward or voicemail). Its 487 answers our CANCEL; relayed, it
+	// would end the forwarded call or follow the voicemail 200. The forward target's
+	// own 487 carries the target in To (buildInviteFork rewrites it), so it never matches.
+	if (session.has_value() && !session.value()->getCancelledLegExt().empty() &&
+		data->getToNumber() == session.value()->getCancelledLegExt())
+	{
+		ackForwardedFinal(data);
+		session.value()->setCancelledLegExt({});
+		return;
+	}
 	// Issue #750: a pickup already answered the caller's INVITE with a 200 and
 	// CANCELled this target, so the session is connected to the picker. The
 	// target's 487 answers our CANCEL: relayed, it would be a second final
@@ -2881,7 +2892,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	if (!cfna.empty() && cfna != destNumber)
 	{
 		newSession->setNoAnswerTarget(cfna);
-		newSession->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
+		newSession->armRingTimer(std::chrono::steady_clock::now() + _cfg.noAnswerTimeout(destNumber));
 	}
 	// Issue #246: no explicit CFNA target, but this extension has voicemail
 	// enabled -- arm the timer anyway with the voicemail sentinel, decided
@@ -2890,7 +2901,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	else if (cfna.empty() && _cfg.isVoicemailEnabled(destNumber))
 	{
 		newSession->setNoAnswerTarget(pbx::kVoicemailForwardSentinel);
-		newSession->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
+		newSession->armRingTimer(std::chrono::steady_clock::now() + _cfg.noAnswerTimeout(destNumber));
 	}
 
 	response->setContact(buildContact(caller.value()->getNumber()));
@@ -9894,7 +9905,22 @@ void RequestsHandler::setForward(const std::string& extension, const std::string
 	printLogs(localLogs);
 }
 
-std::vector<std::tuple<std::string, std::string, std::string, std::string>> RequestsHandler::getForwards()
+bool RequestsHandler::setNoAnswerSeconds(const std::string& extension, int seconds)
+{
+	std::vector<std::pair<bool, std::string>> localLogs;
+	bool ok = false;
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		ok = _cfg.setNoAnswerSecondsLocked(extension, seconds);
+		localLogs = std::move(_logQueue);
+		_logQueue.clear();
+	}
+
+	printLogs(localLogs);
+	return ok;
+}
+
+std::vector<pbx::ForwardRow> RequestsHandler::getForwards()
 {
 	std::lock_guard<std::mutex> lock(_snapshotMutex);
 	return _snapshot.forwards;
@@ -10802,30 +10828,23 @@ void RequestsHandler::tick()
 					}
 					else
 					{
-						if (dest)
+						// Issue #1011: CANCEL the still-ringing callee whichever way the
+						// redirect goes. `dest` is null on the plain INVITE path, so fall
+						// back to the retained INVITE's target, as the voicemail branch does.
+						std::string calleeExt(invite->getToNumber());
+						auto callee = dest ? std::optional<std::shared_ptr<SipClient>>(dest) : findClient(calleeExt);
+						if (callee.has_value())
 						{
-							auto cancel = _forker.buildCancel(invite, dest);
-							if (cancel) _outbox.emplace_back(dest->getAddress(), std::move(cancel));
+							auto cancel = _forker.buildCancel(invite, callee.value());
+							if (cancel) _outbox.emplace_back(callee.value()->getAddress(), std::move(cancel));
 						}
 						queueLog("CFNA: no answer, forwarding -> " + cfna);
-						endCall(callID, src->getNumber(), std::string(invite->getToNumber()), "no answer (CFNA)");
+						endCall(callID, src->getNumber(), calleeExt, "no answer (CFNA)");
 						if (!_forker.redirectInvite(invite, src, cfna))
 						{
 							// Issue #716: the forward target is not registered, so
 							// redirectInvite() sent nothing. Without this the caller
-							// gets no final response (the session is already gone) and
-							// the callee keeps ringing. `dest` is null on the plain
-							// INVITE path, so CANCEL via the retained INVITE's target.
-							std::string calleeExt(invite->getToNumber());
-							if (!dest)
-							{
-								auto callee = findClient(calleeExt);
-								if (callee.has_value())
-								{
-									auto cancel = _forker.buildCancel(invite, callee.value());
-									if (cancel) _outbox.emplace_back(callee.value()->getAddress(), std::move(cancel));
-								}
-							}
+							// gets no final response (the session is already gone).
 							if (_cfg.isVoicemailEnabled(calleeExt))
 							{
 								answerVoicemailDeposit(invite, src, calleeExt);
@@ -10838,6 +10857,13 @@ void RequestsHandler::tick()
 								resp->setContact(buildContact(src->getNumber()));
 								_outbox.emplace_back(invite->getSource(), std::move(resp));
 							}
+						}
+						// The Call-ID now names the forwarded (or voicemail) call: the
+						// cancelled callee's 487 must be ACKed there, not relayed.
+						if (callee.has_value())
+						{
+							auto it = _sessions.find(callID);
+							if (it != _sessions.end()) it->second->setCancelledLegExt(calleeExt);
 						}
 					}
 				}
@@ -11003,8 +11029,14 @@ void RequestsHandler::tick()
 		// session, a relay pair and a billed carrier leg. End it once BOTH
 		// relayed legs have received nothing for kRtpInactivityTimeout; one
 		// quiet leg (VAD-silent listener, far-end hold, mute) is a live call.
-		// Only legs the board relays can be watched: a trunk call's two
-		// receivers and an anchor bridge's handset RTP + anchor audio. Exempt: Held calls
+		// Only calls whose RTP reaches the board can be watched: a trunk call's
+		// two receivers, an anchor bridge's handset RTP + anchor audio, and
+		// (#1003) an 888 conference leg's handset RTP, its only counter, so a
+		// silent participant is reaped while the others talk. Not watched: a
+		// peer-to-peer call, 777 (SDP loopback, no board RTP), and 440 or a
+		// parked call, which the board answers sendonly so the phone sends
+		// nothing; a park has its own timeout. A 997 page has its own silence
+		// sweep and voicemail legs are outside this one. Exempt: Held calls
 		// (a sendonly/inactive leg legitimately sends nothing; the watch
 		// restarts on resume). A 911/933 (Session::isEmergency()) gets the 4 h
 		// bound instead (#741): never cut while either leg carries audio.
@@ -11036,9 +11068,13 @@ void RequestsHandler::tick()
 				legA = b->handsetRtpPackets();
 				legB = b->anchorRxChunks();
 			}
+			else if (const MediaBridge* cb = _conference ? _conference->bridgeForCall(callID) : nullptr)
+			{
+				legA = legB = cb->handsetRtpPackets();   // #1003: one leg, one counter
+			}
 			else
 			{
-				continue;   // peer-to-peer media never passes through the board
+				continue;   // no counter wired here: peer-to-peer, 777, 440, park, 997, voicemail
 			}
 			const auto limit = session->isEmergency() ? std::chrono::steady_clock::duration(kEmergencyRtpInactivityTimeout)
 			                                           : std::chrono::steady_clock::duration(kRtpInactivityTimeout);
@@ -11088,7 +11124,9 @@ void RequestsHandler::tick()
 					" s -- ending " + callID, true);
 			}
 			const std::string handsetNum = handset ? handset->getNumber() : std::string();
-			const std::string farNum = session->isAnchor() ? session->getAnchorParticipantId() : std::string();
+			// A conference leg's far side is the room, as onBye() records it (#1003).
+			const std::string farNum = session->isAnchor() ? session->getAnchorParticipantId()
+				: (_conference && _conference->hasLeg(callID)) ? std::string(ConferenceRoom::EXT) : std::string();
 			if (inbound) endCall(callID, farNum, handsetNum, "rtp inactivity");
 			else         endCall(callID, handsetNum, farNum, "rtp inactivity");
 		}

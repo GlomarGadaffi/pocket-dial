@@ -35,6 +35,10 @@
 // last) when it has not yet taken the earlier ones, instead of N+1 commits under
 // RequestsHandler::_mutex.
 //
+// #997 adds the telephony API config ("tapicfg") as the fourth key, minus its
+// client secrets: those are written synchronously by TelephonyApiConfig, only
+// when one changed, and never pass through a slot, a queue or the scratch.
+//
 // Power-fail window: from stage() until the writer's nvs_commit returns. In
 // RAM the table is already right; on flash the previous snapshot stays valid
 // (an NVS commit is atomic per item) until the new one lands. The window is the
@@ -53,6 +57,7 @@
 #include "ResetGuard.hpp"
 
 #if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
+#include <algorithm>
 #include <mutex>
 #include <vector>
 #endif
@@ -62,8 +67,14 @@ namespace nvswriter
 	// DidMap is not one NVS string like the other two: its blob is a fixed-layout
 	// snapshot of the DID table that DidMapping::writeSnapshot() applies slot by
 	// slot in the "didmap" namespace (#986 slice 4).
-	enum class Key : uint8_t { Devices = 0, Forwards = 1, DidMap = 2 };
-	constexpr size_t kKeyCount = 3;
+	//
+	// Telephony is the "tapicfg" table WITHOUT the client secrets (#997): the snapshot
+	// holds every slot's type, enabled flag, URL, client id and route DN and the active
+	// slot, and TelephonyApiConfig::writeSnapshot() unpacks it into the same keys the
+	// whole-table write always used. The secret is never staged: it would sit, in the
+	// clear and unzeroised, in the staging slot, the queue item and the writer's scratch.
+	enum class Key : uint8_t { Devices = 0, Forwards = 1, DidMap = 2, Telephony = 3 };
+	constexpr size_t kKeyCount = 4;
 	constexpr size_t indexOf(Key k) { return static_cast<size_t>(k); }
 	constexpr Key keyAt(size_t i) { return static_cast<Key>(i); }
 
@@ -323,7 +334,24 @@ namespace nvswriter
 		void clear()
 		{
 			std::lock_guard<std::mutex> g(_m);
-			for (Box& b : _box) b.full = false;
+			for (Box& b : _box)
+			{
+				b.full = false;
+				std::fill(b.bytes.begin(), b.bytes.end(), static_cast<unsigned char>(0));
+			}
+		}
+		// Test seam (#997): whether `needle` is anywhere in any key's queue storage, whole
+		// item, whether or not it is still waiting. A FreeRTOS queue does not wipe its
+		// storage when the writer takes an item, so the host's boxes do not either.
+		bool holdsForTest(std::string_view needle) const
+		{
+			std::lock_guard<std::mutex> g(_m);
+			for (const Box& b : _box)
+			{
+				const std::string_view all(reinterpret_cast<const char*>(b.bytes.data()), b.bytes.size());
+				if (all.find(needle) != std::string_view::npos) return true;
+			}
+			return false;
 		}
 
 	private:

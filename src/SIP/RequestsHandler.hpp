@@ -378,9 +378,12 @@ public:
 	// "busy" or "noanswer") for an extension; an empty target clears it (and the
 	// whole entry once all three are empty). Both are thread-safe (take _mutex /
 	// _snapshotMutex) and NVS-persisted, mirroring setDnd/getDndExtensions. The
-	// getter returns {extension, always, busy, noAnswer} tuples for the dashboard.
+	// getter returns {extension, always, busy, noAnswer, noAnswerSeconds} rows for the dashboard.
 	void setForward(const std::string& extension, const std::string& trigger, const std::string& target);
-	std::vector<std::tuple<std::string, std::string, std::string, std::string>> getForwards();
+	// Issue #1009: per-extension no-answer timeout, 5-120 s, 0 = default (20 s).
+	// False if the value or extension was refused.
+	bool setNoAnswerSeconds(const std::string& extension, int seconds);
+	std::vector<pbx::ForwardRow> getForwards();
 
 	// Ring/hunt groups. setRingGroup replaces a group's membership + mode; an empty
 	// member list deletes the group. Thread-safe and NVS-persisted. The getter
@@ -744,6 +747,11 @@ public:
 	// backs DELETE /api/telephony-config/<slot> (wipes just that one slot);
 	// clearAllTelephonyConfig() backs /api/factory-reset (wipes every slot
 	// and the active-slot selection) -- see TelephonyApiConfig::clearAll().
+	//
+	// #997: the setters stage the table (minus the client secret) for the NVS
+	// writer, so "" means accepted and staged, not yet on flash; a changed secret
+	// is written synchronously, after the stage. Only clearAllTelephonyConfig()
+	// writes everything here and now (the reset has begun; a stage would be refused).
 	std::vector<TelephonyApiConfig::SlotView> getTelephonyConfigSlots();
 	TelephonyApiConfig::SlotView getTelephonyConfigSlot(size_t idx);
 	std::string setTelephonyConfigSlot(size_t idx, const TelephonyApiConfig::Slot& s, bool keepSecret);
@@ -762,6 +770,9 @@ public:
 	// case SBC mode is left exactly as it was). Disabling never touches the
 	// active slot: some other feature (the 555 anchor extension, a manual
 	// Trunk dial-plan rule) may still depend on it.
+	// #997: the activation is staged for the NVS writer like POST .../activate, so
+	// it is refused (and SBC mode stays off) while a factory reset runs or when the
+	// writer is not running; the active slot has changed in RAM all the same.
 	std::string setSbcMode(bool enabled, size_t route);
 
 	// ── RFC 3262 100rel on a forwarded call (Issue #172, step 3) ──────────────
@@ -862,6 +873,14 @@ public:
 		_tapiConfig.load();
 		_didMapping.setStorePath(didmapPath);
 		_didMapping.load();
+	}
+
+	// Test-only (#997): how many times a telephony persist wrote client secrets,
+	// as TelephonyApiConfig::secretWrites(). An import must leave it where it was.
+	uint32_t telephonySecretWritesForTest()
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		return _tapiConfig.secretWrites();
 	}
 
 	// Test-only: seed one CDR record directly (bypassing a real call flow) and
@@ -2983,7 +3002,7 @@ private:
 		std::vector<std::string> dnd;        // extensions currently in DND
 		std::vector<std::string> voicemail;  // extensions with voicemail enabled (Issue #246)
 		// Call-forward config: {extension, always, busy, noAnswer}.
-		std::vector<std::tuple<std::string, std::string, std::string, std::string>> forwards;
+		std::vector<pbx::ForwardRow> forwards;
 		// Ring/hunt groups: {groupExt, "ringall"|"hunt", "m1,m2,..."}.
 		std::vector<std::tuple<std::string, std::string, std::string>> ringGroups;
 		// Parked calls: {orbit, parkedExt, parker, secondsParked}.

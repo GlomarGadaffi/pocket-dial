@@ -39,14 +39,15 @@ using nvswriter::StageResult;
 
 namespace
 {
-	// Three keys, tiny slots: Devices holds 15 payload bytes, Forwards and DidMap 63.
+	// Four keys, tiny slots: Devices holds 15 payload bytes, Forwards, DidMap and Telephony 63.
 	struct Rig
 	{
 		nvswriter::Slot<16> devices;
 		nvswriter::Slot<64> forwards;
 		nvswriter::Slot<64> didmap;
+		nvswriter::Slot<64> telephony;
 		nvswriter::Slot<64> scratch;
-		std::array<nvswriter::SlotRef, nvswriter::kKeyCount> refs{{nvswriter::refOf(devices), nvswriter::refOf(forwards), nvswriter::refOf(didmap)}};
+		std::array<nvswriter::SlotRef, nvswriter::kKeyCount> refs{{nvswriter::refOf(devices), nvswriter::refOf(forwards), nvswriter::refOf(didmap), nvswriter::refOf(telephony)}};
 		nvswriter::DepthOneMailboxes mail{refs};
 		nvswriter::Stager<nvswriter::DepthOneMailboxes> st{mail, refs, &scratch};
 
@@ -132,7 +133,7 @@ TEST_F(NvsWriterLogic, TheStagedBlobEqualsTheSourceBytes)
 	const std::string src = std::string("aabbccddeeff\t201\t0\t0\t1\n") + "112233445566\t202\t1\t3\t4294967295\n";
 	nvswriter::Slot<128> big;
 	nvswriter::Slot<128> scratch;
-	std::array<nvswriter::SlotRef, nvswriter::kKeyCount> refs{{nvswriter::refOf(big), nvswriter::refOf(big), nvswriter::refOf(big)}};
+	std::array<nvswriter::SlotRef, nvswriter::kKeyCount> refs{{nvswriter::refOf(big), nvswriter::refOf(big), nvswriter::refOf(big), nvswriter::refOf(big)}};
 	nvswriter::DepthOneMailboxes mail(refs);
 	nvswriter::Stager<nvswriter::DepthOneMailboxes> st(mail, refs, &scratch);
 
@@ -480,7 +481,7 @@ TEST_F(NvsWriterWiring, NothingIsStagedWhileAFactoryResetRunsButTheTableStaysRig
 	EXPECT_GE(nvswriter::stats().suppressed, 1u);
 	EXPECT_TRUE(staged(Key::Forwards).empty());
 	bool inRam = false;
-	for (const auto& [ext, always, busy, noAnswer] : _h->getForwards())
+	for (const auto& [ext, always, busy, noAnswer, noAnswerSeconds] : _h->getForwards())
 		if (ext == "305" && always == "5500") inRam = true;
 	EXPECT_TRUE(inRam) << "the live forward still works; only the flash copy is refused";
 }

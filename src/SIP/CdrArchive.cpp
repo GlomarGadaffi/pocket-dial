@@ -352,6 +352,11 @@ namespace
 			struct dirent* ent;
 			while ((ent = ::readdir(d)) != nullptr)
 			{
+				// #993: this can run on sip_server_task (DTMF 999, since #992)
+				// under its 5 s task watchdog; a slow card must not trip it
+				// before nvs_flash_erase(). Fed per entry, including the
+				// skipped ones, so no path through the loop goes unfed.
+				resetguard::sweepTick();
 				if (ent->d_name[0] == '.') continue;  // skip "." / ".."
 				// d_name is a fixed-size array in struct dirent (POSIX NAME_MAX+1,
 				// 256 on glibc) but an arbitrary filename at runtime -- unlike

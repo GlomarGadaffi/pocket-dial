@@ -6,7 +6,9 @@
 // callers: Registrar::persistDevices() and PbxFeatureConfig::persistForwards(),
 // both under RequestsHandler::_mutex.
 // Slice 4 adds DidMapping::persist() (Key::DidMap), whose write is not one
-// nvs_set_str but DidMapping::writeSnapshot()'s per-slot sequence.
+// nvs_set_str but DidMapping::writeSnapshot()'s per-slot sequence. #997 adds
+// TelephonyApiConfig::persist() (Key::Telephony): the table without its client
+// secrets, unpacked by TelephonyApiConfig::writeSnapshot().
 
 #include <cstddef>
 
@@ -14,6 +16,7 @@
 #include "FunctionRef.hpp"
 #include "NvsWriterLogic.hpp"
 #include "PoolConfig.hpp"
+#include "TelephonyApiConfig.hpp"
 
 namespace nvswriter
 {
@@ -37,8 +40,19 @@ namespace nvswriter
 	// apply to it; a field that does not fit its cell is refused at stage time.
 	constexpr size_t kDidMapCap = DidMapping::kSnapshotCap;
 
+	// The telephony table without its secrets: also a fixed-layout snapshot (the
+	// cells are sized for the longest value TelephonyApiConfig::load() can read).
+	constexpr size_t kTelephonyCap = TelephonyApiConfig::kSnapshotCap;
+
 	constexpr size_t maxOf(size_t a, size_t b) { return (a > b) ? a : b; }
-	constexpr size_t kScratchCap = maxOf(maxOf(kDevicesCap, kForwardsCap), kDidMapCap);
+	constexpr size_t kScratchCap = maxOf(maxOf(maxOf(kDevicesCap, kForwardsCap), kDidMapCap), kTelephonyCap);
+
+	// What the fourth key costs, as numbers the compiler checks: one staging slot and one
+	// queue item of this size each (PSRAM at init on the S3, internal heap on a build
+	// without it). It is smaller than the 4,004 B the secret-bearing table was estimated
+	// at, and it does not grow the shared scratch, which stays the forwards key's.
+	static_assert(sizeof(Slot<kTelephonyCap>) == 1564, "the telephony slot and its queue item are 1,564 B each");
+	static_assert(kScratchCap == kForwardsCap, "the telephony key must not grow the shared internal scratch");
 
 	// Boot-time and idempotent (loadDevices / loadPbxConfig call it before any
 	// handler dispatches). Board: reserves the slots, creates the queues and
@@ -63,5 +77,12 @@ namespace nvswriter
 	std::string_view stagedForTest(Key k);                                       // payload waiting, or empty
 	unsigned drainForTest(FunctionRef<bool(Key, const char*, size_t)> sink);     // one writer pass
 	void resetForTest();                                                         // empty queues, zero counters
+
+	// #997: which writer buffers hold `needle` right now, anywhere in them (the whole
+	// slot, the whole queue item, the whole scratch, not just the payload a stage
+	// wrote): a slot keeps its last bytes until the next stage overwrites them, a queue
+	// item keeps them after the writer took it, and so does the scratch.
+	enum BufferBit : unsigned { InSlot = 1, InQueue = 2, InScratch = 4 };
+	unsigned buffersHoldingForTest(std::string_view needle);
 #endif
 }

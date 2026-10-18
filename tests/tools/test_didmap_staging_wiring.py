@@ -230,7 +230,7 @@ class SnapshotLayoutAndTheWriterHalf(unittest.TestCase):
         self.assertIn("kSnapshotCap = kSnapshotLen + 1", hdr)
         w = code("Helpers/NvsWriter.hpp")
         self.assertIn("kDidMapCap = DidMapping::kSnapshotCap", w)
-        self.assertRegex(w, r"kScratchCap = maxOf\(maxOf\(kDevicesCap, kForwardsCap\), kDidMapCap\)")
+        self.assertRegex(w, r"kScratchCap = maxOf\(maxOf\(maxOf\(kDevicesCap, kForwardsCap\), kDidMapCap\), kTelephonyCap\)")
 
 
 class BoardWiringForTheThirdKey(unittest.TestCase):
@@ -252,12 +252,12 @@ class BoardWiringForTheThirdKey(unittest.TestCase):
     def test_the_key_name_switch_names_every_key_without_a_default(self):
         names = indented_body(WRITER, r"const char\* nvsKeyName\(Key k\)")
         self.assertNotIn("default", names, "a new Key must be a compile warning here, not a quiet 'forwards'")
-        for k in ("Devices", "Forwards", "DidMap"):
+        for k in ("Devices", "Forwards", "DidMap", "Telephony"):
             self.assertIn("case Key::" + k, names)
 
     def test_the_third_slot_is_psram_at_init_and_freed_on_every_failure_path(self):
         self.assertRegex(self.start, r"s_didmap = allocSlot<Slot<kDidMapCap>>\(\);")
-        self.assertIn("if (s_devices == nullptr || s_forwards == nullptr || s_didmap == nullptr)", self.start)
+        self.assertIn("if (s_devices == nullptr || s_forwards == nullptr || s_didmap == nullptr || s_telephony == nullptr)", self.start)
         self.assertEqual(self.src.count("allocPreferPsram("), 1, "the one allocation site is allocSlot()")
         free = indented_body(WRITER, r"void freeSlots\(\)")
         self.assertIn("psram::freePreferPsram(s_didmap);", free)

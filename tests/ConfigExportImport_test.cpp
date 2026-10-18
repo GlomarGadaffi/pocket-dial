@@ -42,6 +42,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <thread>
@@ -305,6 +307,47 @@ TEST_F(ConfigExportImportTest, PlaintextRoundTrip_DialPlanRingGroupsPageZonesDnd
 	EXPECT_NE(std::find(dnd.begin(), dnd.end(), "101"), dnd.end());
 }
 
+// #1009: the per-extension ring time goes through /api/forward, the export,
+// a factory reset (which clears it) and the import (which restores it).
+TEST_F(ConfigExportImportTest, PlaintextRoundTrip_NoAnswerTimeout)
+{
+	auto setTimeout = [&](const std::string& value) {
+		return statusOf(httpRaw(_port, "POST", "/api/forward",
+			"extension=101&trigger=timeout&target=" + value,
+			"pd_session=" + _sysop.cookie, _sysop.csrf));
+	};
+	auto secondsOf = [&](const std::string& ext) {
+		for (const auto& row : _handler->getForwards())
+			if (std::get<0>(row) == ext) return std::get<4>(row);
+		return -1;
+	};
+	EXPECT_EQ(setTimeout("4"), 400);
+	EXPECT_EQ(setTimeout("121"), 400);
+	EXPECT_EQ(setTimeout("3x"), 400);
+	EXPECT_EQ(secondsOf("101"), -1);
+	ASSERT_EQ(setTimeout("45"), 200);
+	EXPECT_EQ(secondsOf("101"), 45);
+
+	std::string exportResp = httpRaw(_port, "GET", "/api/config/export", "",
+		"pd_session=" + _sysop.cookie);
+	ASSERT_EQ(statusOf(exportResp), 200) << exportResp;
+	const std::string blob = bodyOf(exportResp);
+	EXPECT_NE(blob.find("\"noAnswerSeconds\":45"), std::string::npos) << blob;
+
+	AdminSession owner = loginOwner();
+	ASSERT_EQ(statusOf(httpRaw(_port, "POST", "/api/factory-reset", "confirm=ERASE",
+		"pd_session=" + owner.cookie, owner.csrf)), 200);
+	resetguard::resetForTest();
+	EXPECT_EQ(secondsOf("101"), -1) << "a factory reset clears the ring time";
+
+	AdminSession freshSysop = loginSysop(_port);
+	std::string importResp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(blob) + "&confirm=REPLACE",
+		"pd_session=" + freshSysop.cookie, freshSysop.csrf);
+	ASSERT_EQ(statusOf(importResp), 200) << importResp;
+	EXPECT_EQ(secondsOf("101"), 45);
+}
+
 TEST_F(ConfigExportImportTest, Import_ReplaceNotMerge_DropsEntriesNotInTheBlob)
 {
 	// Two ring groups exist before the import...
@@ -387,6 +430,77 @@ TEST_F(ConfigExportImportTest, Import_StagesTheDidTableOnceInsteadOfCommittingPe
 		"m0did=+15550100001", "m0ext=1001", "m1did=+15550100002", "m1ext=1002",
 		"m2did=+15550100003", "m2ext=1003"};
 	EXPECT_EQ(keys, want) << "the earlier table (the one DID set before the import) is gone";
+}
+
+// #997: the import's two telephony passes (a setTelephonyConfigSlot per listed slot, each
+// with keepSecret=true) used to be 25 NVS sets and a commit apiece under _mutex, eight times
+// over. They stage the table without its secret instead, so the writer is left one snapshot
+// -- and an import, which can never carry a client secret, writes none.
+TEST_F(ConfigExportImportTest, Import_StagesTheTelephonyConfigOnceAndWritesNoSecret)
+{
+	const std::string secret = "IMPORT-sentinel-secret-81c4";
+	const std::string draftSecret = "IMPORT-draft-secret-5d0e";
+	TelephonyApiConfig::Slot s;
+	s.type = TelephonyProviderType::Telephony;
+	s.enabled = true;
+	s.baseUrl = "https://pbx.example.invalid";
+	s.clientId = "imp-client-id";
+	s.secret = secret;
+	s.routeDn = "100";
+	ASSERT_EQ(_handler->setTelephonyConfigSlot(0, s, false), "");
+	// Slot 1 is a disabled draft with a secret of its own: the import must leave that one alone too.
+	TelephonyApiConfig::Slot draft = s;
+	draft.enabled = false;
+	draft.secret = draftSecret;
+	ASSERT_EQ(_handler->setTelephonyConfigSlot(1, draft, false), "");
+
+	AdminSession owner = loginOwner();
+	const std::string exportResp = httpRaw(_port, "POST", "/api/config/export",
+		"password=exportpass123", "pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(exportResp), 200) << exportResp;
+	const std::string blob = bodyOf(exportResp);
+	ASSERT_NE(blob.find("\"secretsEnc\""), std::string::npos) << blob;
+	EXPECT_EQ(blob.find(secret), std::string::npos) << "the plaintext half carries secretSet, never the client secret";
+
+	// Change something after the export so the import has something to restore.
+	TelephonyApiConfig::Slot edit = s;
+	edit.clientId = "changed-after-export";
+	edit.secret.clear();
+	ASSERT_EQ(_handler->setTelephonyConfigSlot(0, edit, /*keepSecret=*/true), "");
+	const uint32_t secretWritesBefore = _handler->telephonySecretWritesForTest();
+
+	nvswriter::resetForTest();
+	const std::string importResp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(blob) + "&password=exportpass123&confirm=REPLACE",
+		"pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(importResp), 200) << importResp;
+
+	EXPECT_EQ(_handler->getTelephonyConfigSlot(0).clientId, "imp-client-id") << "restored, and live before the writer has run";
+	EXPECT_EQ(_handler->telephonySecretWritesForTest(), secretWritesBefore) << "an import writes no secret";
+
+	unsigned writes = 0;
+	std::string s0id;
+	nvswriter::drainForTest([&](nvswriter::Key k, const char* p, size_t n) {
+		if (k != nvswriter::Key::Telephony) return true;
+		++writes;
+		EXPECT_TRUE(TelephonyApiConfig::emitSnapshot(p, n,
+			[](const char*, uint8_t) { return true; },
+			[&](const char* key, const char* val) {
+				if (std::string(key) == "s0id") s0id = val;
+				return true;
+			}));
+		return true;
+	});
+	EXPECT_EQ(writes, 1u) << "eight telephony stages (two passes, four slots), one write of the final table";
+	EXPECT_EQ(s0id, "imp-client-id");
+	EXPECT_NE(nvswriter::buffersHoldingForTest("imp-client-id"), 0u) << "the pairing: the scan does see the staged fields";
+	EXPECT_EQ(nvswriter::buffersHoldingForTest(secret), 0u) << "the secret is in no writer buffer";
+
+	std::ifstream store(_tapiPath, std::ios::binary);
+	const std::string file((std::istreambuf_iterator<char>(store)), std::istreambuf_iterator<char>());
+	EXPECT_NE(file.find(secret), std::string::npos) << "keepSecret: the import left the stored secret alone";
+	EXPECT_NE(file.find(draftSecret), std::string::npos) << "...and the disabled draft's too";
+	EXPECT_EQ(nvswriter::buffersHoldingForTest(draftSecret), 0u);
 }
 
 // ── Password-gated (AES-256-GCM/PBKDF2-SHA256) round-trip ──────────────────

@@ -9,6 +9,7 @@
 #include "bootloader_random.h"   // Issue #588: SAR ADC entropy for the pre-start PSK draw
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"  // #1006: internal free/largest in the task-create failure log
 #include "esp_task_wdt.h"   // Issue #185: sip_server_task TWDT subscription
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -45,6 +46,20 @@
 #define TOPOLOGY_INFRA  2   // Wi-Fi AP  — run embedded DHCP server for phones
 
 static const char *TAG = "wifi softAP";
+
+// #1006: a boot-time task create that fails leaves the board half-booted with
+// no log line. Every create in app_main goes through this on != pdPASS: log the
+// internal heap (task stacks come from it), give the log a second to drain,
+// then restart. Determinism over degradation: a visible boot loop beats a
+// silent half-boot.
+static void boot_task_create_failed(const char* name)
+{
+    ESP_LOGE(TAG, "[boot] xTaskCreate %s failed: internal free=%u largest=%u -- restarting",
+             name, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+}
 
 // Global pointer so the HTTP task (Core 0) can reach the SIP engine built by the
 // SIP task (Core 1). Atomic with acquire/release: a plain pointer is a cross-core
@@ -427,7 +442,8 @@ extern "C" void app_main(void)
     // 3072, up from 2048: the tee adds an lwip send() to this task's deepest path.
     // The high-water mark logged by the task itself is what justifies this number
     // staying here or moving.
-    xTaskCreatePinnedToCore(log_drain_task, "log_drain", 3072, nullptr, 1, nullptr, 0);
+    if (xTaskCreatePinnedToCore(log_drain_task, "log_drain", 3072, nullptr, 1, nullptr, 0) != pdPASS)
+        boot_task_create_failed("log_drain");
 
     // ── Networking stack init ────────────────────────────────────────────────
     // netif + default event loop are non-retryable boot prerequisites: if they fail the
@@ -506,7 +522,8 @@ extern "C" void app_main(void)
     // ── Launch HTTP dashboard on Core 0 (always — needed to provision) ─────────
     // The HTTP dashboard must start even on an unprovisioned device so the admin
     // can submit credentials via the web interface.
-    xTaskCreatePinnedToCore(&http_server_task, "http_server_task", 8192, NULL, 4, NULL, 0);
+    if (xTaskCreatePinnedToCore(&http_server_task, "http_server_task", 8192, NULL, 4, NULL, 0) != pdPASS)
+        boot_task_create_failed("http_server_task");
 
     if (!is_provisioned) {
         ESP_LOGW(TAG, "[boot] device unprovisioned — SIP stack held dark until credential committed");
@@ -540,5 +557,6 @@ extern "C" void app_main(void)
     }
 
     // ── Launch SIP server on Core 1 (gated on provisioning) ─────────────────
-    xTaskCreatePinnedToCore(&sip_server_task, "sip_server_task", 8192, NULL, 5, NULL, 1);
+    if (xTaskCreatePinnedToCore(&sip_server_task, "sip_server_task", 8192, NULL, 5, NULL, 1) != pdPASS)
+        boot_task_create_failed("sip_server_task");
 }
