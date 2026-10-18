@@ -17,7 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
-#include "PsramTask.hpp"   // PD_ASSERT_NOT_PSRAM_STACK -- issue #277
+#include "FlashWriter.hpp"   // #991: the task that takes the blob
 #endif
 
 namespace
@@ -143,94 +143,13 @@ namespace
 		return caps;
 	}
 
-	void cdrPersistWriterTask(void*)
+	// #991: true once the flash_writer task exists and the queue above is made.
+	// The task reaches the ring only after it reads true (release/acquire), and
+	// the queue is never deleted after that.
+	std::atomic<bool>& writerReady()
 	{
-		// `blob` is deliberately a function-STATIC, not a stack-local. At the
-		// default POCKETDIAL_CDR_RECORDS=32, CdrRingBlob::kCapacity is 4481
-		// bytes -- MORE than this task's entire 4096-byte stack, before
-		// counting xQueueReceive()'s own frame or nvs_open/nvs_set_str/
-		// nvs_commit's. A stack-local here would overflow on the very first
-		// persist after boot, reintroducing this PR's own bug class inside
-		// its own fix (caught in review -- sonnet-OG, thank you -- not on
-		// hardware, where it would have looked like an unrelated new crash).
-		// Static also decouples the writer task's required stack size from
-		// POCKETDIAL_CDR_RECORDS, which CallDetailRecord.hpp documents as a
-		// compile-time -D override: a numeric stack size chosen "with
-		// margin" for today's default would silently become insufficient
-		// again if that macro is ever raised, without touching this file to
-		// notice. Safe without synchronization because this task is the
-		// only reader/writer of `blob` and processes exactly one queue item
-		// at a time on its own single thread of execution.
-		static CdrRingBlob blob;
-		while (true)
-		{
-			if (xQueueReceive(cdrPersistQueue(), &blob, portMAX_DELAY) == pdTRUE)
-			{
-				// Defense in depth (#277 suggestion 3): this task is created
-				// WITHOUT PD_TASK_STACK_CAPS (plain xTaskCreatePinnedToCore
-				// below), so this should never fire -- if it ever does,
-				// someone changed the task creation call without reading
-				// PsramTask.hpp first.
-				PD_ASSERT_NOT_PSRAM_STACK();
-				if (blob.erase)
-				{
-					// An empty ring (clearAll(), incl. factory reset): remove it.
-					// Not gated by resetguard -- erasing is what a reset wants.
-					nvs_handle_t h;
-					if (nvs_open(NVS_CDR_NS, NVS_READWRITE, &h) != ESP_OK)
-					{
-						persistFailures().fetch_add(1);
-						continue;
-					}
-					bool ok = true;
-					for (const char* key : {kBlobKey, kLegacyKey})
-					{
-						const esp_err_t e = nvs_erase_key(h, key);
-						if (e != ESP_OK && e != ESP_ERR_NVS_NOT_FOUND) ok = false;
-					}
-					if (nvs_commit(h) != ESP_OK) ok = false;
-					nvs_close(h);
-					if (!ok) persistFailures().fetch_add(1);
-					continue;
-				}
-
-				// #473: a factory reset in progress refuses new data -- the ring
-				// may hold exactly the call history the reset is removing.
-				resetguard::WriteScope scope;
-				if (!scope.allowed())
-				{
-					persistSuppressed().fetch_add(1);
-					continue;
-				}
-				// Issue #470: every return checked, failures counted and logged.
-				// A blob, not a string: nvs_set_str caps at 4000 B and the ring
-				// can reach CdrRingBlob::kCapacity.
-				nvs_handle_t h;
-				esp_err_t e = nvs_open(NVS_CDR_NS, NVS_READWRITE, &h);
-				if (e != ESP_OK)
-				{
-					persistFailures().fetch_add(1);
-					ESP_LOGW("CdrRing", "persist: nvs_open failed (%s)", esp_err_to_name(e));
-					continue;
-				}
-				e = nvs_set_blob(h, kBlobKey, blob.text, blob.len);
-				if (e == ESP_OK)
-				{
-					// Migration: the legacy string must not outlive a good blob,
-					// or a later downgrade/fallback would resurrect stale history.
-					const esp_err_t le = nvs_erase_key(h, kLegacyKey);
-					if (le != ESP_OK && le != ESP_ERR_NVS_NOT_FOUND) e = le;
-				}
-				if (e == ESP_OK) e = nvs_commit(h);
-				nvs_close(h);
-				if (e != ESP_OK)
-				{
-					persistFailures().fetch_add(1);
-					ESP_LOGW("CdrRing", "persist: CDR ring not saved (%s, %u bytes)",
-						esp_err_to_name(e), static_cast<unsigned>(blob.len));
-				}
-			}
-		}
+		static std::atomic<bool> r{false};
+		return r;
 	}
 
 	// Idempotent. Called once from load() (already the class's single-
@@ -252,10 +171,10 @@ namespace
 		// STACK is in PSRAM from touching flash, because cache-disable during
 		// the flash op makes PSRAM unreadable and the task cannot even
 		// execute (its own stack is unreadable). This queue's storage is
-		// data, not a stack, and xQueueReceive() below fully copies an item
-		// OUT of that storage into `blob` -- a function-static that already
-		// lives in internal RAM (see cdrPersistWriterTask's comment) -- before
-		// this task does anything flash-related. By the time nvs_set_str()
+		// data, not a stack, and xQueueReceive() in writePending() fully copies
+		// an item OUT of that storage into `blob` -- a function-static that
+		// already lives in internal RAM (see its comment) -- before the writer
+		// task does anything flash-related. By the time nvs_set_str()
 		// disables the cache, the PSRAM-backed queue storage has not been
 		// touched since the copy completed and is not touched again until the
 		// NEXT xQueueReceive(), well after cache is re-enabled. Net effect:
@@ -285,40 +204,121 @@ namespace
 			started = false;   // allow a retry on a later load() (there is none today, but cheap to allow)
 			return;
 		}
-		// PLAIN stack (no PD_TASK_STACK_CAPS): this task is the only place
-		// allowed to touch flash for the CDR ring -- see PsramTask.hpp.
-		// 6144 bytes matches CdrArchive.cpp's own writer task, the closest
-		// precedent (a comparable flash-adjacent worker with a blocking
-		// library call chain) -- and, like that one, this is a reasoned
-		// estimate, NOT measured with uxTaskGetStackHighWaterMark() on real
-		// hardware. `blob` itself is static now (see cdrPersistWriterTask's
-		// comment), so this only needs to cover xQueueReceive()'s frame and
-		// nvs_open/nvs_set_str/nvs_commit's internal depth. Flag for
-		// hardware bring-up, same as CdrArchive.cpp's.
-		if (xTaskCreatePinnedToCore(cdrPersistWriterTask, "cdr_persist", 6144,
-			nullptr, 1, nullptr, 0) != pdPASS)
+		// #991: no task of its own any more. The flash_writer task
+		// (FlashWriter.cpp, a plain internal stack, the #277 rule) takes this
+		// queue's blob in its pass, round robin with the NVS writer's keys.
+		if (!flashwriter::start())
 		{
-			ESP_LOGE("CdrRing", "xTaskCreate cdr_persist failed -- CDR ring will not persist across reboot");
+			ESP_LOGE("CdrRing", "flash_writer task not started -- CDR ring will not persist across reboot");
 			// Issue #315: a caps-created queue must be torn down with the matching
 			// vQueueDeleteWithCaps(), not vQueueDelete() -- the plain form does not
 			// know how to free PSRAM-backed queue storage -- and a plain one with
-			// vQueueDelete() (#476: which one we got is recorded above).
+			// vQueueDelete() (#476: which one we got is recorded above). Safe: the
+			// task never saw this queue, writerReady() is still false.
 			persistFailures().fetch_add(1);
 			if (queueHasCaps()) vQueueDeleteWithCaps(cdrPersistQueue());
 			else                vQueueDelete(cdrPersistQueue());
 			cdrPersistQueue() = nullptr;
 			started = false;
+			return;
 		}
+		writerReady().store(true, std::memory_order_release);
 	}
 #endif
 }
+
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+// #991: the ring's unit in the flash_writer task's pass (FlashWriter.cpp) --
+// what cdr_persist's loop did with one item. Takes the waiting snapshot, if any,
+// without blocking: the task has other queues to serve.
+unsigned CdrRing::writePending()
+{
+	if (!writerReady().load(std::memory_order_acquire)) return 0;   // not started (yet)
+	// `blob` is deliberately a function-STATIC, not a stack-local. At the
+	// default POCKETDIAL_CDR_RECORDS=32, CdrRingBlob::kCapacity is 4481
+	// bytes -- most of the writer's 6144-byte stack, before counting
+	// xQueueReceive()'s own frame or nvs_open/nvs_set_blob/nvs_commit's. A
+	// stack-local here would overflow on the very first persist after boot,
+	// reintroducing #273's bug class inside its own fix (caught in review --
+	// sonnet-OG, thank you -- not on hardware, where it would have looked like
+	// an unrelated new crash). Static also decouples the writer task's required
+	// stack size from POCKETDIAL_CDR_RECORDS, which CallDetailRecord.hpp
+	// documents as a compile-time -D override: a numeric stack size chosen
+	// "with margin" for today's default would silently become insufficient
+	// again if that macro is ever raised, without touching this file to
+	// notice. Internal RAM (a static), which the flash write needs (#315).
+	// Safe without synchronization because the flash_writer task is the only
+	// caller and takes exactly one queue item at a time.
+	static CdrRingBlob blob;
+	if (xQueueReceive(cdrPersistQueue(), &blob, 0) != pdTRUE) return 0;
+	if (blob.erase)
+	{
+		// An empty ring (clearAll(), incl. factory reset): remove it.
+		// Not gated by resetguard -- erasing is what a reset wants.
+		nvs_handle_t h;
+		if (nvs_open(NVS_CDR_NS, NVS_READWRITE, &h) != ESP_OK)
+		{
+			persistFailures().fetch_add(1);
+			return 0;
+		}
+		bool ok = true;
+		for (const char* key : {kBlobKey, kLegacyKey})
+		{
+			const esp_err_t e = nvs_erase_key(h, key);
+			if (e != ESP_OK && e != ESP_ERR_NVS_NOT_FOUND) ok = false;
+		}
+		if (nvs_commit(h) != ESP_OK) ok = false;
+		nvs_close(h);
+		if (!ok) persistFailures().fetch_add(1);
+		return ok ? 1u : 0u;
+	}
+
+	// #473: a factory reset in progress refuses new data -- the ring
+	// may hold exactly the call history the reset is removing.
+	resetguard::WriteScope scope;
+	if (!scope.allowed())
+	{
+		persistSuppressed().fetch_add(1);
+		return 0;
+	}
+	// Issue #470: every return checked, failures counted and logged.
+	// A blob, not a string: nvs_set_str caps at 4000 B and the ring
+	// can reach CdrRingBlob::kCapacity.
+	nvs_handle_t h;
+	esp_err_t e = nvs_open(NVS_CDR_NS, NVS_READWRITE, &h);
+	if (e != ESP_OK)
+	{
+		persistFailures().fetch_add(1);
+		ESP_LOGW("CdrRing", "persist: nvs_open failed (%s)", esp_err_to_name(e));
+		return 0;
+	}
+	e = nvs_set_blob(h, kBlobKey, blob.text, blob.len);
+	if (e == ESP_OK)
+	{
+		// Migration: the legacy string must not outlive a good blob,
+		// or a later downgrade/fallback would resurrect stale history.
+		const esp_err_t le = nvs_erase_key(h, kLegacyKey);
+		if (le != ESP_OK && le != ESP_ERR_NVS_NOT_FOUND) e = le;
+	}
+	if (e == ESP_OK) e = nvs_commit(h);
+	nvs_close(h);
+	if (e != ESP_OK)
+	{
+		persistFailures().fetch_add(1);
+		ESP_LOGW("CdrRing", "persist: CDR ring not saved (%s, %u bytes)",
+			esp_err_to_name(e), static_cast<unsigned>(blob.len));
+		return 0;
+	}
+	return 1;
+}
+#endif
 
 void CdrRing::serializeForPersist(
 	const std::array<CallDetailRecord, POCKETDIAL_CDR_RECORDS>& ring,
 	size_t head, size_t count, CdrRingBlob& out)
 {
 	// Reset first: `out` may be a reused static (see persist()'s and
-	// cdrPersistWriterTask's callers) carrying a longer previous blob, and
+	// writePending()'s) carrying a longer previous blob, and
 	// std::memset is the only way to guarantee every trailing byte is '\0'
 	// again -- a shorter new blob must not leave stale bytes from the last
 	// call sitting after its own NUL terminator.
@@ -570,11 +570,12 @@ void CdrRing::persist()
 	//
 	// serializeForPersist() is pure CPU work (string formatting into a fixed
 	// buffer, no allocation) -- safe on any stack, including a PSRAM one.
-	// The actual flash write now happens ONLY on cdr_persist_writer's plain
-	// stack; this function just builds the blob and hands it off.
+	// The actual flash write now happens ONLY on the flash_writer task's plain
+	// stack (#991, FlashWriter.cpp); this function just builds the blob and
+	// hands it off.
 	//
 	// `blob` is a function-static, not a stack-local, for the same reason
-	// cdrPersistWriterTask's is (see that function's comment): at
+	// writePending()'s is (see that function's comment): at
 	// CdrRingBlob::kCapacity ~4.5 KB, a stack-local here would add real
 	// pressure to whichever task calls persist() -- tel_wsw and the
 	// makecall worker (both 12 KB PSRAM stacks) or the SIP thread (8 KB) --
@@ -618,10 +619,12 @@ void CdrRing::persist()
 		persistSuppressed().fetch_add(1);
 		return;
 	}
-	if (cdrPersistQueue() != nullptr &&
-		xQueueOverwrite(cdrPersistQueue(), &blob) != pdPASS)   // pdPASS by contract on length 1; checked anyway
+	if (cdrPersistQueue() == nullptr) return;
+	if (xQueueOverwrite(cdrPersistQueue(), &blob) != pdPASS)   // pdPASS by contract on length 1; checked anyway
 	{
 		persistFailures().fetch_add(1);
+		return;
 	}
+	flashwriter::wake();   // #991: never blocks; the flash_writer task takes it
 #endif
 }

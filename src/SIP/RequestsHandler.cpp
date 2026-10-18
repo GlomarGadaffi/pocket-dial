@@ -5717,7 +5717,7 @@ void RequestsHandler::startTelCtl()
 		{
 			// 12288: makeCall is a TLS HTTPS round trip (4096 bootlooped, see
 			// tel_start). PSRAM is safe: TLS I/O only, and endCall()'s CDR write
-			// is handed to the cdr_persist task (PsramTask.hpp, #273).
+			// is handed to the flash_writer task (PsramTask.hpp, #273, #991).
 			const char* name = l == kLaneCtl ? kCtlName[i] : kName[l];
 			if (pd::createTaskPreferPsram(&RequestsHandler::telCtlTask, name, 12288, &lane, 5, nullptr) == pdPASS) ++up;
 		}

@@ -268,10 +268,11 @@ class BoardWiringForTheThirdKey(unittest.TestCase):
         self.assertIn("refOf(*s_devices), refOf(*s_forwards), refOf(*s_didmap)", refs, "index order == Key")
         self.assertIn("refOf(s_devices), refOf(s_forwards), refOf(s_didmap)", refs)
 
-    def test_the_writer_scratch_stays_internal_and_the_task_is_unchanged(self):
+    def test_the_writer_scratch_stays_internal_and_the_task_is_the_shared_flash_writer(self):
         self.assertRegex(self.src, r"(?m)^	Slot<kScratchCap> s_scratch;")
-        self.assertRegex(self.src, r'xTaskCreatePinnedToCore\(nvsWriterTask, "nvs_writer", 6144, nullptr, 1, &handle, 0\)')
-        self.assertEqual(len(re.findall(r"xTaskCreate\w*\(", self.src)), 1)
+        # #991: no task of its own; flash_writer (FlashWriter.cpp) drains the queues.
+        self.assertEqual(re.findall(r"xTaskCreate\w*\(", self.src), [])
+        self.assertIn("flashwriter::start()", self.start)
 
     def test_the_third_queue_is_made_like_the_others(self):
         self.assertIn("for (size_t i = 0; i < kKeyCount; ++i)", self.start)

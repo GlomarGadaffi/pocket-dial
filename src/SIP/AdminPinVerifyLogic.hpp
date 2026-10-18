@@ -10,7 +10,7 @@
 // the window waited that long. Dropping the lock would not help, because the
 // task would still be busy and answer nothing.
 //
-// The shape (the cdr_persist / NvsWriter one): the SIP side, still under _mutex,
+// The shape (the CdrRing / NvsWriter one): the SIP side, still under _mutex,
 // only copies what the check needs into one static slot and wakes the worker;
 // the worker hashes with no lock held; tick() picks the result up under _mutex
 // and does what the synchronous code did, in the same order.

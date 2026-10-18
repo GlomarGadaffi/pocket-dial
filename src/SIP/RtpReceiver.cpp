@@ -607,7 +607,8 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 	// safe under the #273 rule: nothing reachable from this task writes flash --
 	// every sink hands off (DTMF -> _dtmfInbox, drained on the SIP task;
 	// voicemail -> a PSRAM buffer, flushed to /sdcard (SDSPI) by vm_archive; CDR
-	// -> cdr_persist's queue), and its only transmit, sendRaw(), is a sendto()
+	// -> the CDR ring's queue, which flash_writer drains), and its only
+	// transmit, sendRaw(), is a sendto()
 	// whose Ethernet work runs on the tcpip task (LWIP_TCPIP_CORE_LOCKING is
 	// off), never on this stack. Falls back to internal, counted, where PSRAM
 	// is short or absent (pd::createTaskPreferPsram).

@@ -2,8 +2,9 @@
 
 // NvsWriter -- the process-wide NVS writer (#986 slice 2). The policy is in
 // NvsWriterLogic.hpp; this is the sizes, the instance, and (board only) the
-// queues and the pinned task. First callers: Registrar::persistDevices() and
-// PbxFeatureConfig::persistForwards(), both under RequestsHandler::_mutex.
+// queues, which the flash_writer task drains (#991, FlashWriter.hpp). First
+// callers: Registrar::persistDevices() and PbxFeatureConfig::persistForwards(),
+// both under RequestsHandler::_mutex.
 // Slice 4 adds DidMapping::persist() (Key::DidMap), whose write is not one
 // nvs_set_str but DidMapping::writeSnapshot()'s per-slot sequence. #997 adds
 // TelephonyApiConfig::persist() (Key::Telephony): the table without its client
@@ -54,8 +55,15 @@ namespace nvswriter
 	static_assert(kScratchCap == kForwardsCap, "the telephony key must not grow the shared internal scratch");
 
 	// Boot-time and idempotent (loadDevices / loadPbxConfig call it before any
-	// handler dispatches). Board: creates the queues and the task. Host: nothing.
+	// handler dispatches). Board: reserves the slots, creates the queues and
+	// makes sure the flash_writer task runs (#991, FlashWriter.hpp). Host: nothing.
 	void start();
+
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// #991: the keys' unit in the flash_writer task's pass: one Stager drainOnce,
+	// at most one blob per key. Called only by that task; 0 until start() is done.
+	unsigned writePending();
+#endif
 
 	// Serialises into the key's staging slot and overwrites the key's queue.
 	// Never blocks, never allocates. The caller holds _mutex, which is what makes
