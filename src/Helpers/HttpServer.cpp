@@ -69,6 +69,7 @@
 #include <sstream>
 #include <iostream>
 #include <chrono>
+#include <system_error>  // std::system_error: start()'s accept-thread spawn failure (#1006)
 #include <algorithm>
 #include <vector>
 #include <set>
@@ -402,7 +403,31 @@ HttpServer::~HttpServer()
 void HttpServer::start()
 {
 	_running = true;
-	_acceptThread = std::thread(&HttpServer::acceptLoop, this);
+	// #1006: std::thread's constructor throws std::system_error when the pthread
+	// (a FreeRTOS task on ESP) cannot be created -- seen on hardware with SD
+	// enabled. Uncaught it aborts the board with no heap figures in the log. The
+	// per-connection spawn at acceptLoop() already catches this; the accept
+	// thread itself did not.
+	try
+	{
+		_acceptThread = std::thread(&HttpServer::acceptLoop, this);
+	}
+	catch (const std::system_error& e)
+	{
+		_running = false;
+		std::cerr << "[HttpServer] accept thread spawn failed: " << e.what() << "\n";
+#if defined(ESP_PLATFORM)
+		// No dashboard means no provisioning and no admin: restart deterministically
+		// rather than run headless (reliability bar: determinism over degradation).
+		ESP_LOGE("HttpServer", "accept thread not created: internal free=%u largest=%u -- restarting (#1006)",
+			(unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+			(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+		vTaskDelay(pdMS_TO_TICKS(1000));   // let the log drain
+		esp_restart();
+#else
+		throw;   // host: nothing to fall back to; stay as loud as before
+#endif
+	}
 }
 
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
