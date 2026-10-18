@@ -1,16 +1,8 @@
 # pocket-dial. TUI Information Architecture (SSH Sysop Terminal)
 
-> **Phase-A deliverable (UX Architect).** Reads from and stays consistent with
-> [`00-brief.md`](00-brief.md) (canonical), [`brand.md`](brand.md) (name treatment, banner,
-> status lexicon, voice), and [`personas.md`](personas.md) (Task Inventory §3 = coverage
-> checklist; design implications D1–D13). Grounded in the firmware that actually ships:
-> `src/SIP/PbxConfig.hpp`, `PoolConfig.hpp`, `CallDetailRecord.hpp`, and the CLASS feature-code +
-> DTMF-admin handlers in `src/SIP/RequestsHandler.cpp`.
->
-> This file owns: the master hub, the full v1 screen tree, the global keybinding scheme,
-> the panel/tab interaction model, and the SSH-first onboarding wizard. Downstream:
-> [`tui-style.md`](tui-style.md) (UI Designer) renders these screens in full ANSI;
-> [`walkthrough.md`](walkthrough.md) walks the flows.
+This file owns the master hub, the full v1 screen tree, the global keybinding scheme, the panel and tab interaction model, and the SSH-first onboarding wizard. It is grounded in the firmware that ships: `src/SIP/PbxConfig.hpp`, `PoolConfig.hpp`, `CallDetailRecord.hpp`, and the CLASS feature-code and DTMF-admin handlers in `src/SIP/DtmfFeatureCodes.cpp`.
+
+It reads from and stays consistent with [`00-brief.md`](00-brief.md) (canonical), [`brand.md`](brand.md) (name treatment, banner, status lexicon, voice), and [`personas.md`](personas.md) (Task Inventory §3 is the coverage checklist; design implications D1–D13). Downstream, [`tui-style.md`](tui-style.md) renders these screens in full ANSI, and [`walkthrough.md`](walkthrough.md) walks the flows.
 
 
 ## 0. IA principles (the load-bearing rules every screen obeys)
@@ -44,9 +36,8 @@ architecture. Every decision below traces to one of them.
 ## 1. The master HUB (landing screen)
 
 After auth (banner → PIN), the hub is home. It is the brief's numbered command matrix, reconciled to
-pocket-dial's real feature set. `[6] ADDONS` from the brief's example matrix is **renamed `[6] ABOUT`**
-, pocket-dial ships no add-on/plugin surface, and an empty "ADDONS" menu would violate the honesty
-clause (`brand.md` §6.10). ABOUT carries the firmware/build/license/scaling facts an installer reads.
+pocket-dial's real feature set. The brief's example matrix has `[6] ADDONS`, but pocket-dial ships no add-on or plugin surface, and an empty "ADDONS" menu would violate the honesty
+clause (`brand.md` §6.10). This file uses **`[6] ABOUT`**, which carries the firmware, build, license and scaling facts an installer reads.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -168,15 +159,15 @@ SSH CONNECT
     ├─(4) SECURITY          [ SECURITY ]                            → O2,S1,S2,S4
     │   ├─(P) Change admin PIN  ◇ old → new → confirm (never echoed)      → S1
     │   ├─(K) SSH access  authorized key + PIN-login policy               → S2
-    │   ├─ Session info  who/where logged in · sessions logged to CDR
-    │   └─(X) Factory reset  [A!]  ◇ double-confirm (wipes config+PIN)
+    │   ├─ Session info  who/where logged in
+    │   └─(X) Factory reset  [A!]  ◇ double-confirm (wipes config+PIN); the phone path *PIN#999 takes one confirm digit (section 6.1)
     │         (returns the box to the first-run wizard state)
     │
     ├─(5) REPORTS/LOGS      [ REPORTS ]   ← two views, [Tab] switches → R1–R4
     │   ├─ VIEW · Recent Calls (CDR)   newest-first ring of 32            → R1–R3
     │   │   ├─ Row  TIME · FROM → TO · RESULT(glyph+word) · TALK          → R2/R3
     │   │   │     RESULT ∈ {✓ answered · ⊘ busy · … cancelled ·
-    │   │   │               ○ unreachable · ▲ failed}  (real CdrResult)   → R2
+    │   │   │               ○ unavailable · ▲ failed}  (real CdrResult)   → R2
     │   │   └─(Enter) Call detail  ◇ full record (start, duration, ids)   → R3
     │   └─ VIEW · Event Log tail   live system log (queueLog)             → R4
     │
@@ -187,7 +178,7 @@ SSH CONNECT
     │
     ├─(R) REBOOT  [A!]  ◇ Confirm "REBOOT now? phones drop for ~8s. [y/N]" → N3
     │
-    ├─(L) LOGOUT  → closes the SSH session cleanly (logged to CDR)        → S3
+    ├─(L) LOGOUT  → closes the SSH session cleanly                        → S3
     │
     └─(?) HELP OVERLAY  (global; context-scoped; Esc dismisses)           → S4
 ```
@@ -206,8 +197,7 @@ SSH CONNECT
 - **Features tab is read-only.** Star codes are dialed on the *phones*, not configured here; the tab
   is a reference card so Dana can answer "what do I dial to turn off forwarding?" (`*73`). Listing the
   real, firmware-verified codes (not invented ones) honors the honesty clause.
-- **`[5]` has two views (CDR + Event Log)** under one hub key because both answer "what happened?"
-, the CDR for calls (R1–R3), the log tail for system events (R4). `[Tab]` flips between them.
+- **`[5]` has two views (CDR + Event Log)** under one hub key because both answer "what happened?" The CDR covers calls (R1–R3), and the log tail covers system events (R4). `[Tab]` flips between them.
 - **Factory reset lives in `[4]` SECURITY**, not NETWORK, because it is a credential/identity-wiping
   act; it is `[A!]` double-confirmed and dumps you back into the first-run wizard, closing the loop.
 - **Reboot and Logout stay on the hub** (`[R]`/`[L]`) exactly as the brief specifies, system-level
@@ -243,8 +233,8 @@ arrows/Enter/Tab; Esc always backs out one level (D7).
 | `L` | LOGOUT |
 | `T` | Toggle theme BRASS ↔ PHOSPHOR (footer label updates) |
 
-> `T` (theme) is a hub-level toggle so it is always one Esc + one key away from any screen, and the
-> footer's theme label updates immediately, the only "preference" in the product.
+`T` (theme) is a hub-level toggle so it is always one Esc + one key away from any screen, and the
+footer's theme label updates immediately, the only "preference" in the product.
 
 ### 3.3 List / table panels (Extensions, Ring Groups, Forwards/DND, CDR, roster)
 
@@ -289,9 +279,9 @@ arrows/Enter/Tab; Esc always backs out one level (D7).
 | `C` | Clear stale / torn-down rows from the matrix |
 | `Esc` | Back to hub |
 
-> Reserved-but-unused (honesty): the brief's monitor example shows `[P] PCAP`. pocket-dial ships
-> no on-device packet capture (no SD card, RTP is peer-to-peer), so **`P` is not bound**, listing a
-> key that does nothing would violate the honesty clause. The monitor footer shows only real keys.
+Reserved but unused (honesty): the brief's monitor example shows `[P] PCAP`. pocket-dial ships
+no on-device packet capture (no SD card, RTP is peer-to-peer), so **`P` is not bound**, listing a
+key that does nothing would violate the honesty clause. The monitor footer shows only real keys.
 
 ### 3.7 Footer contract (how keys are always discoverable. D10)
 
@@ -492,7 +482,7 @@ primary screen; cross-links noted. No task is unmapped; no screen lacks a task.
 | F6 star-code reference | `[3]` Features tab (read-only) | real codes only (§6.1) |
 | V1 DTMF digit map | `[3]` IVR tab | digit → action |
 | V2 pick prompt | `[3]` IVR | on-flash prompts partition |
-| V3 set/test answer point | `[3]` IVR `(T)` |, |
+| V3 set/test answer point | `[3]` IVR `(T)` |  |
 | M1 live call matrix | `[1]` MONITOR ⟳ | ≤8 sessions |
 | M2 registration roster | `[1]` MONITOR | ● ONLINE / ○ UNREACH |
 | M3 hardware vitals | `[1]` MONITOR | CPU/mem/uptime/pool n/8 |
@@ -513,7 +503,7 @@ primary screen; cross-links noted. No task is unmapped; no screen lacks a task.
 ### 6.1 Star-code reference (Features tab), verified against firmware
 
 These are the **only** codes the firmware's CLASS handler actually implements
-(`src/SIP/RequestsHandler.cpp`); the Features tab lists exactly these, no invented ones:
+(`src/SIP/DtmfFeatureCodes.cpp`); the Features tab lists exactly these, no invented ones:
 
 | Code | Action | Firmware |
 |------|--------|----------|
@@ -524,12 +514,11 @@ These are the **only** codes the firmware's CLASS handler actually implements
 | `*69` | Speak last caller's extension | CDR lookup → echo 777 |
 | `*11` | Echo loopback (line test) | RTP reroute → 777 |
 
-> Admin-only DTMF menu (caller must be the admin extension): `*<PIN>#001` NTP resync,
-> `*<PIN>#101` network-mode toggle. Documented in `[4]` SECURITY help, not the public Features card.
+The admin-only DTMF menu runs only for the admin extension, after the admin PIN is verified. `*<PIN>#001` runs an NTP resync. `*<PIN>#101` toggles network mode between client and access point, and is refused while an emergency call is live. `*<PIN>#200` is a stub that only logs a message. `*<PIN>#999` is a factory reset: it takes one confirm digit, `1`, and is refused while an emergency call is live (`src/SIP/DtmfFeatureCodes.cpp:359-410`). Whether this path must meet the double-confirm rule in section 2 is an open decision. The codes are documented in `[4]` SECURITY help, not the public Features card.
 
-### 6.2 CDR result vocabulary, corrected to the real enum
+### 6.2 CDR result vocabulary (firmware enum)
 
-`personas.md` §3.7 lists outcomes as "answered / busy / no-answer / cancelled / failed", but the
+`personas.md` §3.7 once listed outcomes as "answered / busy / no-answer / cancelled / failed"; the
 shipping `CdrResult` enum (`src/SIP/CallDetailRecord.hpp`) is **`Answered · Busy · Cancelled ·
 Unavailable · Failed`** with `cdrResultToString` emitting the literal words below. The `[5]` Recent
 Calls view uses the firmware strings (glyph + label, never color alone), so the UI never claims a
@@ -576,6 +565,4 @@ state the firmware doesn't write:
   policy (key required vs PIN sufficient for Dana) is a research/security decision, not an IA one.
 
 
-*UX Architect · pocket-dial 3.x redesign · grounded in `src/SIP/{PbxConfig,PoolConfig,*
-*CallDetailRecord}.hpp` + the CLASS/DTMF handlers in `RequestsHandler.cpp`; consistent with*
-*`00-brief.md`, `brand.md`, and `personas.md`.*
+UX Architect deliverable for the pocket-dial 3.x redesign. Grounded in `src/SIP/PbxConfig.hpp`, `src/SIP/PoolConfig.hpp`, and `src/SIP/CallDetailRecord.hpp`, and in the CLASS and DTMF-admin handlers in `src/SIP/DtmfFeatureCodes.cpp`. Consistent with `00-brief.md`, `brand.md`, and `personas.md`.

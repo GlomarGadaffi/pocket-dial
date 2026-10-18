@@ -1,27 +1,24 @@
 # pocket-dial Redesign. Personas, Jobs-to-be-Done & Task Model
 
-> **Phase-A deliverable (UX Researcher).** Reads from and stays consistent with
-> [`00-brief.md`](00-brief.md): product name **pocket-dial**, the BRASS/PHOSPHOR palette,
-> the hub matrix (`[1] SYSTEM MONITOR  [2] NETWORK  [3] PBX CONFIG  [4] SECURITY  [5] REPORTS/LOGS  [6] ADDONS`),
-> the keyboard-first single-key/Esc-to-back scheme, and the v1 feature scope.
-> The efficiency north-star is the brief's own: **`3 → 1 → A` provisions or reroutes in three seconds flat.**
->
-> Downstream agents (UX Architect, UI Designer, Persona Walkthrough) should treat the
-> **Task Inventory** (§3) as the authoritative coverage checklist for the TUI screen tree.
+This document defines the personas, jobs and task inventory for the pocket-dial redesign. It stays consistent with [`00-brief.md`](00-brief.md): product name **pocket-dial**, the BRASS/PHOSPHOR palette, the hub matrix (`[1] SYSTEM MONITOR  [2] NETWORK  [3] PBX CONFIG  [4] SECURITY  [5] REPORTS/LOGS  [6] ABOUT`), the keyboard-first single-key/Esc-to-back scheme, and the v1 feature scope. The efficiency north-star is the brief's own: **`3 → 1 → A` provisions or reroutes in three seconds flat.**
+
+Downstream agents (UX Architect, UI Designer, Persona Walkthrough) should treat the **Task Inventory** (§3) as the authoritative coverage checklist for the TUI screen tree.
 
 
 ## 0. How these personas were grounded
 
 These are evidence-based personas, not invented archetypes. They are triangulated from three
-sources actually present in this repo, so every task in the inventory maps to a real firmware
-capability rather than a wish:
+sources actually present in this repo, so every task in the inventory maps either to a firmware
+capability that exists today or to a surface marked *planned* in §3:
 
 1. **The config schema the firmware exposes**, `src/SIP/PbxConfig.hpp` (ring/hunt groups,
-   the three forward triggers `CFU/CFB/CFNA`, member lists), `src/SIP/RequestsHandler.*`
-   (per-extension DND map, feature codes like `*55` as dialable AORs, the DTMF admin menu,
-   blind-transfer via `Refer-To`), `src/SIP/CallDetailRecord.hpp` (the 32-deep CDR ring with
-   five result states), and `src/SIP/PoolConfig.hpp` (the **hard caps: 32 extensions / 8
-   concurrent sessions**, these are real ceilings the TUI must surface, not hide).
+   the three forward triggers `CFU/CFB/CFNA`, member lists), `src/SIP/PbxFeatureConfig.hpp`
+   (the per-extension `_dnd` map), `src/SIP/RequestsHandler.*` (feature codes like `*55` as
+   dialable AORs, the DTMF admin menu, blind-transfer via `Refer-To`),
+   `src/SIP/CallDetailRecord.hpp` (the CDR ring, sized by `POCKETDIAL_CDR_RECORDS`, with five
+   result states), and `src/SIP/PoolConfig.hpp` (the hard caps, `POCKETDIAL_MAX_CLIENTS` extensions
+   and `POCKETDIAL_MAX_SESSIONS` concurrent sessions; these are real ceilings the TUI must surface,
+   not hide).
 2. **The onboarding the redesign is replacing**, `.smoke/gen_provision_nvs.py`: today a working
    box requires hand-running a Python script that recomputes a 50 000-round salted SHA-256 PIN
    hash, generating an NVS CSV, running `nvs_partition_gen.py`, and `esptool write_flash 0x9000`.
@@ -30,21 +27,12 @@ capability rather than a wish:
 3. **The owner's vision in the brief**, the `3 → 1 → A` "three seconds flat" north-star and the
    reframe from touchscreen-config to SSH-first sysop terminal.
 
-> **Research confidence.** This is a synthetic-but-grounded persona pass (n=0 live interviews;
-> a hard constraint of a pre-launch embedded redesign). Confidence is *high* on tasks and pain
-> points (firmware- and artifact-derived, not opinion) and *medium* on emotional/contextual
-> framing. §6 lists the three validation studies that would raise the latter to high; the
-> Persona Walkthrough agent (`walkthrough.md`) performs the first cheap pass.
+This is a synthetic-but-grounded persona pass (n=0 live interviews; a hard constraint of a pre-launch embedded redesign). Confidence is *high* on tasks and pain points (firmware- and artifact-derived, not opinion) and *medium* on emotional and contextual framing. §6 lists the three validation studies that would raise the latter to high; the Persona Walkthrough agent (`walkthrough.md`) performs the first cheap pass.
 
 
 ## 1. Persona A, "Rivera," the Installer
 
-```
-┌─ PERSONA A ─────────────────────────────────────────── pocket-dial ─┐
-│  RIVERA  ·  Field Installer / IT-VAR Technician                      │
-│  "I have eleven of these on the van today. Don't make me think."     │
-└─────────────────────────────────────────────────────────────────────┘
-```
+**Rivera**, Field Installer / IT-VAR Technician. *"I have eleven of these on the van today. Don't make me think."*
 
 ### Demographics & context
 - Role: Field technician for a small voice/data integrator (a VAR). Installs and hands off
@@ -90,12 +78,7 @@ a workstation toolchain, and turns a 30-minute job into an afternoon.
 
 ## 2. Persona B, "Dana," the Day-2 Admin
 
-```
-┌─ PERSONA B ─────────────────────────────────────────── pocket-dial ─┐
-│  DANA  ·  Office Manager / Accidental Phone Admin (non-specialist)   │
-│  "I just need to send the front desk to voicemail— wait, no... DND." │
-└─────────────────────────────────────────────────────────────────────┘
-```
+**Dana**, Office Manager / Accidental Phone Admin (non-specialist). *"I just need to send the front desk to voicemail— wait, no... DND."*
 
 ### Demographics & context
 - Role: Office manager / operations lead at a 6–30 person SOHO/SMB. Owns the phone system
@@ -134,7 +117,7 @@ destructive action confirms, and "back out without saving" is always one Esc awa
 - *When the boss says "make sales ring as a group," I want to pick the people from a list, choose
   ring-all vs. one-at-a-time in plain language, and apply, without knowing the word "fan-out."*
 - *When someone says "my call dropped," I want to look at a recent-calls list that tells me what
-  happened in words (busy / no-answer / cancelled), so I can answer them myself.*
+  happened in words (busy / unavailable / cancelled), so I can answer them myself.*
 - *Whenever I'm unsure, I want a `?` that explains this exact screen, so I never feel stranded in a
   terminal.*
 
@@ -146,20 +129,17 @@ destructive action confirms, and "back out without saving" is always one Esc awa
 
 ## 3. Task Inventory, the complete surface the TUI must cover
 
-This is the authoritative coverage checklist. Every task maps to (a) a firmware capability that
-exists today, (b) the hub destination from the brief's matrix, and (c) the owning persona(s).
-**I = Installer (Rivera), A = Admin (Dana).** Tasks marked **[A!]** are admin tasks that touch
-guarded surfaces, they must be reachable but protected by confirmation/scoping.
+This is the authoritative coverage checklist. Every task maps to (a) a firmware capability, (b) the hub destination from the brief's matrix, and (c) the owning persona(s). An anchor marked *planned* has no firmware implementation at HEAD; that task is a redesign target, not an existing capability. **I = Installer (Rivera), A = Admin (Dana).** Tasks marked **[A!]** are admin tasks that touch guarded surfaces; they must be reachable but protected by confirmation or scoping.
 
 ### 3.1 Onboarding & first-run (Installer-owned, runs once)
 | # | Task | Persona | Hub home | Firmware anchor |
 |---|------|---------|----------|-----------------|
-| O1 | First SSH connection → forced first-run wizard (no usable default state) | I | (wizard) | replaces `gen_provision_nvs.py` |
-| O2 | Set the master admin PIN (salted/iterated, never echo) | I | wizard → `[4]` | `AdminAuth::hashPin` (50k-round SHA-256) |
+| O1 | First SSH connection → forced first-run wizard (no usable default state) | I | (wizard) | replaces `gen_provision_nvs.py`; SSH entry *planned* (no SSH server at HEAD) |
+| O2 | Set the master admin PIN (salted/iterated, never echo) | I | wizard → `[4]` | `AdminAuth::hashSecret` (50k-round SHA-256) |
 | O3 | Choose network mode: Standalone SoftAP vs. join existing LAN (DHCP) | I | wizard → `[2]` | `wifi_mode` 1=CLIENT / 2=AP |
 | O4 | Confirm reachable identity (`pocketdial.local` mDNS, IP, SoftAP SSID) | I | wizard → `[2]` | mDNS + DHCP already work |
 | O5 | Provision a **block** of extensions in one batch (range + PINs) | I | wizard → `[3]` | `_clientPool`, cap 32 |
-| O6 | Hand-off summary card: creds, host, what the admin can/can't touch | I | wizard end |, |
+| O6 | Hand-off summary card: creds, host, what the admin can/can't touch | I | wizard end | *planned* |
 
 ### 3.2 Extensions (Both)
 | # | Task | Persona | Hub home | Firmware anchor |
@@ -167,9 +147,9 @@ guarded surfaces, they must be reachable but protected by confirmation/scoping.
 | E1 | List extensions with live `[ ONLINE ]`/`[ UNREACH ]` registration state | I, A | `[3]` PBX CONFIG · Extensions | registrar snapshot |
 | E2 | Add a single extension (number + auth PIN) | I, A | `[3]` Extensions | REGISTER / AOR validation (`isValidAor`) |
 | E3 | Add a contiguous **range** of extensions at once | I | `[3]` Extensions | bulk over `_clientPool` |
-| E4 | Edit an extension (PIN / display name) | A | `[3]` Extensions |, |
+| E4 | Edit an extension (PIN / display name) | A | `[3]` Extensions | — |
 | E5 | Delete an extension | **[A!]** | `[3]` Extensions | frees a pool slot |
-| E6 | See/handle the cap: 32 extensions; a 33rd is refused (503), surfaced as a clear "pool full" state, never a silent failure | I, A | `[3]` Extensions | `POCKETDIAL_MAX_CLIENTS`, 503 |
+| E6 | See/handle the cap: `POCKETDIAL_MAX_CLIENTS` extensions (default 32); one more is refused (503), surfaced as a clear "pool full" state, never a silent failure | I, A | `[3]` Extensions | `POCKETDIAL_MAX_CLIENTS`, 503 |
 
 ### 3.3 Ring groups (Both)
 | # | Task | Persona | Hub home | Firmware anchor |
@@ -178,7 +158,7 @@ guarded surfaces, they must be reachable but protected by confirmation/scoping.
 | G2 | Create a ring group; pick members from the extension list | A | `[3]` Ring Groups | `splitMembers`/`joinMembers` |
 | G3 | Choose fan-out mode in plain language: "Ring everyone" (RingAll) vs. "One at a time" (Hunt) | A | `[3]` Ring Groups | `GroupMode::RingAll/Hunt` |
 | G4 | Reorder hunt members / set per-member timeout | A | `[3]` Ring Groups | Hunt sequence |
-| G5 | Edit / delete a ring group | **[A!]** | `[3]` Ring Groups |, |
+| G5 | Edit / delete a ring group | **[A!]** | `[3]` Ring Groups | — |
 | G6 | Integrity warning: group references a deleted/nonexistent extension | I, A | `[3]` Ring Groups | member-validation |
 
 ### 3.4 Per-extension call features (Admin-owned, the day-2 bread-and-butter)
@@ -195,8 +175,8 @@ guarded surfaces, they must be reachable but protected by confirmation/scoping.
 | # | Task | Persona | Hub home | Firmware anchor |
 |---|------|---------|----------|-----------------|
 | V1 | Define a DTMF menu: digit → action (ring an extension/group, play a prompt) | A | `[3]` PBX CONFIG · IVR | DTMF collector state machine |
-| V2 | Pick a prompt to play (from on-flash `prompts` partition, **no queues, no SD**) | A | `[3]` IVR | 3.88 MB `prompts` partition |
-| V3 | Set the IVR as the answer point / test the digit map | A | `[3]` IVR |, |
+| V2 | Pick a prompt to play (from on-flash `prompts` partition, **no queues, no SD**) | A | `[3]` IVR | `prompts` row in `partitions.csv` (size: `grep '^prompts' partitions.csv`) |
+| V3 | Set the IVR as the answer point / test the digit map | A | `[3]` IVR | — |
 
 ### 3.6 Live monitoring (Both. Installer for ring-test, Admin for "is it OK?")
 | # | Task | Persona | Hub home | Firmware anchor |
@@ -210,7 +190,7 @@ guarded surfaces, they must be reachable but protected by confirmation/scoping.
 | # | Task | Persona | Hub home | Firmware anchor |
 |---|------|---------|----------|-----------------|
 | R1 | Browse recent calls (newest-first ring of 32) | A | `[5]` REPORTS/LOGS | CDR ring buffer |
-| R2 | Read each call's outcome in words: answered / busy / no-answer / cancelled / failed | A | `[5]` REPORTS/LOGS | `CdrResult` (5 states) |
+| R2 | Read each call's outcome in words: answered / busy / unavailable / cancelled / failed | A | `[5]` REPORTS/LOGS | `CdrResult` (5 states) |
 | R3 | See caller, callee, start time, talk duration per call | A | `[5]` REPORTS/LOGS | `CallDetailRecord` fields |
 | R4 | Read the live event/system log tail | I, A | `[5]` REPORTS/LOGS | `queueLog` |
 
@@ -225,7 +205,7 @@ guarded surfaces, they must be reachable but protected by confirmation/scoping.
 | # | Task | Persona | Hub home | Firmware anchor |
 |---|------|---------|----------|-----------------|
 | S1 | Change the admin PIN | I, A | `[4]` SECURITY | `AdminAuth` salted hash |
-| S2 | Manage SSH access (authorized key / PIN policy) for admin handoff | I | `[4]` SECURITY | SSH server |
+| S2 | Manage SSH access (authorized key / PIN policy) for admin handoff | I | `[4]` SECURITY | *planned*: no SSH server at HEAD |
 | S3 | Log out cleanly | I, A | `[L]` LOGOUT (hub) | `[L] LOGOUT` in brief |
 | S4 | `?` context help, available on **every** screen | I, A | global | brief hard constraint |
 
@@ -255,7 +235,7 @@ The hub never demands Enter to confirm a single-key choice. Mockup of the landin
 ├──────────────────────────────────────────────────────────────────────────────┤
 │                                                                                │
 │     [1] SYSTEM MONITOR        [2] NETWORK         [3] PBX CONFIG               │
-│     [4] SECURITY              [5] REPORTS/LOGS    [6] ADDONS                   │
+│     [4] SECURITY              [5] REPORTS/LOGS    [6] ABOUT                    │
 │                                                                                │
 │     [R] REBOOT   [L] LOGOUT                                                     │
 │                                                                                │
@@ -353,7 +333,7 @@ states, so Dana self-serves the most common support question. Mockup of the repo
 ┌─ REPORTS/LOGS ▸ Recent Calls ──────────────────────────────────── 32 of 32 ───┐
 │  TIME      FROM   →  TO     RESULT        TALK                                  │
 │  18:02:14  101    →  205    ✓ answered    04:12                                 │
-│  17:58:40  101    →  sales  ✗ no-answer   --:--                                 │
+│  17:58:40  101    →  sales  ✗ unavailable --:--                                 │
 │  17:51:09  204    →  101    ⊘ busy        --:--                                 │
 │  17:44:22  103    →  102    … cancelled   --:--                                 │
 ├─────────────────────────────────────────────────────────────────────────────────
@@ -379,7 +359,7 @@ mono-terminal degrade path, color-blind users, *and* Dana's need to read state l
 Accessibility Auditor (`accessibility.md`) owns the exhaustive glyph table; this is the persona-side
 requirement that motivates it.
 
-**D12. Surface the real ceilings (32 ext / 8 calls) as design objects, not error states.** Because
+**D12. Surface the real ceilings (`POCKETDIAL_MAX_CLIENTS` extensions, `POCKETDIAL_MAX_SESSIONS` calls; defaults 32 and 8) as design objects, not error states.** Because
 the pools are hard caps that 503 on overflow, the TUI must show headroom *ambiently* (hub footer:
 `ext 12/32`, `1/8 calls`) and *predictively* (D2's pre-apply cap check), so neither persona ever
 discovers a limit by hitting it.
@@ -416,11 +396,6 @@ Three lightweight studies, ordered by cost, that the team should run before/at l
    color-blind-sim filter; confirm no task relies on color (D11). Run a screen-reader-over-SSH spot
    check. Owned jointly with the Accessibility Auditor (`accessibility.md`).
 
-> Key open questions for live research: Does Dana trust an SSH terminal at all, or does the
-> printed "how to connect" card need to live in the box's splash/QR (see `imagery.md`)? Is the
-> 32-extension cap ever a real ceiling for the SMB target, or comfortably above the 8–30-seat
-> reality? Does the installer want SSH-key handoff or is a PIN sufficient for the day-2 admin (S2)?
+Key open questions for live research: does Dana trust an SSH terminal at all, or does the printed "how to connect" card need to live in the box's splash/QR (see `imagery.md`)? Is the `POCKETDIAL_MAX_CLIENTS` cap ever a real ceiling for the SMB target, or comfortably above the 8–30-seat reality? Does the installer want SSH-key handoff or is a PIN sufficient for the day-2 admin (S2)?
 
-
-*UX Researcher · pocket-dial Phase-A design sprint · grounded in firmware (`src/SIP/*`),*
-*the legacy provisioning artifact (`.smoke/gen_provision_nvs.py`), and `00-brief.md`.*
+Sources: the firmware under `src/SIP/`, the legacy provisioning artifact `.smoke/gen_provision_nvs.py`, and `00-brief.md`.

@@ -1,17 +1,22 @@
 # Design: heap-free token fetch on the 911 lane, the rest of fetchToken (#951)
 
+This document sets out how the 911 lane can fetch a token without heap allocation, and the four options for doing so.
+
 Status: Proposed, for vote. Design only: no code, no hardware, nothing posted to GitHub.
+
 Author: BigDog (Claude Sonnet 5.5), 2026-10-09. Follows the #945 rulings and the #948 contract (arena, failure contract, 10 ms bound).
 
 Two code bases, and every claim says which:
 
-- **[main]** = `origin/main` 7bcf952f. It has **no 911 lane**: no arena, no sos scope, no background refresh.
-- **[branch]** = `origin/fix/862-hot-path-allocs` 79e0133f (#945, draft, DO NOT MERGE). The arena, the three token
-  lanes and the 911 path below exist only there. Paths: `TA.cpp` = src/SIP/TelephonyAnchorClient.cpp, `TAL.hpp` = src/SIP/TelephonyAnchorLogic.hpp.
+- **[main]** = commit 7bcf952f, `main` as it was read. It has **no 911 lane**: no arena, no sos scope, no background refresh.
+- **[branch]** = commit 79e0133f, the head of `origin/fix/862-hot-path-allocs` as it was read (#945). #945 is merged, not a draft:
+  its squash commit 813cd80 is on `origin/main`, and the spot-checked line numbers below match it. The arena, the three token
+  lanes and the 911 path below are in 79e0133f and in 813cd80. Paths: `TA.cpp` = src/SIP/TelephonyAnchorClient.cpp, `TAL.hpp` = src/SIP/TelephonyAnchorLogic.hpp.
+  The [main] label describes 7bcf952f, which is older than 813cd80.
 - **Rule for line numbers: an unmarked `TA.cpp` or `TAL.hpp` number is [branch] 79e0133f; a [main] number is marked.**
   TA.cpp differs by about 200 lines between the two. IDF and config numbers are the same on both (config files are not on the branch diff).
 
-Nothing here is measured on a board. IDF facts were read in `/home/glomar/esp/esp-idf` (v6.0.2; the code comments cite v6.0.1).
+Nothing here is measured on a board. IDF facts were read in `/home/glomar/esp/esp-idf` (v6.0.2; the code comments cite v6.0.1). IDF line numbers were not re-verified (the IDF tree is not in this checkout).
 
 ## 1. When the 911 lane fetches a token [branch]
 
@@ -27,6 +32,16 @@ Nothing here is measured on a board. IDF facts were read in `/home/glomar/esp/es
   Not proven (I traced no restart race); ruling A keeps the branch as defence. Effect: the real inline fetch is the 401 retry.
 - The off-path half of option (b) is already built: `tel_maint` wakes the maintenance lane, which refreshes at 10 minutes
   before expiry (TAL.hpp:848, :890-914; TA.cpp:2053-2084). Host-tested; ESP side is compile-checked only (#945 body).
+
+The decision path for the two fetch cases above, on the [branch] code:
+
+```mermaid
+flowchart TD
+    A["911/933 makeCall"] --> B{"Cached token?"}
+    B -- "No" --> C["Fetch inline, then POST"]
+    B -- "Yes, even past expiry" --> D["POST at once"]
+    D -- "401" --> E["One bounded fetch, then one retry"]
+```
 
 ## 2. What still allocates in fetchToken on the 911 lane [branch, TA.cpp:997-1183]
 
@@ -99,14 +114,14 @@ handshake is not a lock; it is bounded by `kSosTokenBudgetUs` = 3 s (TAL.hpp:116
 |---|---|---|
 | Three token arenas, already on the branch | 3 x 4,108 = 12,324 | TAL.hpp:824-825 ("about 12.3 KB on the 32-bit ESP32") |
 | #948 persistent status handle | 5,000 to 6,000 | #948's estimate, unmeasured |
-| Slice 1: `tokenUrl` 143 + encoded body 440 | 583 | caps TelephonyApiConfig.hpp:36-37 |
+| Slice 1: `tokenUrl` 142 + encoded body 439 | 581 | caps TelephonyApiConfig.hpp:36-37 (URL = 128 + 14 for `/connect/token`; body as row 4) |
 | Slice 1: `_bearerHeader` reserved to the arena limit | 4,103 | `kTokenBodyBytes` 4,096 (TAL.hpp:635) + "Bearer " |
 | Slice 1: `_accessToken` dropped | minus its capacity | token length, unmeasured |
 | Slice 2: client buffers | 5,120 + struct + session | 4,096 + 1,024; the struct and session are unmeasured |
-| Slices 1 and 2, added | about 9,800 | 583 + 4,103 + 5,120 |
-| Permanent total, 911 token and status lanes | about 27,600 | 12,324 + 5,500 + 9,806 |
+| Slices 1 and 2, added | about 9,800 | 581 + 4,103 + 5,120 |
+| Permanent total, 911 token and status lanes | about 27,600 | 12,324 + 5,500 + 9,804 |
 
-The #945 body says two arenas and 8.2 KB; the branch head has three arenas (the maintenance lane was added after), so that figure is stale.
+The #945 body says two arenas and 8.2 KB; the branch head has three arenas, so that figure does not match the code.
 Share of the classic board: 27.6 KB against ~290-320 KB usable internal DRAM (docs/SCALING.md:106,291) is 8.6 to 9.5%, before the TLS
 transient, which is the largest unknown. On the S3 the static buffers ride in the RequestsHandler allocation (PSRAM, docs/SCALING.md:102-105,
 unverified), but the persistent client's buffers are IDF mallocs under the 16 KB threshold, so they are internal DRAM (PsramAllocator.hpp:6-11).

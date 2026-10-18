@@ -1,21 +1,12 @@
 # pocket-dial: Experiential Narrative (Boot · First-Run · the Live "Glow")
 
-> **Phase-A deliverable (Visual Storyteller).** This file tells the *story* of using pocket-dial
-> over SSH: how it feels to connect, how it feels to provision a fresh box, and how the 1 Hz live
-> monitor reads as **alive without being noisy**. It is the connective tissue between the locked
-> docs; it does **not** re-spec screens. It cross-references:
-> [`00-brief.md`](00-brief.md) (constraints), [`brand.md`](brand.md) (voice, banner, flavor budget),
-> [`tui-ia.md`](tui-ia.md) (navigation, wizard flow), [`tui-style.md`](tui-style.md) (the exact
-> 80×24 mockups, the 16-color mapping, the renderer contract), and the on-device palette in
-> `main/ui/ui.cpp` lines 39–64.
->
-> What this file owns: the experiential beats and their *timing/motion*. The connect-to-banner-to-hub
-> sequence as a felt sequence; the first-run story as a 3-minute narrative arc; and the "glow"
-> console concept (motion, focus, restraint) with concrete ANSI cursor-positioning sketches.
->
-> Reading the sketches: where a beat is a *motion*, I show the literal escape bytes the renderer
-> emits (`ESC` = `0x1B`). These are illustrative of the felt result, consistent with the renderer
-> contract in [`tui-style.md §6`](tui-style.md); the mockups there remain the authoritative geometry.
+This file tells the story of using pocket-dial over SSH: how it feels to connect, how it feels to provision a fresh box, and how the 1 Hz live monitor reads as **alive without being noisy**. It is the connective tissue between the locked docs and does **not** re-spec screens. It cross-references [`00-brief.md`](00-brief.md) (constraints), [`brand.md`](brand.md) (voice, banner, flavor budget), [`tui-ia.md`](tui-ia.md) (navigation, wizard flow), [`tui-style.md`](tui-style.md) (the exact 80×24 mockups, the 16-color mapping, the renderer contract), and the on-device palette in `main/ui/ui.cpp` lines 36–61.
+
+No SSH server exists at HEAD. The SSH terminal was removed (`docs/THREAT_MODEL.md`, E-3). Act I, the SSH-session beats in Acts II and III, and the sshd references in this file describe a planned redesign, not the current firmware. Whether SSH returns is an open decision; see [`imagery.md`](imagery.md) §2.6.
+
+What this file owns: the experiential beats and their *timing and motion*: the connect-to-banner-to-hub sequence as a felt sequence, the first-run story as a 3-minute narrative arc, and the "glow" console concept (motion, focus, restraint) with concrete ANSI cursor-positioning sketches.
+
+Where a beat is a *motion*, the sketches show the literal escape bytes the renderer emits (`ESC` = `0x1B`). They are illustrative of the felt result, consistent with the renderer contract in [`tui-style.md §6`](tui-style.md); the mockups there remain the authoritative geometry.
 
 ## 0. The character on duty (whose story this is)
 
@@ -38,7 +29,7 @@ The flavor budget is **exactly two sanctioned lines** (brand §4.4): the banner 
 two. Every other felt beat is carried by *motion, focus, and restraint*, not by extra copy.
 That discipline is itself the brand: the chrome glows, the prose stays quiet.
 
-## ACT I: THE CONNECT SEQUENCE (SSH → banner → hub)
+## Act I: the connect sequence (SSH → banner → hub)
 
 ### I.1 The story in one paragraph
 
@@ -59,7 +50,7 @@ already counting live phones. The unmistakable read: *I joined something that wa
   ~0.3s  sshd capability probe (TERM)  (invisible) picks glyph+color tier   §6.1 renderer contract
   ~0.3s  BANNER prints once, whole     the nameplate lights — ◆ READY      single write, top→bottom
   ~0.3s  login: sysop  /  PIN: _       "it's expecting me"                  cursor parks at PIN
-  …      sysop types PIN (silent)      authority, not ceremony              no echo (brand §4.6)
+  …      sysop types PIN (silent)      authority, not ceremony              no echo (see tui-ia.md)
   +0.1s  PIN accepted                  the operator steps aside             clear → paint hub once
   +0.1s  HUB appears, clock LIVE       "I'm holding the board now"          clock + headroom already ⟳
 ```
@@ -69,8 +60,9 @@ beyond the banner's sanctioned `operator on duty`.
 
 ### I.3 The banner blooms: print discipline (the "already on" feeling)
 
-The banner is the firmware `sshd` greeting locked verbatim in [`brand.md §3.2`](brand.md) and
-re-shown in [`tui-style.md §3.1`](tui-style.md). The *story* lives in how it arrives:
+The banner is locked verbatim in [`brand.md §3.2`](brand.md) and re-shown in
+[`tui-style.md §3.1`](tui-style.md). No firmware code emits it at HEAD, because no SSH server exists, so this
+section describes the planned redesign surface. The *story* lives in how it arrives:
 
 - One write, whole. The banner is emitted as a single top-to-bottom block, with no animation and no
   typewriter reveal. A switchboard nameplate doesn't fade up; it's *lit when you look at it.* The
@@ -79,7 +71,7 @@ re-shown in [`tui-style.md §3.1`](tui-style.md). The *story* lives in how it ar
   banner the instant it prints. The board is not "starting"; it **was on duty before you connected.**
   This is the single most important beat in Act I and it costs zero motion.
 - The runtime fields fill from the box. `«pocketdial.local»`, `«192.168.1.50»`, `«…MAC…»`,
-  `«v3.0.0»`, `«up 4d 02:17»` are guillemet slots the firmware substitutes. The uptime line quietly
+  `«v3.0»`, `«up 4d 02:17»` are guillemet slots the firmware substitutes. The uptime line quietly
   proves *"already running for four days,"* reinforcing "already on duty" with a fact, not a flourish.
 
 ```
@@ -87,7 +79,7 @@ re-shown in [`tui-style.md §3.1`](tui-style.md). The *story* lives in how it ar
  ║   ◖▌  S Y S O P   T E R M I N A L  ▐◗     single-board SIP PBX             ║
  ║ ──────────────────────────────────────────────────────────────────────── ║
  ║   HOST · «pocketdial.local»            ◆ READY — operator on duty          ║   ◀ lamp already lit
- ║   FW   · POCKET-DIAL «v3.0.0»  ·  up «4d 02:17»                            ║   ◀ uptime = quiet proof
+ ║   FW   · POCKET-DIAL «v3.0»  ·  up «4d 02:17»                              ║   ◀ uptime = quiet proof
  ╚════════════════════════════════════════════════════════════════════════════╝
  login: sysop
  PIN: _                                    ◀ never echoed; cursor parks here, waiting
@@ -98,13 +90,13 @@ and [`brand.md §3`](brand.md); this narrative does not redraw them.)
 
 ### I.4 The PIN: authority without ceremony
 
-The PIN is read silently (brand §4.6, *never echoed*). The felt beat is quiet competence: no
+The PIN is read silently (*never echoed*, per [`tui-ia.md`](tui-ia.md)). The felt beat is quiet competence: no
 "●●●●●●" theater, no progress spinner. On a wrong PIN the operator-terse correction reprints **in
 place**: it blames the input, states the fix, no exclamation mark:
 
 ```
  PIN: _
- PIN rejected. Try again.                 ◀ in place; the input is wrong, never "you" (brand §4.6)
+ PIN rejected. Try again.                 ◀ in place; the input is wrong, never "you" (brand §4.2)
 ```
 
 After repeated failures, the back-off notice stays level and factual (e.g. `Too many tries. Wait
@@ -145,7 +137,7 @@ because there is nothing behind the operator's chair.
   the lamp's hue differs, and the footer names the theme by label downstream. The bench lighting is
   set; the board is the same board.
 
-## ACT II: THE FIRST-RUN STORY (a fresh box, provisioned in ~3 minutes)
+## Act II: the first-run story (a fresh box, provisioned in ~3 minutes)
 
 ### II.1 The story in one paragraph
 
@@ -208,7 +200,7 @@ clause turned into trust: the operator tells you exactly what it does with your 
 gets the DTMF `*PIN#code` menu. Felt beat: **claiming the chair.** It quietly becomes the first
 roster entry, so by the end of step 3 the board already has one real phone on it.
 
-**`[4/5]` First extensions, THE MARQUEE BEAT.** This is the emotional and demonstrational peak of
+**`[4/5]` First extensions, the marquee beat.** This is the emotional and demonstrational peak of
 the entire product (the owner's north-star: *"3→1→A … three seconds flat"*). The installer types a
 range, `101-124`, picks a PIN policy, optionally drops them all in a ring group, and provisions
 **twenty-four phones with one keypress.** The screen earns its drama with a **predictive cap line**
@@ -254,7 +246,7 @@ intact:
 Felt beat: **the operator remembered where we were.** This is the single most reassuring motion in
 Act II and it is invisible until you need it, which is exactly when it matters most.
 
-## ACT III: THE LIVE "GLOW" CONSOLE (how the 1 Hz monitor feels alive)
+## Act III: the live "glow" console (how the 1 Hz monitor feels alive)
 
 ### III.1 The concept in one paragraph
 
@@ -377,6 +369,4 @@ the existing one:
     idle line invites the first call. Act II hands off directly into Act III.
 ```
 
-*Visual Storyteller · pocket-dial 3.x redesign · the experiential narrative for boot, first-run, and*
-*the live glow. Sequences the voice locked in [`brand.md`](brand.md), the flow in [`tui-ia.md`](tui-ia.md),*
-*and the exact geometry/motion contract in [`tui-style.md`](tui-style.md). Constraints per [`00-brief.md`](00-brief.md).*
+This narrative sequences the voice locked in [`brand.md`](brand.md), the flow in [`tui-ia.md`](tui-ia.md), and the exact geometry and motion contract in [`tui-style.md`](tui-style.md). Constraints are in [`00-brief.md`](00-brief.md).

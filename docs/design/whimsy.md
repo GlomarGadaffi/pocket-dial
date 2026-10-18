@@ -1,18 +1,10 @@
 # pocket-dial: Retro-BBS Delight Pass (Whimsy, opt-in)
 
-> **Phase-A deliverable (Whimsy Injector).** Reads from and stays subordinate to
-> [`00-brief.md`](00-brief.md) (canonical constraints), [`brand.md`](brand.md) (voice, the
-> **two-line flavor budget** in §4.4, the status lexicon §4.5, ASCII-fallback map §3.3),
-> [`tui-ia.md`](tui-ia.md) (keybindings, reserved-but-unused keys), and
-> [`tui-style.md`](tui-style.md) (component library, renderer contract §6).
->
-> This file owns the third flavor tier only. `brand.md` §4.4 budgets *core* copy to exactly two
-> sanctioned lines, `operator on duty` and `Patching you through…`, and then says: *"Anything
-> beyond these two is an opt-in easter egg owned by `docs/design/whimsy.md`."* That is this file. The
-> delight here is the **night-shift operator's brass-and-phosphor charm**, kept off the critical path:
-> every flourish is **skippable, resource-free, and never slows a fast operator**.
->
-> One-line essence: **charm lives in the chrome and the corners, never in the keystroke path.**
+This file defines the opt-in delight layer for the SSH console: the night-shift operator's brass-and-phosphor charm, kept off the critical path. Charm lives in the chrome and the corners, never in the keystroke path.
+
+It reads from and stays subordinate to [`00-brief.md`](00-brief.md) (canonical constraints), [`brand.md`](brand.md) (voice, the **two-line flavor budget** in §4.4, the status lexicon §4.5, ASCII-fallback map §3.3), [`tui-ia.md`](tui-ia.md) (keybindings, reserved-but-unused keys), and [`tui-style.md`](tui-style.md) (component library, renderer contract §6).
+
+This file owns the third flavor tier only. `brand.md` §4.4 budgets *core* copy to exactly two sanctioned lines, `operator on duty` and `Patching you through…`, and then says: *"Anything beyond these two is an opt-in easter egg owned by `docs/design/whimsy.md`."* That is this file. Every flourish is **skippable, resource-free, and never slows a fast operator**.
 
 ## 0. The whimsy contract (the rules every flourish below obeys)
 
@@ -74,7 +66,7 @@ On a correct PIN, in the ~0 ms before the hub paints, one line clears in place:
   lamp + the words carry it; mono `<*> line is yours.`›
 - It paints **after** auth succeeds, replacing the PIN echo region, and is overwritten the instant the
   hub draws. Zero added latency: it occupies a frame that was already blank.
-- **Wrong PIN** never gets charm. The error stays strictly brand §4.6: `PIN rejected. Try again.`
+- **Wrong PIN** never gets charm. The error stays strictly in the brand §4.2 error tone (blame the input, say the fix): `PIN rejected. Try again.`
   Whimsy never decorates a failure (rule §0.4, §0.6).
 
 ### 1.2 The register-beep: acknowledging a phone coming online
@@ -133,14 +125,14 @@ anyway. Off by default (it costs three repaints the fast path doesn't need).
 
 ### 1.4 The logout sign-off: closing the board for the night
 
-`[L]` Logout already closes the SSH session cleanly (logged to the CDR, IA S3). Tier-0 prints one
+`[L]` Logout already closes the SSH session cleanly (IA S3). The CDR records completed calls only (`src/SIP/CallDetailRecord.hpp`), so no session record is written. Tier-0 prints one
 sign-off line into the dying session, the operator clocking off:
 
 ```
-  Session closed.  4d 02:19 on the board · logged to CDR.   Board's yours next shift.
+  Session closed.  4d 02:19 on the board.   Board's yours next shift.
 ```
 
-- Operator-terse, faintly retro, honest (it states the real uptime and the real CDR log). `Board's
+- Operator-terse, faintly retro, honest (it states the real uptime). `Board's
   yours next shift.` is the single charm beat, a night-shift hand-off, never cute. ‹all brass; no
   color carries meaning›. Mono is byte-identical (no box glyphs).
 - It prints **after** the session-close is committed, so it cannot delay logout. If the transport is
@@ -363,8 +355,8 @@ Restraint is the brand (brand §4.1: "the chrome is loud, the copy is quiet"). R
   keystroke path and the 1 Hz budget for nothing. It was demoted to opt-in Tier-1 (§1.3) at most.
 - **No ASCII-art splash between screens.** A transition animation violates "no full clears in steady
   state" (style §6.4) and slows navigation. The only art is the *static* login nameplate (brand §2.1).
-- **No "fun" error copy.** Errors stay brand §4.6: blame the input, state the fix, no exclamation, no
-  "oops". `Ext 204 already exists. Pick another number.` is the whole personality budget for errors.
+- **No "fun" error copy.** Errors follow brand §4.2 (blame the input, state the fix) and the banned
+  words in brand §4.3 (no exclamation, no "oops"). `Ext 204 already exists. Pick another number.` is the whole personality budget for errors.
 - **No emoji, no color-only delight.** Every flourish has a glyph and an ASCII fallback; none means
   anything in hue alone (brief §6, brand §4.5). A color-blind or serial-console sysop sees the same
   board.
@@ -379,8 +371,9 @@ Restraint is the brand (brand §4.1: "the chrome is loud, the copy is quiet"). R
 ## 6. The whimsy toggle (one NVS byte, opt-in, remembered)
 
 All non-default delight is governed by a single setting so a sysop owns the vibe and an installer in a
-hurry is never surprised. It lives in `[4]` SECURITY (it is a session/box preference, alongside the
-theme metaphor), not a new hub slot (IA conserves the 6-matrix). Three states:
+hurry is never surprised. The intended home is `[4]` SECURITY (it is a session/box preference, alongside the
+theme metaphor), not a new hub slot (IA conserves the 6-matrix). Neither the `[4]` SECURITY entry in
+[`tui-ia.md`](tui-ia.md) nor `tui-style.md` §3.10 lists this screen yet. Three states:
 
 ```
         ┌─ Console feel ─────────────────────────────────────────┐
@@ -425,6 +418,4 @@ theme metaphor), not a new hub slot (IA conserves the 6-matrix). Three states:
 [x] Easter eggs are PULL not PUSH (typed ':' / deliberate sequence); never collide with typeahead/verbs
 ```
 
-*Whimsy Injector · pocket-dial 3.x redesign · the third flavor tier brand §4.4 reserves for this file.*
-*Charm lives in the chrome and the corners, never in the keystroke path; every beat is skippable,*
-*resource-free, monochrome-safe, and in the voice of a calm night-shift switchboard operator.*
+This file is the third flavor tier that brand §4.4 reserves for it, written for the pocket-dial 3.x redesign. Every beat is skippable, resource-free, monochrome-safe, and in the voice of a calm night-shift switchboard operator.
