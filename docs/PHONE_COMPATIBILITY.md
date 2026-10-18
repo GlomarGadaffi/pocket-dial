@@ -212,6 +212,21 @@ packet capture or a real phone (#800).
     calls are ended.
   * Neither kind of prune happens while the client is on an emergency call (911/933), so a
     lapsed lease is enforced only after that call ends.
+- The same tick ends a connected call whose phone has sent the board no RTP for **60 s** (#604),
+  sending the phone a BYE, so a phone that lost power or left the LAN does not hold a slot until
+  its lease runs out. It watches only calls the board carries media for: a trunk relay, the `555`
+  anchor bridge and, since #1003, each `888` conference leg. A conference leg has one counter, so
+  a participant whose phone stops sending is dropped while the others keep talking. The counter
+  counts PCMU audio packets only: telephone-event and comfort-noise packets do not count, and a
+  phone that does silence suppression and sends nothing for 60 s in a conference is dropped. The
+  clock starts at the first 1 Hz tick that sees the count move and fires on the first tick at or
+  past 60 s, so the reap lands 60 to 62 s after the last packet.
+  * Not watched: a held call (the clock restarts on resume), `777` (an SDP loopback, the board
+    sees no RTP), `440` and a call parked with hold music (the board answers `sendonly`, so the
+    phone is meant to send nothing; a parked call has its own timeout), ordinary
+    extension-to-extension calls (peer-to-peer), and the `997` page and voicemail legs (the page
+    has its own 5 s silence sweep above; voicemail is outside this one). A 911/933 gets a 4 h
+    bound instead (#741).
 
 Leave each phone's "answer OPTIONS / keep-alive" behavior at its default (on). The pruning
 decision for one registered client is:
@@ -256,7 +271,7 @@ flowchart TD
 | `777` echo test | **Peer-to-peer, to itself.** The answer is an SDP loopback of the caller's own offer, so the phone streams to its own address. The board sources and receives *no* RTP. The loopback is built in the `777` branch of `RequestsHandler::onInvite`. |
 | `440` tone | **Server-terminated.** The board opens an RTP socket and sends a synthesized µ-law tone (`RtpSender.cpp`). One concurrent stream. |
 | `555` anchor bridge | **Server-terminated.** The board sends *and* receives RTP and bridges it to an `AnchorClient`. `POCKETDIAL_MAX_ANCHOR_CALLS` = 4; effective limit is `min(provider, 4)`, and the default `LoopbackAnchorClient` declares 1. |
-| `888` conference | **Server-terminated.** The board decodes, mixes and re-encodes every leg (`MixBus`, `ConferenceRoom`). Capped at `POCKETDIAL_CONF_LEGS` = 4, no PIN, one global room. |
+| `888` conference | **Server-terminated.** The board decodes, mixes and re-encodes every leg (`MixBus`, `ConferenceRoom`). Capped at `POCKETDIAL_CONF_LEGS` = 4, no PIN, one global room. A leg whose phone sends no RTP for 60 s is ended with a BYE (§4). |
 | Outbound trunk call | **Server-terminated, two legs.** Your handset ↔ the board is ordinary **RTP** (a SIP phone speaks nothing else) through `MediaBridge`. The board ↔ carrier leg is the AnchorClient's chunked-HTTPS PCM16 stream, **not** SIP and **not** RTP, so the board never registers to an ITSP. Reaching a trunk at all requires a dial-plan rule with `action=trunk`; there is no "9" prefix and no fallback. See [FEATURE_ROADMAP.md §1.3](FEATURE_ROADMAP.md) and [`POST /api/dialplan`](API.md#post-apidialplan). |
 
 ## 5. Quick verification per client
