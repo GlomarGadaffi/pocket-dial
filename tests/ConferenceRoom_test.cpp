@@ -723,3 +723,318 @@ TEST(ConferenceRoom, ConferenceExtensionIsReservedFromForwardsAndRingGroups)
 		<< "the conference intercept must still win, got:\n" << raw;
 	EXPECT_EQ(handler.getConferenceLegs(), 1);
 }
+
+// ── Issue #1003: an 888 leg whose phone vanished is reaped by the #604 sweep ──
+//
+// A harness that dies mid-conference sends no BYE and no more RTP. tick()'s RTP-
+// inactivity sweep used to skip every session that was neither a trunk relay nor
+// an anchor bridge, so the legs sat in the room (and kept being streamed to) until
+// the registration lease ran out. A conference leg has one received-packet counter,
+// MediaBridge::handsetRtpPackets(), and the sweep now watches it.
+//
+// 777 (SDP loopback), 440 (sendonly tone), and a parked call (sendonly hold music,
+// bounded by the park timeout) have no board-side receive path, so there is no
+// counter to watch; the last three tests pin that they are NOT reaped.
+namespace
+{
+	// RequestsHandler + the datagrams it sent, with the one-line steps these tests repeat.
+	struct ReapBench
+	{
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+		RequestsHandler handler{"192.168.7.1", 5060,
+			[this](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+				sent.emplace_back(addr, std::move(msg));
+			}};
+
+		static std::string callIdOf(const std::string& id) { return "Call-ID: " + id; }
+
+		// Registers `num` and dials `to` from it; returns the 200 OK the board answered with.
+		std::string dial(const std::string& num, const std::string& ip, const std::string& id,
+			const std::string& to = ConferenceRoom::EXT)
+		{
+			handler.handle(makeRegister(num, ip, "reg-" + num));
+			sent.clear();
+			handler.handle(makeInvite(num, to, ip, id));
+			for (const auto& [addr, msg] : sent)
+			{
+				(void)addr;
+				const std::string raw = msg ? msg->toString() : std::string{};
+				if (raw.rfind("SIP/2.0 200 OK", 0) == 0) return raw;
+			}
+			return {};
+		}
+
+		std::shared_ptr<Session> session(const std::string& id)
+		{
+			auto s = handler.getSession(callIdOf(id));
+			return s.has_value() ? s.value() : nullptr;
+		}
+
+		bool alive(const std::string& id) { return handler.getSession(callIdOf(id)).has_value(); }
+
+		// One packet of audio from the phone on this conference leg, as its RTP receiver delivers it.
+		void rtpFrom(const std::string& id)
+		{
+			MediaBridge* b = handler.conferenceForTest()->bridgeForCall(callIdOf(id));
+			ASSERT_NE(b, nullptr) << id << " has no conference leg";
+			const std::vector<uint8_t> f = ulawFrame(1000);
+			b->onHandsetRtp(f.data(), f.size());
+		}
+
+		// Run the watch clock `age` forward and run one tick() pass.
+		void tickAfter(const std::string& id, std::chrono::seconds age)
+		{
+			auto s = session(id);
+			ASSERT_NE(s, nullptr) << id;
+			s->ageRtpWatchForTest(age);
+			tickNow();
+		}
+		void tickNow()
+		{
+			handler.forceNextTickForTest();
+			sent.clear();
+			handler.tick();
+		}
+
+		std::vector<std::string> byesTo(const std::string& ip)
+		{
+			std::vector<std::string> out;
+			for (const auto& [addr, msg] : sent)
+			{
+				if (!msg || addr.sin_addr.s_addr != addrFor(ip).sin_addr.s_addr) continue;
+				const std::string raw = msg->toString();
+				if (raw.rfind("BYE ", 0) == 0) out.push_back(raw);
+			}
+			return out;
+		}
+	};
+
+	// "To: x" -> "x" (first header of that name).
+	std::string headerValue(const std::string& raw, const std::string& name)
+	{
+		const size_t at = raw.find("\r\n" + name + ": ");
+		if (at == std::string::npos) return {};
+		const size_t from = at + 4 + name.size();
+		return raw.substr(from, raw.find("\r\n", from) - from);
+	}
+}
+
+TEST(ConferenceReap, AnOrphanedConferenceLegIsReapedAfterSixtySecondsOfRxSilenceAndNotBefore)
+{
+	ReapBench b;
+	const std::string answer = b.dial("501", "192.168.7.51", "conf-1003");
+	ASSERT_FALSE(answer.empty()) << "precondition: 501 joined the room";
+	ASSERT_EQ(b.handler.getConferenceLegs(), 1);
+	b.handler.tick();   // arms the watch
+
+	b.tickAfter("conf-1003", std::chrono::seconds(55));
+	ASSERT_TRUE(b.alive("conf-1003")) << "55 s of silence is inside the 60 s limit";
+	ASSERT_TRUE(b.byesTo("192.168.7.51").empty());
+
+	b.tickAfter("conf-1003", std::chrono::seconds(6));   // 61 s in all
+
+	EXPECT_FALSE(b.alive("conf-1003")) << "61 s with no RTP from the phone and no BYE: reaped";
+	EXPECT_EQ(b.handler.getConferenceLegs(), 0) << "the room leg must go with the session";
+	EXPECT_EQ(b.handler.getSessionCount(), 0u);
+	EXPECT_EQ(b.handler.conferenceForTest()->legCount(), 0);
+	EXPECT_EQ(b.handler.conferenceForTest()->bridgeForCall("Call-ID: conf-1003"), nullptr);
+	EXPECT_EQ(b.handler.conferenceForTest()->senderForCall("Call-ID: conf-1003"), nullptr);
+
+	// The phone is told, once, from our side of the dialog (RFC 3261 s12.2.1.1).
+	const auto byes = b.byesTo("192.168.7.51");
+	ASSERT_EQ(byes.size(), 1u) << "exactly one BYE to the vanished phone";
+	EXPECT_EQ(byes[0].rfind("BYE sip:501@192.168.7.51:5060 SIP/2.0", 0), 0u) << byes[0];
+	EXPECT_NE(byes[0].find("Call-ID: conf-1003"), std::string::npos);
+	EXPECT_EQ(headerValue(byes[0], "From"), headerValue(answer, "To"))
+		<< "the BYE is from the PBX end of the dialog: the 200 OK's To, with our tag";
+	EXPECT_EQ(headerValue(byes[0], "To"), "<sip:501@server>;tag=ftconf-1003")
+		<< "and to the phone's own From, with its tag";
+
+	// The CDR names the room, as a BYE-ended 888 leg's does.
+	bool recorded = false;
+	for (const auto& rec : b.handler.cdrSnapshotForTest())
+	{
+		if (rec.caller == "501" && rec.callee == ConferenceRoom::EXT) recorded = true;
+	}
+	EXPECT_TRUE(recorded) << "CDR 501 -> 888";
+}
+
+TEST(ConferenceReap, AConferenceLegThatKeepsReceivingIsNotReapedUntilItGoesQuiet)
+{
+	ReapBench b;
+	ASSERT_FALSE(b.dial("501", "192.168.7.51", "conf-talk").empty());
+	b.handler.tick();
+
+	// RTP arrives within every 61 s window: the clock restarts each time, however old it is.
+	for (int round = 0; round < 3; ++round)
+	{
+		b.rtpFrom("conf-talk");
+		b.tickAfter("conf-talk", std::chrono::seconds(61));
+		ASSERT_TRUE(b.alive("conf-talk")) << "round " << round << ": a talking leg is live";
+	}
+	EXPECT_EQ(b.handler.getConferenceLegs(), 1);
+
+	// Control: the same leg, now silent, is reaped, so the checks above ran a live watch.
+	b.tickAfter("conf-talk", std::chrono::seconds(61));
+	EXPECT_FALSE(b.alive("conf-talk"));
+}
+
+TEST(ConferenceReap, FourHarnessUasThatDieWithoutByeAreAllReapedAndTheRoomIsReusable)
+{
+	// The #1003 repro: a harness puts every slot of the room in use and exits without hanging up.
+	ReapBench b;
+	constexpr int kLegs = ConferenceRoom::MAX_LEGS;
+	for (int i = 0; i < kLegs; ++i)
+	{
+		const std::string num = "61" + std::to_string(i);
+		ASSERT_FALSE(b.dial(num, "192.168.7." + std::to_string(60 + i), "conf-dead-" + num).empty());
+	}
+	ASSERT_EQ(b.handler.getConferenceLegs(), kLegs);
+	b.handler.tick();   // arms the watch and refreshes the status snapshot getSessionCount() reads
+	ASSERT_EQ(b.handler.getSessionCount(), static_cast<size_t>(kLegs));
+
+	// Each leg has its own counter: one participant still talking does not keep the others up,
+	// and its silence is its own, not the room's.
+	b.rtpFrom("conf-dead-610");
+	for (int i = 0; i < kLegs; ++i) b.session("conf-dead-61" + std::to_string(i))->ageRtpWatchForTest(std::chrono::seconds(61));
+	b.tickNow();
+	EXPECT_TRUE(b.alive("conf-dead-610")) << "the leg that kept sending stays";
+	EXPECT_EQ(b.handler.getConferenceLegs(), 1);
+	EXPECT_EQ(b.handler.getSessionCount(), 1u);
+
+	b.tickAfter("conf-dead-610", std::chrono::seconds(61));
+	EXPECT_EQ(b.handler.getConferenceLegs(), 0) << "room empty";
+	EXPECT_EQ(b.handler.getSessionCount(), 0u) << "sessionCount back to 0";
+	for (int i = 0; i < kLegs; ++i)
+	{
+		EXPECT_EQ(b.handler.conferenceForTest()->legSenderForTest(i)->isActive(), false)
+			<< "leg " << i << " must not keep an RTP sender streaming";
+	}
+
+	// Nothing leaked: the whole room can be filled again.
+	for (int i = 0; i < kLegs; ++i)
+	{
+		const std::string num = "62" + std::to_string(i);
+		EXPECT_FALSE(b.dial(num, "192.168.7." + std::to_string(80 + i), "conf-again-" + num).empty())
+			<< "slot " << i << " must be free again after the reap";
+	}
+	EXPECT_EQ(b.handler.getConferenceLegs(), kLegs);
+}
+
+TEST(ConferenceReap, AHeldConferenceLegIsExemptAndTheWatchRestartsWhenItResumes)
+{
+	// Conference hold is declined (488) so a real leg never reaches Held; this forces the
+	// state to pin the shared sweep's exemption for a watched service leg.
+	ReapBench b;
+	ASSERT_FALSE(b.dial("501", "192.168.7.51", "conf-held").empty());
+	b.handler.tick();
+	auto s = b.session("conf-held");
+	ASSERT_NE(s, nullptr);
+
+	s->setState(Session::State::Held);
+	b.tickAfter("conf-held", std::chrono::seconds(61));
+	ASSERT_TRUE(b.alive("conf-held")) << "a held leg legitimately sends nothing";
+
+	s->setState(Session::State::Connected);
+	b.tickNow();
+	ASSERT_TRUE(b.alive("conf-held")) << "resume restarts the watch; it must not fire at once";
+
+	// Control: silent for 61 s after resume, it is reaped.
+	b.tickAfter("conf-held", std::chrono::seconds(61));
+	EXPECT_FALSE(b.alive("conf-held"));
+}
+
+TEST(ConferenceReap, ALegFlaggedEmergencyIsNotReapedAtTheOrdinaryLimit)
+{
+	// Rule 5: the emergency exemption stays in the shared path. A 911/933 never reaches 888, but a
+	// session flagged so (a PSAP callback) is held to the #741 4 h bound, never the 60 s one.
+	ReapBench b;
+	ASSERT_FALSE(b.dial("501", "192.168.7.51", "conf-911").empty());
+	b.handler.tick();
+	b.session("conf-911")->setEmergency(true);
+
+	b.tickAfter("conf-911", std::chrono::seconds(61));
+	EXPECT_TRUE(b.alive("conf-911")) << "61 s of silence on an emergency session";
+	b.tickAfter("conf-911", std::chrono::hours(3));
+	EXPECT_TRUE(b.alive("conf-911")) << "3 h of silence on an emergency session";
+	EXPECT_EQ(b.handler.getConferenceLegs(), 1);
+	EXPECT_TRUE(b.byesTo("192.168.7.51").empty());
+}
+
+TEST(ConferenceReap, TheBuildWithoutAConferenceRoomHasNothingToWatchAndDoesNotFault)
+{
+	// POCKETDIAL_CONFERENCE=0 / SIP_CONSTRAINED leaves _conference null.
+	ReapBench b;
+	ASSERT_FALSE(b.dial("501", "192.168.7.51", "conf-none").empty());
+	b.handler.tick();
+	b.handler.dropConferenceForTest();
+
+	b.tickAfter("conf-none", std::chrono::seconds(61));
+	EXPECT_TRUE(b.alive("conf-none")) << "no room, so no leg to watch";
+}
+
+TEST(ConferenceReap, TheReapedByeKeepsTheURIThePhoneRegistered)
+{
+	// Rule 1: a Snom 370 answers a BYE to a bare sip:ext@ip:port with 404/481 when it registered ;line=.
+	ReapBench b;
+	const std::string reg =
+		"REGISTER sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.7.51:5060;branch=z9hG4bKrline\r\n"
+		"From: <sip:501@server>;tag=rtline\r\n"
+		"To: <sip:501@server>\r\n"
+		"Call-ID: reg-line\r\n"
+		"CSeq: 1 REGISTER\r\n"
+		"Contact: <sip:501@192.168.7.51:5060;line=2>;expires=3600\r\n"
+		"Content-Length: 0\r\n\r\n";
+	b.handler.handle(RequestsHandler::getMessageFromPool(reg, addrFor("192.168.7.51")));
+	b.handler.handle(makeInvite("501", ConferenceRoom::EXT, "192.168.7.51", "conf-line"));
+	ASSERT_EQ(b.handler.getConferenceLegs(), 1);
+	b.handler.tick();
+
+	b.tickAfter("conf-line", std::chrono::seconds(61));
+
+	const auto byes = b.byesTo("192.168.7.51");
+	ASSERT_EQ(byes.size(), 1u);
+	EXPECT_EQ(byes[0].rfind("BYE sip:501@192.168.7.51:5060;line=2 SIP/2.0", 0), 0u) << byes[0];
+}
+
+// ── Not reaped: service legs with no board-side receive path (green on main, by design) ──
+
+TEST(ConferenceReap, TheEchoTestHasNoBoardMediaToWatchAndIsNeverReapedForRxSilence)
+{
+	// 777 answers with the caller's own SDP: the phone streams to itself and the board sees no RTP.
+	ReapBench b;
+	ASSERT_FALSE(b.dial("501", "192.168.7.51", "echo-1003", "777").empty());
+	b.handler.tick();
+
+	b.tickAfter("echo-1003", std::chrono::seconds(61));
+
+	EXPECT_TRUE(b.alive("echo-1003")) << "a watch here would hang up every echo test at 60 s";
+}
+
+TEST(ConferenceReap, TheToneCallIsSendonlyAndIsNeverReapedForRxSilence)
+{
+	// 440 answers a=sendonly: the phone is told to send nothing, so silence is the healthy state.
+	ReapBench b;
+	ASSERT_FALSE(b.dial("501", "192.168.7.51", "tone-1003", "440").empty());
+	b.handler.tick();
+
+	b.tickAfter("tone-1003", std::chrono::seconds(61));
+
+	EXPECT_TRUE(b.alive("tone-1003")) << "a watch here would hang up every 440 call at 60 s";
+}
+
+TEST(ConferenceReap, AParkedCallIsSendonlyHoldMusicAndIsLeftToTheParkTimeout)
+{
+	// The parked leg is Connected (not Held) but the phone is told to send nothing; park has its
+	// own bound (POCKETDIAL_PARK_TIMEOUT_SEC, then ring-back).
+	ReapBench b;
+	ASSERT_FALSE(b.dial("501", "192.168.7.51", "park-1003", "700").empty());
+	b.handler.tick();
+	ASSERT_TRUE(b.alive("park-1003"));
+	ASSERT_EQ(b.session("park-1003")->getState(), Session::State::Connected);
+
+	b.tickAfter("park-1003", std::chrono::seconds(61));
+
+	EXPECT_TRUE(b.alive("park-1003")) << "a watch here would take the call off the orbit at 60 s, ahead of the park timeout";
+}
