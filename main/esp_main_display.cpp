@@ -49,6 +49,20 @@
 
 static const char *TAG = "main_display";
 
+// #1006: a boot-time task create that fails leaves the board half-booted with
+// no log line (seen on hardware: STA dashboard never came up, http=-1). Every
+// create in app_main goes through this on != pdPASS: log the internal heap
+// (task stacks come from it), give the log a second to drain, then restart.
+// Determinism over degradation: a visible boot loop beats a silent half-boot.
+static void boot_task_create_failed(const char* name)
+{
+    ESP_LOGE(TAG, "[boot] xTaskCreate %s failed: internal free=%u largest=%u -- restarting",
+             name, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+}
+
 // Board Pin mappings (Guition cheap black display JC3248W535)
 #define TFT_CS      45
 #define TFT_SCK     47
@@ -832,7 +846,8 @@ extern "C" void app_main(void) {
     original_log_vprintf = esp_log_set_vprintf(screen_log_vprintf);
 
     // Start Core 1 graphics loop last: it drives all LVGL rendering from here on.
-    xTaskCreatePinnedToCore(&lvgl_task, "lvgl_task", 8192, NULL, 5, NULL, 1);
+    if (xTaskCreatePinnedToCore(&lvgl_task, "lvgl_task", 8192, NULL, 5, NULL, 1) != pdPASS)
+        boot_task_create_failed("lvgl_task");
 
     // 4. Retrieve saved operational Wi-Fi configuration from NVS
     uint8_t wifi_mode = 0;   // 0 = captive-portal default, 1 = STATION, 2 = explicit Standalone
@@ -905,8 +920,10 @@ extern "C" void app_main(void) {
         ESP_LOGI(TAG, "STATION mode: attempting to join '%s'...", saved_ssid);
         if (wifi_init_sta(saved_ssid, saved_pass)) {
             if (lvgl_lock(-1)) { ui_set_onboarding_mode(false); lvgl_unlock(); }
-            xTaskCreatePinnedToCore(&sip_server_task,  "sip_server_task",  8192, NULL, 5, NULL, 0);
-            xTaskCreatePinnedToCore(&http_server_task, "http_server_task", 8192, NULL, 4, NULL, 0);
+            if (xTaskCreatePinnedToCore(&sip_server_task,  "sip_server_task",  8192, NULL, 5, NULL, 0) != pdPASS)
+                boot_task_create_failed("sip_server_task");
+            if (xTaskCreatePinnedToCore(&http_server_task, "http_server_task", 8192, NULL, 4, NULL, 0) != pdPASS)
+                boot_task_create_failed("http_server_task");
             g_setupComplete = true;
         } else {
             ESP_LOGW(TAG, "Station association failed -> captive portal.");
@@ -948,8 +965,10 @@ extern "C" void app_main(void) {
         }
         g_localIp = "192.168.4.1";
         wifi_init_softap(STANDALONE_SSID, g_apPsk.c_str(), !ap_secure);
-        xTaskCreatePinnedToCore(&sip_server_task,  "sip_server_task",  8192, NULL, 5, NULL, 0);
-        xTaskCreatePinnedToCore(&http_server_task, "http_server_task", 8192, NULL, 4, NULL, 0);
+        if (xTaskCreatePinnedToCore(&sip_server_task,  "sip_server_task",  8192, NULL, 5, NULL, 0) != pdPASS)
+            boot_task_create_failed("sip_server_task");
+        if (xTaskCreatePinnedToCore(&http_server_task, "http_server_task", 8192, NULL, 4, NULL, 0) != pdPASS)
+            boot_task_create_failed("http_server_task");
         g_setupComplete = true;
     }
 
@@ -980,7 +999,8 @@ extern "C" void app_main(void) {
         }
 
         ESP_LOGI(TAG, "Captive onboarding active at http://192.168.4.1/ or pocketdial.local (decays in %ds)", CAPTIVE_DECAY_SECONDS);
-        xTaskCreatePinnedToCore(&captive_decay_task, "decay_task", 3072, NULL, 3, NULL, 0);
+        if (xTaskCreatePinnedToCore(&captive_decay_task, "decay_task", 3072, NULL, 3, NULL, 0) != pdPASS)
+            boot_task_create_failed("decay_task");
     }
 
     // ── SSH / esp_console engine (Ticket 2) ─────────────────────────────────
@@ -991,5 +1011,6 @@ extern "C" void app_main(void) {
     //
     // Plumb the real network identity into the SSH sysop-terminal TUI so its banner
     // 5. Spin up periodic status and battery updater task
-    xTaskCreatePinnedToCore(&system_status_task, "status_task", 4096, NULL, 3, NULL, 0);
+    if (xTaskCreatePinnedToCore(&system_status_task, "status_task", 4096, NULL, 3, NULL, 0) != pdPASS)
+        boot_task_create_failed("status_task");
 }
