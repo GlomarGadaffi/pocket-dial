@@ -181,6 +181,7 @@ namespace
 			struct dirent* ext;
 			while ((ext = ::readdir(top)) != nullptr)
 			{
+				resetguard::sweepTick();   // #993: see CdrArchive.cpp's wipe()
 				if (ext->d_name[0] == '.') continue;   // "." / ".."
 				char path[300];
 				const int dirLen = std::snprintf(path, sizeof(path), "%s/%s", kArchiveDir, ext->d_name);
@@ -194,6 +195,7 @@ namespace
 				struct dirent* f;
 				while ((f = ::readdir(d)) != nullptr)
 				{
+					resetguard::sweepTick();   // #993
 					if (f->d_name[0] == '.') continue;
 					const size_t room = sizeof(path) - static_cast<size_t>(dirLen);
 					const int n = std::snprintf(path + dirLen, room, "/%s", f->d_name);
