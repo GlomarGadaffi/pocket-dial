@@ -5701,7 +5701,7 @@ void HttpServer::sendApiAdminSetCredential(int sock, const HttpRequest& req)
 		if (!claimed.empty())
 		{
 			char body[128];
-			snprintf(body, sizeof(body),
+			(void)snprintf(body, sizeof(body),
 			         "{\"error\":\"DTMF PIN must not start with %.*s: the %.*s feature code would fire before the PIN completes\"}",
 			         static_cast<int>(claimed.size() - 1), claimed.data() + 1,
 			         static_cast<int>(claimed.size()), claimed.data());
