@@ -84,6 +84,10 @@ struct PbxEnv
 	// ── Engine services (registration + session tables) ───────────────────────
 	// Look up a live registration binding; nullptr when `number` isn't registered.
 	virtual std::shared_ptr<SipClient> findRegistered(std::string_view number) = 0;
+	// An extension this PBX owns although it is not registered right now: authenticated
+	// (a Secured device, not an open-registered one) AND voicemail enabled (#1026). The
+	// SBC trunk fallback must not claim it. Default false so a test env needs no override.
+	virtual bool isOfflineOwnedExtension(std::string_view /*number*/) { return false; }
 	// Draw a transient virtual-peer SipClient (777/440/park leg) from the fixed
 	// pool. Falls back to a BOUNDED number of heap allocations and then returns
 	// nullptr (Issue #101(A)) — check it, and abandon the operation rather than
