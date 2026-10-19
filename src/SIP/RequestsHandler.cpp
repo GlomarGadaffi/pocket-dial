@@ -2048,6 +2048,14 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 		}
 		return;
 	}
+	// A 487 on a Call-ID with no session answers a CANCEL this PBX sent as it ended the call
+	// (the plain no-answer sweep, which has already given the caller its 480). Relayed, it
+	// would be a second final to the caller; unACKed, the callee retransmits it until Timer H.
+	if (!session.has_value())
+	{
+		ackForwardedFinal(data);
+		return;
+	}
 	endHandle(data->getFromNumber(), data);
 }
 
