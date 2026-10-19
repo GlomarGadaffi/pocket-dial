@@ -1,2 +1,2 @@
-# VoicemailDivert_test.cpp: 8 (#1023: a PBX-built 480 carries a To tag, the 180's when the caller already saw one; DND, plain and forwarded no-answer, CFNA failure, spent hunt, empty ring group, empty page zone)
-8
+# VoicemailDivert_test.cpp: 10 (#1023: a PBX-built 480 carries a To tag, the 180's when the caller already saw one; DND, plain and forwarded no-answer, CFNA failure, spent hunt, empty ring group, empty page zone; plus a callee tag over 15 characters is not stored, and a 12-character one is)
+10

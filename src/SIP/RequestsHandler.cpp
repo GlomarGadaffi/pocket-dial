@@ -209,6 +209,26 @@ namespace
 		return out;
 	}
 
+	// Longest To tag onRinging() stores in Session::localTag: std::string's inline (SSO) capacity,
+	// so copying it never allocates. The callee chooses that tag; every tag the PBX mints is 9.
+	constexpr size_t kMaxStoredToTag = 15;
+
+	// The ;tag= value of a From/To line as a view into it: no std::string, so no allocation. Empty
+	// when there is none. The same stop characters as siphdr::tagOf().
+	std::string_view tagViewOf(std::string_view header)
+	{
+		size_t p = header.find(";tag=");
+		if (p == std::string_view::npos) return {};
+		p += 5;
+		size_t e = p;
+		while (e < header.size() && header[e] != ';' && header[e] != '>' &&
+			header[e] != ' ' && header[e] != '\r' && header[e] != '\n')
+		{
+			++e;
+		}
+		return header.substr(p, e - p);
+	}
+
 	// #398 D review: an SDP's c= address and m= port as a relay peer, only when
 	// it is a dotted quad (inet_addr() turns "999.0.0.1" into broadcast) that
 	// sipwire::isUsableRtpPeer() allows: not loopback, multicast, reserved, this
@@ -6530,9 +6550,15 @@ void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
 	// Issue #1023: remember the tag this 180 gave the caller (the callee's own), so a 480 the PBX
 	// later answers with itself (no-answer, CFNA failure) stays in that early dialog. The first
 	// one wins; an empty tag, or a session that already has one (anchor, trunk), is left alone.
+	// The callee chose the tag: one longer than kMaxStoredToTag is not stored (that copy would
+	// allocate on the receive path), and the 480 then mints its own.
 	if (session.has_value() && session.value()->getLocalTag().empty())
 	{
-		session.value()->setLocalTag(siphdr::tagOf(data->getTo()));
+		const std::string_view calleeTag = tagViewOf(data->getTo());
+		if (!calleeTag.empty() && calleeTag.size() <= kMaxStoredToTag)
+		{
+			session.value()->setLocalTag(std::string(calleeTag));
+		}
 	}
 	endHandle(data->getFromNumber(), data);
 }
