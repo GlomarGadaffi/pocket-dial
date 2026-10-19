@@ -189,6 +189,12 @@ bool CallForker::redirectInvite(const std::shared_ptr<SipMessage>& invite,
 			return true;   // we DID handle it (with a 503); target lookup succeeded
 		}
 		_env.insertSession(std::string(invite->getCallID()), session);
+		// #1024: bound the forward leg by the ring time too, or a caller that vanishes
+		// leaves the target ringing and this session in Invited for good.
+		// ponytail: the default ring time, not the target's own noAnswerSeconds; wire the
+		// per-extension value through PbxEnv if a forward target needs a different one.
+		session->setForwardLeg(invite, target);
+		session->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
 	}
 
 	buildInviteFork(invite, caller, targetClient, /*intercom=*/false);

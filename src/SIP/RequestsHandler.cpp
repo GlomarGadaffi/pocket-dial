@@ -10805,12 +10805,15 @@ void RequestsHandler::tick()
 				auto dest = session->getDest();
 				auto src = session->getSrc();
 				std::string cfna = session->getNoAnswerTarget();
+				// A forwarded leg (#1024) keeps its INVITE and target apart from _inviteMessage.
+				const auto fwdInvite = session->getForwardLegInvite();
+				if (!invite) invite = fwdInvite;
 				if (invite && src && cfna.empty() && !session->isTrunk())
 				{
 					// No forward and no voicemail: nobody answered within the callee's ring time.
 					// CANCEL the still-ringing callee and 480 the caller, then end the session.
 					// Without this the session sat in Invited with its timer cleared, forever.
-					std::string calleeExt(invite->getToNumber());
+					std::string calleeExt(fwdInvite ? session->getForwardLegTarget() : std::string(invite->getToNumber()));
 					auto callee = findClient(calleeExt);
 					if (callee.has_value())
 					{
