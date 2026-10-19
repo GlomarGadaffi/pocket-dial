@@ -1124,6 +1124,70 @@ TEST(DialPlanRouting, SbcModeStillTrunksANumberThatIsNotARegisteredExtension)
 	EXPECT_EQ(loopback->lastMakeCallDestination(), "602");
 }
 
+// #1026: the fallback is for numbers this PBX does not own. An authenticated (Secured)
+// extension with voicemail enabled is owned even while its phone is offline, so the call
+// continues to CFU/DND/delivery instead of leaving on the billable trunk.
+TEST(DialPlanRouting, SbcModeKeepsAnOfflineSecuredVoicemailExtensionOffTheTrunk)
+{
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	isolateTapiStoreForTest(handler);
+	registerThreePhones(handler);
+	handler.adoptDeviceForTest("0200000000cc", "602", Registrar::DeviceState::Secured);
+	handler.setVoicemail("602", true);
+	handler.setForward("602", "always", "600");
+	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+
+	wire.clear();
+	handler.handle(makeInvite("500", "602", "192.168.9.50", "sbc-offline-owned"));
+
+	EXPECT_EQ(handler.anchorBridgeForCallIdForTest("Call-ID: sbc-offline-owned"), nullptr)
+		<< "an offline authenticated voicemail extension must not be placed through the trunk";
+	EXPECT_TRUE(wire.sawInviteTo("600")) << "its CFU target must be rung instead";
+}
+
+TEST(DialPlanRouting, SbcModeStillTrunksAnOfflineSecuredExtensionWithoutVoicemail)
+{
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	isolateTapiStoreForTest(handler);
+	registerThreePhones(handler);
+	handler.adoptDeviceForTest("0200000000cc", "602", Registrar::DeviceState::Secured);
+	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+
+	wire.clear();
+	handler.handle(makeInvite("500", "602", "192.168.9.50", "sbc-secured-no-vm"));
+
+	EXPECT_NE(handler.anchorBridgeForCallIdForTest("Call-ID: sbc-secured-no-vm"), nullptr)
+		<< "the gate needs voicemail as well as authentication";
+}
+
+TEST(DialPlanRouting, SbcModeStillTrunksAnOpenRegisteredExtensionWithVoicemail)
+{
+	WireLog wire;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&wire](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			wire.sent.emplace_back(addr, std::move(msg));
+		});
+	isolateTapiStoreForTest(handler);
+	registerThreePhones(handler);
+	handler.adoptDeviceForTest("0200000000cc", "602", Registrar::DeviceState::Learned);
+	handler.setVoicemail("602", true);
+	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+
+	wire.clear();
+	handler.handle(makeInvite("500", "602", "192.168.9.50", "sbc-open-vm"));
+
+	EXPECT_NE(handler.anchorBridgeForCallIdForTest("Call-ID: sbc-open-vm"), nullptr)
+		<< "the gate needs authentication as well as voicemail";
+}
+
 TEST(DialPlanRouting, SbcModeExplicitRuleStillBeatsARegisteredLocalExtension)
 {
 	// An operator's explicit rule is deliberate and keeps precedence even over

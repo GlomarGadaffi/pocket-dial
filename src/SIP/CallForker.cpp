@@ -418,6 +418,12 @@ bool CallForker::routeDialPlan(const std::shared_ptr<SipMessage>& data,
 		{
 			return false;
 		}
+		// #1026: an authenticated extension with voicemail is ours even while offline.
+		// Fall through to CFU/DND/voicemail rather than out the trunk.
+		if (_env.isOfflineOwnedExtension(destNumber))
+		{
+			return false;
+		}
 		sbcFallback.pattern = "*";
 		sbcFallback.action = pbx::DialActionType::Trunk;
 		rule = &sbcFallback;

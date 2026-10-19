@@ -1234,6 +1234,10 @@ private:
 	}
 	const std::string& localIp() const override { return _localIp; }
 	int serverPort() const override { return _serverPort; }
+	bool isOfflineOwnedExtension(std::string_view number) override
+	{
+		return _registrar.isExtensionSecured(number) && _cfg.isVoicemailEnabled(std::string(number));
+	}
 	std::shared_ptr<SipClient> findRegistered(std::string_view number) override
 	{
 		// THE routing choke point. Every path that asks "can a call go to this
