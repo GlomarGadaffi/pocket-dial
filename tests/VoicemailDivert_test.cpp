@@ -246,6 +246,39 @@ TEST(VoicemailDivert, CfnaFallsBackToVoicemailAndCancelsTheRingingCallee)
 		<< "the 200 OK needs the board's own To-tag: " << okToCaller;
 }
 
+// Issue #1011 follow-up: a plain direct call (no forward, no voicemail) had no ring bound.
+// Nothing armed its timer, so a caller that vanished left the callee ringing on a session
+// that never ended. The sweep now CANCELs the callee and answers the caller 480.
+TEST(VoicemailDivert, PlainDirectCallNoAnswerCancelsTheCalleeAndAnswersTheCaller)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.40.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in calleeAddr = addrFor("192.168.40.10");  // 301
+	const sockaddr_in callerAddr = addrFor("192.168.40.20");  // 302
+
+	handler.handle(makeRegister("301", "192.168.40.10", "reg-301-p"));
+	handler.handle(makeRegister("302", "192.168.40.20", "reg-302-p"));
+
+	const std::string callId = "plain-noanswer-1";
+	handler.handle(makeInvite("302", "301", "192.168.40.20", callId, "z9hG4bKplain1"));
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+
+	std::string cancelToCallee = findSentTo(sent, calleeAddr, "CANCEL sip:");
+	EXPECT_NE(cancelToCallee.find("Call-ID: " + callId), std::string::npos)
+		<< "the still-ringing callee must be CANCELed: " << cancelToCallee;
+	EXPECT_FALSE(findSentTo(sent, callerAddr, "SIP/2.0 480").empty())
+		<< "the caller must get a final response, not wait on a session that is gone";
+	EXPECT_FALSE(handler.getSession("Call-ID: " + callId).has_value())
+		<< "the no-answer session must be ended";
+}
+
 // #232 regression: a BYE against the locally-answered voicemail leg must
 // actually be matched and torn down, not silently ignored the way 777/888
 // legs were before setDialogHeaders() was added here.

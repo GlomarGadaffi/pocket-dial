@@ -137,6 +137,11 @@ TEST_F(NoAnswerTimeout, AnExplicitNoAnswerForwardUsesTheCalleesRingTime)
 	expectRingTime("nat-cfna", 45);
 }
 
+TEST_F(NoAnswerTimeout, APlainDirectCallIsBoundedByTheDefaultRingTime)
+{
+	expectRingTime("nat-plain", 20);
+}
+
 TEST_F(NoAnswerTimeout, TheCallersRingTimeDoesNotApply)
 {
 	_h->setVoicemail("401", true);
