@@ -1439,3 +1439,77 @@ TEST(UnavailableToTag, PageZoneWithNobodyToPageCarriesAToTag)
 	EXPECT_FALSE(toTagOf(unavailable).empty())
 		<< "a UAS final response carries a To tag (RFC 3261 s8.2.6.2): " << unavailable;
 }
+
+// The callee chooses its tag, and the PBX keeps it only when it fits a std::string's inline
+// buffer (15 characters), so storing it never allocates on the SIP receive path. A longer one
+// is not kept: the 480 carries a tag the PBX mints, not the callee's.
+TEST(UnavailableToTag, ACalleeTagTooLongToStoreIsNotReusedByThe480)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in calleeAddr = addrFor("192.168.47.31");  // 481
+	const sockaddr_in callerAddr = addrFor("192.168.47.32");  // 482
+	handler.handle(makeRegister("481", "192.168.47.31", "reg-481-t"));
+	handler.handle(makeRegister("482", "192.168.47.32", "reg-482-t"));
+
+	const std::string longTag(40, 'L');
+	const std::string callId = "tag-plain-long";
+	handler.handle(makeInvite("482", "481", "192.168.47.32", callId, "z9hG4bKtagplainlong"));
+	const std::string inviteToCallee = findSentTo(sent, calleeAddr, "Call-ID: " + callId);
+	ASSERT_FALSE(inviteToCallee.empty());
+
+	handler.handle(responseTo(inviteToCallee, "180 Ringing", longTag, "192.168.47.31"));
+	ASSERT_EQ(toTagOf(findSentTo(sent, callerAddr, "SIP/2.0 180")), longTag)
+		<< "precondition: the callee's 180 reaches the caller with its 40-character tag";
+
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+
+	const std::string unavailable = findSentTo(sent, callerAddr, "SIP/2.0 480");
+	ASSERT_FALSE(unavailable.empty()) << "the no-answer sweep answers the caller 480";
+	const std::string tag = toTagOf(unavailable);
+	EXPECT_FALSE(tag.empty()) << "the 480 still carries a To tag: " << unavailable;
+	EXPECT_LE(tag.size(), 15u) << "a tag that long is not the one the PBX stored: " << unavailable;
+	EXPECT_NE(tag, longTag) << "the callee's over-long tag must not be reused: " << unavailable;
+}
+
+// Positive control: a tag of 12 characters fits, so it is kept and reused exactly.
+TEST(UnavailableToTag, AShortCalleeTagIsStillReusedByThe480)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in calleeAddr = addrFor("192.168.47.33");  // 491
+	const sockaddr_in callerAddr = addrFor("192.168.47.34");  // 492
+	handler.handle(makeRegister("491", "192.168.47.33", "reg-491-t"));
+	handler.handle(makeRegister("492", "192.168.47.34", "reg-492-t"));
+
+	const std::string shortTag(12, 'S');
+	const std::string callId = "tag-plain-short";
+	handler.handle(makeInvite("492", "491", "192.168.47.34", callId, "z9hG4bKtagplainshort"));
+	const std::string inviteToCallee = findSentTo(sent, calleeAddr, "Call-ID: " + callId);
+	ASSERT_FALSE(inviteToCallee.empty());
+
+	handler.handle(responseTo(inviteToCallee, "180 Ringing", shortTag, "192.168.47.33"));
+	ASSERT_EQ(toTagOf(findSentTo(sent, callerAddr, "SIP/2.0 180")), shortTag)
+		<< "precondition: the callee's 180 reaches the caller with its 12-character tag";
+
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+
+	const std::string unavailable = findSentTo(sent, callerAddr, "SIP/2.0 480");
+	ASSERT_FALSE(unavailable.empty()) << "the no-answer sweep answers the caller 480";
+	EXPECT_EQ(toTagOf(unavailable), shortTag)
+		<< "the 480 must carry the tag the caller's 180 carried: " << unavailable;
+}
