@@ -197,6 +197,18 @@ namespace
 		return out;
 	}
 
+	// Issue #1023, RFC 3261 §8.2.6.2: a final response the PBX answers a caller with itself carries
+	// a To tag. `seen` is the tag a provisional already gave that caller (the callee's relayed 180,
+	// or the PBX's own), reused so the final stays in that early dialog. With none, or a To that
+	// already has a tag, toWithTag(to) decides.
+	std::string toWithTag(std::string_view to, const std::string& seen)
+	{
+		if (seen.empty() || to.find(";tag=") != std::string_view::npos) return toWithTag(to);
+		std::string out(to);
+		out += ";tag=" + seen;
+		return out;
+	}
+
 	// #398 D review: an SDP's c= address and m= port as a relay peer, only when
 	// it is a dotted quad (inet_addr() turns "999.0.0.1" into broadcast) that
 	// sipwire::isUsableRtpPeer() allows: not loopback, multicast, reserved, this
@@ -2809,6 +2821,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader("SIP/2.0 480 Temporarily Unavailable");
+		response->setTo(toWithTag(data->getTo()));   // #1023, RFC 3261 §8.2.6.2: a UAS final carries a To tag
 		response->clearBody();
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		response->setContact(buildContact(caller.value()->getNumber()));
@@ -6513,6 +6526,13 @@ void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
 		data->addHeader("Require", "100rel");
 		data->setHeaderOnce("RSeq", std::string_view(rseqText, static_cast<size_t>(conv.ptr - rseqText)));
 		presentContact(*data, data->getToNumber());
+	}
+	// Issue #1023: remember the tag this 180 gave the caller (the callee's own), so a 480 the PBX
+	// later answers with itself (no-answer, CFNA failure) stays in that early dialog. The first
+	// one wins; an empty tag, or a session that already has one (anchor, trunk), is left alone.
+	if (session.has_value() && session.value()->getLocalTag().empty())
+	{
+		session.value()->setLocalTag(siphdr::tagOf(data->getTo()));
 	}
 	endHandle(data->getFromNumber(), data);
 }
@@ -10790,6 +10810,7 @@ void RequestsHandler::tick()
 						{
 							resp->setHeader(SipMessageTypes::UNAVAILABLE);
 							resp->clearBody();
+							resp->setTo(toWithTag(invite->getTo(), session->getLocalTag()));   // #1023: the 180's tag
 							resp->setContact(buildContact(session->getGroupExt()));
 							_outbox.emplace_back(invite->getSource(), std::move(resp));
 						}
@@ -10805,6 +10826,8 @@ void RequestsHandler::tick()
 				auto dest = session->getDest();
 				auto src = session->getSrc();
 				std::string cfna = session->getNoAnswerTarget();
+				// #1023: the To tag the caller's 180 carried, read now because endCall() recycles the session.
+				const std::string ringTag = session->getLocalTag();
 				// A forwarded leg (#1024) keeps its INVITE and target apart from _inviteMessage.
 				const auto fwdInvite = session->getForwardLegInvite();
 				if (!invite) invite = fwdInvite;
@@ -10826,6 +10849,7 @@ void RequestsHandler::tick()
 					{
 						resp->setHeader(SipMessageTypes::UNAVAILABLE);
 						resp->clearBody();
+						resp->setTo(toWithTag(invite->getTo(), ringTag));   // #1023
 						resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
 						resp->setContact(buildContact(src->getNumber()));
 						_outbox.emplace_back(invite->getSource(), std::move(resp));
@@ -10891,6 +10915,7 @@ void RequestsHandler::tick()
 							{
 								resp->setHeader(SipMessageTypes::UNAVAILABLE);
 								resp->clearBody();
+								resp->setTo(toWithTag(invite->getTo(), ringTag));   // #1023
 								resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
 								resp->setContact(buildContact(src->getNumber()));
 								_outbox.emplace_back(invite->getSource(), std::move(resp));
