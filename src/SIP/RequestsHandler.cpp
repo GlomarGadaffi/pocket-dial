@@ -2048,6 +2048,14 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 		}
 		return;
 	}
+	// A 487 on a Call-ID with no session answers a CANCEL this PBX sent as it ended the call
+	// (the plain no-answer sweep, which has already given the caller its 480). Relayed, it
+	// would be a second final to the caller; unACKed, the callee retransmits it until Timer H.
+	if (!session.has_value())
+	{
+		ackForwardedFinal(data);
+		return;
+	}
 	endHandle(data->getFromNumber(), data);
 }
 
@@ -2888,6 +2896,10 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// CallForker::buildCancel() and the 487 ACK copy it (RFC 3261 §9.1, §17.1.1.3).
 	retargetRequest(*data, *called.value());
 	newSession->setInviteMessage(data);
+	// Every direct call is bounded by the callee's ring time. Without this a plain call (no forward,
+	// no voicemail) never armed the timer, so a caller that vanished left the callee ringing forever.
+	// The CFNA and voicemail arms below set the same deadline again, which is harmless.
+	newSession->armRingTimer(std::chrono::steady_clock::now() + _cfg.noAnswerTimeout(destNumber));
 	std::string cfna = _cfg.getForwardTarget(destNumber, "noanswer");
 	if (!cfna.empty() && cfna != destNumber)
 	{
@@ -10793,7 +10805,30 @@ void RequestsHandler::tick()
 				auto dest = session->getDest();
 				auto src = session->getSrc();
 				std::string cfna = session->getNoAnswerTarget();
-				if (invite && src && !cfna.empty())
+				if (invite && src && cfna.empty() && !session->isTrunk())
+				{
+					// No forward and no voicemail: nobody answered within the callee's ring time.
+					// CANCEL the still-ringing callee and 480 the caller, then end the session.
+					// Without this the session sat in Invited with its timer cleared, forever.
+					std::string calleeExt(invite->getToNumber());
+					auto callee = findClient(calleeExt);
+					if (callee.has_value())
+					{
+						auto cancel = _forker.buildCancel(invite, callee.value());
+						if (cancel) _outbox.emplace_back(callee.value()->getAddress(), std::move(cancel));
+					}
+					queueLog("no answer after ring time, no forward -- " + calleeExt);
+					endCall(callID, src->getNumber(), calleeExt, "no answer");
+					if (auto resp = getMessageFromPool(*invite))
+					{
+						resp->setHeader(SipMessageTypes::UNAVAILABLE);
+						resp->clearBody();
+						resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
+						resp->setContact(buildContact(src->getNumber()));
+						_outbox.emplace_back(invite->getSource(), std::move(resp));
+					}
+				}
+				else if (invite && src && !cfna.empty())
 				{
 					if (cfna == pbx::kVoicemailForwardSentinel)
 					{
