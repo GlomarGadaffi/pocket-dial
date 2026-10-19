@@ -281,6 +281,17 @@ public:
 	std::shared_ptr<SipMessage> getInviteMessage() const { return _inviteMessage; }
 	void setInviteMessage(std::shared_ptr<SipMessage> msg) { _inviteMessage = msg; }
 
+	// A CFU/CFB/CFNA redirect leg keeps the caller's INVITE and the forward target here,
+	// not in _inviteMessage: a retained INVITE would let CFB chain from the target's 486
+	// and loop A -> B -> A. Only the no-answer sweep reads these (#1024).
+	void setForwardLeg(std::shared_ptr<SipMessage> invite, std::string target)
+	{
+		_forwardInvite = std::move(invite);
+		_forwardTarget = std::move(target);
+	}
+	std::shared_ptr<SipMessage> getForwardLegInvite() const { return _forwardInvite; }
+	const std::string& getForwardLegTarget() const { return _forwardTarget; }
+
 	// ── No-answer / hunt-group timer (Class A sweep) ──────────────────
 	// A non-default _ringDeadline arms a one-shot timer that tick() polls: on
 	// expiry the registrar CANCELs the outstanding leg and advances (CFNA forward,
@@ -492,6 +503,8 @@ private:
 	bool _degradedReported = false;    // #906: a kept degraded 911/933 was reported to the notify list
 	std::vector<std::shared_ptr<SipClient>> _pendingTargets;
 	std::shared_ptr<SipMessage> _inviteMessage;
+	std::shared_ptr<SipMessage> _forwardInvite;   // #1024: see setForwardLeg()
+	std::string _forwardTarget;
 
 	// No-answer / hunt timer + forwarding/hunt bookkeeping (Class A sweep).
 	std::chrono::steady_clock::time_point _ringDeadline;

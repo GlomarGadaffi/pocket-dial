@@ -320,6 +320,43 @@ TEST(VoicemailDivert, PlainNoAnswerCalleeFinalIsAckedAndKeptFromTheCaller)
 	EXPECT_TRUE(acked) << "the PBX must ACK the 487 to its own CANCELled INVITE (RFC 3261 s17.1.1.3)";
 }
 
+// #1024: a call forwarded unconditionally (CFU) rings the forward target on a leg of its
+// own. That leg is bounded by the ring time too: with the caller gone, the target gets a
+// CANCEL for this Call-ID, the caller gets a 480 and the session is released.
+TEST(VoicemailDivert, ForwardedLegNoAnswerCancelsTheTargetAndAnswersTheCaller)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.40.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in targetAddr = addrFor("192.168.40.13");  // 322, the forward target
+	const sockaddr_in callerAddr = addrFor("192.168.40.23");  // 323
+	handler.handle(makeRegister("321", "192.168.40.14", "reg-321-f"));
+	handler.handle(makeRegister("322", "192.168.40.13", "reg-322-f"));
+	handler.handle(makeRegister("323", "192.168.40.23", "reg-323-f"));
+	handler.setForward("321", "always", "322");
+
+	const std::string callId = "cfu-noanswer-1024";
+	handler.handle(makeInvite("323", "321", "192.168.40.23", callId, "z9hG4bKcfu1024"));
+	const std::string inviteToTarget = findSentTo(sent, targetAddr, "Call-ID: " + callId);
+	ASSERT_FALSE(inviteToTarget.empty()) << "the call must be forwarded to 322";
+	auto session = handler.getSession("Call-ID: " + callId);
+	ASSERT_TRUE(session.has_value());
+	EXPECT_TRUE(session.value()->hasRingTimer()) << "a forwarded leg must be bounded by the ring time";
+	session.value()->armRingTimer(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+
+	const std::string cancel = findSentTo(sent, targetAddr, "CANCEL sip:322@");
+	EXPECT_NE(cancel.find("Call-ID: " + callId), std::string::npos)
+		<< "the forward target must be CANCELed, not 321: " << cancel;
+	EXPECT_FALSE(findSentTo(sent, callerAddr, "SIP/2.0 480").empty())
+		<< "the caller must get a final response";
+	EXPECT_FALSE(handler.getSession("Call-ID: " + callId).has_value())
+		<< "the forwarded leg's session must be ended";
+}
+
 // #232 regression: a BYE against the locally-answered voicemail leg must
 // actually be matched and torn down, not silently ignored the way 777/888
 // legs were before setDialogHeaders() was added here.
