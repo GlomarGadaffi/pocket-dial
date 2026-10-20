@@ -69,6 +69,9 @@ namespace SipLimits
 {
 	constexpr size_t   kMaxCallIdLine   = 127;  // TransactionLayer/VmSdJob callId[128]; stores the whole line (corpus 41)
 	constexpr size_t   kMaxDialogLineBytes = 200;  // #870: a From/To line a dialog stores; a BYE built from it fits sipb::kMaxByeBytes (820 B worst case)
+	// #1030: the To line a callee's 2xx may store. The INVITE gate admits a To of kMaxDialogLineBytes
+	// before the callee adds its tag, and the PBX's own tag is ";tag=" + 9 = 14; 15 leaves a byte.
+	constexpr size_t   kMaxDialogToLineBytes = kMaxDialogLineBytes + 15;
 	constexpr size_t   kMaxBranch       = 71;   // TransactionLayer viaBranch[72] (corpus 41)
 	constexpr size_t   kMaxCSeqMethod   = 11;   // TransactionLayer cseqMethod[12] (corpus 8)
 	constexpr size_t   kMaxCSeqDigits   = 10;   // RFC 3261 §8.1.1.5: < 2^31 (corpus 5)

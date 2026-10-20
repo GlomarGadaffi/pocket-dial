@@ -436,6 +436,109 @@ TEST(RegisteredContact, ServerOriginatedByeIsAddressedToTheRegisteredContact)
 		<< "a BYE the PBX authors itself needs the registered Contact too";
 }
 
+// ── #1030: the callee's 2xx is bounded where its dialog lines are stored ─────────────
+//
+// #870 bounds the INVITE's From and To, but the dialog stores the callee's 2xx lines,
+// and the callee chooses its To tag (or pads a line). A line past the bound would store
+// a dialog whose BYE sipb::bye() refuses, so the far leg would never be told.
+namespace
+{
+	// "To: " + a display name sized so the whole line is `lineBytes` + the callee's tag.
+	std::string toLineOfSize(size_t lineBytes, const std::string& tag)
+	{
+		const std::string head = "To: \"";
+		const std::string tail = "\" <sip:106@server>;tag=" + tag;
+		return head + std::string(lineBytes - head.size() - tail.size(), 'x') + tail;
+	}
+
+	// Snom (100) calls Yealink (106); Yealink answers with `toLine` / `fromLine` (empty: the
+	// fork's own From). The call may or may not connect.
+	void callAnsweredWith(RequestsHandler& handler, Sent& sent, const std::string& callId,
+	                      const std::string& toLine, const std::string& fromLine = "")
+	{
+		handler.handle(makeRegister("100", kSnomIp, 1037, snomContactLine()));
+		handler.handle(makeRegister("106", kYealinkIp, 5062, "Contact: <sip:106@192.168.31.20:5062>\r\n"));
+		const std::string body = sdpBody();
+		const std::string invite =
+			"INVITE sip:106@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kSnomIp) + ":1037;branch=z9hG4bKinv" + callId + "\r\n"
+			"From: <sip:100@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:106@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <" + std::string(kSnomContactUri) + ">\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		handler.handle(RequestsHandler::getMessageFromPool(invite, addrFor(kSnomIp, 1037)));
+		const std::string fork = findSentTo(sent, addrFor(kYealinkIp, 5062), "INVITE sip:106@");
+		ASSERT_FALSE(fork.empty()) << "the call must be forwarded to 106";
+		const std::string ok =
+			"SIP/2.0 200 OK\r\n" +
+			headerLine(fork, "Via:") + "\r\n" +
+			(fromLine.empty() ? headerLine(fork, "From:") : fromLine) + "\r\n" +
+			toLine + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Contact: <sip:106@192.168.31.20:5062>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		handler.handle(RequestsHandler::getMessageFromPool(ok, addrFor(kYealinkIp, 5062)));
+	}
+}
+
+TEST(CalleeDialogLine, AToLineAtTheBoundConnectsAndTheServerByeIsBuilt)
+{
+	Sent sent;
+	RequestsHandler handler(kPbxIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+	const std::string line = toLineOfSize(SipLimits::kMaxDialogToLineBytes, "ans106");
+	ASSERT_EQ(line.size(), SipLimits::kMaxDialogToLineBytes);
+	callAnsweredWith(handler, sent, "cdl-bound", line);
+
+	const auto session = handler.getSession("Call-ID: cdl-bound");
+	ASSERT_TRUE(session.has_value());
+	EXPECT_EQ(session.value()->getState(), Session::State::Connected);
+	EXPECT_EQ(session.value()->getDialogTo().size(), SipLimits::kMaxDialogToLineBytes)
+		<< "the stored To is the parsed line, whole, header name included";
+
+	ASSERT_TRUE(handler.forceDisconnect("106"));
+	handler.tick();   // drainOutbox() merges _asyncOutbox
+	EXPECT_EQ(countSentTo(sent, addrFor(kSnomIp, 1037), "BYE "), 1);
+	EXPECT_EQ(countSentTo(sent, addrFor(kYealinkIp, 5062), "BYE "), 1);
+	EXPECT_EQ(handler.getByeTruncated(), 0u);
+}
+
+TEST(CalleeDialogLine, ALineOverTheBoundIsRefusedAndTheCallerGetsAFinal)
+{
+	struct Case { const char* what; std::string to; std::string from; };
+	const std::vector<Case> cases = {
+		{"To one byte over", toLineOfSize(SipLimits::kMaxDialogToLineBytes + 1, "ans106"), ""},
+		{"a 600 B callee tag", "To: <sip:106@server>;tag=" + std::string(600, 't'), ""},
+		{"From over the bound", "To: <sip:106@server>;tag=ans106",
+		 "From: \"" + std::string(SipLimits::kMaxDialogLineBytes, 'x') + "\" <sip:100@server>;tag=ftcdl-over"},
+	};
+	for (const auto& c : cases)
+	{
+		SCOPED_TRACE(c.what);
+		Sent sent;
+		RequestsHandler handler(kPbxIp, 5060,
+			[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+		callAnsweredWith(handler, sent, "cdl-over", c.to, c.from);
+
+		EXPECT_FALSE(handler.getSession("Call-ID: cdl-over").has_value()) << "no dialog is stored";
+		EXPECT_EQ(countSentTo(sent, addrFor(kSnomIp, 1037), "SIP/2.0 502"), 1) << "the caller gets a final";
+		int okForTheCall = 0;   // the registers' 200s go to the same address
+		for (const auto& [to, msg] : sent)
+		{
+			const std::string raw = msg ? msg->toString() : std::string();
+			if (to.sin_port == addrFor(kSnomIp, 1037).sin_port && raw.rfind("SIP/2.0 200", 0) == 0 &&
+				raw.find("Call-ID: cdl-over") != std::string::npos) ++okForTheCall;
+		}
+		EXPECT_EQ(okForTheCall, 0) << "and never the oversize 200";
+	}
+}
+
 // ── #744 B2a: the server BYE's bytes are main's ──────────────────────────────────
 //
 // buildServerBye() moved from an ostringstream onto sipb::bye(). With IDGen's bytes
