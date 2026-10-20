@@ -355,50 +355,69 @@ inline bool tokenIsExpiringSoon(int64_t nowUs, int64_t obtainedUs, int64_t lifet
 }
 
 // Issue #336: what a dropped or errored control WebSocket does about the Authorization header it
-// will send on its next handshake. The header is baked into the WS client at init, and the client's
-// own reconnect resends it unchanged, so a token that has moved on can only be picked up by a full
-// anchor stop()/start(). Two reasons ask for one:
+// will send on its next handshake. The header is baked into the WS client's transport when it is
+// started, and every later handshake of that client, the library's own auto-reconnect included,
+// resends it unchanged. esp_websocket_client_set_headers() replaces that copy only while the client
+// is CONNECTED (it returns ESP_ERR_INVALID_ARG in every other state), and a handshake that 401s
+// never reaches CONNECTED, so the library retries forever with the same stale header and nothing
+// in place can heal it: only a full anchor stop()/start(), which rebuilds the client from the
+// current token. Two reasons ask for one:
 //   TokenExpiring  #343: the held token is within the refresh margin of its expiry (a clock test).
 //   HeaderStale    the header was built from a token other than the one now held. Since #945 the
 //                  background refresh keeps the token ten minutes ahead of its expiry, so the clock
 //                  never says yes; a refresh that lands while the socket is not connected cannot reach
-//                  the header (connectWs() records that esp_websocket_client_set_headers fails unless
-//                  the client is connected; fetchToken() does not rely on that, it counts a header as
-//                  landed only if the call returned ESP_OK and the socket is up), and 3CX revokes the
-//                  old token when it grants the new one. The reconnect then sends a revoked Bearer, gets
-//                  a 401 on every retry, and the clock gate stays shut.
+//                  the header (set_headers fails, and fetchToken() then leaves the record behind), and
+//                  3CX revokes the old token when it grants the new one. The reconnect then sends a
+//                  revoked Bearer, gets a 401 on every retry, and the clock gate stays shut.
 // wsHeaderGen and tokenGen count token installs: the generation the header was built from, and the
 // generation held now. They are compared for equality only. The token's obtained-at stamp is not
 // usable for this: the token_age bench fault rewrites it in place.
 enum class WsRestartReason : std::uint8_t { None, TokenExpiring, HeaderStale };
 
-// The least time between two restart requests from the socket's events. ERROR fires on every failed
-// retry, every 5 s, so a restart that does not heal its cause (a token whose lifetime is within the
-// margin, say) would otherwise repeat at that rate, each one a full stop()/start() with a token fetch.
-// The same floor as the background refresh's (kMaintRefreshRetryUs, below).
+// The least time between two restart requests from the socket's events. A failed connect cycle fires
+// ERROR and DISCONNECTED both, about every 5 s, so a restart that does not heal its cause (a token
+// whose lifetime is within the margin, say) would otherwise repeat at that rate, each one a full
+// stop()/start() with a token fetch. The same floor as the background refresh's (kMaintRefreshRetryUs,
+// below).
 inline constexpr std::int64_t kWsRestartMinIntervalUs = 60LL * 1000000;
 
 // running: the anchor's _running flag. stop() clears it before it stops the WS client, whose last
 // DISCONNECTED would otherwise ask for a second restart while the first is tearing down. It is false
 // for the whole of a restart, from stop() to start(), and after a shutdown. tokenExpiring:
-// tokenIsExpiringSoon() with the 5 minute margin. lastRequestUs: when this decision last said yes
-// (0: never). #343's reason wins when both hold, so the line its bench counter reads is unchanged.
-// RED COMMIT (#336 rework): the socket-state input is accepted and ignored, and raiseWsHeaderGen below
-// is a plain store. Both are deliberately wrong; the next commit makes them right.
-inline WsRestartReason wsRestartDecision(bool running, bool tokenExpiring, bool /*wsConnected*/,
+// tokenIsExpiringSoon() with the 5 minute margin. wsConnected: the socket's _connected flag (set by
+// CONNECTED, cleared by DISCONNECTED before this is asked). Only HeaderStale needs it down: a socket in
+// a 401 loop never reached CONNECTED, and one that is up completed a handshake with a header 3CX
+// accepted, so a record that is behind must not tear it down (a drop clears the flag and asks again).
+// TokenExpiring is not gated on it: that is #343, unchanged. lastRequestUs: when this decision last
+// said yes (0: never). #343's reason wins when both hold, so the line its bench counter reads is
+// unchanged.
+inline WsRestartReason wsRestartDecision(bool running, bool tokenExpiring, bool wsConnected,
                                          std::uint32_t wsHeaderGen, std::uint32_t tokenGen, std::int64_t nowUs,
                                          std::int64_t lastRequestUs)
 {
 	if (!running) return WsRestartReason::None;
 	if (lastRequestUs != 0 && nowUs - lastRequestUs < kWsRestartMinIntervalUs) return WsRestartReason::None;
 	if (tokenExpiring) return WsRestartReason::TokenExpiring;
-	if (wsHeaderGen != tokenGen) return WsRestartReason::HeaderStale;
+	if (!wsConnected && wsHeaderGen != tokenGen) return WsRestartReason::HeaderStale;
 	return WsRestartReason::None;
 }
 
+// Raises the record of the header generation the WS client holds to `gen`, never lowers it. A fetch
+// records its generation from outside _mutex once set_headers returned ESP_OK, so two fetches that
+// finish out of order must not leave the older one's record in place (a current header would then
+// read as stale, a needless restart). Serial-number order, so the counter may wrap. The narrow race
+// that is left runs the other way: two set_headers calls in which the library keeps the older
+// header, while the record has already gone to the newer generation and says current. It needs two
+// fetches in flight on different lanes at once, and the next background refresh puts a header right.
 inline void raiseWsHeaderGen(std::atomic<std::uint32_t>& slot, std::uint32_t gen)
 {
-	slot.store(gen, std::memory_order_release);   // wrong on purpose: a late older store lowers it
+	std::uint32_t current = slot.load(std::memory_order_acquire);
+	for (;;)
+	{
+		const std::uint32_t ahead = gen - current;   // wraps: serial-number arithmetic
+		if (ahead == 0 || ahead >= 0x80000000u) return;
+		if (slot.compare_exchange_weak(current, gen, std::memory_order_acq_rel, std::memory_order_acquire)) return;
+	}
 }
 
 // Issue #336: a restart is stop() then start(). When start() cannot fetch its token (an outage, DRAM

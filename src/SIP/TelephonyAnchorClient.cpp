@@ -1208,22 +1208,22 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 						const char* wsHeaders = telephony::wsAuthHeaderInPlace(lease.data(), lease.capacity(), tokenStr);
 						if (wsHeaders)
 						{
-							// #336: only a header that landed is the socket's header now. The comments here and in
-							// connectWs() say set_headers returns an error unless the client is CONNECTED; the
-							// #343 comment says it silently does nothing. Trust neither: it counts as landed
-							// only if it returned ESP_OK AND the socket is up, so under either reading a
-							// refresh that missed leaves _wsHeaderGen behind _tokenGen, and the next WS drop
-							// restarts the anchor (at worst one extra, rate-limited restart).
+							// #336: only a header that landed is the socket's header now. set_headers returns
+							// ESP_ERR_INVALID_ARG in every state but CONNECTED (esp_websocket_client 1.6-1.8) and
+							// otherwise replaces the transport's copy, which every later handshake of that client
+							// sends, auto-reconnect included. So ESP_OK is the whole evidence, and the record is
+							// raised, never lowered, because two fetches can finish out of order (see
+							// raiseWsHeaderGen for the race that stays). A failure leaves _wsHeaderGen behind
+							// _tokenGen, and the next drop of a socket that is down restarts the anchor.
 							const esp_err_t headerErr = esp_websocket_client_set_headers(ws, wsHeaders);
-							const bool wsUp = _connected.load(std::memory_order_acquire);
-							if (headerErr == ESP_OK && wsUp)
+							if (headerErr == ESP_OK)
 							{
-								_wsHeaderGen.store(gen, std::memory_order_release);
+								telephony::raiseWsHeaderGen(_wsHeaderGen, gen);
 							}
 							else
 							{
-								ESP_LOGW(TAG, "WebSocket Authorization header not confirmed (%s, socket %s): the next WS drop restarts the anchor",
-								         esp_err_to_name(headerErr), wsUp ? "up" : "down");
+								ESP_LOGW(TAG, "WebSocket Authorization header not updated (%s): the next WS drop restarts the anchor",
+								         esp_err_to_name(headerErr));
 							}
 						}
 						else
@@ -1357,15 +1357,19 @@ void TelephonyAnchorClient::requestRestartIfTokenStale()
 	// way for the analogous reason (line ~2400).
 	//
 	// The decision is telephony::wsRestartDecision (host-tested): the _running
-	// gate above, a 60 s floor between requests (ERROR fires every 5 s and a
-	// restart that does not heal its cause must not repeat at that rate), then
-	// two reasons. The token is expiring (#343), or the header baked into this
-	// WS client is not the token now held. The second is what #343 missed: the
+	// gate above, a 60 s floor between requests (a failed connect cycle raises
+	// ERROR and DISCONNECTED every 5 s and a restart that does not heal its
+	// cause must not repeat at that rate), then two reasons. The token is
+	// expiring (#343), or the header baked into this WS client is not the token
+	// now held and the socket is down. The second is what #343 missed: the
 	// background refresh keeps the token ten minutes ahead of its expiry, so the
-	// clock never says yes, and a refresh that landed while the socket was down
-	// could not reach the header (set_headers failed) while 3CX revoked the old
-	// token. Every retry then sent a revoked Bearer. Generations, not the
-	// obtained-at stamp: the token_age probe rewrites that in place.
+	// clock never says yes, and a refresh that landed while the socket was not
+	// CONNECTED could not reach the header (set_headers refused) while 3CX
+	// revoked the old token. Every retry then sent a revoked Bearer. Down is
+	// _connected false: a socket in a 401 loop never reached CONNECTED, and a
+	// live one is not torn down for a counter (DISCONNECTED clears the flag
+	// before it asks). Generations, not the obtained-at stamp: the token_age
+	// probe rewrites that in place.
 	const int64_t nowUs = esp_timer_get_time();
 	const telephony::WsRestartReason why = telephony::wsRestartDecision(
 	    _running.load(std::memory_order_acquire), tokenExpiringSoon(), _connected.load(std::memory_order_acquire),
@@ -1459,8 +1463,10 @@ bool TelephonyAnchorClient::connectWs()
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_wsClient = wsClient;
-		// #336: the header this client was initialised with. A token installed since the copy above
-		// (headerGen < _tokenGen) could not reach this client, so the next drop restarts the anchor.
+		// #336: the header this client was initialised with. A plain store, not raiseWsHeaderGen: this
+		// is a brand-new client with a header of its own, whatever the last one held. A token installed
+		// since the copy above (headerGen behind _tokenGen) could not reach this client, so the next
+		// drop of a socket that is down restarts the anchor.
 		_wsHeaderGen.store(headerGen, std::memory_order_release);
 	}
 
@@ -2523,8 +2529,18 @@ void TelephonyAnchorClient::restartTaskTrampoline(void* arg)
 {
 	auto* self = static_cast<TelephonyAnchorClient*>(arg);
 
-	ESP_LOGW(TAG, "anchor restart: reclaiming socket pool after %d detached rx task(s)",
-	         self->_leakedGetClients.load(std::memory_order_relaxed));
+	// #336: a retry after a failed start() (no detached rx tasks to reclaim) logs its own line, so the
+	// "reclaiming" one is once per cause and not once per backoff step of an outage.
+	if (self->_startFailures.load(std::memory_order_relaxed) == 0)
+	{
+		ESP_LOGW(TAG, "anchor restart: reclaiming socket pool after %d detached rx task(s)",
+		         self->_leakedGetClients.load(std::memory_order_relaxed));
+	}
+	else
+	{
+		ESP_LOGW(TAG, "anchor restart: retrying start() after %u failed attempt(s)",
+		         static_cast<unsigned>(self->_startFailures.load(std::memory_order_relaxed)));
+	}
 
 	// Clear the request BEFORE the cycle so a leak that happens during/after the
 	// restart re-arms the watchdog instead of being swallowed.
@@ -3391,11 +3407,11 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 			requestRestartIfTokenStale();   // #336
 			break;
 
-		// Issue #336: previously unhandled (fell to `default: break`) — this is the event
-		// the esp_websocket_client fires on EVERY failed auto-reconnect attempt, not just
-		// the first disconnect, so it is the actual repeat-offender in the stuck-401 loop
-		// (DISCONNECTED fires once; ERROR fires every 5 s after, forever, once the token
-		// is stale). Same check as DISCONNECTED, for the same reason.
+		// Issue #336: previously unhandled (fell to `default: break`). The esp_websocket_client
+		// fires ERROR and then DISCONNECTED on EVERY failed connect cycle, so the stuck-401 loop
+		// (the library retries forever, every 5 s, with the same header) raises both each time.
+		// Same check as DISCONNECTED; either alone would do. (A server CLOSE frame raises neither:
+		// it ends the client with CLOSED, then FINISH, which nothing here handles.)
 		case WEBSOCKET_EVENT_ERROR:
 			requestRestartIfTokenStale();   // #336
 			break;

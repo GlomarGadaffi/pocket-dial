@@ -1,2 +1,2 @@
-# TelephonyAnchorLogic_test.cpp: TelephonyLogic.WsRestart* (7) + WsHeaderGenerationIsComparedForEqualityNotOrder (1) + StartRetryDelay* (2) + ARestartIsHeldBackUntilItsNotBeforeStampHasPassed (1) (#336: a dropped control WebSocket restarts the anchor on an expiring token or a header behind the held token, rate limited; a failed restart's start() retries on a capped backoff)
-11
+# TelephonyAnchorLogic_test.cpp: TelephonyLogic.WsRestart* (9) + WsHeaderGenerationIsComparedForEqualityNotOrder (1) + RaiseWsHeaderGen* (2) + StartRetryDelay* (2) + ARestartIsHeldBackUntilItsNotBeforeStampHasPassed (1) (#336: a dropped control WebSocket restarts the anchor on an expiring token, or on a header behind the held token while the socket is down, rate limited; the header record only goes up; a failed restart's start() retries on a capped backoff). tests/tools/test_anchor_ws_reauth_wiring.py (10) is Python, not a gtest, and is not in this count.
+15
