@@ -2,6 +2,8 @@
 
 This guide takes you from a clean machine to a compiled and flashed pocket-dial firmware, with the HTTP dashboard running on your development board.
 
+Before you deploy a board for real use, read [DEMARCATION.md](DEMARCATION.md): it states what the firmware does for emergency calling and what the administrator owns.
+
 ## Prerequisites & Tools
 
 Install the toolchain and platform dependencies for your operating system before you begin.
