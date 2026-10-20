@@ -737,14 +737,15 @@ jobs:
   # data, recursion cycles in IDF, lwIP and mbedtls, dynamic frames in mdns, and
   # a constructor template the C1/C2 alias rule missed. Those are modelled now in
   # tools/ci/task_stacks.json, each row with its provenance; estimates say so.
-  # Two findings stay red on purpose:
-  #   * http_conn: 4768 B + 512 B margin against its 4096 B stack. 2048 B of that
-  #     is the newlib snprintf estimate at the end of the chain (sendApiKill ->
-  #     forceDisconnect -> endCall -> cdrarchive::record -> formatLine ->
-  #     formatRfc3339), so read stackHwm_http_conn before changing the stack.
-  #   * smtp_worker, tel_maint, tel_wsw: cJSON's parser and cJSON_Delete recurse
-  #     to its nesting limit, 1000, which no stack here holds. Lowering
-  #     CJSON_NESTING_LIMIT in the build lowers the two recursion rows.
+  # One finding stays red on purpose:
+  #   * http_conn: 4768 B + 512 B margin against its 4096 B stack in the first
+  #     run. 2048 B of that is the newlib snprintf estimate at the end of the
+  #     chain (sendApiKill -> forceDisconnect -> endCall -> cdrarchive::record ->
+  #     formatLine -> formatRfc3339), so the figure is pending a hardware
+  #     measurement (stackHwm_http_conn). The 4096 B budget stays in the table as
+  #     the finding; no budget is set from an estimate.
+  # cJSON's recursion is bounded by CJSON_NESTING_LIMIT=16, set in the top-level
+  # CMakeLists.txt for the cjson component; the two cJSON recursion rows follow it.
   # A signal, not a gate: do not add it to a required-checks list (desmo
   # 2026-10-09), and there is no continue-on-error to hide the red. It uploads
   # nothing.

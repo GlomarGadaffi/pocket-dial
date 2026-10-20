@@ -51,6 +51,16 @@ if(DEFINED ENV{IDF_PATH})
         target_compile_definitions(${pd_lwip_lib} PRIVATE "ARP_TABLE_SIZE=40")
     endif()
 
+    # #457: cJSON parses and deletes recursively and refuses nesting only past
+    # CJSON_NESTING_LIMIT, 1000 by default, and no task stack here holds a thousand
+    # levels (the parse_value and cJSON_Delete rows of tools/ci/task_stacks.json).
+    # The limit is desmo's decision on #457: 16. Only cJSON.c reads the macro, so
+    # it is a definition of the cjson component alone. The cjson target exists only
+    # now, after project(); the test in tests/tools/test_task_stack_gate.py reads
+    # this line, and the gate's two cJSON rows follow it.
+    idf_component_get_property(pd_cjson_lib espressif__cjson COMPONENT_LIB)
+    target_compile_definitions(${pd_cjson_lib} PRIVATE "CJSON_NESTING_LIMIT=16")
+
     # Issues #410 / #328, BENCH ONLY (docs/BENCH_PROBE.md): the HTTP DRAM accounting image
     # reads lwIP's per-pool memp counters (httpDramAccount.memp). lwIP keeps them only when
     # MEMP_STATS is 1; its default is (MEMP_MEM_MALLOC == 0), which IDF's MEMP_MEM_MALLOC=1
