@@ -7620,6 +7620,25 @@ void HttpServer::handleMohUpload(int sock, const std::string& alreadyRead,
 void HttpServer::handleOtaUpload(int sock, const std::string& alreadyRead,
                                  size_t bodyStart, size_t contentLength)
 {
+	// #986 (owner ruling, 2026-10-19): refuse while any call is up or ringing. A flash erase or
+	// write stalls every task that runs from flash, and the engine's tasks with it: holds of the
+	// SIP lock of 93, 190 and 296 ms were witnessed across three OTA flashes. This route neither
+	// takes that lock nor can yield it, so the only protection for a 911 or a PSAP callback is
+	// not to start. Refused, not deferred or buffered; the operator retries on an idle line.
+	// One check, before the ESP/host split, so the host tests run the code the device runs, and
+	// before the body is read: like the 401/403/411 refusals ahead of it, the body is not drained
+	// (that would take a 4 KB heap chunk and a multi-MB receive during a call), so a client still
+	// sending may see the connection reset instead of this reply. No engine attached (null) means
+	// no call can exist. The check is made once, at the start: it does not cover a call that
+	// begins while the image is streaming.
+	if (RequestsHandler* h = _handler.load(std::memory_order_acquire); h && h->hasLiveCall())
+	{
+		sendResponse(sock, 409, "Conflict", "application/json",
+		             "{\"error\":\"busy\",\"message\":\"call in progress; firmware upload "
+		             "refused until no call is up or ringing\"}");
+		return;
+	}
+
 	const char*  prefix    = (bodyStart <= alreadyRead.size())
 	                             ? alreadyRead.data() + bodyStart : nullptr;
 	const size_t prefixLen = (bodyStart <= alreadyRead.size())

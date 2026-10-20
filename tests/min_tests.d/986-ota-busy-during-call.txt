@@ -1,0 +1,2 @@
+# AdminHttpGate_test.cpp: OtaUpload 5 (IsRefusedWhileACallIsRinging, IsRefusedWhileACallIsConnected, IsRefusedDuringAnEmergencyCall, ProceedsWithRegisteredPhonesAndNoCall, AnUnauthenticatedUploadDuringACallIsStillRefusedByTheGate) (#986: OTA upload refused while a call is live)
+5

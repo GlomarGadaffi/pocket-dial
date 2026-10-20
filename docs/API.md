@@ -277,7 +277,7 @@ Endpoints marked "None" are read-only and reachable without a session: `/`, `/in
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
 | [`/api/registrar/forget-learned`](#post-apiregistrarforget-learned) | `POST` | High | Gated (+ `X-CSRF`) | Forgets every `learned` device at once; `secured` ones stay (#515). |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
-| [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated, owner (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
+| [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated, owner (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). Refused with `409` while any call is up or ringing (#986). |
 | [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image, or plainly restarts with `confirm=1` if none is staged (#645). Simulated (`200`, no-op) on desktop. While a 911/933 call is live a plain restart answers `409` `{"error":"emergency call in progress"}` and a staged-image reboot waits for the call to end (#652). |
 | [`/api/media-tx`](#post-apimedia-tx) | `POST` | High | Gated, owner (+ `X-CSRF`) | **Experimental (#985).** `nodelay=0\|1`: the A/B switch for `TCP_NODELAY` on the anchor's audio POST socket. RAM only, off at every boot; read back as `mediaTx.nodelay` in `/api/status`. |
 | [`/setup/email`](#get-setupemail) | `GET` | Low | None | Standalone SMTP-configuration page (own document, not part of the `/` SPA). Shell only, no data. |
@@ -2377,6 +2377,7 @@ Streams a firmware image body directly into the inactive OTA slot. **Not routed 
   * `400 Bad Request`: Body was incomplete or a flash write failed mid-stream.
   * `403 Forbidden`: `{"error":"owner privilege required"}`. A sysop session, with an owner already provisioned.
   * `401 Unauthorized` / `403 Forbidden`: as above.
+  * `409 Conflict` (#986): `{"error":"busy","message":"call in progress; firmware upload refused until no call is up or ringing"}`. Any call counts: ringing, answered, held or parked, an anchor or trunk leg, a conference, page, echo or voicemail leg, a 911/933, a PSAP callback. Nothing is written to flash, and the upload is not deferred or buffered: retry on an idle line (`sessionCount` on [`/api/status`](#get-apistatus) is `0`). Why: a flash erase or write stalls every task that runs from flash, and holds of the SIP engine lock of 93, 190 and 296 ms were measured across three OTA flashes. The check is made once, after the auth gate and before the body is read. The body is not drained, so a client that is still sending may see the connection reset instead of the `409`. A call that starts after the check, while the image is streaming, is not covered.
   * `411 Length Required`: `Content-Length` missing or `0`.
   * `422 Unprocessable Entity`: The image was fully received but failed validation (e.g. bad magic byte / signature).
   * `500 Internal Server Error`: OTA slot could not be opened, or activation failed after a valid image was written.

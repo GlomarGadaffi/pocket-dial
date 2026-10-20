@@ -1837,6 +1837,259 @@ TEST(OtaReboot, RebootIsRefusedDuringAPsapCallback)
 	AdminAuth::clearCredential();
 }
 
+// #986 (owner ruling, 2026-10-19): a firmware flash erases and writes flash, which stalls every task
+// that runs from flash for up to ~300 ms (holds of 93, 190 and 296 ms were witnessed on the engine
+// lock across three OTA flashes). POST /api/ota/upload is therefore refused, not deferred or buffered,
+// while any call is up or ringing, 911/933 and PSAP callbacks included.
+//
+// The host stub answers 501 to an upload that gets past the guard and never touches OtaUpdater. So
+// 501 is the "proceeds" branch, 409 is the refusal, and "the OTA state is untouched" is
+// isUpdateInProgress() plus the partition labels. Only the 409 assertions can tell the two apart.
+namespace
+{
+	sockaddr_in otaBusyAddr(const std::string& ip)
+	{
+		sockaddr_in a{};
+		a.sin_family = AF_INET;
+		a.sin_addr.s_addr = inet_addr(ip.c_str());
+		a.sin_port = htons(5060);
+		return a;
+	}
+
+	void otaBusyRegister(RequestsHandler& h, const std::string& ext, const std::string& ip)
+	{
+		h.handle(RequestsHandler::getMessageFromPool(
+			"REGISTER sip:server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKobr" + ext + "\r\n"
+			"From: <sip:" + ext + "@server>;tag=obr" + ext + "\r\n"
+			"To: <sip:" + ext + "@server>\r\n"
+			"Call-ID: ob-reg-" + ext + "\r\nCSeq: 1 REGISTER\r\n"
+			"Contact: <sip:" + ext + "@" + ip + ":5060>;expires=3600\r\n"
+			"Content-Length: 0\r\n\r\n", otaBusyAddr(ip)));
+	}
+
+	std::string otaBusySdp(const std::string& ip)
+	{
+		return "v=0\r\no=- 0 0 IN IP4 " + ip + "\r\ns=-\r\nc=IN IP4 " + ip + "\r\nt=0 0\r\n"
+		       "m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	}
+
+	// 101 (at .11) calls 102 (at .12): an ordinary relayed call, so 102 rings until it answers.
+	void otaBusyInvite(RequestsHandler& h, const std::string& callId)
+	{
+		const std::string sdp = otaBusySdp("192.168.4.11");
+		h.handle(RequestsHandler::getMessageFromPool(
+			"INVITE sip:102@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 192.168.4.11:5060;branch=z9hG4bK" + callId + "\r\n"
+			"From: <sip:101@server>;tag=from" + callId + "\r\n"
+			"To: <sip:102@server>\r\n"
+			"Call-ID: " + callId + "\r\nCSeq: 1 INVITE\r\nMax-Forwards: 70\r\n"
+			"Contact: <sip:101@192.168.4.11:5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp,
+			otaBusyAddr("192.168.4.11")));
+	}
+
+	// The whole header line (name included) from a raw SIP message, or "".
+	std::string otaBusyLine(const std::string& raw, const std::string& name)
+	{
+		size_t pos = 0;
+		while (pos < raw.size())
+		{
+			size_t eol = raw.find("\r\n", pos);
+			if (eol == std::string::npos) eol = raw.size();
+			if (raw.compare(pos, name.size(), name) == 0) return raw.substr(pos, eol - pos);
+			pos = eol + 2;
+		}
+		return std::string();
+	}
+
+	std::string otaBusyRelayedInvite(const std::vector<std::string>& sent)
+	{
+		for (const std::string& s : sent)
+			if (s.rfind("INVITE sip:102@", 0) == 0) return s;
+		return std::string();
+	}
+
+	// 102's 200 OK to the INVITE the engine relayed to it (RFC 3261 section 8.2.6.2: Via, From,
+	// Call-ID and CSeq copied from the request, a To-tag added).
+	void otaBusyAnswer(RequestsHandler& h, const std::string& relayed)
+	{
+		const std::string sdp = otaBusySdp("192.168.4.12");
+		h.handle(RequestsHandler::getMessageFromPool(
+			"SIP/2.0 200 OK\r\n" + otaBusyLine(relayed, "Via:") + "\r\n" +
+			otaBusyLine(relayed, "From:") + "\r\n" +
+			otaBusyLine(relayed, "To:") + ";tag=ph102\r\n" +
+			otaBusyLine(relayed, "Call-ID:") + "\r\n" +
+			otaBusyLine(relayed, "CSeq:") + "\r\n"
+			"Contact: <sip:102@192.168.4.12:5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp,
+			otaBusyAddr("192.168.4.12")));
+	}
+
+	// A tiny body: the whole request arrives in the first recv, so the server's early reply is
+	// never racing an unread upload. The Owner gate admits a sysop session while no owner exists.
+	std::string otaBusyUpload(int port, const std::string& cookie, const std::string& csrf)
+	{
+		return httpPostRaw(port, "/api/ota/upload", "not-a-real-firmware-image", cookie, csrf);
+	}
+
+	void expectOtaBusy(const std::string& resp)
+	{
+		EXPECT_EQ(statusOf(resp), 409) << resp;
+		EXPECT_NE(bodyOf(resp).find("\"error\":\"busy\""), std::string::npos) << resp;
+		EXPECT_NE(bodyOf(resp).find("call in progress"), std::string::npos) << resp;
+		EXPECT_FALSE(OtaUpdater::isUpdateInProgress()) << "a refused upload opens no update session";
+		EXPECT_EQ(OtaUpdater::bootPartitionLabel(), OtaUpdater::runningPartitionLabel())
+			<< "a refused upload stages nothing";
+	}
+}
+
+TEST(OtaUpload, IsRefusedWhileACallIsRinging)
+{
+	AdminAuth::clearCredential();
+	std::vector<std::string> sent;
+	RequestsHandler handler("192.168.4.1", 5060,
+		[&sent](const sockaddr_in&, std::shared_ptr<SipMessage> m) { sent.push_back(m->toString()); });
+	otaBusyRegister(handler, "101", "192.168.4.11");
+	otaBusyRegister(handler, "102", "192.168.4.12");
+	otaBusyInvite(handler, "ob-ring");
+	const auto call = handler.getSession("Call-ID: ob-ring");
+	ASSERT_TRUE(call.has_value()) << "precondition: the call exists";
+	ASSERT_EQ(call.value()->getState(), Session::State::Invited) << "precondition: 102 is ringing";
+
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	AdminSession a = loginAndCompleteSetup(port);
+
+	expectOtaBusy(otaBusyUpload(port, "pd_session=" + a.cookie, a.csrf));
+	EXPECT_TRUE(handler.getSession("Call-ID: ob-ring").has_value()) << "the refusal leaves the call alone";
+
+	AdminAuth::clearCredential();
+}
+
+TEST(OtaUpload, IsRefusedWhileACallIsConnected)
+{
+	AdminAuth::clearCredential();
+	std::vector<std::string> sent;
+	RequestsHandler handler("192.168.4.1", 5060,
+		[&sent](const sockaddr_in&, std::shared_ptr<SipMessage> m) { sent.push_back(m->toString()); });
+	otaBusyRegister(handler, "101", "192.168.4.11");
+	otaBusyRegister(handler, "102", "192.168.4.12");
+	otaBusyInvite(handler, "ob-conn");
+	const std::string relayed = otaBusyRelayedInvite(sent);
+	ASSERT_FALSE(relayed.empty()) << "precondition: the INVITE reached 102";
+	otaBusyAnswer(handler, relayed);
+	const auto call = handler.getSession("Call-ID: ob-conn");
+	ASSERT_TRUE(call.has_value()) << "precondition: the call exists";
+	ASSERT_EQ(call.value()->getState(), Session::State::Connected) << "precondition: 102 answered";
+
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	AdminSession a = loginAndCompleteSetup(port);
+
+	expectOtaBusy(otaBusyUpload(port, "pd_session=" + a.cookie, a.csrf));
+	EXPECT_EQ(handler.getSession("Call-ID: ob-conn").value()->getState(), Session::State::Connected)
+		<< "the refusal leaves the call alone";
+
+	AdminAuth::clearCredential();
+}
+
+// The 911 goes to the host's loopback anchor posing as a real provider (the #652 seam, as in
+// OtaReboot above); nothing leaves the process. The guard has no emergency special case: a 911
+// leg is a session like any other, which is the property this pins for the anchor path.
+TEST(OtaUpload, IsRefusedDuringAnEmergencyCall)
+{
+	AdminAuth::clearCredential();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.setAnchorPlacesRealCallsForTest(true);
+	otaBusyRegister(handler, "101", "192.168.4.11");
+	const std::string sdp = otaBusySdp("192.168.4.11");
+	handler.handle(RequestsHandler::getMessageFromPool(
+		"INVITE sip:911@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.4.11:5060;branch=z9hG4bKob911\r\n"
+		"From: <sip:101@server>;tag=iob911\r\nTo: <sip:911@server>\r\n"
+		"Call-ID: ob-911\r\nCSeq: 1 INVITE\r\nMax-Forwards: 70\r\n"
+		"Contact: <sip:101@192.168.4.11:5060>\r\nContent-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp,
+		otaBusyAddr("192.168.4.11")));
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr);
+	ASSERT_EQ(loop->lastMakeCallDestination(), "911") << "precondition: the 911 session is up";
+	ASSERT_TRUE(handler.hasLiveEmergencyCall()) << "precondition: the 911 session is live";
+
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	AdminSession a = loginAndCompleteSetup(port);
+
+	expectOtaBusy(otaBusyUpload(port, "pd_session=" + a.cookie, a.csrf));
+	EXPECT_TRUE(handler.hasLiveEmergencyCall()) << "the refusal leaves the 911 alone";
+
+	AdminAuth::clearCredential();
+}
+
+// The positive control: two registered phones and no call is an idle line, and the upload gets
+// past the guard to the host stub's 501. Without this the three tests above would also pass
+// against a guard that refused everything.
+TEST(OtaUpload, ProceedsWithRegisteredPhonesAndNoCall)
+{
+	AdminAuth::clearCredential();
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	otaBusyRegister(handler, "101", "192.168.4.11");
+	otaBusyRegister(handler, "102", "192.168.4.12");
+
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	AdminSession a = loginAndCompleteSetup(port);
+
+	const std::string resp = otaBusyUpload(port, "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(resp), 501) << resp;
+	EXPECT_NE(bodyOf(resp).find("OTA only available on device"), std::string::npos) << resp;
+
+	AdminAuth::clearCredential();
+}
+
+// The gate answers first: a caller without a session, or without the CSRF token, learns nothing
+// about the line. 401 and 403 are not 409.
+TEST(OtaUpload, AnUnauthenticatedUploadDuringACallIsStillRefusedByTheGate)
+{
+	AdminAuth::clearCredential();
+	std::vector<std::string> sent;
+	RequestsHandler handler("192.168.4.1", 5060,
+		[&sent](const sockaddr_in&, std::shared_ptr<SipMessage> m) { sent.push_back(m->toString()); });
+	otaBusyRegister(handler, "101", "192.168.4.11");
+	otaBusyRegister(handler, "102", "192.168.4.12");
+	otaBusyInvite(handler, "ob-gate");
+	ASSERT_TRUE(handler.getSession("Call-ID: ob-gate").has_value()) << "precondition: the call exists";
+
+	HttpServer server("127.0.0.1", 0, nullptr);   // #540: OS-assigned port
+	const int port = server.port();
+	server.attachHandler(&handler);
+	server.start();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	AdminSession a = loginAndCompleteSetup(port);
+
+	EXPECT_EQ(statusOf(otaBusyUpload(port, "", "")), 401);
+	EXPECT_EQ(statusOf(otaBusyUpload(port, "pd_session=" + a.cookie, "")), 403);
+
+	AdminAuth::clearCredential();
+}
+
 TEST(OtaUpdater, ProgressFlagTracksSessionLifecycle)
 {
 	EXPECT_FALSE(OtaUpdater::isUpdateInProgress());

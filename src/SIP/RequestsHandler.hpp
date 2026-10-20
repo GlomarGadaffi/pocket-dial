@@ -478,6 +478,17 @@ public:
 		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		return emergencyCallLive();
 	}
+	// #986: true while the engine holds any dialog in _sessions: a call ringing, answered or held,
+	// a parked call, an anchor or trunk leg, a conference, page, echo, media or voicemail leg, a
+	// 911/933 or a PSAP callback. POST /api/ota/upload refuses on it, because a firmware flash
+	// stalls every task that runs from flash. Reads _sessions itself, not the dashboard snapshot
+	// (getSessionCount() lags tick() by up to a second). Takes _mutex, like hasLiveEmergencyCall(),
+	// so it must NOT be called with _mutex already held.
+	bool hasLiveCall()
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		return !_sessions.empty();
+	}
 	// PbxEnv hook for the DTMF restart doors (#652). Caller holds _mutex.
 	bool emergencyCallLive() override
 	{
