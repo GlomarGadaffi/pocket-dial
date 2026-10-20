@@ -714,7 +714,12 @@ table's capacity), and if any is refused, or the device table cannot be staged f
 the table is left exactly as it was and one `skipped` entry names the rows (`row 3
 extension`) by number and reason class, never by value. A file whose list is empty
 clears the table; a file with no list (an encrypted export from before bindings
-travelled in it) leaves it alone and says so. Sysop-level, with its own `confirm=REPLACE` interlock. It is owner-only when `password` is non-empty (see [Two-Role Privilege Model](#two-role-privilege-model-issue-173)).
+travelled in it) leaves it alone and says so. The sealed block is applied as a whole:
+the digest secrets in it are written only if the bindings list was not refused, so a
+refused list changes neither the table nor the stored secrets (`extensionSecrets (not
+applied ...)`). Locked and Secured rows come back exactly as the source board had them,
+so a phone with a different MAC (a replacement) is refused its extension until that row
+is forgotten; the import says so under `skipped`. Sysop-level, with its own `confirm=REPLACE` interlock. It is owner-only when `password` is non-empty (see [Two-Role Privilege Model](#two-role-privilege-model-issue-173)).
 
 * Requires Same-Origin Check + CSRF Token: Yes
 * Requires `pd_session` cookie: Yes (sysop)
@@ -731,14 +736,16 @@ travelled in it) leaves it alone and says so. Sysop-level, with its own `confirm
   * `401`/`403`: gates 1-3 as in §0.1.
 
 Switching the registrar to `secure` mode via an imported blob is refused (reported
-`skipped`, not an error) when the device has no secured extensions after the
-import (the same guard [`POST /api/registrar`](#post-apiregistrar) already applies to
-a live switch), since restoring `secure` onto a board whose secured extensions could
-not be restored (a plaintext-only import carries neither their MAC bindings nor their
-digest secrets) would digest-challenge every `REGISTER` with no working handset left to
-notice. The mode is decided last, after the bindings and digest secrets, so an
+`skipped`, not an error) when no secured extension on the device has a stored digest
+secret after the import (the live switch, [`POST /api/registrar`](#post-apiregistrar),
+counts secured extensions only), since restoring `secure` onto a board whose secured
+extensions could not be restored (a plaintext-only import carries neither their MAC
+bindings nor their digest secrets) would digest-challenge every `REGISTER` with no
+working handset left to notice. A Secured row left without a secret is named under
+`skipped`. The mode is decided last, after the bindings and digest secrets, so an
 Owner-level import of an encrypted file brings the Secured rows back first and `secure`
-applies.
+applies. It is not applied at all when the file's bindings list was refused: the board's
+table is then not the one the file's `secure` was made for.
 
 ```bash
 curl -s -X POST "http://$DEV/api/config/import" \

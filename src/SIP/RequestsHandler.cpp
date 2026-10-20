@@ -10681,7 +10681,7 @@ size_t RequestsHandler::forgetLearnedDevices()
 }
 
 Registrar::ReplaceResult RequestsHandler::replaceBindings(const std::vector<Registrar::Binding>& rows,
-	std::vector<Registrar::BindingFault>& faults)
+	FunctionRef<bool(const std::string&)> hasSecret, std::vector<Registrar::BindingFault>& faults)
 {
 	// What onRegister() demands before it adopts an extension: the charset and length, then
 	// the engine's own service names (a REGISTER as "pbx" is refused 403, so a row for one
@@ -10694,7 +10694,7 @@ Registrar::ReplaceResult RequestsHandler::replaceBindings(const std::vector<Regi
 	Registrar::ReplaceResult result = Registrar::ReplaceResult::Refused;
 	{
 		std::lock_guard<pd::TimedMutex> lock(_mutex);
-		result = _registrar.replaceDevices(rows, extensionOk, faults);
+		result = _registrar.replaceDevices(rows, extensionOk, hasSecret, faults);
 		applyDeviceChange(_registrar.consumeDevicesChange());
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();

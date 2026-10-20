@@ -6358,10 +6358,20 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 			if (handler)
 			{
 				std::vector<RequestsHandler::AdoptedDevice> rows = handler->getAdoptedDevices();
-				std::sort(rows.begin(), rows.end(),
-					[](const RequestsHandler::AdoptedDevice& a, const RequestsHandler::AdoptedDevice& b) {
-						return a.seq != b.seq ? a.seq < b.seq : a.mac < b.mac;
-					});
+				// An insertion sort, not std::sort: the table is POCKETDIAL_MAX_CLIENTS rows at
+				// most, and std::sort's introsort recurses, a cycle the task-stack gate would
+				// charge to http_conn (tools/ci/task_stacks.json).
+				const auto firstClaim = [](const RequestsHandler::AdoptedDevice& a,
+				                           const RequestsHandler::AdoptedDevice& b) {
+					return a.seq != b.seq ? a.seq < b.seq : a.mac < b.mac;
+				};
+				for (size_t i = 1; i < rows.size(); ++i)
+				{
+					for (size_t j = i; j > 0 && firstClaim(rows[j], rows[j - 1]); --j)
+					{
+						std::swap(rows[j], rows[j - 1]);
+					}
+				}
 				for (const auto& d : rows)
 				{
 					if (d.assigned) continue;
@@ -6408,6 +6418,113 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 	out << "}";
 	sendResponse(sock, 200, "OK", "application/json", out.str());
 }
+
+#if POCKETDIAL_BACKUP_SECTION_C
+// #483: the sealed block's MAC bindings. Rows are ["<mac>","<extension>",<state 0|1>,<flags 0-3>].
+// One this cannot read is a fault of its own, with an empty placeholder in `rows` so indexes
+// line up; the table's own checks (MAC form, extension, duplicate, secret, capacity) are
+// Registrar::replaceDevices's. `willHaveSecret` is the secret store as it will be once the
+// same block's digest secrets are restored, so a Secured row is judged against the secrets it
+// comes with. True when the table was replaced; false means it, and so the secrets, are left
+// alone. Reasons are class names, never values. Not inlined, so sendApiConfigImport's frame
+// does not grow (the task-stack gate's per-frame ceiling, #457).
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+static bool restoreMacBindings(RequestsHandler& handler, const JsonReader::Value& list,
+	FunctionRef<bool(const std::string&)> willHaveSecret,
+	std::vector<std::string>& applied, std::vector<std::string>& skipped)
+{
+	using JsonValue = JsonReader::Value;
+	std::vector<Registrar::Binding> rows;
+	std::vector<Registrar::BindingFault> faults;
+	// At most the table's capacity is ever materialised: a crafted list of thousands of
+	// tiny entries must not become thousands of rows on the heap. The first one past the
+	// capacity is the fault (row `cap`), and the rest are not looked at.
+	const size_t cap = static_cast<size_t>(POCKETDIAL_MAX_CLIENTS);
+	size_t pastCap = 0;
+	rows.reserve((list.arrVal.size() < cap) ? list.arrVal.size() : cap);
+	for (const auto& e : list.arrVal)
+	{
+		if (rows.size() >= cap) { ++pastCap; continue; }
+		Registrar::Binding b;
+		const std::vector<JsonValue>& a = e.arrVal;
+		const char* bad = nullptr;
+		if (!e.isArray() || a.size() != 4 || !a[0].isString() || !a[1].isString() ||
+			a[2].type != JsonValue::Type::Number || a[3].type != JsonValue::Type::Number)
+		{
+			bad = "shape";
+		}
+		else if (a[2].numVal != 0 && a[2].numVal != 1)
+		{
+			bad = "state";
+		}
+		else if (a[3].numVal < 0 || a[3].numVal > 3 || a[3].numVal != static_cast<int>(a[3].numVal))
+		{
+			bad = "flags";
+		}
+		else
+		{
+			const Registrar::RowFlags flags = Registrar::decodeRowFlags(static_cast<int>(a[3].numVal));
+			b.mac = a[0].strVal;
+			b.extension = a[1].strVal;
+			b.state = (a[2].numVal == 1) ? RequestsHandler::DeviceState::Secured
+			                             : RequestsHandler::DeviceState::Learned;
+			b.locked = flags.locked;
+			b.shared = flags.shared;
+		}
+		if (bad != nullptr) faults.push_back({rows.size(), bad});
+		rows.push_back(std::move(b));
+	}
+	if (pastCap > 0) faults.push_back({cap, "capacity"});
+
+	const Registrar::ReplaceResult result = handler.replaceBindings(rows, willHaveSecret, faults);
+	if (result == Registrar::ReplaceResult::Replaced)
+	{
+		applied.push_back("extensions (" + std::to_string(rows.size()) + " MAC bindings)");
+		// Locked and Secured rows come back exactly as the source board had them, so a phone
+		// whose MAC differs (a replacement) is refused its extension until the row is forgotten.
+		for (const auto& b : rows)
+		{
+			if (b.locked || b.state == RequestsHandler::DeviceState::Secured)
+			{
+				skipped.push_back("extensions (locked and Secured rows are restored as they were on the "
+					"source board: a phone with a different MAC, a replacement, is refused its extension "
+					"until that row is forgotten)");
+				break;
+			}
+		}
+		return true;
+	}
+	if (result == Registrar::ReplaceResult::NotStaged)
+	{
+		skipped.push_back("extensions (bindings not replaced, table unchanged: "
+			"it could not be staged for flash)");
+		return false;
+	}
+	// Up to six refused rows, by row number. A selection per row, not a sort: std::sort
+	// recurses, which the task-stack gate would charge to http_conn. Each row has one fault.
+	std::string listed;
+	size_t shown = 0, next = 0;
+	while (shown < 6)
+	{
+		const Registrar::BindingFault* pick = nullptr;
+		for (const auto& f : faults)
+		{
+			if (f.row >= next && (pick == nullptr || f.row < pick->row)) pick = &f;
+		}
+		if (pick == nullptr) break;
+		listed += std::string(shown ? ", row " : "row ") + std::to_string(pick->row) + " " + pick->why;
+		next = pick->row + 1;
+		++shown;
+	}
+	if (faults.size() > shown) listed += ", and " + std::to_string(faults.size() - shown) + " more";
+	skipped.push_back("extensions (bindings not replaced, table unchanged: " + listed + ")");
+	return false;
+}
+#endif
 
 // Restores config from an export blob. Body: form-encoded
 // blob=<url-encoded export JSON>&password=<optional>&confirm=REPLACE.
@@ -6547,6 +6664,7 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 	// before this) leaves the table alone, like extensionSecrets.
 	const JsonReader::Value* bindings = nullptr;
 	bool bindingsOnThisBuild = false;
+	bool bindingsRefused = false;   // the sealed list was there and was NOT restored (set below)
 #if POCKETDIAL_BACKUP_SECTION_C
 	bindingsOnThisBuild = true;
 	if (haveSecrets) bindings = secretsValue.find("extensions");
@@ -6840,18 +6958,67 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		// key is present: an encrypted export from before #482 has no such list,
 		// and must not wipe every secret on the board. The count is capped at the
 		// device's own client capacity, so a crafted file cannot flood the store.
+		// #483 review: the block is applied as a whole. The secret list is PLANNED first (every
+		// entry checked, nothing written), the MAC bindings are then checked and replaced against
+		// the secrets that plan leaves, and only if that has not been refused are the secrets
+		// written. So a refused bindings list changes neither store; before, the secrets were
+		// restored and the stale ones cleared first, which nothing could undo, and the table
+		// kept a Secured row whose phone had lost its secret.
 		const JsonReader::Value* secretsList = secretsValue.find("extensionSecrets");
-		if (secretsList != nullptr && secretsList->isArray())
+		const bool haveSecretList = secretsList != nullptr && secretsList->isArray();
+		const size_t cap = static_cast<size_t>(POCKETDIAL_MAX_CLIENTS);
+		std::vector<std::pair<std::string, std::string>> secretPlan;   // what setHa1 will accept
+		size_t secretsRejected = 0, secretsOverCap = 0;
+		if (haveSecretList)
 		{
-			const size_t cap = static_cast<size_t>(POCKETDIAL_MAX_CLIENTS);
-			size_t restored = 0, rejected = 0, overCap = 0;
-			std::vector<std::string> inFile;
-			for (const auto& e : secretsValue.arrayOr("extensionSecrets"))
+			for (const auto& e : secretsList->arrVal)
 			{
-				if (restored + rejected >= cap) { ++overCap; continue; }
-				const std::string ext = e.stringOr("extension");
-				if (SipSecretStore::setHa1(ext, e.stringOr("ha1"))) { ++restored; inFile.push_back(ext); }
-				else ++rejected;
+				if (secretPlan.size() + secretsRejected >= cap) { ++secretsOverCap; continue; }
+				std::string ext = e.stringOr("extension");
+				std::string ha1 = e.stringOr("ha1");
+				if (SipSecretStore::isValidHa1Entry(ext, ha1)) secretPlan.emplace_back(std::move(ext), std::move(ha1));
+				else ++secretsRejected;
+			}
+		}
+		bool secretsMayChange = true;
+#if POCKETDIAL_BACKUP_SECTION_C
+		// #483: the MAC bindings, all or nothing (see restoreMacBindings). A key the block
+		// lacks leaves the table alone (`bindings` is null then).
+		if (bindings != nullptr)
+		{
+			if (handler)
+			{
+				const auto willHaveSecret = [&](const std::string& ext) {
+					if (!haveSecretList) return SipSecretStore::hasSecret(ext);   // the list leaves the store as it is
+					for (const auto& planned : secretPlan)
+					{
+						if (planned.first == ext) return true;
+					}
+					return false;
+				};
+				secretsMayChange = restoreMacBindings(*handler, *bindings, willHaveSecret, applied, skipped);
+			}
+			else
+			{
+				secretsMayChange = false;
+				skipped.push_back("extensions (SIP engine not attached yet)");
+			}
+			bindingsRefused = !secretsMayChange;
+		}
+#endif
+		if (haveSecretList && !secretsMayChange)
+		{
+			skipped.push_back("extensionSecrets (not applied: the bindings list was not replaced, "
+				"so the digest secrets are left as they were)");
+		}
+		else if (haveSecretList)
+		{
+			size_t restored = 0;
+			std::vector<std::string> inFile;
+			for (const auto& planned : secretPlan)
+			{
+				if (SipSecretStore::setHa1(planned.first, planned.second)) { ++restored; inFile.push_back(planned.first); }
+				else ++secretsRejected;
 			}
 			size_t cleared = 0;
 			for (const auto& ext : SipSecretStore::securedExtensions())
@@ -6867,91 +7034,12 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 			if (cleared > 0)
 				applied.push_back("extensionSecrets cleared (" + std::to_string(cleared) +
 					" secured extension(s) not in the file)");
-			if (rejected > 0)
-				skipped.push_back("extensionSecrets (" + std::to_string(rejected) + " malformed entries)");
-			if (overCap > 0)
-				skipped.push_back("extensionSecrets (" + std::to_string(overCap) +
+			if (secretsRejected > 0)
+				skipped.push_back("extensionSecrets (" + std::to_string(secretsRejected) + " malformed entries)");
+			if (secretsOverCap > 0)
+				skipped.push_back("extensionSecrets (" + std::to_string(secretsOverCap) +
 					" entries over the device's capacity of " + std::to_string(cap) + ")");
 		}
-#if POCKETDIAL_BACKUP_SECTION_C
-		// #483: the MAC bindings, after the digest secrets (a Secured row is restored only
-		// once its extension has one). REPLACE means replace, and all or nothing: every row
-		// is read and checked before the table is touched, and only a list with no fault
-		// swaps in, in one step (RequestsHandler::replaceBindings: one _mutex hold, one
-		// persist, one snapshot rebuild), so a file of bad rows cannot empty the table and
-		// a locked claim already on this board cannot survive beside the file's own. A key
-		// the block lacks leaves the table alone (`bindings` is null then). The table holds
-		// POCKETDIAL_MAX_CLIENTS rows, so a crafted file cannot flood it.
-		if (bindings != nullptr && handler)
-		{
-			// Rows are ["<mac>","<extension>",<state 0|1>,<flags 0-3>]. One this cannot read
-			// is a fault of its own, with an empty placeholder in `rows` so indexes line up;
-			// the table's own checks (MAC form, extension, duplicate, secret, capacity) are
-			// Registrar::replaceDevices's. Reasons are class names, never values.
-			using JsonValue = JsonReader::Value;
-			std::vector<Registrar::Binding> rows;
-			std::vector<Registrar::BindingFault> faults;
-			rows.reserve(bindings->arrVal.size());
-			for (const auto& e : bindings->arrVal)
-			{
-				Registrar::Binding b;
-				const std::vector<JsonValue>& a = e.arrVal;
-				const char* bad = nullptr;
-				if (!e.isArray() || a.size() != 4 || !a[0].isString() || !a[1].isString() ||
-					a[2].type != JsonValue::Type::Number || a[3].type != JsonValue::Type::Number)
-				{
-					bad = "shape";
-				}
-				else if (a[2].numVal != 0 && a[2].numVal != 1)
-				{
-					bad = "state";
-				}
-				else if (a[3].numVal < 0 || a[3].numVal > 3 || a[3].numVal != static_cast<int>(a[3].numVal))
-				{
-					bad = "flags";
-				}
-				else
-				{
-					const Registrar::RowFlags flags = Registrar::decodeRowFlags(static_cast<int>(a[3].numVal));
-					b.mac = a[0].strVal;
-					b.extension = a[1].strVal;
-					b.state = (a[2].numVal == 1) ? RequestsHandler::DeviceState::Secured
-					                             : RequestsHandler::DeviceState::Learned;
-					b.locked = flags.locked;
-					b.shared = flags.shared;
-				}
-				if (bad != nullptr) faults.push_back({rows.size(), bad});
-				rows.push_back(std::move(b));
-			}
-
-			const Registrar::ReplaceResult result = handler->replaceBindings(rows, faults);
-			if (result == Registrar::ReplaceResult::Replaced)
-			{
-				applied.push_back("extensions (" + std::to_string(rows.size()) + " MAC bindings)");
-			}
-			else if (result == Registrar::ReplaceResult::NotStaged)
-			{
-				skipped.push_back("extensions (bindings not replaced, table unchanged: "
-					"it could not be staged for flash)");
-			}
-			else
-			{
-				std::sort(faults.begin(), faults.end(),
-					[](const Registrar::BindingFault& x, const Registrar::BindingFault& y) { return x.row < y.row; });
-				std::string list;
-				for (size_t i = 0; i < faults.size() && i < 6; ++i)
-				{
-					list += std::string(i ? ", row " : "row ") + std::to_string(faults[i].row) + " " + faults[i].why;
-				}
-				if (faults.size() > 6) list += ", and " + std::to_string(faults.size() - 6) + " more";
-				skipped.push_back("extensions (bindings not replaced, table unchanged: " + list + ")");
-			}
-		}
-		else if (bindings != nullptr)
-		{
-			skipped.push_back("extensions (SIP engine not attached yet)");
-		}
-#endif
 	}
 	else if (secretsEncNode)
 	{
@@ -6997,19 +7085,40 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 			importedMode = "learn";
 			skipped.push_back("registrarMode=open (the open registrar is retired; applied learn instead)");
 		}
+		// #483 review: a Secured row counts toward the guard only with a stored digest
+		// secret. Its phone is refused without one (admitSecure: "not provisioned"), so a
+		// table whose Secured rows have all lost theirs (the file's secret list omits them,
+		// and a file with no bindings list cannot be checked against it) is no table to
+		// switch a whole board to digest on. Those rows are named either way.
+		size_t secured = 0, stranded = 0;
+		for (const auto& d : handler->getAdoptedDevices())
+		{
+			if (d.state != RequestsHandler::DeviceState::Secured) continue;
+			if (SipSecretStore::hasSecret(d.extension)) ++secured;
+			else ++stranded;
+		}
+		if (stranded > 0)
+		{
+			skipped.push_back("extensions (" + std::to_string(stranded) + " Secured binding(s) have no "
+				"stored digest secret: their phones are refused until it is set again)");
+		}
 		if (parseRegistrarMode(importedMode, parsedMode))
 		{
 			if (parsedMode == RequestsHandler::RegistrarMode::Secure)
 			{
-				size_t secured = 0;
-				for (const auto& d : handler->getAdoptedDevices())
+				if (bindingsRefused)
 				{
-					if (d.state == RequestsHandler::DeviceState::Secured) ++secured;
+					// The file's table was not restored, so this board's is not the one the
+					// file's `secure` was made for. Switching to digest-only is the step that
+					// locks phones out; leave it to the operator.
+					skipped.push_back("registrarMode=secure (not applied: the file's MAC bindings were "
+						"not restored, so this board's table is not the one the file was made for; "
+						"switch manually)");
 				}
-				if (secured == 0)
+				else if (secured == 0)
 				{
-					skipped.push_back("registrarMode=secure (no extensions are secured on "
-						"this device yet -- would lock out every phone; switch manually "
+					skipped.push_back("registrarMode=secure (no secured extension has a stored digest "
+						"secret on this device -- would lock out every phone; switch manually "
 						"once extensions are re-provisioned)");
 				}
 				else

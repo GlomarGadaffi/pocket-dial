@@ -180,8 +180,10 @@ public:
 	//   extension  non-empty, no tab or newline (the NVS blob's delimiters), and accepted by
 	//              `extensionOk` (the caller's AOR / identity checks)
 	//   duplicate  a MAC listed twice is refused, not last-one-wins
-	//   secret     a Secured row's extension must already have a stored secret (the guard
-	//              secure() applies to a live promotion), so restore the secrets first
+	//   secret     a Secured row's extension must have a stored secret (the guard secure()
+	//              applies to a live promotion), as `hasSecret` sees it: the caller passes
+	//              the store as it will be once its own restore is done, so the table and
+	//              the secrets are judged together and can be applied together
 	//   capacity   a row past POCKETDIAL_MAX_CLIENTS; nothing is ever evicted
 	// Rows are adopted in list order, so seq (first-claim order) rises with it. A phone's
 	// live online flag survives if its MAC is in both tables.
@@ -203,7 +205,8 @@ public:
 	};
 	enum class ReplaceResult : uint8_t { Replaced, Refused, NotStaged };
 	ReplaceResult replaceDevices(const std::vector<Binding>& rows,
-		FunctionRef<bool(const std::string&)> extensionOk, std::vector<BindingFault>& faults);
+		FunctionRef<bool(const std::string&)> extensionOk,
+		FunctionRef<bool(const std::string&)> hasSecret, std::vector<BindingFault>& faults);
 	// Current registry contents (MAC-sorted by map order) for the dashboard
 	// snapshot mirror.
 	std::vector<AdoptedDevice> adoptedDevices() const;

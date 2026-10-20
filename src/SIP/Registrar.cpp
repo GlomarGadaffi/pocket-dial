@@ -726,7 +726,8 @@ size_t Registrar::forgetLearned()
 }
 
 Registrar::ReplaceResult Registrar::replaceDevices(const std::vector<Binding>& rows,
-	FunctionRef<bool(const std::string&)> extensionOk, std::vector<BindingFault>& faults)
+	FunctionRef<bool(const std::string&)> extensionOk,
+	FunctionRef<bool(const std::string&)> hasSecret, std::vector<BindingFault>& faults)
 {
 	// Phase 1: look at every row, change nothing. The table is persisted as
 	// "mac \t ext \t ..." lines, so the MAC must be what ARP resolution yields (toHex12)
@@ -755,7 +756,7 @@ Registrar::ReplaceResult Registrar::replaceDevices(const std::vector<Binding>& r
 		{
 			why = "duplicate";
 		}
-		else if (b.state == DeviceState::Secured && !SipSecretStore::hasSecret(b.extension))
+		else if (b.state == DeviceState::Secured && !hasSecret(b.extension))
 		{
 			// A Secured row with no stored secret would digest-challenge a phone that can
 			// never answer: the lockout secure() refuses.
