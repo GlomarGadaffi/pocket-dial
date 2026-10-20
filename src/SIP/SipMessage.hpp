@@ -275,6 +275,8 @@ public:
 	HeaderVerdict checkHeaders(std::string_view& unsupported, bool reliableRoute = false) const;
 	// RFC 3262 §3: a Require header naming 100rel.
 	bool requiresReliableProvisional() const;
+	// RFC 4028 §9: a Require header naming timer (any case, anywhere in a list, on any Require line).
+	bool requiresTimer() const;
 	// Removes `tag` (compared ignoring case, `tag` in lower case) from every `name` header line, and from
 	// every `compact` one when given, keeping the other tags in order; a line left with no tag is dropped.
 	// In place and without allocating. Issue #172 step 3: 100rel leaves the Require and Supported of a
