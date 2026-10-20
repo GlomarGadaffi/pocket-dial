@@ -22,6 +22,8 @@
 #include "SipSecretStore.hpp"   // #482
 #include "TrunkConfigStore.hpp"   // #483
 #include "EmailConfigStore.hpp"   // #483
+#include "ArpLookup.hpp"      // #483: REGISTERs from MACs the host ARP stub resolves
+#include "PoolConfig.hpp"     // POCKETDIAL_MAX_CLIENTS: the device table's capacity
 #include "ResetGuard.hpp"     // #450: a reset leaves the guard up on host
 #include "NvsWriter.hpp"      // #986 slice 4: the DID table stages instead of committing
 #include "DidMapping.hpp"
@@ -219,6 +221,20 @@ namespace
 			owner.cookie = cookieOf(loginResp, "pd_session");
 			owner.csrf   = csrfOf(loginResp);
 			return owner;
+		}
+
+		// A replacement board: a new engine with no bindings, no telephony slot and the
+		// default mode. The server is pointed at it before the old one goes, so it never
+		// holds a dangling handler.
+		void swapInFreshHandler()
+		{
+			std::remove(_tapiPath.c_str());
+			std::remove(_didPath.c_str());
+			auto fresh = std::make_unique<RequestsHandler>("192.168.4.1", 5060,
+				[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+			fresh->setTelephonyStorePathsForTest(_tapiPath, _didPath);
+			_server->attachHandler(fresh.get());
+			_handler = std::move(fresh);
 		}
 
 		int _port = 0;
@@ -1165,17 +1181,11 @@ TEST_F(ConfigExportImportTest, EncryptedRoundTrip_ReproducesBindingsRegistrarMod
 	EXPECT_NE(blob.find("\"secretSet\":true"), std::string::npos) << "the pairing: the export does say the slot has a secret";
 	EXPECT_EQ(blob.find(slotSecret), std::string::npos) << "...and never what it is";
 
-	// A replacement board: a new engine with no bindings, no slot and the default mode,
-	// and no digest secrets in the store.
+	// A replacement board: no bindings, no slot, the default mode, and no digest secrets
+	// in the store.
 	SipSecretStore::clearSecret("101");
 	SipSecretStore::clearSecret("102");
-	std::remove(_tapiPath.c_str());
-	std::remove(_didPath.c_str());
-	auto fresh = std::make_unique<RequestsHandler>("192.168.4.1", 5060,
-		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
-	fresh->setTelephonyStorePathsForTest(_tapiPath, _didPath);
-	_server->attachHandler(fresh.get());
-	_handler = std::move(fresh);
+	swapInFreshHandler();
 	ASSERT_TRUE(_handler->getAdoptedDevices().empty());
 	ASSERT_EQ(_handler->getRegistrarMode(), RequestsHandler::RegistrarMode::Learn);
 	ASSERT_FALSE(_handler->getTelephonyConfigSlot(0).secretSet);
@@ -1244,4 +1254,338 @@ TEST_F(ConfigExportImportTest, EncryptedRestore_ReplacesMacBindingsNotInTheFile)
 	ASSERT_EQ(statusOf(importResp), 200) << importResp;
 	const std::vector<std::string> want = {"0200000000b1 102 learned locked"};
 	EXPECT_EQ(bindingsOf(*_handler), want) << bodyOf(importResp);
+}
+
+// ── Issue #483 review: a checked, all-or-nothing, ordered restore ───────────
+namespace
+{
+	std::string hexString(const std::string& bytes)
+	{
+		static const char kDigits[] = "0123456789abcdef";
+		std::string out;
+		out.reserve(bytes.size() * 2);
+		for (unsigned char c : bytes)
+		{
+			out.push_back(kDigits[c >> 4]);
+			out.push_back(kDigits[c & 15]);
+		}
+		return out;
+	}
+
+	// An export file the board never wrote: `secretsJson` sealed under `password` with the
+	// readable part as its AAD, byte for byte, exactly as sendApiConfigExport() does it.
+	std::string sealedExport(const std::string& plaintextJson, const std::string& secretsJson,
+	                         const std::string& password)
+	{
+		uint8_t salt[AdminAuth::kKdfSaltBytes];
+		uint8_t nonce[AdminAuth::kGcmNonceBytes];
+		AdminAuth::secureRandomBytes(salt, sizeof(salt));
+		AdminAuth::secureRandomBytes(nonce, sizeof(nonce));
+		uint8_t key[AdminAuth::kAesKeyBytes];
+		AdminAuth::pbkdf2Sha256(password, salt, sizeof(salt), AdminAuth::kExportKdfIterations,
+			key, sizeof(key));
+		std::string ct;
+		AdminAuth::aesGcmSeal(key, nonce, plaintextJson, secretsJson, ct);
+		return "{\"exportVer\":1,\"plaintext\":" + plaintextJson +
+			",\"secretsEnc\":{\"kdf\":\"pbkdf2-sha256\",\"iter\":" +
+			std::to_string(AdminAuth::kExportKdfIterations) +
+			",\"salt\":\"" + hexString(std::string(reinterpret_cast<const char*>(salt), sizeof(salt))) +
+			"\",\"nonce\":\"" + hexString(std::string(reinterpret_cast<const char*>(nonce), sizeof(nonce))) +
+			"\",\"ct\":\"" + hexString(ct) + "\"}}";
+	}
+
+	// Imports a hand-sealed file as the Owner and returns the report (200 expected).
+	std::string importSealed(int port, const AdminSession& owner, const std::string& secretsJson,
+	                         const std::string& plaintextJson = "{\"extensions\":[]}")
+	{
+		const std::string blob = sealedExport(plaintextJson, secretsJson, "exportpass123");
+		const std::string resp = httpRaw(port, "POST", "/api/config/import",
+			"blob=" + urlEncode(blob) + "&password=exportpass123&confirm=REPLACE",
+			"pd_session=" + owner.cookie, owner.csrf);
+		EXPECT_EQ(statusOf(resp), 200) << resp;
+		return bodyOf(resp);
+	}
+
+	// The sealed block's binding list, rows being ["<mac>","<ext>",<state 0|1>,<flags>] with
+	// flags as Registrar::encodeRowFlags(): bit 0 locked, bit 1 shared.
+	std::string listOf(const std::string& rowsJson)
+	{
+		return "{\"extensions\":[" + rowsJson + "]}";
+	}
+
+	// The row an import that refuses must leave exactly as it is.
+	const char* const kOwnRow = "0200000000e1 201 learned locked";
+
+	void seedOwnRow(RequestsHandler& h)
+	{
+		h.adoptDeviceForTest("0200000000e1", "201", RequestsHandler::DeviceState::Learned, /*locked=*/true);
+	}
+
+	std::string macHex(uint8_t last)
+	{
+		return ArpLookup::toHex12(ArpLookup::Mac{0x02, 0x00, 0x00, 0x00, 0x00, last});
+	}
+
+	// One REGISTER for 101 from the phone at 192.168.70.<last>, whose ARP-resolved MAC is macHex(last).
+	void registerFor101(RequestsHandler& h, uint8_t last, int seq)
+	{
+		const std::string ip = "192.168.70." + std::to_string(last);
+		sockaddr_in src{};
+		src.sin_family = AF_INET;
+		src.sin_port = htons(5060);
+		inet_pton(AF_INET, ip.c_str(), &src.sin_addr);
+		ArpLookup::setMockMac(src, ArpLookup::Mac{0x02, 0x00, 0x00, 0x00, 0x00, last});
+		const std::string id = "r" + std::to_string(seq);
+		const std::string hostPort = ip + ":5060";
+		const std::string raw =
+			"REGISTER sip:server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + hostPort + ";branch=z9hG4bK" + id + "\r\n"
+			"From: <sip:101@server>;tag=t" + id + "\r\n"
+			"To: <sip:101@server>\r\n"
+			"Call-ID: " + id + "@" + ip + "\r\n"
+			"CSeq: " + std::to_string(seq) + " REGISTER\r\n"
+			"Contact: <sip:101@" + hostPort + ">;expires=3600\r\n"
+			"Content-Length: 0\r\n\r\n";
+		h.handle(RequestsHandler::getMessageFromPool(raw, src));
+	}
+}
+
+// The engine-owned names onRegister() refuses (pbx, moh, server) can never be ADOPTED, so a
+// restored file may not plant one: findProvisioningInfo() would serve a config for it.
+TEST_F(ConfigExportImportTest, EncryptedRestore_RefusesAServiceNameBinding)
+{
+	AdminSession owner = loginOwner();
+	seedOwnRow(*_handler);
+	for (const char* name : {"pbx", "moh", "server"})
+	{
+		SCOPED_TRACE(name);
+		const std::string report = importSealed(_port, owner,
+			listOf(std::string("[\"0200000000a1\",\"") + name + "\",0,0]"));
+		EXPECT_EQ(bindingsOf(*_handler), std::vector<std::string>{kOwnRow}) << report;
+		EXPECT_NE(report.find("bindings not replaced"), std::string::npos) << report;
+		EXPECT_NE(report.find("row 0 extension"), std::string::npos) << report;
+	}
+}
+
+// One refused row refuses the whole list: the board's own table is exactly as it was (the
+// sweep used to run before any row was looked at, so a file of bad rows emptied the table and
+// still answered 200), and the report names the row and the reason class, never a value.
+TEST_F(ConfigExportImportTest, EncryptedRestore_AnyRefusedRowLeavesTheTableAsItWas)
+{
+	SecuredExts secured;   // 101 and 102 hold digest secrets
+	SipSecretStore::clearSecret("103");
+	AdminSession owner = loginOwner();
+	seedOwnRow(*_handler);
+	struct Case { const char* name; std::string badRow; const char* fault; };
+	const std::vector<Case> cases = {
+		{"an uppercase MAC",             R"(["0200000000AB","102",0,0])",  "row 1 mac"},
+		{"a MAC of the wrong length",    R"(["0200000000b","102",0,0])",   "row 1 mac"},
+		{"a tab in the extension",       R"(["0200000000b2","1\t2",0,0])", "row 1 extension"},
+		{"a Secured row with no secret", R"(["0200000000b3","103",1,0])",  "row 1 secret"},
+		{"the same MAC twice",           R"(["0200000000a1","102",0,0])",  "row 1 duplicate"},
+		{"a state out of range",         R"(["0200000000b4","102",2,0])",  "row 1 state"},
+		{"flags out of range",           R"(["0200000000b5","102",0,4])",  "row 1 flags"},
+		{"a number for the extension",   R"(["0200000000b7",102,0,0])",    "row 1 shape"},
+		{"the earlier object form",
+			R"({"mac":"0200000000b6","extension":"102","state":"learned","locked":false})", "row 1 shape"},
+	};
+	for (const auto& c : cases)
+	{
+		SCOPED_TRACE(c.name);
+		const std::string report = importSealed(_port, owner,
+			listOf(R"(["0200000000a1","101",0,1],)" + c.badRow));
+		EXPECT_EQ(bindingsOf(*_handler), std::vector<std::string>{kOwnRow}) << report;
+		EXPECT_NE(report.find("bindings not replaced"), std::string::npos) << report;
+		EXPECT_NE(report.find(c.fault), std::string::npos) << report;
+		EXPECT_EQ(report.find("MAC bindings)"), std::string::npos) << "no claim that rows were applied:\n" << report;
+	}
+}
+
+// The emptied table holds POCKETDIAL_MAX_CLIENTS rows. One more is refused whole, with nothing
+// evicted and nothing half restored; exactly that many restore.
+TEST_F(ConfigExportImportTest, EncryptedRestore_RefusesMoreRowsThanTheTableHolds_AndTakesExactlyThatMany)
+{
+	AdminSession owner = loginOwner();
+	seedOwnRow(*_handler);
+	const size_t cap = static_cast<size_t>(POCKETDIAL_MAX_CLIENTS);
+	auto rowsOf = [](size_t n) {
+		std::string rows;
+		char mac[16];
+		for (size_t i = 0; i < n; ++i)
+		{
+			std::snprintf(mac, sizeof(mac), "0200000001%02x", static_cast<unsigned>(i));
+			rows += std::string(i ? "," : "") + "[\"" + mac + "\",\"" + std::to_string(3000 + i) + "\",0,0]";
+		}
+		return rows;
+	};
+
+	std::string report = importSealed(_port, owner, listOf(rowsOf(cap + 1)));
+	EXPECT_EQ(bindingsOf(*_handler), std::vector<std::string>{kOwnRow}) << report;
+	EXPECT_NE(report.find("bindings not replaced"), std::string::npos) << report;
+	EXPECT_NE(report.find("row " + std::to_string(cap) + " capacity"), std::string::npos) << report;
+
+	report = importSealed(_port, owner, listOf(rowsOf(cap)));
+	EXPECT_EQ(_handler->getAdoptedDevices().size(), cap) << report;
+	EXPECT_NE(report.find("(" + std::to_string(cap) + " MAC bindings)"), std::string::npos) << report;
+}
+
+// "extensions":[] in a sealed block is an instruction: the file's board had no rows.
+TEST_F(ConfigExportImportTest, EncryptedRestore_AnEmptyListClearsEveryRow)
+{
+	AdminSession owner = loginOwner();
+	seedOwnRow(*_handler);
+	_handler->adoptDeviceForTest("0200000000e2", "202");
+	const std::string report = importSealed(_port, owner, listOf(""));
+	EXPECT_TRUE(_handler->getAdoptedDevices().empty()) << report;
+	EXPECT_NE(report.find("(0 MAC bindings)"), std::string::npos) << report;
+}
+
+// An encrypted file from before bindings travelled in it has no list at all: the board's table
+// is left alone, and the report says the FILE is the problem, not that a password is missing.
+TEST_F(ConfigExportImportTest, EncryptedRestore_AFileWithoutTheList_LeavesTheTableAlone_AndSaysItPredatesBindings)
+{
+	AdminSession owner = loginOwner();
+	seedOwnRow(*_handler);
+	const std::string report = importSealed(_port, owner, R"({"wifiPassword":""})",
+		R"({"extensions":[{"mac":"0200000000f1","extension":"501","state":"learned"}]})");
+	EXPECT_EQ(bindingsOf(*_handler), std::vector<std::string>{kOwnRow}) << report;
+	EXPECT_NE(report.find("predates MAC bindings"), std::string::npos) << report;
+	EXPECT_EQ(report.find("re-export with a password"), std::string::npos)
+		<< "the user has a password and used it; that advice is wrong for this file:\n" << report;
+}
+
+// Applying the sealed block is Owner-only, bindings included: a sysop who seals a list of their
+// own, or replays an Owner's file, is refused and the table is not touched.
+TEST_F(ConfigExportImportTest, SysopImportWithAPassword_IsRefused_BindingsUnchanged)
+{
+	_handler->adoptDeviceForTest("0200000000b1", "102", RequestsHandler::DeviceState::Learned, /*locked=*/true);
+	AdminSession owner = loginOwner();
+	const std::string exportResp = httpRaw(_port, "POST", "/api/config/export",
+		"password=exportpass123", "pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(exportResp), 200) << exportResp;
+
+	ASSERT_TRUE(_handler->forgetDevice("0200000000b1"));
+	seedOwnRow(*_handler);
+	const std::string importResp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(bodyOf(exportResp)) + "&password=exportpass123&confirm=REPLACE",
+		"pd_session=" + _sysop.cookie, _sysop.csrf);
+	EXPECT_EQ(statusOf(importResp), 403) << importResp;
+	EXPECT_EQ(bindingsOf(*_handler), std::vector<std::string>{kOwnRow}) << "a refused import must not touch the table";
+}
+
+// A table the NVS writer refuses (a factory reset is running) is not a restored table: the
+// Owner is told, and the rows already there are still there.
+TEST_F(ConfigExportImportTest, EncryptedRestore_WhenTheTableCannotBeStaged_ChangesNothingAndSaysSo)
+{
+	AdminSession owner = loginOwner();
+	seedOwnRow(*_handler);
+	resetguard::begin();
+	const std::string report = importSealed(_port, owner, listOf(R"(["0200000000a1","101",0,1])"));
+	resetguard::resetForTest();
+	EXPECT_EQ(bindingsOf(*_handler), std::vector<std::string>{kOwnRow}) << report;
+	EXPECT_NE(report.find("bindings not replaced"), std::string::npos) << report;
+	EXPECT_NE(report.find("staged"), std::string::npos) << report;
+	EXPECT_EQ(report.find("MAC bindings)"), std::string::npos) << report;
+}
+
+// Lock and shared travel as the registry's own row flags (bit 0, bit 1), and survive the restore.
+TEST_F(ConfigExportImportTest, EncryptedRestore_CarriesTheLockAndSharedFlags)
+{
+	AdminSession owner = loginOwner();
+	const std::string report = importSealed(_port, owner, listOf(
+		R"(["0200000000a1","101",0,1],["0200000000a2","102",0,2],["0200000000a3","103",0,0])"));
+	std::vector<std::string> rows;
+	for (const auto& d : _handler->getAdoptedDevices())
+		rows.push_back(d.mac + (d.locked ? " locked" : " unlocked") + (d.shared ? " shared" : " unshared"));
+	std::sort(rows.begin(), rows.end());
+	const std::vector<std::string> want = {
+		"0200000000a1 locked unshared", "0200000000a2 unlocked shared", "0200000000a3 unlocked unshared"};
+	EXPECT_EQ(rows, want) << report;
+}
+
+// A full table: POCKETDIAL_MAX_CLIENTS Secured bindings, each with its digest secret, must still
+// export under the import's 16,384-byte caps (HttpServer's body cap, JsonReader::kMaxBytes) with
+// room for what a real board adds, and must restore.
+//
+// What one Secured binding costs in the file (bytes):
+//   readable `extensions` row   59 + 1 comma
+//   `securedExtensions` entry    6 + 1 comma
+//   sealed HA1 row              61 + 1 comma, doubled by hex  = 124
+//   sealed binding row          27 + 1 comma, doubled by hex  =  56   (`["<12>","2001",1,1]`)
+//   total                       247
+// A board with nothing else configured is about 1.8 KB. The bound allows 270 B a row and 2.6 KB
+// fixed: 2,600 + 32 x 270 = 11,240, i.e. 5.1 KB under the 16,384 B JsonReader cap for the telephony
+// slots, trunk and SMTP strings and a GSA key (hex-doubled) a real board adds. The import's form
+// body is this blob URL-encoded: the readable part (about 3 KB, a third of it punctuation) gains
+// about 2 KB, the hex inside secretsEnc nothing, so the body at the bound is about 13.3 KB, 3 KB
+// under HttpServer's 16,384 B body cap. The first form of the sealed row, an object with long
+// keys, is 74 B and 148 hex, which makes a row 339 B and this table about 12.6 KB: over the bound.
+TEST_F(ConfigExportImportTest, EncryptedExport_OfAFullSecuredTable_StaysUnderTheImportCaps_AndRestores)
+{
+	// Only this test's secrets in the process-global store, so the file holds only their rows.
+	for (const auto& ext : SipSecretStore::securedExtensions()) SipSecretStore::clearSecret(ext);
+	const size_t n = static_cast<size_t>(POCKETDIAL_MAX_CLIENTS);
+	struct CleanUp
+	{
+		size_t n;
+		~CleanUp() { for (size_t i = 0; i < n; ++i) SipSecretStore::clearSecret(std::to_string(2001 + i)); }
+	} cleanUp{n};
+	for (size_t i = 0; i < n; ++i)
+	{
+		const std::string ext = std::to_string(2001 + i);
+		ASSERT_TRUE(SipSecretStore::setSecret(ext, "digestpw-" + ext));
+		_handler->adoptDeviceForTest(macHex(static_cast<uint8_t>(0x10 + i)), ext,
+			RequestsHandler::DeviceState::Secured, /*locked=*/true);
+	}
+	const std::vector<std::string> want = bindingsOf(*_handler);
+	ASSERT_EQ(want.size(), n);
+
+	AdminSession owner = loginOwner();
+	const std::string exportResp = httpRaw(_port, "POST", "/api/config/export",
+		"password=exportpass123", "pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(exportResp), 200) << exportResp;
+	const std::string blob = bodyOf(exportResp);
+	EXPECT_LT(blob.size(), 2600u + n * 270u) << "the export of a full Secured table is " << blob.size() << " bytes";
+
+	for (const auto& d : _handler->getAdoptedDevices()) ASSERT_TRUE(_handler->forgetDevice(d.mac));
+	const std::string importResp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(blob) + "&password=exportpass123&confirm=REPLACE",
+		"pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(importResp), 200) << importResp;
+	EXPECT_EQ(bindingsOf(*_handler), want) << bodyOf(importResp);
+}
+
+// First-claim order survives a restore. Eight unlocked rows hold 101; only the earliest can ever
+// lock it (Registrar::admitLearn: "first claim wins"). They are seeded earliest first with MACs in
+// DESCENDING order, so a file in MAC order, or in the table's arbitrary iteration order, gives some
+// other row the lowest seq and the wrong phone locks.
+TEST_F(ConfigExportImportTest, EncryptedRoundTrip_KeepsTheFirstClaimOrderOfRowsForOneExtension)
+{
+	struct ArpCleanUp { ~ArpCleanUp() { ArpLookup::clearMockMacs(); } } arpCleanUp;
+	ArpLookup::clearMockMacs();
+	for (int i = 0; i < 8; ++i) _handler->adoptDeviceForTest(macHex(static_cast<uint8_t>(0x78 - i)), "101");
+	AdminSession owner = loginOwner();
+	const std::string exportResp = httpRaw(_port, "POST", "/api/config/export",
+		"password=exportpass123", "pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(exportResp), 200) << exportResp;
+
+	swapInFreshHandler();
+	const std::string importResp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(bodyOf(exportResp)) + "&password=exportpass123&confirm=REPLACE",
+		"pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(importResp), 200) << importResp;
+	ASSERT_EQ(_handler->getAdoptedDevices().size(), 8u) << bodyOf(importResp);
+
+	// Every later claim registers twice first and must stay unlocked; the first claim registers
+	// last, twice, and locks. Were another row first, it would lock and the first claim get a 403.
+	int seq = 0;
+	for (uint8_t last = 0x71; last <= 0x78; ++last)
+	{
+		registerFor101(*_handler, last, ++seq);
+		registerFor101(*_handler, last, ++seq);
+	}
+	std::vector<std::string> locked;
+	for (const auto& d : _handler->getAdoptedDevices())
+		if (d.locked) locked.push_back(d.mac);
+	EXPECT_EQ(locked, std::vector<std::string>{macHex(0x78)});
 }
