@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +16,7 @@
 #include <future>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "AllocCounter.hpp"
 #include "PsramAllocator.hpp"
@@ -765,6 +767,272 @@ TEST(SosStatusWitness, EachSiteWritesItsFirstLinesOnlyAndCountsEveryFallback)
 	EXPECT_EQ(pdwitness::count("911 status GET: handle claim held"), 2u) << "the other site has its own cap";
 	EXPECT_EQ(w.count(SosFallback::Teardown), 10u);
 	EXPECT_EQ(w.count(SosFallback::Get), 2u);
+}
+
+// ── #977: every list read of the #349 window errored; look for the orphan and drop it ─────────
+// Owner ruling on #977 (option 2): the 503 stands, at the same moment, and nothing is answered early or
+// adopted. A sweep after makeCall() has returned reads the list again and drops the one leg it finds.
+// TelephonyAnchorClient.cpp is ESP-only; these drive the decisions it calls (SosStatusGet.hpp), and
+// tests/tools/test_anchor_orphan_sweep.py pins the wiring by source text.
+
+// A sweep on a simulated clock: only the pauses move time, and the sweep is armed at 0. The n-th read
+// answers script[n] (the last one repeats). Every step is recorded, in order.
+struct SweepRun
+{
+	std::vector<OrphanRead>  script;
+	int64_t                  t         = 0;
+	bool                     keepGoing = true;
+	bool                     dropOk    = true;
+	int                      readNo    = 0;
+	int                      pauses    = 0;
+	std::vector<std::string> events;
+
+	OrphanSweepResult run()
+	{
+		if (script.empty()) script.push_back(OrphanRead{});
+		return runOrphanSweep(
+			0,
+			[&] {
+				events.push_back("read");
+				const std::size_t i = std::min(static_cast<std::size_t>(readNo), script.size() - 1);
+				++readNo;
+				return script[i];
+			},
+			[&] { return t; },
+			[&] { return keepGoing; },
+			[&] {
+				events.push_back("pause");
+				++pauses;
+				t += int64_t{ kOrphanSweepPollMs } * 1000;
+			},
+			[&](const std::string& leg) { events.push_back("hold:" + leg); },
+			[&](const std::string& leg) {
+				events.push_back("drop:" + leg);
+				return dropOk;
+			});
+	}
+
+	int count(const char* prefix) const
+	{
+		int n = 0;
+		for (const std::string& e : events) n += e.compare(0, std::strlen(prefix), prefix) == 0 ? 1 : 0;
+		return n;
+	}
+};
+
+TEST(SosOrphanSweep, ASweepIsWantedOnlyForA911WhoseEveryListReadErrored)
+{
+	const UnreadOutcome fail = UnreadOutcome::Fail;
+	EXPECT_TRUE(orphanSweepWanted(/*sosLane=*/true, fail, /*reads=*/10, /*listsRead=*/0)) << "all ten reads errored";
+	EXPECT_TRUE(orphanSweepWanted(true, fail, 1, 0)) << "the anchor stopping after the first read";
+	EXPECT_FALSE(orphanSweepWanted(false, fail, 10, 0)) << "an ordinary call is refused as on main";
+	EXPECT_FALSE(orphanSweepWanted(true, UnreadOutcome::Adopt, 4, 0)) << "a leg was listed and is adopted";
+	EXPECT_FALSE(orphanSweepWanted(true, fail, 10, 1)) << "3CX answered the list once: its answer was no leg";
+	EXPECT_FALSE(orphanSweepWanted(true, fail, 10, 10)) << "3CX answered every read: no leg";
+	EXPECT_FALSE(orphanSweepWanted(true, fail, 0, 0)) << "no read was made";
+}
+
+TEST(SosOrphanSweep, TheCallerStillGetsTheUsual503AtTheSameTimeAndTheSweepIsDecidedAfterIt)
+{
+	// The window and its outcome are the ones SosStatusUnread pins; the sweep adds nothing to them.
+	int64_t t = 0;
+	int pauses = 0;
+	const UnreadWindow w = readOwnLegWindow(
+		[] { return std::string(); },   // every list read errored: no leg, and no list shown
+		[&] { return t; }, [] { return true; }, [](int) {},
+		[&] {
+			++pauses;
+			t += int64_t{ kUnreadAdoptPollMs } * 1000;
+		});
+	const UnreadOutcome outcome = unreadOutcome(!w.ownLeg.empty());
+	EXPECT_EQ(outcome, UnreadOutcome::Fail) << "the 503 stands: no early answer, no adopted leg";
+	EXPECT_TRUE(w.ownLeg.empty());
+	EXPECT_EQ(w.reads, 10);
+	EXPECT_EQ(pauses, 9);
+	EXPECT_EQ(t, kInstantFailureWindowUs) << "the window, and so the moment of the 503, is unchanged";
+	EXPECT_TRUE(orphanSweepWanted(/*sosLane=*/true, outcome, w.reads, /*listsRead=*/0))
+		<< "the sweep is decided from the window's outcome alone: it moves nothing the caller sees";
+}
+
+TEST(SosOrphanSweep, TheStepTable)
+{
+	const int64_t lastRead = kOrphanSweepWindowUs - int64_t{ kOrphanSweepPollMs } * 1000;
+	EXPECT_EQ(orphanSweepStep(1, 0), OrphanSweepStep::Drop) << "one candidate is the orphan";
+	EXPECT_EQ(orphanSweepStep(1, kOrphanSweepWindowUs * 3), OrphanSweepStep::Drop) << "a leg on a late read is still dropped";
+	EXPECT_EQ(orphanSweepStep(2, 0), OrphanSweepStep::Ambiguous) << "one of two may be a PSAP callback";
+	EXPECT_EQ(orphanSweepStep(5, lastRead), OrphanSweepStep::Ambiguous);
+	EXPECT_EQ(orphanSweepStep(0, 0), OrphanSweepStep::ReadAgain) << "a failed read, or a list with no candidate yet";
+	EXPECT_EQ(orphanSweepStep(0, lastRead - 1), OrphanSweepStep::ReadAgain);
+	EXPECT_EQ(orphanSweepStep(0, lastRead), OrphanSweepStep::GiveUp) << "no read starts once the bound would pass";
+	EXPECT_EQ(orphanSweepStep(0, kOrphanSweepWindowUs * 10), OrphanSweepStep::GiveUp);
+}
+
+TEST(SosOrphanSweep, TheSweepReadsAgainAndDropsTheOneLegItFinds)
+{
+	SweepRun s;
+	s.script = { { "", 0 }, { "", 0 }, { "517", 1 } };   // two reads that errored, then the list shows the leg
+	const OrphanSweepResult r = s.run();
+	EXPECT_EQ(r.end, OrphanSweepEnd::Dropped);
+	EXPECT_EQ(r.reads, 3);
+	EXPECT_EQ(r.leg, "517");
+	const std::vector<std::string> expected = { "read", "pause", "read", "pause", "read", "hold:517", "drop:517" };
+	EXPECT_EQ(s.events, expected) << "a pause between reads only, and the leg is noted as ours before its drop";
+	EXPECT_EQ(s.t, 2 * int64_t{ kOrphanSweepPollMs } * 1000) << "a vTaskDelay-sized gap per pause, nothing else";
+}
+
+TEST(SosOrphanSweep, ASweepThatNeverSeesALegGivesUpWithinTheBoundAndDropsNothing)
+{
+	SweepRun s;   // every read errors
+	const OrphanSweepResult r = s.run();
+	EXPECT_EQ(r.end, OrphanSweepEnd::GaveUp);
+	EXPECT_EQ(r.reads, 10) << "the window's own count: a read every 400 ms while another still fits";
+	EXPECT_EQ(s.pauses, 9);
+	EXPECT_EQ(s.t, kInstantFailureWindowUs);
+	EXPECT_LT(s.t, kOrphanSweepWindowUs) << "never the whole bound spent asleep";
+	EXPECT_EQ(s.count("hold:"), 0);
+	EXPECT_EQ(s.count("drop:"), 0) << "nothing found, nothing dropped";
+	EXPECT_TRUE(r.leg.empty());
+}
+
+TEST(SosOrphanSweep, TwoCandidatesAreNeverDroppedBecauseOneMayBeAPsapCallback)
+{
+	SweepRun s;
+	s.script = { { "517", 2 } };   // resolveOutboundLeg picked one of two candidates
+	const OrphanSweepResult r = s.run();
+	EXPECT_EQ(r.end, OrphanSweepEnd::Ambiguous);
+	EXPECT_EQ(r.reads, 1);
+	EXPECT_EQ(s.pauses, 0) << "ends at once: waiting does not tell the two legs apart";
+	EXPECT_EQ(s.count("hold:"), 0);
+	EXPECT_EQ(s.count("drop:"), 0) << "a leg left up is better than a PSAP callback hung up";
+	EXPECT_TRUE(r.leg.empty());
+}
+
+TEST(SosOrphanSweep, ASweepTelMaintReachesAfterTheBoundReadsNothing)
+{
+	SweepRun late;
+	late.t = kOrphanSweepWindowUs;   // a restart job ran first on tel_maint
+	const OrphanSweepResult r = late.run();
+	EXPECT_EQ(r.end, OrphanSweepEnd::TooLate);
+	EXPECT_EQ(r.reads, 0);
+	EXPECT_TRUE(late.events.empty()) << "no read, no pause, no drop: the hold has lapsed with the bound";
+
+	SweepRun justInside;
+	justInside.t = kOrphanSweepWindowUs - 1;
+	const OrphanSweepResult r2 = justInside.run();
+	EXPECT_EQ(r2.end, OrphanSweepEnd::GaveUp);
+	EXPECT_EQ(r2.reads, 1) << "inside the bound it reads once";
+	EXPECT_EQ(justInside.pauses, 0);
+}
+
+TEST(SosOrphanSweep, AStoppingAnchorEndsTheSweepBeforeItReadsAnything)
+{
+	SweepRun s;
+	s.keepGoing = false;
+	s.script = { { "517", 1 } };
+	const OrphanSweepResult r = s.run();
+	EXPECT_EQ(r.end, OrphanSweepEnd::Stopped);
+	EXPECT_EQ(r.reads, 0);
+	EXPECT_TRUE(s.events.empty()) << "the client is going away: no read, and no drop on a dying connection";
+}
+
+TEST(SosOrphanSweep, AFailedDropIsReportedAndNotRetried)
+{
+	SweepRun s;
+	s.script = { { "517", 1 } };
+	s.dropOk = false;
+	const OrphanSweepResult r = s.run();
+	EXPECT_EQ(r.end, OrphanSweepEnd::DropFailed);
+	EXPECT_EQ(r.leg, "517");
+	const std::vector<std::string> expected = { "read", "hold:517", "drop:517" };
+	EXPECT_EQ(s.events, expected) << "one attempt: dropCall() has its own retry, and the sweep has a bound";
+}
+
+TEST(SosOrphanSweep, TheLegIsOursBeforeItsDropAndALateUpsertForItIsNotAnInboundCall)
+{
+	AnchorOwnLegs own;
+	constexpr uint64_t kPostSeq = 40;   // the WS event number when the makecall POST went out
+	int64_t t = 0;
+	bool oursWhenTheDropWentOut = false;
+	const OrphanSweepResult r = runOrphanSweep(
+		0,
+		[&] { return t < 800'000 ? OrphanRead{} : OrphanRead{ "517", 1 }; },
+		[&] { return t; }, [] { return true; },
+		[&] { t += int64_t{ kOrphanSweepPollMs } * 1000; },
+		[&](const std::string& leg) { own.noteNamed(leg, t, kPostSeq); },   // what the client's hold hook does
+		[&](const std::string& leg) {
+			oursWhenTheDropWentOut = !inboundAnnounceAllowed(own, leg, t, kPostSeq + 1);
+			return true;
+		});
+	ASSERT_EQ(r.end, OrphanSweepEnd::Dropped);
+	EXPECT_TRUE(oursWhenTheDropWentOut) << "an upsert between the hold's end and 3CX's Remove must not ring the handsets";
+
+	// 3CX repeats the orphan's upsert while the drop is in flight: not an inbound call.
+	EXPECT_FALSE(inboundAnnounceAllowed(own, "517", t, kPostSeq + 5)) << "the phantom inbound";
+	// A PSAP callback is another participant: announced as always.
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "518", t, kPostSeq + 5));
+	// After 3CX's Remove of 517 the id is released.
+	own.release("517", kPostSeq + 10);
+	EXPECT_TRUE(inboundAnnounceAllowed(own, "517", t, kPostSeq + 11));
+}
+
+TEST(SosOrphanSweep, TheHoldCoversTheGapBetweenThe503AndTheDropAndNoLonger)
+{
+	// makeCall() has returned, so its own pending count is 0 again. The classifier promotes an unmatched
+	// upsert to a new inbound call only when the count it sees is 0.
+	const int64_t armed = 1'000'000'000;
+	const int64_t until = orphanHoldUntil(armed);
+	EXPECT_EQ(until, armed + kOrphanSweepWindowUs) << "from the arm, so a queued sweep cannot extend it";
+	EXPECT_GE(pendingWithOrphanHold(0, until, armed), 1) << "the orphan's repeat upsert right after the 503";
+	EXPECT_GE(pendingWithOrphanHold(0, until, until - 1), 1);
+	EXPECT_EQ(pendingWithOrphanHold(0, until, until), 0) << "the hold lapses at the bound, however the job fares";
+	EXPECT_EQ(pendingWithOrphanHold(0, until, until + 5'000'000), 0);
+	EXPECT_EQ(pendingWithOrphanHold(0, 0, armed), 0) << "no sweep armed (or the hold taken back): no hold";
+	EXPECT_EQ(pendingWithOrphanHold(2, until, armed), 2) << "a real pending makeCall count is never changed";
+	EXPECT_EQ(pendingWithOrphanHold(2, 0, armed), 2);
+}
+
+TEST(SosOrphanSweepWitness, EachEndIsCountedAndItsLineIsCappedAndCarriesNoNumber)
+{
+	pdwitness::clear();
+	OrphanSweepWitness w;
+	for (int i = 0; i < 12; ++i) w.noteEnd(OrphanSweepEnd::GaveUp);
+	EXPECT_TRUE(w.noteEnd(OrphanSweepEnd::Dropped));
+	EXPECT_TRUE(w.noteEnd(OrphanSweepEnd::DropFailed));
+	EXPECT_TRUE(w.noteEnd(OrphanSweepEnd::Ambiguous));
+	EXPECT_TRUE(w.noteEnd(OrphanSweepEnd::Stopped));
+	EXPECT_TRUE(w.noteEnd(OrphanSweepEnd::TooLate));
+	EXPECT_TRUE(w.noteNoWorker());
+
+	EXPECT_EQ(w.count(OrphanSweepEnd::GaveUp), 12u) << "the cap limits the log, not the count";
+	EXPECT_EQ(w.count(OrphanSweepEnd::Dropped), 1u);
+	EXPECT_EQ(w.count(OrphanSweepEnd::DropFailed), 1u);
+	EXPECT_EQ(w.count(OrphanSweepEnd::Ambiguous), 1u);
+	EXPECT_EQ(w.count(OrphanSweepEnd::Stopped), 1u);
+	EXPECT_EQ(w.count(OrphanSweepEnd::TooLate), 1u);
+	EXPECT_EQ(w.noWorker(), 1u);
+
+	EXPECT_EQ(pdwitness::count("911 orphan sweep: no leg listed within the bound, none dropped (#977)"),
+	          static_cast<std::size_t>(OrphanSweepWitness::kLinesPerEnd));
+	EXPECT_EQ(pdwitness::count("911 orphan sweep: the leg left on 3CX was found and dropped (#977)"), 1u);
+	EXPECT_EQ(pdwitness::count("911 orphan sweep: the leg left on 3CX was found, the drop failed (#977)"), 1u);
+	EXPECT_EQ(pdwitness::count("911 orphan sweep: more than one candidate leg, none dropped (#977)"), 1u);
+	EXPECT_EQ(pdwitness::count("911 orphan sweep: anchor stopping, ended (#977)"), 1u);
+	EXPECT_EQ(pdwitness::count("911 orphan sweep: tel_maint reached it after the bound, nothing read (#977)"), 1u);
+	EXPECT_EQ(pdwitness::count("911 orphan sweep: no tel_maint task, not armed (#977)"), 1u);
+
+	const std::vector<std::string> lines = pdwitness::lines();
+	EXPECT_EQ(lines.size(), std::size_t{ OrphanSweepWitness::kLinesPerEnd } + 6u);
+	for (const std::string& line : lines)
+	{
+		// Only the issue tag, the emergency lane's name and the PBX's name have digits in them.
+		std::string rest = line;
+		for (const char* word : { "#977", "911", "3CX" })
+		{
+			for (std::size_t at; (at = rest.find(word)) != std::string::npos;) rest.erase(at, std::strlen(word));
+		}
+		EXPECT_TRUE(std::none_of(rest.begin(), rest.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
+			<< "a witness never carries a number: " << line;
+	}
 }
 
 }  // namespace
