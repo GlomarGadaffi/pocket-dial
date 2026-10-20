@@ -27,7 +27,9 @@ task that nobody budgeted fails closed). Line numbers in the table are
 references only, so unrelated edits don't break the gate.
 
 The numbers only mean something on Xtensa .ci files from the ESP build
-(BigDog's gate runs it that way; GitHub CI runs the self-test only). Host
+(CI runs it in the stack-depth-gate job, which builds the esp32s3/eth image with
+the call-graph flags; BigDog's gate runs it by hand; the Call-Graph Guard job runs
+the self-test only). Host
 x86-64 frames differ. Static depth is an upper bound over direct calls; it
 can't see indirect calls. The runtime stackHwm_* (#451) stays ground truth.
 

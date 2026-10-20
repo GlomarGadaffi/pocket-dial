@@ -588,8 +588,9 @@ jobs:
         # tools/ci/task_stacks.json, frame ceiling, PYTHONHASHSEED determinism,
         # and the checked-in table against today's src/ + main/ task sites.
         # Real numbers need Xtensa -fcallgraph-info=su output from the ESP eth
-        # build, which this runner doesn't produce; BigDog's local gate runs
-        # tools/ci/task_stack_gate.py --ci-dir <esp build dir> for that.
+        # build, which this runner doesn't produce: the stack-depth-gate job
+        # builds it and runs tools/ci/task_stack_gate.py on it, and BigDog's
+        # local gate does the same by hand.
         run: python3 -m unittest discover -s tests/tools -p 'test_task_stack_gate.py' -v
 
   # Job 2: Build firmware for target ESP32 and ESP32-S3 boards using official Espressif Docker Images.
@@ -714,6 +715,66 @@ jobs:
             build/partition_table/partition-table.bin
             partitions.csv
           retention-days: 7
+
+  # Job 2a: Per-task stack depth gate (#457).
+  # The worst-case static stack depth of every task against its configured
+  # stack (tools/ci/task_stacks.json), on the esp32s3/eth image: the image the
+  # gate walks by default (--main main/esp_main_eth.cpp). It builds that image
+  # itself, with GCC's call-graph (.ci) and stack-usage flags in EXTRA_CFLAGS /
+  # EXTRA_CXXFLAGS, which IDF reads when CMake configures (tools/cmake/
+  # project.cmake), so the first `idf.py set-target` here already carries them.
+  # The flags write side files and change no instruction.
+  #
+  # Its own job, not a step of the build-esp-idf leg, on purpose: hil-244 needs
+  # build-esp-idf, so a red gate in that matrix would skip it; and the leg's build
+  # cache would flip between flagged and flagless builds on every run. Here the
+  # flags never change, so this job's cache (its own key, which names the flags
+  # and is never the shipping build's) stays incremental. The only `needs` is
+  # site-gate, like the other leaf jobs, and nothing waits for this job.
+  #
+  # Expected red on its first runs (library callees with no library_defaults row,
+  # frames that moved since the allowlist was written; #457). A signal, not a
+  # gate: do not add it to a required-checks list (desmo 2026-10-09), and there
+  # is no continue-on-error to hide the red. It uploads nothing.
+  stack-depth-gate:
+    name: Stack Depth Gate (esp32s3 / eth, #457)
+    runs-on: ubuntu-latest
+    needs: site-gate
+    if: ${{ !cancelled() && needs.site-gate.outputs.code != 'false' }}
+    container:
+      image: espressif/idf:v6.0.1
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          # As build-esp-idf (#411): full history and tags, so the version stamp
+          # configures exactly as it does for the shipping esp32s3/eth build.
+          fetch-depth: 0
+
+      # A key of its own: "callgraph-su" names the flags below, so a build
+      # with other flags is a different key, and it can never match (or prefix)
+      # build-esp-idf's `<os>-idf-<version>-<chip>-<transport>-` keys.
+      - name: Cache ESP-IDF Build Artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ccache
+            build
+          key: ${{ runner.os }}-idf-callgraph-su-v6.0.1-esp32s3-eth-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-idf-callgraph-su-v6.0.1-esp32s3-eth-
+
+      - name: Export Environment & Build Firmware with call-graph flags
+        env:
+          EXTRA_CFLAGS: "-fcallgraph-info=su -fstack-usage"
+          EXTRA_CXXFLAGS: "-fcallgraph-info=su -fstack-usage"
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target esp32s3
+          idf.py -D SIP_TRANSPORT=eth build
+
+      - name: Per-task stack depth gate (#457)
+        run: python3 tools/ci/task_stack_gate.py --ci-dir build/esp-idf --project-root "$GITHUB_WORKSPACE"
 
   # Job 2b: Heap-poisoning build.
   # The shipped default is HEAP_POISONING_LIGHT, which only checks an
