@@ -614,6 +614,42 @@ TEST(FinalFailureRelay, ASilentCalleesCancelIsEndedAt32sWithTheCallersOwn487)
 		<< "the PBX answers the caller's INVITE with its own 487, exactly once";
 }
 
+// A retransmitted CANCEL (same branch, same Call-ID, 500 ms later while the callee stays silent)
+// must leave the 32 s window armed from the first CANCEL: it neither clears it nor pushes it out.
+// RED against the first fix commit: the second CANCEL finds state Cancel and clears the timer.
+TEST(FinalFailureRelay, ARetransmittedCancelKeepsTheBoundedWaitArmedFromTheFirstCancel)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.50.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.50.20");
+	handler.handle(makeRegister("401", "192.168.50.20", "reg-401"));
+	handler.handle(makeRegister("402", "192.168.50.21", "reg-402"));
+	handler.handle(makeInvite("401", "402", "192.168.50.20", "cb-4", "z9hG4bKcb4"));
+
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-4", "z9hG4bKcb4"));
+	const auto afterFirst = TestClock::now();
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-4", "z9hG4bKcb4"));   // retransmit
+
+	const std::string key = "Call-ID: cb-4";
+	auto session = handler.getSession(key);
+	ASSERT_TRUE(session.has_value());
+	EXPECT_EQ(session.value()->getState(), Session::State::Cancel);
+	EXPECT_TRUE(session.value()->isRingExpired(afterFirst + std::chrono::seconds(32)))
+		<< "a retransmitted CANCEL must not disarm the 32 s bound";
+
+	session.value()->armRingTimer(TestClock::now() - std::chrono::seconds(1));
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+	EXPECT_FALSE(handler.getSession(key).has_value())
+		<< "the call is still ended once the 32 s are up";
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 487"), 1)
+		<< "exactly one 487 reaches the caller";
+}
+
 // RED on main for the plain call (its ring deadline is never honoured in state Cancel).
 // The emergency twin, armed past its deadline in the same tick, must stay untouched.
 TEST(FinalFailureRelay, AnEmergencyCancelIsNotEndedByTheBoundedWait)
