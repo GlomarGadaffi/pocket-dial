@@ -307,6 +307,83 @@ TEST_F(CoreDumpHttpTest, EraseNeedsTheCsrfTokenAndClearsTheDump)
 	EXPECT_FALSE(CoreDumpStore::query().present);
 }
 
+// #1045: the erase route is a 128 KiB flash erase, which stalls every flash-resident task
+// as an OTA flash does. It refuses while a call is up or ringing, with the same hasLiveCall()
+// gate and 409 busy body that POST /api/ota/upload uses (#986).
+namespace
+{
+	sockaddr_in eraseBusyAddr(const std::string& ip)
+	{
+		sockaddr_in a{};
+		a.sin_family = AF_INET;
+		a.sin_addr.s_addr = inet_addr(ip.c_str());
+		a.sin_port = htons(5060);
+		return a;
+	}
+
+	void eraseBusyRegister(RequestsHandler& h, const std::string& ext, const std::string& ip)
+	{
+		h.handle(RequestsHandler::getMessageFromPool(
+			"REGISTER sip:server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKebr" + ext + "\r\n"
+			"From: <sip:" + ext + "@server>;tag=ebr" + ext + "\r\n"
+			"To: <sip:" + ext + "@server>\r\n"
+			"Call-ID: eb-reg-" + ext + "\r\nCSeq: 1 REGISTER\r\n"
+			"Contact: <sip:" + ext + "@" + ip + ":5060>;expires=3600\r\n"
+			"Content-Length: 0\r\n\r\n", eraseBusyAddr(ip)));
+	}
+
+	// 101 (at .11) calls 102 (at .12): 102 rings, so a session is up.
+	void eraseBusyInvite(RequestsHandler& h, const std::string& callId)
+	{
+		const std::string sdp = "v=0\r\no=- 0 0 IN IP4 192.168.4.11\r\ns=-\r\nc=IN IP4 192.168.4.11\r\nt=0 0\r\n"
+		                        "m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+		h.handle(RequestsHandler::getMessageFromPool(
+			"INVITE sip:102@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 192.168.4.11:5060;branch=z9hG4bK" + callId + "\r\n"
+			"From: <sip:101@server>;tag=from" + callId + "\r\n"
+			"To: <sip:102@server>\r\n"
+			"Call-ID: " + callId + "\r\nCSeq: 1 INVITE\r\nMax-Forwards: 70\r\n"
+			"Contact: <sip:101@192.168.4.11:5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp,
+			eraseBusyAddr("192.168.4.11")));
+	}
+}
+
+TEST_F(CoreDumpHttpTest, EraseIsRefusedWhileACallIsRinging)
+{
+	AdminSession sysop, owner;
+	provisionBoth(_port, sysop, owner);
+	CoreDumpStore::setImageForTest(fakeImage());
+	eraseBusyRegister(*_handler, "101", "192.168.4.11");
+	eraseBusyRegister(*_handler, "102", "192.168.4.12");
+	eraseBusyInvite(*_handler, "cd-ring");
+	ASSERT_TRUE(_handler->hasLiveCall()) << "precondition: a call is ringing";
+
+	const std::string resp = httpRaw(_port, "POST", "/api/coredump/erase", "",
+		"pd_session=" + sysop.cookie, sysop.csrf);
+	EXPECT_EQ(statusOf(resp), 409) << resp;
+	EXPECT_NE(bodyOf(resp).find("\"error\":\"busy\""), std::string::npos) << bodyOf(resp);
+	EXPECT_NE(bodyOf(resp).find("call in progress"), std::string::npos) << bodyOf(resp);
+	EXPECT_TRUE(CoreDumpStore::query().present)
+		<< "a refused erase must not have run: the dump is still on flash";
+}
+
+TEST_F(CoreDumpHttpTest, EraseStillRunsOnAnIdleLine)
+{
+	AdminSession sysop, owner;
+	provisionBoth(_port, sysop, owner);
+	CoreDumpStore::setImageForTest(fakeImage());
+	ASSERT_FALSE(_handler->hasLiveCall()) << "precondition: no call is up";
+
+	const std::string resp = httpRaw(_port, "POST", "/api/coredump/erase", "",
+		"pd_session=" + sysop.cookie, sysop.csrf);
+	EXPECT_EQ(statusOf(resp), 200) << resp;
+	EXPECT_NE(bodyOf(resp).find("\"erased\":true"), std::string::npos) << bodyOf(resp);
+	EXPECT_FALSE(CoreDumpStore::query().present);
+}
+
 // Issue #405: /api/status is polled continuously on 4 KB per-connection
 // threads. It must report the dump from the boot-time cache, never by probing
 // the partition (the flash driver's call chain is the ~836 B of stack #405

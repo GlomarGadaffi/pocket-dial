@@ -41,7 +41,7 @@ curl -s -b jar -o core.bin $B/api/coredump
 |---|---|---|
 | `GET /api/coredump/info` | admin session | `supported`, `present` and `size`; plus `task`, `pc`, `elfSha`, `reason` and `valid` (stored checksum verified) when a dump is present |
 | `GET /api/coredump` | **owner** session (a sysop passes while no owner account exists, as with every #173 owner action) | the raw flash image, `application/octet-stream` |
-| `POST /api/coredump/erase` | admin session + `X-CSRF` | `{"erased":true}` |
+| `POST /api/coredump/erase` | admin session + `X-CSRF` | `{"erased":true}`; `409` busy while a call is up or ringing (#1045) |
 
 The download is owner-gated because a dump is a copy of task stacks at the moment of the panic, and a stack can hold a digest secret, an OAuth token or a TLS session key. Treat `core.bin` accordingly.
 
