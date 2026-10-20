@@ -361,6 +361,63 @@ TEST(ForceDisconnect, EchoLegFreesTheServerTransactionAndNeverByesTheStandInPeer
 	EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
 }
 
+TEST(ForceDisconnect, ToneLegByesTheKilledHandsetOnceAndNeverTheStandInPeer)
+{
+	// #1003: 100 dials the 440 tone. As on the echo leg above, the PBX is the UAS and the session's "dest" is a
+	// stand-in carrying 100's OWN address. The tone answer records its dialog headers (the 10-minute cap BYEs
+	// the phone from them), so a kill now has a src BYE to send, and the stand-in must stay silent: a second,
+	// tag-reversed BYE to the same phone is the #228 bug.
+	Rig rig;
+	const std::string callId = "kill-1003-tone";
+	{
+		std::string body = sdpBody(kCallerIp);
+		std::string raw =
+			"INVITE sip:440@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kCallerIp) + ":5060;branch=z9hG4bKi" + callId + "\r\n"
+			"From: <sip:100@server>;tag=ctag" + callId + "\r\n"
+			"To: <sip:440@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:100@" + std::string(kCallerIp) + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		rig.handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(kCallerIp)));
+	}
+	ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value())
+		<< "precondition: the tone call must be up before it is killed";
+
+	// The tone leg's own 200 OK carries the To-tag the Session must hold: capture it (it is random) so the
+	// BYE below is checked against the tag this call actually used.
+	std::string toneToTag;
+	for (const auto& [addr, msg] : rig.sent)
+	{
+		if (!msg) continue;
+		std::string raw = msg->toString();
+		if (raw.rfind("SIP/2.0 200 OK", 0) == 0 && headerValue(raw, "Call-ID") == callId)
+		{
+			toneToTag = headerValue(raw, "To");
+			break;
+		}
+	}
+	ASSERT_NE(toneToTag.find("tag="), std::string::npos)
+		<< "precondition: the tone leg's own 200 OK must carry a To-tag";
+
+	rig.sent.clear();
+	rig.handler.forceDisconnect("100");
+	flushAsyncOutbox(rig.handler);
+
+	const auto toCaller = byesTo(rig.sent, addrFor(kCallerIp));
+	ASSERT_EQ(toCaller.size(), 1u)
+		<< "exactly one BYE to the killed handset: the src leg's, never the dest stand-in's";
+	EXPECT_EQ(toCaller[0].rfind("BYE sip:100@" + std::string(kCallerIp) + ":5060 SIP/2.0", 0), 0u)
+		<< toCaller[0];
+	EXPECT_NE(headerValue(toCaller[0], "From").find(toneToTag.substr(toneToTag.find("tag="))),
+		std::string::npos) << toCaller[0];
+	EXPECT_NE(headerValue(toCaller[0], "To").find("tag=ctag" + callId), std::string::npos) << toCaller[0];
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
+}
+
 TEST(ForceDisconnect, KillingTheCalleeSideWorksToo)
 {
 	// The involvement check must match whichever leg the extension is on. This

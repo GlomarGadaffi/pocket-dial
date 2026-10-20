@@ -161,6 +161,13 @@ namespace
 	// long is ended. A live emergency call, one with RTP on either leg, is
 	// never cut; this only reclaims a call whose phone and far end both vanished.
 	constexpr auto kEmergencyRtpInactivityTimeout = std::chrono::hours(4);
+	// #1003 (desmo, 2026-10-19): a 440 tone call is ended this long after it was
+	// answered, even if its listener is healthy. 440 is answered a=sendonly, so a
+	// phone that vanished without a BYE cannot be told from a listener by rx
+	// silence, and its stream holds the board's one RtpSender slot (every other
+	// 440 caller gets 486) until the registration lease runs out. 911/933 never
+	// use 440.
+	constexpr auto k440MaxCallDuration = std::chrono::seconds(600);
 
 	// How long an outbound anchor/trunk call may RING before tick() reaps it.
 	//
@@ -3205,6 +3212,7 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	}
 
 	newSession->setDest(dummy440);
+	newSession->setToneCall(true);   // #1003: the 600 s cap keys on this; *11/*69 repoint dest at a 777 peer
 	_sessions.emplace(data->getCallID(), newSession);
 	newSession->setState(Session::State::Connected);
 
@@ -3215,6 +3223,12 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	// 777-bug class — see tests/SipMessage_test.cpp).
 	std::string toTag = IDGen::GenerateID(9);
 	std::string sdpBody = buildMediaSdp(activeIp, _rtpSender.serverRtpPort());
+	// #1003: this leg is server-terminated (the PBX is the UAS), so its dialog identity
+	// is known only here; the 777 and 888 answers record theirs the same way (#232).
+	// sweepToneCall() BYEs the phone from it when the 600 s cap ends the call, and a
+	// BYE with an empty From or To is malformed (#72).
+	newSession->setDialogHeaders(std::string(data->getFrom()),
+		std::string(data->getTo()) + ";tag=" + toTag);
 
 	// Assemble the OK from the INVITE's headers + our body. clearBody() leaves the
 	// header/blank-line boundary intact; we then append the SDP and let
@@ -3247,6 +3261,59 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 
 	queueLog("440 media: streaming tone to " + destIp + ":" + std::to_string(destPort)
 		+ " (callID=" + std::string(data->getCallID()) + ")");
+}
+
+// #1003 (desmo, 2026-10-19): end a 440 tone call that has run k440MaxCallDuration, and BYE
+// the phone. The tone is answered a=sendonly, so a phone that vanished without a BYE sends
+// nothing, exactly as a healthy listener does, and rx silence (#604) cannot tell them
+// apart; the orphan streams 50 packets/s to a dead port and holds the one RtpSender slot
+// until the registration lease runs out. So the bound is on duration, and it ends a healthy
+// long call too. The clock is the #604 watch with no packet counter to move it, so it reads
+// pure elapsed time from the first tick that finds the call Connected. A tone call is
+// found by Session::isToneCall(), set at setup, not by its dest: *11 and *69 over SIP INFO
+// repoint a live call's dest at a virtual 777 peer and the stream keeps the slot. A Held call is
+// disarmed by that sweep and resume restarts the clock (a 440 re-INVITE is declined, so a
+// real call never holds). A session flagged emergency is never cut (Rule 5; 911/933 never
+// use 440). Its own function so tick()'s frame does not grow (#457); noinline for the same
+// reason as byeFromPool(). endCall() stops the stream and frees the slot. Caller holds _mutex.
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+void RequestsHandler::sweepToneCall(std::chrono::steady_clock::time_point now)
+{
+	if (!_rtpSender.isActive()) return;   // no tone stream up: nothing holds the slot
+
+	std::shared_ptr<Session> over;
+	for (const auto& entry : _sessions)
+	{
+		const std::shared_ptr<Session>& session = entry.second;
+		if (!session->isToneCall() || session->getState() != Session::State::Connected ||
+		    session->isEmergency()) continue;
+		if (session->rtpSilence(0, 0, now) >= k440MaxCallDuration)
+		{
+			over = session;
+			break;
+		}
+	}
+	if (!over) return;
+
+	// The server is the UAS here and originates the BYE: our To is its From, on our own
+	// CSeq space (sweepMulticastPage()'s shape). Copies, because endCall() erases the
+	// map's entry and recycles the pooled Session.
+	const std::string callID = over->getCallID();
+	const auto src = over->getSrc();
+	const std::string& dFrom = over->getDialogFrom();
+	const std::string& dTo = over->getDialogTo();
+	const uint32_t byeCSeq = over->nextServerCSeq();
+	if (src && !dFrom.empty() && !dTo.empty())
+	{
+		auto bye = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom, byeCSeq);
+		if (bye) _outbox.emplace_back(src->getAddress(), std::move(bye));
+	}
+	over->noteServerCSeq(byeCSeq);
+	queueLog("[media] 440 tone call reached its " + std::to_string(k440MaxCallDuration.count()) +
+		" s limit -- ending " + callID, true);
+	endCall(callID, src ? src->getNumber() : "", "440", "440 maximum duration");
 }
 
 // ── Local N-way conference (virtual extension 888) ───────────────────────────
@@ -9555,7 +9622,7 @@ bool RequestsHandler::forceDisconnect(const std::string& extension)
 				auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom, byeCSeq);
 				if (b) _asyncOutbox.emplace_back(src->getAddress(), std::move(b));
 			}
-			// A virtual-extension leg (777 echo, 888 conference, 555 anchor, or a
+			// A virtual-extension leg (777 echo, 440 tone, 888 conference, 555 anchor, or a
 			// trunk call's stand-in "trunk" peer, #795) has no second phone: its
 			// "dest" is a stand-in SipClient carrying the CALLER's own address (see
 			// onReinvite()'s note), so a BYE to it would reach the caller a second
@@ -9563,7 +9630,8 @@ bool RequestsHandler::forceDisconnect(const std::string& extension)
 			// src BYE above already ends it; the carrier leg is endCall()'s.
 			const std::string destNum = dest ? dest->getNumber() : "";
 			// #800: a 997 page is one too, recognised by its own dialog.
-			const bool destIsVirtual = destNum == "777" || destNum == ConferenceRoom::EXT ||
+			const bool destIsVirtual = destNum == "777" || destNum == "440" ||
+			                           destNum == ConferenceRoom::EXT ||
 			                           destNum == kAnchorCallExt || session->isTrunk() ||
 			                           isMulticastPageCall(callID);
 			if (dest && !destIsVirtual && !dFrom.empty() && !dTo.empty())
@@ -11189,7 +11257,8 @@ void RequestsHandler::tick()
 		// silent participant is reaped while the others talk. Not watched: a
 		// peer-to-peer call, 777 (SDP loopback, no board RTP), and 440 or a
 		// parked call, which the board answers sendonly so the phone sends
-		// nothing; a park has its own timeout. A 997 page has its own silence
+		// nothing; a park has its own timeout and a 440 call its own 600 s cap
+		// (sweepToneCall(), run just below). A 997 page has its own silence
 		// sweep and voicemail legs are outside this one. Exempt: Held calls
 		// (a sendonly/inactive leg legitimately sends nothing; the watch
 		// restarts on resume). A 911/933 (Session::isEmergency()) gets the 4 h
@@ -11228,7 +11297,7 @@ void RequestsHandler::tick()
 			}
 			else
 			{
-				continue;   // no counter wired here: peer-to-peer, 777, 440, park, 997, voicemail
+				continue;   // no counter wired here: peer-to-peer, 777, 440 (sweepToneCall), park, 997, voicemail
 			}
 			const auto limit = session->isEmergency() ? std::chrono::steady_clock::duration(kEmergencyRtpInactivityTimeout)
 			                                           : std::chrono::steady_clock::duration(kRtpInactivityTimeout);
@@ -11284,6 +11353,10 @@ void RequestsHandler::tick()
 			if (inbound) endCall(callID, farNum, handsetNum, "rtp inactivity");
 			else         endCall(callID, handsetNum, farNum, "rtp inactivity");
 		}
+
+		// #1003: the 440 tone call's hard maximum duration. Its own function, not more
+		// of the sweep above, so tick()'s frame does not grow (#457's 1024 B ceiling).
+		sweepToneCall(now);
 
 		// Reap ORPHANED media bridges — active but with NO owning anchor session.
 		// Under a concurrent burst a bridge can outlive its session (a session

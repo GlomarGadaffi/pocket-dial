@@ -227,6 +227,11 @@ packet capture or a real phone (#800).
     extension-to-extension calls (peer-to-peer), and the `997` page and voicemail legs (the page
     has its own 5 s silence sweep above; voicemail is outside this one). A 911/933 gets a 4 h
     bound instead (#741).
+  * A `440` tone call is ended after **10 minutes** (600 s), however healthy (#1003): the phone is
+    sent a BYE and the stream slot is freed. The board answers `sendonly`, so a phone that
+    vanished without a BYE cannot be told from a listener by silence, and its stream would hold
+    the one `440` slot (every other caller gets 486) until the registration lease ran out. The
+    clock starts at the first 1 Hz tick after the call is answered. A 911/933 never uses `440`.
 
 Leave each phone's "answer OPTIONS / keep-alive" behavior at its default (on). The pruning
 decision for one registered client is:
@@ -269,7 +274,7 @@ flowchart TD
 | Hold / resume, blind & attended transfer, ring/hunt groups, pickup | **Peer-to-peer**, same property preserved; only the codec list is narrowed. |
 | Call parked on an orbit | **Peer-to-peer only while no hold-music clip is loaded.** With a clip loaded the board answers the parked leg `sendonly` from its own port and transmits G.711 µ-law to it for the duration of the park (`ParkOrbit::onInvite`); with no clip it answers `a=inactive` and sources nothing. Retrieve returns the call to peer-to-peer either way. A handset that cannot accept a `sendonly` answer on a re-INVITE will show this as a park-specific fault. |
 | `777` echo test | **Peer-to-peer, to itself.** The answer is an SDP loopback of the caller's own offer, so the phone streams to its own address. The board sources and receives *no* RTP. The loopback is built in the `777` branch of `RequestsHandler::onInvite`. |
-| `440` tone | **Server-terminated.** The board opens an RTP socket and sends a synthesized µ-law tone (`RtpSender.cpp`). One concurrent stream. |
+| `440` tone | **Server-terminated.** The board opens an RTP socket and sends a synthesized µ-law tone (`RtpSender.cpp`). One concurrent stream. A call is ended with a BYE after 10 minutes (§4). |
 | `555` anchor bridge | **Server-terminated.** The board sends *and* receives RTP and bridges it to an `AnchorClient`. `POCKETDIAL_MAX_ANCHOR_CALLS` = 4; effective limit is `min(provider, 4)`, and the default `LoopbackAnchorClient` declares 1. |
 | `888` conference | **Server-terminated.** The board decodes, mixes and re-encodes every leg (`MixBus`, `ConferenceRoom`). Capped at `POCKETDIAL_CONF_LEGS` = 4, no PIN, one global room. A leg whose phone sends no RTP for 60 s is ended with a BYE (§4). |
 | Outbound trunk call | **Server-terminated, two legs.** Your handset ↔ the board is ordinary **RTP** (a SIP phone speaks nothing else) through `MediaBridge`. The board ↔ carrier leg is the AnchorClient's chunked-HTTPS PCM16 stream, **not** SIP and **not** RTP, so the board never registers to an ITSP. Reaching a trunk at all requires a dial-plan rule with `action=trunk`; there is no "9" prefix and no fallback. See [FEATURE_ROADMAP.md §1.3](FEATURE_ROADMAP.md) and [`POST /api/dialplan`](API.md#post-apidialplan). |

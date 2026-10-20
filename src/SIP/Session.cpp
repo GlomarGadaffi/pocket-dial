@@ -76,6 +76,7 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	//
 	// Deliberately NOT mirrored in release(): see the note there.
 	_isVoicemail = false;
+	_isToneCall = false;   // #1003: a recycled slot is not a tone call
 	_voicemailLegSlot = -1;
 	_voicemailPurpose = VoicemailPurpose::Deposit;
 	_voicemailDeadlineArmed = false;
