@@ -10680,6 +10680,26 @@ size_t RequestsHandler::forgetLearnedDevices()
 	return removed;
 }
 
+bool RequestsHandler::adoptDevice(const std::string& mac, const std::string& ext,
+	Registrar::DeviceState state, bool locked)
+{
+	// What onRegister() checks before it adopts an extension: the charset and length,
+	// then the reserved/emergency/PSTN-shaped identity guard. A restored file gets no
+	// weaker ones.
+	if (!isValidAor(ext) || pbx::isReservedOrPstnAor(ext)) return false;
+	std::vector<std::pair<bool, std::string>> localLogs;
+	bool adopted = false;
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		adopted = _registrar.adoptDevice(mac, ext, state, locked);
+		applyDeviceChange(_registrar.consumeDevicesChange());
+		localLogs = std::move(_logQueue);
+		_logQueue.clear();
+	}
+	printLogs(localLogs);
+	return adopted;
+}
+
 // ── Outbound SIP MESSAGE (STAGE 2) ────────────────────────────────────────────
 
 bool RequestsHandler::sendMessageTo(const std::string& ext, const std::string& text)

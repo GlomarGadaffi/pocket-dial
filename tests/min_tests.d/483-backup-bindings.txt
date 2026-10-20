@@ -1,0 +1,2 @@
+# ConfigExportImport_test.cpp: 3 (#483: MAC bindings, registrar mode and the telephony slot across an encrypted restore; a plaintext import adopts no binding; REPLACE drops rows the file lacks)
+3

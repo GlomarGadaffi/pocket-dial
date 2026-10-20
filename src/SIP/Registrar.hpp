@@ -171,6 +171,13 @@ public:
 	// #515: forget every Learned device in one step (one NVS write); Secured
 	// devices are kept. Returns how many were removed.
 	size_t forgetLearned();
+	// #483: install one row from a restored config export, replacing any row for `mac`.
+	// False, nothing changed, for: a MAC that is not 12 lowercase hex; an empty extension,
+	// or one holding a tab or newline (the NVS blob's delimiters); a Secured row whose
+	// extension has no stored secret (the guard secure() applies to a live promotion);
+	// a new MAC when the table is at POCKETDIAL_MAX_CLIENTS (nothing is evicted). The AOR
+	// and identity checks are the caller's (RequestsHandler::adoptDevice).
+	bool adoptDevice(const std::string& mac, const std::string& ext, DeviceState state, bool locked);
 	// Current registry contents (MAC-sorted by map order) for the dashboard
 	// snapshot mirror.
 	std::vector<AdoptedDevice> adoptedDevices() const;

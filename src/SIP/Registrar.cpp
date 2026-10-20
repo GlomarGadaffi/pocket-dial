@@ -725,6 +725,37 @@ size_t Registrar::forgetLearned()
 	return n;
 }
 
+bool Registrar::adoptDevice(const std::string& mac, const std::string& ext, DeviceState state, bool locked)
+{
+	// The table is persisted as "mac \t ext \t ..." lines, so the MAC must be what ARP
+	// resolution yields (toHex12) and the extension must hold neither delimiter.
+	const auto lowerHex = [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); };
+	if (mac.size() != 12 || !std::all_of(mac.begin(), mac.end(), lowerHex) ||
+		ext.empty() || ext.find_first_of("\t\n") != std::string::npos)
+	{
+		return false;
+	}
+	// A Secured row with no stored secret would digest-challenge a phone that can never
+	// answer: the lockout secure() refuses.
+	if (state == DeviceState::Secured && !SipSecretStore::hasSecret(ext)) return false;
+	// A restore never evicts: it was handed these rows and the table it emptied has room
+	// for POCKETDIAL_MAX_CLIENTS of them, so a crafted file cannot grow it past that.
+	if (_devices.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS) && _devices.find(mac) == _devices.end())
+	{
+		return false;
+	}
+	DeviceRecord rec;
+	rec.extension = ext;
+	rec.state = state;
+	rec.locked = locked;
+	rec.seq = _nextSeq++;
+	_devices[mac] = std::move(rec);
+	persistDevices();
+	noteChange(Change::Structural);
+	_env.log("Device " + mac + " (ext " + ext + ") restored from a config import");
+	return true;
+}
+
 std::vector<Registrar::AdoptedDevice> Registrar::adoptedDevices() const
 {
 	std::vector<AdoptedDevice> out;

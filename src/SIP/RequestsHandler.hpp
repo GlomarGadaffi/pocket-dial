@@ -1116,6 +1116,10 @@ public:
 	bool forgetDevice(const std::string& macOrExt);
 	// #515: forget every Learned device at once; Secured ones stay. Thread-safe + persisted.
 	size_t forgetLearnedDevices();
+	// #483: install one binding from a restored config export (only the Owner-gated import
+	// calls this). Registrar::adoptDevice's checks, after the AOR charset and identity guard
+	// onRegister() applies. Returns false, nothing changed, if any refuses. Thread-safe + persisted.
+	bool adoptDevice(const std::string& mac, const std::string& ext, DeviceState state, bool locked);
 
 private:
 	void initHandlers();

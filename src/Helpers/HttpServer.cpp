@@ -6011,31 +6011,30 @@ namespace
 // real gaps fell out of that constraint, and are surfaced here rather than
 // hidden:
 //
-//   1. Per-extension digest secrets (SipSecretStore::getHa1) and MAC bindings
-//      (RequestsHandler::getAdoptedDevices) export cleanly but have NO way
-//      back in: SipSecretStore exposes setSecret(ext, PLAINTEXT) but no
-//      "install this HA1 directly" setter, and there is no adoptDevice(mac,
-//      ext, state)-shaped mutator at all. sendApiConfigImport() reports both
-//      as "skipped" rather than silently dropping them.
+//   1. (Closed.) Per-extension digest secrets come back through
+//      SipSecretStore::setHa1 (#482, #484) and MAC bindings through
+//      RequestsHandler::adoptDevice (#483), both from the secretsEnc block
+//      only: a Secured or locked row decides who may register an extension, so
+//      a sysop-level import must not be able to create one.
 //   2. A TelephonyApiConfig slot's actual secret is masked by SlotView
 //      (secretSet only) with no accessor that would reverse that -- the
 //      gated block below carries baseUrl/clientId/routeDn per slot, never
 //      the secret. An operator restoring a trunk config re-enters that one
-//      field once, same as fresh setup.
+//      field once, same as fresh setup. That is on purpose (#483): a second
+//      board given the first one's client secret connects as the same device
+//      and fights it for the control WebSocket (#396), so the import names it
+//      under "skipped" instead.
 //   3. mDNS hostname (POCKETDIAL_HOSTNAME) and the park-call timeout
 //      (POCKETDIAL_PARK_TIMEOUT_SEC) are compile-time constants in this
 //      codebase today, not NVS-backed settings -- included as informational
 //      plaintext fields so a restored device's operator can see what the
 //      backed-up device was running under; import is a no-op for both.
 //
-// Followup filed in the PR description: an adoptDevice()/setHa1() pair on
-// RequestsHandler/SipSecretStore, and a masked-secret round trip for
-// TelephonyApiConfig slots, would close gaps 1 and 2 without ever exposing a
-// plaintext secret over this API.
-//
 // #483 section C: the ITSP trunk, SMTP, E911 and admin_ext, through the
 // helpers their own routes use (defined with those routes below). The
 // constrained 4 MB image has no room for it (#689); main/CMakeLists.txt sets 0.
+// The MAC bindings in secretsEnc (#483, gap 1) ride the same switch, for the same
+// reason; an import that carries them says so under "skipped" there.
 #ifndef POCKETDIAL_BACKUP_SECTION_C
 #define POCKETDIAL_BACKUP_SECTION_C 1
 #endif
@@ -6054,8 +6053,9 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 	std::ostringstream pt;
 	pt << "{";
 
-	// Extensions + MAC bindings (always-plaintext per #186's field list).
-	// EXPORT ONLY -- see gap 1 above.
+	// Extensions + MAC bindings (always-plaintext per #186's field list). Readable
+	// here, but the import never adopts from this list: it restores bindings only
+	// from the secretsEnc copy below, which also carries the lock (gap 1 above).
 	pt << "\"extensions\":[";
 	{
 		bool first = true;
@@ -6343,6 +6343,29 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 			      << "\",\"smtpPass\":\"" << jsonEscape(email.pass)
 			      << "\",\"gsaKey\":\"" << jsonEscape(email.gsaKey) << "\"";
 		}
+		// #483: the MAC bindings, lock included. A Secured or locked row decides who
+		// may register an extension, so restoring one is as privileged as restoring an
+		// HA1 (the route is Owner-gated for the same reason). Unclaimed zero-touch
+		// rows (#826) stay out: restored as plain locked rows, nothing would evict them.
+		gated << ",\"extensions\":[";
+		{
+			bool first = true;
+			if (handler)
+			{
+				for (const auto& d : handler->getAdoptedDevices())
+				{
+					if (d.assigned) continue;
+					if (!first) gated << ",";
+					first = false;
+					gated << "{\"mac\":\"" << jsonEscape(d.mac)
+					      << "\",\"extension\":\"" << jsonEscape(d.extension)
+					      << "\",\"state\":\""
+					      << ((d.state == RequestsHandler::DeviceState::Secured) ? "secured" : "learned")
+					      << "\",\"locked\":" << (d.locked ? "true" : "false") << "}";
+				}
+			}
+		}
+		gated << "]";
 #endif
 		gated << "}";
 		std::string gatedPlaintext = gated.str();
@@ -6392,11 +6415,11 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 //
 // DEVIATION FROM THE ISSUE TEXT: #186 describes a 204 on success. This
 // returns 200 with {"applied":[...],"skipped":[...]} instead -- see gaps 1/2
-// on sendApiConfigExport() above: this feature genuinely cannot restore
-// everything a plaintext-capable export can carry (MAC bindings, digest
-// secrets, a trunk slot's secret), and a bare 204 would tell the operator
-// "fully restored" when it was not. Silently dropping those fields would be
-// worse than saying so.
+// on sendApiConfigExport() above: this feature does not restore everything
+// an export can carry (MAC bindings and digest secrets only from a password-
+// encrypted file, a telephony client secret never), and a bare 204 would tell
+// the operator "fully restored" when it was not. Silently dropping those
+// fields would be worse than saying so.
 void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 {
 	if (getFormParam(body, "confirm") != "REPLACE")
@@ -6509,9 +6532,20 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 	std::vector<std::string> applied;
 	std::vector<std::string> skipped;
 
-	if (!pt->arrayOr("extensions").empty())
+	// #483: MAC bindings (state and lock too) come back ONLY from the decrypted secretsEnc
+	// block, applied below with the other Owner-gated data: a Secured or locked row decides
+	// who may register an extension, so a sysop-level import must not be able to create one.
+	// The plaintext list is informational. A block without the key (an encrypted export from
+	// before this) leaves the table alone, like extensionSecrets.
+	const JsonReader::Value* bindings = nullptr;
+#if POCKETDIAL_BACKUP_SECTION_C
+	if (haveSecrets) bindings = secretsValue.find("extensions");
+	if (bindings != nullptr && !bindings->isArray()) bindings = nullptr;
+#endif
+	if (bindings == nullptr && !pt->arrayOr("extensions").empty())
 	{
-		skipped.push_back("extensions (MAC bindings: no import accessor -- see PR description)");
+		skipped.push_back("extensions (MAC bindings travel only in the password-encrypted export, "
+			"on a build that carries them -- re-export with a password)");
 	}
 	// #482: digest secrets come back ONLY from the decrypted secretsEnc block
 	// (applied further below). An export from before #482 carried them in the
@@ -6646,59 +6680,6 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		}
 		applied.push_back("didMappings");
 
-		// Registrar mode: the SAME lockout guard sendApiRegistrarSet() already
-		// enforces for a live switch to `secure` -- restoring `secure` onto a
-		// device whose extensions could NOT be restored (see the
-		// extensions/extensionSecrets skip above) would digest-challenge every
-		// REGISTER with no working handset left to notice. Every other mode
-		// applies outright.
-		//
-		// #500: an export from before the open registrar was retired may say
-		// "open". Apply learn, the closest mode that still exists (it admits every
-		// phone's first REGISTER), and say so, so the operator is not surprised.
-		RequestsHandler::RegistrarMode parsedMode;
-		// A blob with no registrarMode key leaves the mode as it is (BigDog's #502
-		// review): defaulting a missing key would quietly drop a Secure board to
-		// Learn, reported only under "applied". The empty string parses as no
-		// mode, so nothing below applies it.
-		std::string importedMode = pt->stringOr("registrarMode", "");
-		if (importedMode.empty())
-		{
-			skipped.push_back("registrarMode (not in the file; left unchanged)");
-		}
-		if (importedMode == "open")
-		{
-			importedMode = "learn";
-			skipped.push_back("registrarMode=open (the open registrar is retired; applied learn instead)");
-		}
-		if (parseRegistrarMode(importedMode, parsedMode))
-		{
-			if (parsedMode == RequestsHandler::RegistrarMode::Secure)
-			{
-				size_t secured = 0;
-				for (const auto& d : handler->getAdoptedDevices())
-				{
-					if (d.state == RequestsHandler::DeviceState::Secured) ++secured;
-				}
-				if (secured == 0)
-				{
-					skipped.push_back("registrarMode=secure (no extensions are secured on "
-						"this device yet -- would lock out every phone; switch manually "
-						"once extensions are re-provisioned)");
-				}
-				else
-				{
-					handler->setRegistrarMode(parsedMode);
-					applied.push_back("registrarMode");
-				}
-			}
-			else
-			{
-				handler->setRegistrarMode(parsedMode);
-				applied.push_back("registrarMode");
-			}
-		}
-
 		// Telephony-config metadata (type/enabled only -- baseUrl/clientId/
 		// routeDn are gated, applied further below if a password was given).
 		// keepSecret=true always: the plaintext half never carries the
@@ -6708,10 +6689,12 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		// keepSecret=true none of them writes a secret either: the import holds
 		// _mutex for no telephony flash I/O at all. A "" means staged, not on flash.
 		bool telRefused = false;
+		bool tapiSecretListed = false;
 		for (const auto& slot : pt->arrayOr("telephonyConfig"))
 		{
 			int idxI = slot.intOr("index", -1);
 			if (idxI < 0) continue;
+			if (slot.boolOr("secretSet")) tapiSecretListed = true;
 			size_t idx = static_cast<size_t>(idxI);
 			TelephonyApiConfig::SlotView existing = handler->getTelephonyConfigSlot(idx);
 			TelephonyApiConfig::Slot s;
@@ -6744,6 +6727,15 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 			}
 		}
 		if (!telRefused) applied.push_back("telephonyConfig (metadata)");
+		// #483, on purpose: a client secret is never exported, so the stored ones stay. Were
+		// it carried, a second board would connect as the first one's device and the two
+		// would fight over the control WebSocket (#396). The provider type is likewise kept.
+		if (tapiSecretListed)
+		{
+			skipped.push_back("telephonyConfig client secrets and provider types (not restored: "
+				"select the type and enter the secret on this board; a second board given the "
+				"first one's secret fights it for the control WebSocket, #396)");
+		}
 	}
 	else
 	{
@@ -6866,6 +6858,42 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 				skipped.push_back("extensionSecrets (" + std::to_string(overCap) +
 					" entries over the device's capacity of " + std::to_string(cap) + ")");
 		}
+#if POCKETDIAL_BACKUP_SECTION_C
+		// #483: the MAC bindings, after the digest secrets (a Secured row is adopted only
+		// once its extension has one). REPLACE means replace: every current row goes first,
+		// or a locked claim already on this board and the file's own would each reject the
+		// other's phone. The emptied table holds POCKETDIAL_MAX_CLIENTS rows and no more,
+		// so a crafted file cannot flood it.
+		if (bindings != nullptr && handler)
+		{
+			for (const auto& d : handler->getAdoptedDevices()) handler->forgetDevice(d.mac);
+			size_t restored = 0, rejected = 0;
+			for (const auto& e : secretsValue.arrayOr("extensions"))
+			{
+				const std::string state = e.stringOr("state");
+				if ((state == "secured" || state == "learned") &&
+					handler->adoptDevice(e.stringOr("mac"), e.stringOr("extension"),
+						state == "secured" ? RequestsHandler::DeviceState::Secured
+						                   : RequestsHandler::DeviceState::Learned,
+						e.boolOr("locked")))
+				{
+					++restored;
+				}
+				else
+				{
+					++rejected;
+				}
+			}
+			applied.push_back("extensions (" + std::to_string(restored) + " MAC bindings)");
+			if (rejected > 0)
+				skipped.push_back("extensions (" + std::to_string(rejected) + " bindings refused: "
+					"malformed, Secured without its digest secret, or over the device's capacity)");
+		}
+		else if (bindings != nullptr)
+		{
+			skipped.push_back("extensions (SIP engine not attached yet)");
+		}
+#endif
 	}
 	else if (secretsEncNode)
 	{
@@ -6880,6 +6908,64 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		skipped.push_back("extensionSecrets (" + std::to_string(securedListed) +
 			" secured extension(s): digest secrets travel only in the password-encrypted "
 			"export -- re-export with a password, or re-set them)");
+	}
+
+	// Registrar mode, decided last (#483): the lockout guard below counts Secured rows,
+	// and those are only there once the digest secrets and MAC bindings above came back.
+	if (handler)
+	{
+		// Registrar mode: the SAME lockout guard sendApiRegistrarSet() already
+		// enforces for a live switch to `secure` -- restoring `secure` onto a
+		// device whose extensions could NOT be restored (see the
+		// extensions/extensionSecrets skip above) would digest-challenge every
+		// REGISTER with no working handset left to notice. Every other mode
+		// applies outright.
+		//
+		// #500: an export from before the open registrar was retired may say
+		// "open". Apply learn, the closest mode that still exists (it admits every
+		// phone's first REGISTER), and say so, so the operator is not surprised.
+		RequestsHandler::RegistrarMode parsedMode;
+		// A blob with no registrarMode key leaves the mode as it is (BigDog's #502
+		// review): defaulting a missing key would quietly drop a Secure board to
+		// Learn, reported only under "applied". The empty string parses as no
+		// mode, so nothing below applies it.
+		std::string importedMode = pt->stringOr("registrarMode", "");
+		if (importedMode.empty())
+		{
+			skipped.push_back("registrarMode (not in the file; left unchanged)");
+		}
+		if (importedMode == "open")
+		{
+			importedMode = "learn";
+			skipped.push_back("registrarMode=open (the open registrar is retired; applied learn instead)");
+		}
+		if (parseRegistrarMode(importedMode, parsedMode))
+		{
+			if (parsedMode == RequestsHandler::RegistrarMode::Secure)
+			{
+				size_t secured = 0;
+				for (const auto& d : handler->getAdoptedDevices())
+				{
+					if (d.state == RequestsHandler::DeviceState::Secured) ++secured;
+				}
+				if (secured == 0)
+				{
+					skipped.push_back("registrarMode=secure (no extensions are secured on "
+						"this device yet -- would lock out every phone; switch manually "
+						"once extensions are re-provisioned)");
+				}
+				else
+				{
+					handler->setRegistrarMode(parsedMode);
+					applied.push_back("registrarMode");
+				}
+			}
+			else
+			{
+				handler->setRegistrarMode(parsedMode);
+				applied.push_back("registrarMode");
+			}
+		}
 	}
 
 #if POCKETDIAL_BACKUP_SECTION_C
