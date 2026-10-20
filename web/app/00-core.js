@@ -3,6 +3,16 @@
    Gate controls with data-needs="login"|"owner". poll.register(path, ms, fn, "<section>") runs only while shown; true runs always. */
 /* Swapped for the session token when served. */
 var PD_CSRF="__PD_CSRF__";
+/* The board serves 3 connections and refuses a source that holds more than 2 (kMaxConnectionsPerSource, #529),
+   and a 3rd request is DRAM it cannot spare. The page used to fire up to 6 GETs at once at boot and got 503s. Every
+   fetch goes through a FIFO queue of 2, and a slot frees when the body has been read, not at the headers. Uploads
+   use XHR and are not queued. */
+(function(){var f=window.fetch.bind(window),q=[],n=0;
+ function done(){n--;next();}
+ function next(){while(n<2&&q.length){var j=q.shift();n++;
+  f(j.u,j.o).then(r=>{r.clone().arrayBuffer().then(done,done);j.res(r);},e=>{done();j.rej(e);});}}
+ window.fetch=function(u,o){return new Promise((res,rej)=>{q.push({u:u,o:o,res:res,rej:rej});next();});};
+})();
 var adminState={needsSetup:false,loggedIn:false,role:"",csrf:PD_CSRF,ownerProvisioned:false,remain:0,expired:false};
 var otaUploading=false;
 var failCount=0;

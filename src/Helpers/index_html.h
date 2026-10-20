@@ -1296,6 +1296,12 @@ R"html18(
 </dialog>
 <script>
 var PD_CSRF="__PD_CSRF__";
+(function(){var f=window.fetch.bind(window),q=[],n=0;
+function done(){n--;next();}
+function next(){while(n<2&&q.length){var j=q.shift();n++;
+f(j.u,j.o).then(r=>{r.clone().arrayBuffer().then(done,done);j.res(r);},e=>{done();j.rej(e);});}}
+window.fetch=function(u,o){return new Promise((res,rej)=>{q.push({u:u,o:o,res:res,rej:rej});next();});};
+})();
 var adminState={needsSetup:false,loggedIn:false,role:"",csrf:PD_CSRF,ownerProvisioned:false,remain:0,expired:false};
 var otaUploading=false;
 var failCount=0;
@@ -1443,7 +1449,10 @@ if(b===armCur)armCur=null;
 armPaint(b,false);};
 ui.arm=(b,label,onExec)=>{
 if(!b)return;
-b._armLabel=label;
+)html18";
+
+static const char PD_HTML_19[] =
+R"html19(b._armLabel=label;
 if(b._armT){ui.disarm(b);onExec();return;}
 ui.disarm(armCur);
 armCur=b;
@@ -1455,10 +1464,7 @@ ui.confirm=(title,line,actionLabel)=>{
 var d=$("confirm-dlg");
 if(confirmRes){var old=confirmRes;confirmRes=null;old(false);}
 $("confirm-t").textContent=title;
-)html18";
-
-static const char PD_HTML_19[] =
-R"html19($("confirm-d").textContent=line;
+$("confirm-d").textContent=line;
 $("confirm-yes").textContent=actionLabel||"Confirm";
 return new Promise(res=>{
 confirmRes=res;
@@ -1854,15 +1860,15 @@ if(pin&&!/^[0-9]{4,16}$/.test(pin)){setMsg("setup-msg","The DTMF PIN must be 4 t
 var b={username:user,password:pass};
 if(pin)b.dtmfPin=pin;
 post("/api/admin/set-credential",b).then(()=>{
-["setup-pass","setup-pass2","setup-pin"].forEach(i=>{$(i).value="";});
+)html19";
+
+static const char PD_HTML_20[] =
+R"html20(["setup-pass","setup-pass2","setup-pin"].forEach(i=>{$(i).value="";});
 setMsg("setup-msg","Login saved. The factory login is retired.","ok");
 return fetchAdminStatus();
 }).then(()=>{
 if(!adminState.loggedIn&&!adminState.needsSetup)openLogin("Login saved. Log in with the new credentials.");
-)html19";
-
-static const char PD_HTML_20[] =
-R"html20(}).catch(e=>{setMsg("setup-msg","Could not save the login: "+e.message,msgCls(e));});
+}).catch(e=>{setMsg("setup-msg","Could not save the login: "+e.message,msgCls(e));});
 }
 var nav={current:""};
 nav.render=()=>{
