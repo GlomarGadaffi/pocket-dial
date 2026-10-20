@@ -141,7 +141,11 @@ APPROVALS = (
     # desmo, 2026-09-27: rows X1-X7 to the designated far end only.
     "https://github.com/GlomarGadaffi/pocket-dial/discussions/451#discussioncomment-18621141",
 )
-EXTRA_APPROVALS = ()          # a later recorded approval is added here by a reviewed PR
+EXTRA_APPROVALS = (
+    # desmo, 2026-10-19: #370 comment 15, the get_sock_shutdown probe fault plus the x370 ballast and
+    # far-end approvals (per-run ballast OKs are still needed separately).
+    "https://github.com/GlomarGadaffi/pocket-dial/issues/370#issuecomment-6280577487",
+)
 # The recorded approvals above allow ~30 s a call. A held scenario (x952) keeps one call up for minutes,
 # so it needs its own recorded OK, and an old approval never covers it.
 LONG_HOLD_APPROVALS = (
