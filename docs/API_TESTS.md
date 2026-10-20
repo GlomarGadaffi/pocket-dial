@@ -687,13 +687,23 @@ normal `ctest` pass; see §6.
   `wifiMode` that would otherwise silently wrap into a valid value via integer
   narrowing, and a missing `confirm=REPLACE` (`400`); and that
   the admin credential's hash (and the operators' real passwords) never appear
-  anywhere in an export, plaintext or decrypted-gated.
+  anywhere in an export, plaintext or decrypted-gated. The MAC-binding restore (#483)
+  is covered end to end: a Learned, a locked and a Secured binding, Secure mode and a
+  telephony slot reproduced on a fresh handler; a plaintext import adopting none;
+  REPLACE dropping rows the file lacks; one refused row (service name, uppercase or
+  short MAC, tab in the extension, Secured without a stored secret, duplicate MAC, bad
+  state or flags, wrong shape, one row past capacity) leaving the table as it was with
+  the row and reason class reported; an empty list clearing, and a file with no list
+  leaving the table alone; a sysop import with a password getting `403`; a table the NVS
+  writer refuses being reported rather than claimed; the lock and shared flags and the
+  first-claim order of rows for one extension surviving a round trip; and a full table
+  of `POCKETDIAL_MAX_CLIENTS` Secured bindings exporting under a stated size and
+  restoring.
 
-**Known gap this suite does NOT cover** (see `HttpServer.cpp`'s
-`sendApiConfigExport()` comment): a
-Secure-mode fleet cannot be fully restored end-to-end, because per-extension digest
-secrets and MAC-to-extension bindings export but have no import accessor on
-`RequestsHandler`/`SipSecretStore` today, and a telephony-trunk slot's client secret
-is never exported at all (`TelephonyApiConfig::SlotView` masks it with no reversing
-accessor). All three are reported `skipped` by the import response rather than
-silently dropped, and are tracked as a follow-up.
+**What this suite deliberately does not restore** (see `HttpServer.cpp`'s
+`sendApiConfigExport()` comment): a telephony-trunk slot's client secret is never
+exported (`TelephonyApiConfig::SlotView` masks it with no reversing accessor, on
+purpose: a second board holding the first one's secret would fight it for the control
+WebSocket, #396), and the slot's provider type is kept as it is on the board. The
+import names both under `skipped` rather than dropping them silently. Per-extension
+digest secrets and the MAC bindings are restored, from a password-encrypted file only.

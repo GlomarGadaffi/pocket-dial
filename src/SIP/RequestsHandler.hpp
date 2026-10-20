@@ -1116,10 +1116,15 @@ public:
 	bool forgetDevice(const std::string& macOrExt);
 	// #515: forget every Learned device at once; Secured ones stay. Thread-safe + persisted.
 	size_t forgetLearnedDevices();
-	// #483: install one binding from a restored config export (only the Owner-gated import
-	// calls this). Registrar::adoptDevice's checks, after the AOR charset and identity guard
-	// onRegister() applies. Returns false, nothing changed, if any refuses. Thread-safe + persisted.
-	bool adoptDevice(const std::string& mac, const std::string& ext, DeviceState state, bool locked);
+	// #483: replace the whole device table with a restored config export's rows, all or
+	// nothing (Registrar::replaceDevices; only the Owner-gated import calls this), in ONE
+	// _mutex hold with one persist and one snapshot rebuild. Each extension must pass what
+	// onRegister() demands before it adopts one: the AOR charset and length, the engine's
+	// service names, the reserved / emergency / PSTN-shaped identities. `faults` may already
+	// hold rows the caller could not read; with any fault left on return (Refused) the table
+	// is untouched, and so it is for NotStaged. Thread-safe + persisted.
+	Registrar::ReplaceResult replaceBindings(const std::vector<Registrar::Binding>& rows,
+		std::vector<Registrar::BindingFault>& faults);
 
 private:
 	void initHandlers();

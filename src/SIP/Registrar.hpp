@@ -67,6 +67,7 @@ public:
 		bool locked = false;     // #440: Learn has bound its extension to this MAC
 		bool shared = false;     // #440: this MAC registered >1 extension (NAT) -- never locked
 		bool assigned = false;   // #826: zero-touch row its MAC has not registered yet
+		uint32_t seq = 0;        // #483: adoption order, lowest = first claim (the export sorts by it)
 	};
 
 	// RetryLater (#515, #440): admitLearn has already enqueued a 503 + Retry-After.
@@ -171,13 +172,38 @@ public:
 	// #515: forget every Learned device in one step (one NVS write); Secured
 	// devices are kept. Returns how many were removed.
 	size_t forgetLearned();
-	// #483: install one row from a restored config export, replacing any row for `mac`.
-	// False, nothing changed, for: a MAC that is not 12 lowercase hex; an empty extension,
-	// or one holding a tab or newline (the NVS blob's delimiters); a Secured row whose
-	// extension has no stored secret (the guard secure() applies to a live promotion);
-	// a new MAC when the table is at POCKETDIAL_MAX_CLIENTS (nothing is evicted). The AOR
-	// and identity checks are the caller's (RequestsHandler::adoptDevice).
-	bool adoptDevice(const std::string& mac, const std::string& ext, DeviceState state, bool locked);
+	// #483: replace the whole table with a restored config export's rows, ALL OR NOTHING.
+	// Every row is checked first; one refused row, or a table the NVS writer will not take,
+	// and the table is exactly as it was. Done in one pass under the caller's _mutex hold,
+	// with one persist and one change flag, so no reader sees a half-restored table.
+	//   mac        12 lowercase hex (what ARP resolution yields)
+	//   extension  non-empty, no tab or newline (the NVS blob's delimiters), and accepted by
+	//              `extensionOk` (the caller's AOR / identity checks)
+	//   duplicate  a MAC listed twice is refused, not last-one-wins
+	//   secret     a Secured row's extension must already have a stored secret (the guard
+	//              secure() applies to a live promotion), so restore the secrets first
+	//   capacity   a row past POCKETDIAL_MAX_CLIENTS; nothing is ever evicted
+	// Rows are adopted in list order, so seq (first-claim order) rises with it. A phone's
+	// live online flag survives if its MAC is in both tables.
+	// `faults` may already hold rows the caller could not read (a row index and a reason
+	// class, never a value); this adds the table's own. Replaced / Refused (faults is not
+	// empty) / NotStaged (nothing refused, but the device table could not be staged).
+	struct Binding
+	{
+		std::string mac;
+		std::string extension;
+		DeviceState state = DeviceState::Learned;
+		bool locked = false;
+		bool shared = false;
+	};
+	struct BindingFault
+	{
+		std::size_t row;
+		const char* why;   // a string literal: "shape", "state", "flags", "mac", "extension", ...
+	};
+	enum class ReplaceResult : uint8_t { Replaced, Refused, NotStaged };
+	ReplaceResult replaceDevices(const std::vector<Binding>& rows,
+		FunctionRef<bool(const std::string&)> extensionOk, std::vector<BindingFault>& faults);
 	// Current registry contents (MAC-sorted by map order) for the dashboard
 	// snapshot mirror.
 	std::vector<AdoptedDevice> adoptedDevices() const;

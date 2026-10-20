@@ -10680,24 +10680,27 @@ size_t RequestsHandler::forgetLearnedDevices()
 	return removed;
 }
 
-bool RequestsHandler::adoptDevice(const std::string& mac, const std::string& ext,
-	Registrar::DeviceState state, bool locked)
+Registrar::ReplaceResult RequestsHandler::replaceBindings(const std::vector<Registrar::Binding>& rows,
+	std::vector<Registrar::BindingFault>& faults)
 {
-	// What onRegister() checks before it adopts an extension: the charset and length,
-	// then the reserved/emergency/PSTN-shaped identity guard. A restored file gets no
-	// weaker ones.
-	if (!isValidAor(ext) || pbx::isReservedOrPstnAor(ext)) return false;
+	// What onRegister() demands before it adopts an extension: the charset and length, then
+	// the engine's own service names (a REGISTER as "pbx" is refused 403, so a row for one
+	// can never have existed, and findProvisioningInfo() would serve it a config), then the
+	// reserved, emergency and PSTN-shaped identities. A restored file gets no weaker checks.
+	auto extensionOk = [this](const std::string& ext) {
+		return isValidAor(ext) && !pbx::isServiceName(ext) && !pbx::isReservedOrPstnAor(ext);
+	};
 	std::vector<std::pair<bool, std::string>> localLogs;
-	bool adopted = false;
+	Registrar::ReplaceResult result = Registrar::ReplaceResult::Refused;
 	{
 		std::lock_guard<pd::TimedMutex> lock(_mutex);
-		adopted = _registrar.adoptDevice(mac, ext, state, locked);
+		result = _registrar.replaceDevices(rows, extensionOk, faults);
 		applyDeviceChange(_registrar.consumeDevicesChange());
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
 	printLogs(localLogs);
-	return adopted;
+	return result;
 }
 
 // ── Outbound SIP MESSAGE (STAGE 2) ────────────────────────────────────────────

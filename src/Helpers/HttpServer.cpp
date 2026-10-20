@@ -6013,7 +6013,7 @@ namespace
 //
 //   1. (Closed.) Per-extension digest secrets come back through
 //      SipSecretStore::setHa1 (#482, #484) and MAC bindings through
-//      RequestsHandler::adoptDevice (#483), both from the secretsEnc block
+//      RequestsHandler::replaceBindings (#483), both from the secretsEnc block
 //      only: a Secured or locked row decides who may register an extension, so
 //      a sysop-level import must not be able to create one.
 //   2. A TelephonyApiConfig slot's actual secret is masked by SlotView
@@ -6347,21 +6347,29 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 		// may register an extension, so restoring one is as privileged as restoring an
 		// HA1 (the route is Owner-gated for the same reason). Unclaimed zero-touch
 		// rows (#826) stay out: restored as plain locked rows, nothing would evict them.
+		// Each row is ["<mac>","<extension>",<state 0 learned | 1 secured>,<flags>] with the
+		// flags of Registrar::encodeRowFlags (bit 0 locked, bit 1 shared): 27 bytes where an
+		// object with long keys took 74, which is what keeps a full table under the import's
+		// 16 KB caps. In adoption order (seq), so the import, which adopts in file order,
+		// keeps which phone holds an extension's first claim.
 		gated << ",\"extensions\":[";
 		{
 			bool first = true;
 			if (handler)
 			{
-				for (const auto& d : handler->getAdoptedDevices())
+				std::vector<RequestsHandler::AdoptedDevice> rows = handler->getAdoptedDevices();
+				std::sort(rows.begin(), rows.end(),
+					[](const RequestsHandler::AdoptedDevice& a, const RequestsHandler::AdoptedDevice& b) {
+						return a.seq != b.seq ? a.seq < b.seq : a.mac < b.mac;
+					});
+				for (const auto& d : rows)
 				{
 					if (d.assigned) continue;
 					if (!first) gated << ",";
 					first = false;
-					gated << "{\"mac\":\"" << jsonEscape(d.mac)
-					      << "\",\"extension\":\"" << jsonEscape(d.extension)
-					      << "\",\"state\":\""
-					      << ((d.state == RequestsHandler::DeviceState::Secured) ? "secured" : "learned")
-					      << "\",\"locked\":" << (d.locked ? "true" : "false") << "}";
+					gated << "[\"" << jsonEscape(d.mac) << "\",\"" << jsonEscape(d.extension) << "\","
+					      << (d.state == RequestsHandler::DeviceState::Secured ? 1 : 0) << ","
+					      << Registrar::encodeRowFlags(Registrar::RowFlags{d.locked, d.shared, false}) << "]";
 				}
 			}
 		}
@@ -6538,14 +6546,21 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 	// The plaintext list is informational. A block without the key (an encrypted export from
 	// before this) leaves the table alone, like extensionSecrets.
 	const JsonReader::Value* bindings = nullptr;
+	bool bindingsOnThisBuild = false;
 #if POCKETDIAL_BACKUP_SECTION_C
+	bindingsOnThisBuild = true;
 	if (haveSecrets) bindings = secretsValue.find("extensions");
 	if (bindings != nullptr && !bindings->isArray()) bindings = nullptr;
 #endif
 	if (bindings == nullptr && !pt->arrayOr("extensions").empty())
 	{
-		skipped.push_back("extensions (MAC bindings travel only in the password-encrypted export, "
-			"on a build that carries them -- re-export with a password)");
+		skipped.push_back(!bindingsOnThisBuild
+			? "extensions (MAC bindings are not on this build, #689)"
+			: haveSecrets
+				? "extensions (this encrypted file predates MAC bindings: the table is unchanged -- "
+				  "re-export it from the source board)"
+				: "extensions (MAC bindings travel only in the password-encrypted export -- "
+				  "re-export with a password)");
 	}
 	// #482: digest secrets come back ONLY from the decrypted secretsEnc block
 	// (applied further below). An export from before #482 carried them in the
@@ -6859,35 +6874,78 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 					" entries over the device's capacity of " + std::to_string(cap) + ")");
 		}
 #if POCKETDIAL_BACKUP_SECTION_C
-		// #483: the MAC bindings, after the digest secrets (a Secured row is adopted only
-		// once its extension has one). REPLACE means replace: every current row goes first,
-		// or a locked claim already on this board and the file's own would each reject the
-		// other's phone. The emptied table holds POCKETDIAL_MAX_CLIENTS rows and no more,
-		// so a crafted file cannot flood it.
+		// #483: the MAC bindings, after the digest secrets (a Secured row is restored only
+		// once its extension has one). REPLACE means replace, and all or nothing: every row
+		// is read and checked before the table is touched, and only a list with no fault
+		// swaps in, in one step (RequestsHandler::replaceBindings: one _mutex hold, one
+		// persist, one snapshot rebuild), so a file of bad rows cannot empty the table and
+		// a locked claim already on this board cannot survive beside the file's own. A key
+		// the block lacks leaves the table alone (`bindings` is null then). The table holds
+		// POCKETDIAL_MAX_CLIENTS rows, so a crafted file cannot flood it.
 		if (bindings != nullptr && handler)
 		{
-			for (const auto& d : handler->getAdoptedDevices()) handler->forgetDevice(d.mac);
-			size_t restored = 0, rejected = 0;
-			for (const auto& e : secretsValue.arrayOr("extensions"))
+			// Rows are ["<mac>","<extension>",<state 0|1>,<flags 0-3>]. One this cannot read
+			// is a fault of its own, with an empty placeholder in `rows` so indexes line up;
+			// the table's own checks (MAC form, extension, duplicate, secret, capacity) are
+			// Registrar::replaceDevices's. Reasons are class names, never values.
+			using JsonValue = JsonReader::Value;
+			std::vector<Registrar::Binding> rows;
+			std::vector<Registrar::BindingFault> faults;
+			rows.reserve(bindings->arrVal.size());
+			for (const auto& e : bindings->arrVal)
 			{
-				const std::string state = e.stringOr("state");
-				if ((state == "secured" || state == "learned") &&
-					handler->adoptDevice(e.stringOr("mac"), e.stringOr("extension"),
-						state == "secured" ? RequestsHandler::DeviceState::Secured
-						                   : RequestsHandler::DeviceState::Learned,
-						e.boolOr("locked")))
+				Registrar::Binding b;
+				const std::vector<JsonValue>& a = e.arrVal;
+				const char* bad = nullptr;
+				if (!e.isArray() || a.size() != 4 || !a[0].isString() || !a[1].isString() ||
+					a[2].type != JsonValue::Type::Number || a[3].type != JsonValue::Type::Number)
 				{
-					++restored;
+					bad = "shape";
+				}
+				else if (a[2].numVal != 0 && a[2].numVal != 1)
+				{
+					bad = "state";
+				}
+				else if (a[3].numVal < 0 || a[3].numVal > 3 || a[3].numVal != static_cast<int>(a[3].numVal))
+				{
+					bad = "flags";
 				}
 				else
 				{
-					++rejected;
+					const Registrar::RowFlags flags = Registrar::decodeRowFlags(static_cast<int>(a[3].numVal));
+					b.mac = a[0].strVal;
+					b.extension = a[1].strVal;
+					b.state = (a[2].numVal == 1) ? RequestsHandler::DeviceState::Secured
+					                             : RequestsHandler::DeviceState::Learned;
+					b.locked = flags.locked;
+					b.shared = flags.shared;
 				}
+				if (bad != nullptr) faults.push_back({rows.size(), bad});
+				rows.push_back(std::move(b));
 			}
-			applied.push_back("extensions (" + std::to_string(restored) + " MAC bindings)");
-			if (rejected > 0)
-				skipped.push_back("extensions (" + std::to_string(rejected) + " bindings refused: "
-					"malformed, Secured without its digest secret, or over the device's capacity)");
+
+			const Registrar::ReplaceResult result = handler->replaceBindings(rows, faults);
+			if (result == Registrar::ReplaceResult::Replaced)
+			{
+				applied.push_back("extensions (" + std::to_string(rows.size()) + " MAC bindings)");
+			}
+			else if (result == Registrar::ReplaceResult::NotStaged)
+			{
+				skipped.push_back("extensions (bindings not replaced, table unchanged: "
+					"it could not be staged for flash)");
+			}
+			else
+			{
+				std::sort(faults.begin(), faults.end(),
+					[](const Registrar::BindingFault& x, const Registrar::BindingFault& y) { return x.row < y.row; });
+				std::string list;
+				for (size_t i = 0; i < faults.size() && i < 6; ++i)
+				{
+					list += std::string(i ? ", row " : "row ") + std::to_string(faults[i].row) + " " + faults[i].why;
+				}
+				if (faults.size() > 6) list += ", and " + std::to_string(faults.size() - 6) + " more";
+				skipped.push_back("extensions (bindings not replaced, table unchanged: " + list + ")");
+			}
 		}
 		else if (bindings != nullptr)
 		{
