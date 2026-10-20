@@ -1212,6 +1212,9 @@ TEST_F(ConfigExportImportTest, EncryptedRoundTrip_ReproducesBindingsRegistrarMod
 	EXPECT_EQ(view.routeDn, slot.routeDn);
 	EXPECT_FALSE(view.secretSet) << "the first board's client secret is not activated on this one";
 	EXPECT_NE(report.find("telephonyConfig client secrets"), std::string::npos) << report;
+	// Locked and Secured rows come back as they were on the source board, so a phone with
+	// another MAC (a replacement) is refused its extension: the report says so.
+	EXPECT_NE(report.find("a phone with a different MAC"), std::string::npos) << report;
 }
 
 // A sysop-level (plaintext) import cannot create the rows that decide who may register an
@@ -1427,6 +1430,8 @@ TEST_F(ConfigExportImportTest, EncryptedRestore_RefusesMoreRowsThanTheTableHolds
 	report = importSealed(_port, owner, listOf(rowsOf(cap)));
 	EXPECT_EQ(_handler->getAdoptedDevices().size(), cap) << report;
 	EXPECT_NE(report.find("(" + std::to_string(cap) + " MAC bindings)"), std::string::npos) << report;
+	EXPECT_EQ(report.find("a phone with a different MAC"), std::string::npos)
+		<< "no row is locked or Secured, so there is nothing to warn about:\n" << report;
 }
 
 // "extensions":[] in a sealed block is an instruction: the file's board had no rows.
@@ -1588,4 +1593,73 @@ TEST_F(ConfigExportImportTest, EncryptedRoundTrip_KeepsTheFirstClaimOrderOfRowsF
 	for (const auto& d : _handler->getAdoptedDevices())
 		if (d.locked) locked.push_back(d.mac);
 	EXPECT_EQ(locked, std::vector<std::string>{macHex(0x78)});
+}
+
+// ── Issue #483 review, round 2: the sealed block is applied as a whole ──────
+
+// A valid digest-secret list beside an INVALID bindings list changes nothing. The secrets used
+// to be restored (and every secret not in the file cleared) before the bindings were looked at,
+// and that could not be undone: the table kept its Secured row, its phone lost its secret, and
+// `secure` was applied over it.
+TEST_F(ConfigExportImportTest, EncryptedRestore_AnInvalidBindingsList_LeavesTheTableAndTheDigestSecretsAsTheyWere)
+{
+	SecuredExts secured;   // 101 and 102 hold digest secrets
+	const std::string ha1Of101 = *SipSecretStore::getHa1("101");
+	const std::string ha1Of102 = *SipSecretStore::getHa1("102");
+	const std::string fileHa1 = "0123456789abcdef0123456789abcdef";
+	ASSERT_NE(fileHa1, ha1Of101);
+	_handler->adoptDeviceForTest("0200000000e1", "101", RequestsHandler::DeviceState::Secured, /*locked=*/true);
+	AdminSession owner = loginOwner();
+
+	// 101 would get a different HA1 and 102 (not listed) would lose its secret; the one
+	// binding row has a state of 2.
+	const std::string report = importSealed(_port, owner,
+		R"({"extensionSecrets":[{"extension":"101","ha1":")" + fileHa1 + R"("}],)"
+		R"("extensions":[["0200000000b1","101",2,0]]})",
+		R"({"extensions":[],"registrarMode":"secure"})");
+
+	EXPECT_EQ(bindingsOf(*_handler), std::vector<std::string>{"0200000000e1 101 secured locked"}) << report;
+	ASSERT_TRUE(SipSecretStore::hasSecret("101")) << report;
+	EXPECT_EQ(*SipSecretStore::getHa1("101"), ha1Of101) << "the file's digest secret was applied beside a refused bindings list";
+	ASSERT_TRUE(SipSecretStore::hasSecret("102")) << "a secret the file does not list was cleared beside a refused bindings list";
+	EXPECT_EQ(*SipSecretStore::getHa1("102"), ha1Of102);
+	EXPECT_EQ(_handler->getRegistrarMode(), RequestsHandler::RegistrarMode::Learn) << report;
+	EXPECT_NE(report.find("bindings not replaced"), std::string::npos) << report;
+	EXPECT_NE(report.find("extensionSecrets (not applied"), std::string::npos) << report;
+}
+
+// A file with no bindings list cannot be checked against its secrets: the table stays, and a
+// digest-secret list that omits a Secured row's extension strands that row (#484: REPLACE
+// clears what the file does not list). `secure` must not then be applied, since the lockout
+// guard exists for exactly this, and the stranded row is named.
+TEST_F(ConfigExportImportTest, EncryptedRestore_NeverAppliesSecureOverASecuredRowLeftWithoutASecret)
+{
+	SecuredExts secured;
+	_handler->adoptDeviceForTest("0200000000e1", "101", RequestsHandler::DeviceState::Secured, /*locked=*/true);
+	AdminSession owner = loginOwner();
+	const std::string report = importSealed(_port, owner, R"({"extensionSecrets":[]})",
+		R"({"extensions":[],"registrarMode":"secure"})");
+	ASSERT_FALSE(SipSecretStore::hasSecret("101")) << "setup: REPLACE cleared the secret the file does not list (#484)";
+	EXPECT_EQ(_handler->getRegistrarMode(), RequestsHandler::RegistrarMode::Learn) << report;
+	EXPECT_NE(report.find("registrarMode=secure"), std::string::npos) << "the guard says why:\n" << report;
+	EXPECT_NE(report.find("no stored digest secret"), std::string::npos) << "the stranded row is named:\n" << report;
+}
+
+// Refused rows are listed by row number, in order, six at most, whichever side found them:
+// row 3 is unreadable (found while parsing), the rest fail the table's own MAC check.
+TEST_F(ConfigExportImportTest, EncryptedRestore_ListsRefusedRowsInRowOrder_SixAtMost)
+{
+	AdminSession owner = loginOwner();
+	seedOwnRow(*_handler);
+	std::string rows;
+	for (int i = 0; i < 10; ++i)
+	{
+		if (i > 0) rows += ",";
+		if (i == 3) rows += R"(["0200000000b3",7,0,0])";
+		else rows += "[\"BAD" + std::to_string(i) + "\",\"3" + std::to_string(i) + "00\",0,0]";
+	}
+	const std::string report = importSealed(_port, owner, listOf(rows));
+	EXPECT_EQ(bindingsOf(*_handler), std::vector<std::string>{kOwnRow}) << report;
+	EXPECT_NE(report.find("row 0 mac, row 1 mac, row 2 mac, row 3 shape, row 4 mac, row 5 mac, and 4 more"),
+		std::string::npos) << report;
 }
