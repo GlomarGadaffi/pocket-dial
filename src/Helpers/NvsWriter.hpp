@@ -51,7 +51,8 @@ namespace nvswriter
 	// queue item of this size each (PSRAM at init on the S3, internal heap on a build
 	// without it). It is smaller than the 4,004 B the secret-bearing table was estimated
 	// at, and it does not grow the shared scratch, which stays the forwards key's.
-	static_assert(sizeof(Slot<kTelephonyCap>) == 1564, "the telephony slot and its queue item are 1,564 B each");
+	// #1073: 1,564 B before each slot carried its acceptance cell (+112 B).
+	static_assert(sizeof(Slot<kTelephonyCap>) == 1676, "the telephony slot and its queue item are 1,676 B each");
 	static_assert(kScratchCap == kForwardsCap, "the telephony key must not grow the shared internal scratch");
 
 	// Boot-time and idempotent (loadDevices / loadPbxConfig call it before any

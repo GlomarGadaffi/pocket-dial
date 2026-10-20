@@ -46,6 +46,60 @@ namespace
 		return v < static_cast<uint8_t>(TelephonyProviderType::Count);
 	}
 
+	// #1073: the acceptance counts only for the CURRENT warning text and a role the session
+	// code can produce (0 none, 1 sysop, 2 owner). The role bound is also what keeps the stored
+	// text "255,2,<20 digits>" inside TelephonyApiConfig::kAcceptCellLen.
+	bool currentAcceptance(const TelephonyApiConfig::Acceptance& a)
+	{
+		return a.version == TelephonyApiConfig::kAcceptanceVersion && a.role <= 2;
+	}
+
+	// The stored/staged text of an acceptance: "version,role,epoch", "" for none.
+	void formatAcceptance(char* out, size_t cap, const TelephonyApiConfig::Acceptance& a)
+	{
+		if (a.version == 0)
+		{
+			out[0] = '\0';
+			return;
+		}
+		const int n = std::snprintf(out, cap, "%u,%u,%llu", static_cast<unsigned>(a.version), static_cast<unsigned>(a.role),
+		                            static_cast<unsigned long long>(a.epoch));
+		if (n < 0 || static_cast<size_t>(n) >= cap)
+		{
+			out[0] = '\0';   // cannot happen (the cell fits the worst case); no acceptance rather than a cut one
+		}
+	}
+
+	// The inverse, for a store this build did not write: anything that is not exactly
+	// "version(1..255),role(0..2),epoch" is no acceptance.
+	TelephonyApiConfig::Acceptance parseAcceptance(const char* t)
+	{
+		TelephonyApiConfig::Acceptance none;
+		auto digit = [](char c) { return c >= '0' && c <= '9'; };
+		if (!digit(t[0]) || std::strlen(t) > TelephonyApiConfig::kAcceptCellLen - 2) return none;
+		char* e = nullptr;
+		const unsigned long v = std::strtoul(t, &e, 10);
+		if (*e != ',' || v == 0 || v > 255 || !digit(e[1])) return none;
+		const char* p = e + 1;
+		const unsigned long r = std::strtoul(p, &e, 10);
+		if (*e != ',' || r > 2 || !digit(e[1])) return none;
+		p = e + 1;
+		const unsigned long long ep = std::strtoull(p, &e, 10);
+		if (*e != '\0') return none;
+		TelephonyApiConfig::Acceptance a;
+		a.version = static_cast<uint8_t>(v);
+		a.role = static_cast<uint8_t>(r);
+		a.epoch = ep;
+		return a;
+	}
+
+	std::string acceptanceRequiredError()
+	{
+		return std::string(TelephonyApiConfig::kAcceptanceRequiredPrefix) +
+		       "enabling or activating an anchor path needs the administrator's explicit acceptance of the limitations: send acceptLimitations=" +
+		       std::to_string(TelephonyApiConfig::kAcceptanceVersion);
+	}
+
 	// #1060: a store written before the #1047 refusal can hold an emergency routeDn, and the
 	// boot path copies an enabled slot's routeDn into the anchor config. load() runs this on
 	// each slot it read: such a slot comes up disabled (the stored value is left for the
@@ -93,6 +147,11 @@ TelephonyApiConfig::SlotView TelephonyApiConfig::view(size_t idx) const
 	v.clientId    = s.clientId;
 	v.routeDn     = s.routeDn;
 	v.secretSet   = !s.secret.empty();   // the value itself never leaves
+	v.accepted    = currentAcceptance(s.accepted);
+	v.acceptanceMissing = s.enabled && s.type != TelephonyProviderType::Loopback && !v.accepted;
+	v.acceptedVersion = s.accepted.version;
+	v.acceptedRole    = s.accepted.role;
+	v.acceptedAt      = s.accepted.epoch;
 	return v;
 }
 
@@ -109,7 +168,7 @@ bool isEmergencyRouteDn(std::string_view dn)
 	return pbx::classifyEmergencyDial(dn).isEmergency || dn == "112" || dn == "113";
 }
 
-std::string TelephonyApiConfig::setSlot(size_t idx, const Slot& s, bool keepSecret)
+std::string TelephonyApiConfig::setSlot(size_t idx, const Slot& s, bool keepSecret, const Acceptance* accept)
 {
 	if (idx >= kSlots)
 	{
@@ -164,9 +223,29 @@ std::string TelephonyApiConfig::setSlot(size_t idx, const Slot& s, bool keepSecr
 		}
 	}
 
+	// #1073: after the field checks above (their messages stay what they were), before the
+	// first write. The Loopback simulator is not an anchor path and has no limitations to accept.
+	Acceptance next;   // none: a disabled slot holds no acceptance, so the next enable asks again
+	if (s.enabled && s.type != TelephonyProviderType::Loopback)
+	{
+		if (accept != nullptr && currentAcceptance(*accept))
+		{
+			next = *accept;
+		}
+		else if (_slots[idx].enabled && currentAcceptance(_slots[idx].accepted))
+		{
+			next = _slots[idx].accepted;
+		}
+		else
+		{
+			return acceptanceRequiredError();
+		}
+	}
+
 	Slot& dst = _slots[idx];
 	dst.type     = s.type;
 	dst.enabled  = s.enabled;
+	dst.accepted = next;
 	dst.baseUrl  = s.baseUrl;
 	dst.clientId = s.clientId;
 	dst.routeDn  = s.routeDn;
@@ -182,6 +261,7 @@ std::string TelephonyApiConfig::setSlot(size_t idx, const Slot& s, bool keepSecr
 		scrub(dst.secret);
 		dst.secret = s.secret;
 	}
+	refreshMissingMask();
 	return persist();
 }
 
@@ -198,6 +278,7 @@ void TelephonyApiConfig::wipeSlot(size_t idx)
 	scrub(s.routeDn);
 	s.type = TelephonyProviderType::Loopback;
 	s.enabled = false;
+	s.accepted = Acceptance{};
 	if (_active == idx)
 	{
 		_active = kNoActiveSlot;
@@ -211,6 +292,7 @@ std::string TelephonyApiConfig::clearSlot(size_t idx)
 		return "Bad slot index";
 	}
 	wipeSlot(idx);
+	refreshMissingMask();
 	return persist();
 }
 
@@ -226,12 +308,47 @@ std::string TelephonyApiConfig::clearAll()
 		wipeSlot(i);
 	}
 	_active = kNoActiveSlot;
+	refreshMissingMask();
 	const std::string err = persistNow();
 	if (err.empty())
 	{
 		std::fill(std::begin(_secretPending), std::end(_secretPending), false);   // every secret key was just written empty
 	}
 	return err;
+}
+
+void TelephonyApiConfig::refreshMissingMask()
+{
+	uint8_t mask = 0;
+	for (size_t i = 0; i < kSlots; ++i)
+	{
+		if (view(i).acceptanceMissing) mask = static_cast<uint8_t>(mask | (1u << i));
+	}
+	_missingMask.store(mask, std::memory_order_relaxed);
+}
+
+std::string TelephonyApiConfig::activateSlot(size_t idx, const Acceptance* accept)
+{
+	if (idx == kNoActiveSlot)
+	{
+		return setActiveSlot(idx);   // deactivating takes nothing on
+	}
+	if (idx >= kSlots)
+	{
+		return "Bad slot index";
+	}
+	Slot& s = _slots[idx];
+	if (accept != nullptr && currentAcceptance(*accept))
+	{
+		s.accepted = *accept;
+	}
+	else if (!currentAcceptance(s.accepted))
+	{
+		return acceptanceRequiredError();
+	}
+	_active = idx;
+	refreshMissingMask();
+	return persist();
 }
 
 std::string TelephonyApiConfig::setActiveSlot(size_t idx)
@@ -257,23 +374,26 @@ bool TelephonyApiConfig::anySecretPending() const
 // IS NOT HERE and must never be: this runs under _mutex into a slot nothing zeroises.
 void TelephonyApiConfig::fillSnapshot(nvswriter::BlobWriter& w) const
 {
-	auto cell = [&w](const char* v) {
+	auto cell = [&w](const char* v, size_t width) {
 		const size_t n = std::strlen(v);
-		if (n >= kCellLen)
+		if (n >= width)
 		{
 			w.fail();
 			return;
 		}
 		w.str(std::string_view(v, n));
-		for (size_t pad = n; pad < kCellLen; ++pad) w.ch('\0');
+		for (size_t pad = n; pad < width; ++pad) w.ch('\0');
 	};
 	for (const Slot& s : _slots)
 	{
 		w.ch(static_cast<char>(static_cast<uint8_t>(s.type)));
 		w.ch(static_cast<char>(s.enabled ? 1 : 0));
-		cell(s.baseUrl.c_str());
-		cell(s.clientId.c_str());
-		cell(s.routeDn.c_str());
+		cell(s.baseUrl.c_str(), kCellLen);
+		cell(s.clientId.c_str(), kCellLen);
+		cell(s.routeDn.c_str(), kCellLen);
+		char acc[kAcceptCellLen];
+		formatAcceptance(acc, sizeof(acc), s.accepted);
+		cell(acc, kAcceptCellLen);
 	}
 	w.ch(static_cast<char>((_active < kSlots) ? static_cast<uint8_t>(_active) : 0xff));
 }
@@ -291,6 +411,7 @@ bool TelephonyApiConfig::emitSnapshot(const char* blob, size_t len,
 		{
 			if (blob[i * kSlotSnapshotLen + 2 + c * kCellLen - 1] != '\0') return false;
 		}
+		if (blob[i * kSlotSnapshotLen + 2 + 3 * kCellLen + kAcceptCellLen - 1] != '\0') return false;
 	}
 	char key[16];
 	for (size_t i = 0; i < kSlots; ++i)
@@ -306,6 +427,8 @@ bool TelephonyApiConfig::emitSnapshot(const char* blob, size_t len,
 		if (!putStr(key, p + 2 + kCellLen)) return false;
 		slotKey(key, sizeof(key), i, "dn");
 		if (!putStr(key, p + 2 + 2 * kCellLen)) return false;
+		slotKey(key, sizeof(key), i, "acc");
+		if (!putStr(key, p + 2 + 3 * kCellLen)) return false;
 	}
 	return putU8("active", static_cast<uint8_t>(blob[kSlots * kSlotSnapshotLen]));
 }
@@ -392,6 +515,9 @@ void TelephonyApiConfig::load()
 		getStr("id",  s.clientId);
 		getStr("sec", s.secret);
 		getStr("dn",  s.routeDn);
+		std::string acc;
+		getStr("acc", acc);
+		s.accepted = parseAcceptance(acc.c_str());
 		refuseStoredEmergencyRouteDn(s, i);
 	}
 	uint8_t act = 0xff;
@@ -400,6 +526,7 @@ void TelephonyApiConfig::load()
 		_active = act;
 	}
 	nvs_close(h);
+	refreshMissingMask();
 }
 
 // The nvs_writer task's half of persist(): every slot's type, enabled flag, URL,
@@ -478,6 +605,10 @@ std::string TelephonyApiConfig::persistNow()
 		ok = ok && nvs_set_str(h, key, s.secret.c_str()) == ESP_OK;
 		slotKey(key, sizeof(key), i, "dn");
 		ok = ok && nvs_set_str(h, key, s.routeDn.c_str()) == ESP_OK;
+		char acc[kAcceptCellLen];
+		formatAcceptance(acc, sizeof(acc), s.accepted);
+		slotKey(key, sizeof(key), i, "acc");
+		ok = ok && nvs_set_str(h, key, acc) == ESP_OK;
 	}
 	ok = ok && nvs_set_u8(h, "active",
 	          (_active < kSlots) ? static_cast<uint8_t>(_active) : 0xff) == ESP_OK;
@@ -530,11 +661,13 @@ void TelephonyApiConfig::load()
 		else if (field == "id")  s.clientId = val;
 		else if (field == "sec") s.secret = val;
 		else if (field == "dn")  s.routeDn = val;
+		else if (field == "acc") s.accepted = parseAcceptance(val.c_str());
 	}
 	for (size_t i = 0; i < kSlots; ++i)
 	{
 		refuseStoredEmergencyRouteDn(_slots[i], i);
 	}
+	refreshMissingMask();
 }
 
 // Host: there is one file, so "write the secrets" is "write the file" (the secrets are
@@ -572,6 +705,9 @@ std::string TelephonyApiConfig::persistNow()
 		    << 's' << i << "id="   << s.clientId << '\n'
 		    << 's' << i << "sec="  << s.secret << '\n'
 		    << 's' << i << "dn="   << s.routeDn << '\n';
+		char acc[kAcceptCellLen];
+		formatAcceptance(acc, sizeof(acc), s.accepted);
+		out << 's' << i << "acc=" << acc << '\n';
 	}
 	if (_active < kSlots)
 	{

@@ -296,7 +296,7 @@ Endpoints marked "None" are read-only and reachable without a session: `/`, `/in
 | `/api/e911-config` | `GET` | Medium | Gated | E911 notify list, callback and location, with `maxNotifyExts`. |
 | `/api/e911-config` | `PUT` | High | Gated (+ `X-CSRF`) | Sets `notifyExts`, `callback` and `location`. All optional; an empty `notifyExts` turns SIP notification off. |
 | `/api/sbc-mode` | `GET` | Medium | Gated | SBC mode and the telephony slot it routes through. |
-| `/api/sbc-mode` | `PUT` | High | Gated (+ `X-CSRF`) | Sets `enabled` and `route` (a telephony slot index). Enabling with a bad route is a `400`. Enabling changes the active slot like `.../activate`, which is accepted and staged for the NVS writer, not yet on flash; it is also a `400` while a factory reset is running or when the NVS writer is not running, and SBC mode then stays off (#997). |
+| `/api/sbc-mode` | `PUT` | High | Gated (+ `X-CSRF`) | Sets `enabled` and `route` (a telephony slot index). Enabling with a bad route is a `400`. (#1073) Selecting a slot that is not already the active one is an activation: it needs `acceptLimitations=<current acceptanceVersion>` unless the slot holds an acceptance, else `409` and SBC mode stays as it was; re-selecting the active slot, and turning SBC mode off, need none. Enabling changes the active slot like `.../activate`, which is accepted and staged for the NVS writer, not yet on flash; it is also a `400` while a factory reset is running or when the NVS writer is not running, and SBC mode then stays off (#997). |
 | [`/api/multicast-paging`](#get-apimulticast-paging) | `GET` | Medium | Gated | Multicast paging configuration (`enabled`, `group`, `port`). |
 | [`/api/multicast-paging`](#put-apimulticast-paging) | `PUT` | High | Gated (+ `X-CSRF`) | Sets the multicast paging configuration. Every parameter is optional. |
 | [`/api/config/export`](#get-apiconfigexport) | `GET` | Medium | Gated | Plaintext configuration backup. |
@@ -711,7 +711,7 @@ from the blob is **removed**, not left behind. Sysop-level, with its own `confir
   * `confirm` (Required): must be the literal string `REPLACE`.
 * Response Content-Type: `application/json`
 * Response Status Codes:
-  * `200 OK`: `{"status":"ok","applied":[...],"skipped":[...]}`. For `forwards`, `didMappings` and `telephonyConfig`, `applied` means accepted and staged for the NVS writer, not yet on flash (see the notes under [`POST /api/forward`](#post-apiforward), [`PUT /api/did-mapping`](#put-apidid-mapping) and [`PUT /api/telephony-config/<slot>`](#put-apitelephony-configslot) for the power-fail window); the burst of per-entry writes an import makes coalesces into one flash write, the last table, for as long as the writer has not yet taken the previous one (it runs at priority 1 and may wake between entries under light load, in which case an intermediate table is written first; the last table is always written last). An import never carries or changes a telephony client secret, so it writes none. The other settings an import applies (ring groups, voicemail, page zones, dial plan, registrar mode, E911, admin extension) are still written to flash before their setter returns. The response is not a bare `204`. This feature cannot restore everything a plaintext-capable export can carry, and a bare `204` would tell the operator "fully restored" when it was not.
+  * `200 OK`: `{"status":"ok","applied":[...],"skipped":[...]}`. For `forwards`, `didMappings` and `telephonyConfig`, `applied` means accepted and staged for the NVS writer, not yet on flash (see the notes under [`POST /api/forward`](#post-apiforward), [`PUT /api/did-mapping`](#put-apidid-mapping) and [`PUT /api/telephony-config/<slot>`](#put-apitelephony-configslot) for the power-fail window); the burst of per-entry writes an import makes coalesces into one flash write, the last table, for as long as the writer has not yet taken the previous one (it runs at priority 1 and may wake between entries under light load, in which case an intermediate table is written first; the last table is always written last). An import never carries or changes a telephony client secret, so it writes none. (#1073) Nor does it carry an acceptance of the limitations, so it cannot enable a slot that is not already enabled and accepted on this board: such a slot is imported **disabled** and listed under `skipped` (`telephonyConfig slot N (imported disabled: Acceptance required: ...)`); a slot already enabled without an acceptance is left exactly as it is (`left unchanged`). The other settings an import applies (ring groups, voicemail, page zones, dial plan, registrar mode, E911, admin extension) are still written to flash before their setter returns. The response is not a bare `204`. This feature cannot restore everything a plaintext-capable export can carry, and a bare `204` would tell the operator "fully restored" when it was not.
   * `400 Bad Request`: `{"error":"import requires confirm=REPLACE"}` / `"missing blob parameter"` / `"malformed export blob"` / `"export blob is missing a plaintext object"` / `"unsupported exportVer"` / `"malformed secretsEnc block"`.
   * `422 Unprocessable Entity`: `{"error":"bad password or corrupted secrets block"}`. A wrong password and a tampered/corrupted `secretsEnc` block are **deliberately indistinguishable** (the GCM tag check fails identically either way). A `400`/`422` leaves the device completely untouched; the whole blob is validated (and decrypted, if a password was given) before the first setter runs.
   * `401`/`403`: gates 1-3 as in §0.1.
@@ -836,6 +836,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `memory.dynamicTaskCreates` | Integer | (#479) Tasks created with a heap stack and TCB since boot: every `pd::createTaskPreferPsram()` task plus the media call path's `moh_tx`. RTP media tasks and `conf_mix_tick` run on boot-preallocated stacks and are not counted. Read it before and after a call; the difference is the call path's dynamic task creation (0 for an ordinary extension-to-extension call). Also counts the anchor client's persistent `tel_maint` task (#658), created once by its first `start()`; restart, TLS re-warm, reconcile and the background token refresh (#862) run on it and create nothing. |
 | `version` | String | (#411) The firmware build stamp (the `git describe` of the commit it was built from). No build host, path or timestamp. |
 | `wifiCapable` | Boolean | (#167) Whether this build has a radio at all. `false` on the Ethernet builds, so an empty Wi-Fi scan is not mistaken for "no networks found". |
+| `anchorAcceptanceMissing` | Array of 4 booleans | (#1073) Per telephony slot: enabled without an acceptance of the current warning text (see [`GET /api/telephony-config`](#get-apitelephony-config)). Such a slot keeps working. Only for a logged-in caller; absent otherwise and while no SIP engine is attached. |
 | `emergencyRoute` | String | (#521) The emergency route the telephony layer provides: `"anchor"` when the boot-selected telephony provider places real 911/933 calls, or `"none"` when only the loopback test provider is present. With `"none"` the board **refuses** emergency calls with `503 Emergency Call Not Routable`; the loopback simulator never answers one. The dashboard shows a warning banner while this is `"none"`. Ungated like the rest of the block. **Absent** while no SIP engine is attached yet (the first seconds after boot), which a client should treat as unknown, not as `"none"`. |
 | `uptime` | Integer | Time in seconds since the HTTP server initialized. |
 | `cdrPersistFailures` | Integer | (#470) CDR ring writes to flash that failed. Non-zero means call history is not surviving reboots. |
@@ -1937,9 +1938,15 @@ and at most one is active at a time.
       "baseUrl": "https://pbx.example.com",
       "clientId": "pocketdial",
       "routeDn": "8000",
-      "secretSet": true
+      "secretSet": true,
+      "accepted": true,
+      "acceptanceMissing": false,
+      "acceptedVersion": 1,
+      "acceptedBy": "owner",
+      "acceptedAt": 1760000000
     }
-  ]
+  ],
+  "acceptanceVersion": 1
 }
 ```
 
@@ -1954,6 +1961,13 @@ and at most one is active at a time.
 | `clientId` | String | OAuth2 client identifier. |
 | `routeDn` | String | The provider-side DN this box owns. Outbound calls originate from it; inbound calls to it are what [`/api/did-mapping`](#get-apidid-mapping) routes. |
 | `secretSet` | Boolean | Whether a secret is stored. **The secret itself is never returned by any endpoint**, by design (`telephonySlotJson()`). |
+| `accepted` | Boolean | (#1073) The slot holds an acceptance of the **current** warning text. |
+| `acceptanceMissing` | Boolean | (#1073) The slot is enabled and `accepted` is `false`: it was enabled before acceptances existed, or the warning text changed since. It keeps working; the dashboard shows a banner. A `LOOPBACK` slot is never flagged. |
+| `acceptedVersion` | Integer | (#1073) The warning-text version that was accepted, `0` for none. |
+| `acceptedBy` | String | (#1073) The role of the admin session that accepted: `owner`, `sysop`, or `""`. The session carries no user name, so no name is recorded. |
+| `acceptedAt` | Integer | (#1073) Seconds since 1970 when it was accepted (`timesync::epochSeconds()`), `0` if the board's clock had not synced yet (the boards have no RTC) or there is no acceptance. |
+
+The top level also carries `acceptanceVersion`, the current warning-text version (`TelephonyApiConfig::kAcceptanceVersion`); a client sends it back as `acceptLimitations`. [`GET /api/status`](#get-apistatus) carries `anchorAcceptanceMissing`, four booleans, for a logged-in caller.
 
 These slots do not describe a SIP trunk. The client speaks HTTP/OAuth2 plus a call-control WebSocket, with media as chunked-HTTPS PCM16, and the shipping real client targets the **3CX Call Control API**. The firmware never sends a `REGISTER` of its own, so the box does not register to an ITSP and speaks no SIP to a carrier. Reaching a trunk also requires a dial-plan rule with `action=trunk` ([`POST /api/dialplan`](#post-apidialplan)); there is no `9`-prefix default.
 
@@ -1977,6 +1991,7 @@ Writes one slot. `<slot>` is the decimal index from the `GET`. Form-encoded.
 | `clientId` | ≤ 64 chars | OAuth2 client id. |
 | `secret` | ≤ 64 chars | OAuth2 client secret. **An empty value means "keep the stored secret"**, so a slot can be edited without re-typing it. |
 | `routeDn` | ≤ 64 chars | The DN this box owns on the provider. |
+| `acceptLimitations` | the current `acceptanceVersion` | (#1073) The administrator's explicit acceptance of the limitations (the dashboard's "Accept and enable" dialog). **Required to enable a slot** unless that slot is already enabled and holds an acceptance of the current text. Stored with the slot: the version, the accepting session's role and the time. Disabling needs none and clears the stored acceptance, so each enable asks again. |
 
 `type` is deliberately **not** a parameter: this endpoint only ever configures a real
 (`TELEPHONY-API`) provider. `LOOPBACK` is the internal default and is never set through
@@ -1996,6 +2011,7 @@ lives in exactly one place in the codebase, deliberately.
 
 * Response Status Codes:
   * `200 OK`: Slot written. Body is `{"status":"ok","slot":{…}}` with the same slot shape as the `GET`.
+  * `409 Conflict`: (#1073) enabling without an acceptance: `{"error":"Acceptance required: ... send acceptLimitations=1","acceptanceRequired":true,"acceptanceVersion":1}`. Checked after the field validation below, before anything is written; nothing is changed. An `acceptLimitations` of any other version counts as none.
   * `400 Bad Request`: the body carries the literal reason from `TelephonyApiConfig::setSlot`, one of `{"error":"Bad slot index"}`, `{"error":"Unknown provider type"}`, `{"error":"Base URL too long"}` (over 128), `{"error":"Field too long"}` (`clientId`/`secret`/`routeDn` over 64), `{"error":"Enabled slot needs an https:// base URL"}`, `{"error":"Enabled slot needs a route DN"}`, `{"error":"Enabled slot needs a client ID"}`, `{"error":"Enabled slot needs a client secret"}`, `{"error":"Route DN may not be an emergency number"}` (refused whether or not the slot is enabled), `{"error":"Telephony config not persisted: ..."}` (a factory reset is running, the NVS writer is not running because its staging memory could not be reserved at boot, or a stored value is longer than the writer's 129-byte cell, which only a hand-edited store can produce), or an NVS failure (`{"error":"NVS open failed"}` / `{"error":"NVS write failed"}` on device, `{"error":"config file open failed"}` on host). In every `400` from persisting the change is live in RAM all the same. A refused stage (the first three) wrote nothing to flash; but when the stage was accepted and the secret write then failed (`NVS write failed`), the staged half still reaches flash next to the old secret, and the new secret stays owed to the next write.
   * `401`/`403`: gates 1-4 as in §0.1.
 
@@ -2028,9 +2044,10 @@ Makes that slot the one the outbound anchor path uses.
 
 A reboot is required before the new slot is actually live. Provider selection is boot-time-only: the running `_anchorClient` was chosen at startup and activation only changes the persisted choice. Until the board restarts, the previously-active slot is still the one placing calls, and [`POST /api/telephony-config/<slot>/test`](#post-apitelephony-configslottest) will refuse the newly-activated slot with *"this slot is not the active one — activate it and reboot first"* (`RequestsHandler::testDialSlot()`).
 
-* Request Parameters: none. The body is ignored; the slot is the path segment.
+* Request Parameters: `acceptLimitations` (optional, #1073), the current `acceptanceVersion`. **Required** unless the slot already holds an acceptance of the current text; it is stored with the slot. Index `4` (deactivate) needs none.
 * Response Status Codes:
   * `200 OK`: `{"status":"ok","activeIndex":0}`
+  * `409 Conflict`: (#1073) the slot has no stored acceptance and the request carries none: `{"error":"Acceptance required: ...","acceptanceRequired":true,"acceptanceVersion":1}`. Nothing is changed.
   * `400 Bad Request`: `{"error":"Bad slot index"}`, or an NVS/persist failure string from `TelephonyApiConfig::setActiveSlot`.
   * `401`/`403`: gates 1-4 as in §0.1.
 
