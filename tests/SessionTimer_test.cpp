@@ -793,6 +793,21 @@ TEST(SessionTimer, TheConferenceAnswerCarriesNoTimerBecauseItsRefreshIsRefused)
 	EXPECT_NE(headerValue(ok, "Contact").find("sip:888@"), std::string::npos) << ok;
 }
 
+// #739: onReinvite() answers a 440 re-INVITE 488 (the tone leg has no peer), so
+// the 440 answer grants no timer either. It is built from a clone of the INVITE,
+// so it must also shed the phone's own Require: timer.
+TEST(SessionTimer, The440AnswerCarriesNoTimerBecauseItsRefreshIsRefused)
+{
+	Rig r;
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "440", "se-440",
+		std::string(kTimerOffer) + "Require: timer\r\n"));
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectNoTimer(ok, "440 answer");
+	// Positive control: it is 440's own answer, carrying the tone's SDP, that was inspected.
+	EXPECT_NE(headerValue(ok, "Contact").find("sip:440@"), std::string::npos) << ok;
+	EXPECT_NE(ok.find("c=IN IP4 " + std::string(kServerIp) + "\r\n"), std::string::npos) << ok;
+}
+
 // Positive control for the grant: 555 answers its own re-INVITE with a 200
 // (answerAnchorReinvite), so its answer, built by the same buildOkWithSdp()
 // as 888's, does name the phone as refresher.

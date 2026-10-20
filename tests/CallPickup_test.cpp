@@ -68,7 +68,7 @@ namespace
 	// call and for the picker's own **ext/*8 dial (which is, from the server's
 	// point of view, just another INVITE to a virtual extension).
 	std::shared_ptr<SipMessage> makeInvite(const std::string& fromExt, const std::string& toExt,
-		const std::string& fromIp, const std::string& callId)
+		const std::string& fromIp, const std::string& callId, const std::string& extraHeaders = "")
 	{
 		const std::string body = sdpBody(fromIp);
 		std::string raw =
@@ -78,7 +78,7 @@ namespace
 			"To: <sip:" + toExt + "@server>\r\n"
 			"Call-ID: " + callId + "\r\n"
 			"CSeq: 1 INVITE\r\n"
-			"Contact: <sip:" + fromExt + "@" + fromIp + ":5060>\r\n"
+			"Contact: <sip:" + fromExt + "@" + fromIp + ":5060>\r\n" + extraHeaders +
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
 		return RequestsHandler::getMessageFromPool(raw, addrFor(fromIp));
@@ -300,6 +300,57 @@ TEST(CallPickup, PickupCancelCarriesTheRequestUriAndToOfTheInviteItCancels)
 		<< "Request-URI must match the INVITE's";
 	EXPECT_EQ(lineStarting(cancel, "To:"), lineStarting(invite, "To:"))
 		<< "To must match the INVITE's";
+}
+
+// Issue #739 / RFC 4028 §9: both pickup answers are clones of an INVITE (the
+// caller's original, and the picker's own **ext), so each echoed that phone's
+// own Session-Expires and Require with no refresher. A pickup splices two
+// dialogs and relays a re-INVITE refresh into the peer's, so the PBX does not
+// answer it, and RFC 4028 §10 says only a 2xx extends a session: neither answer
+// grants a timer. No Session-Expires is §7.2's "no session expiration".
+TEST(CallPickup, BothPickupAnswersCarryNoSessionTimer)
+{
+	std::vector<Sent> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&](const sockaddr_in& to, std::shared_ptr<SipMessage> msg) {
+			sent.push_back({ ipOf(to), msg->toString() });
+		});
+
+	handler.handle(makeRegister("200", "192.168.9.10", "reg-caller739"));
+	handler.handle(makeRegister("100", "192.168.9.20", "reg-target739"));
+	handler.handle(makeRegister("102", "192.168.9.30", "reg-picker739"));
+	handler.setRingGroup("600", "100,102", "ringall");
+
+	// Both phones offer a timer and put it in Require, so each INVITE an answer
+	// is cloned from carries both lines.
+	const std::string timerLines =
+		"Supported: timer\r\nRequire: timer\r\nSession-Expires: 1800\r\nMin-SE: 90\r\n";
+	handler.handle(makeInvite("200", "100", "192.168.9.10", "call-739", timerLines));
+	handler.handle(makeInvite("102", "**100", "192.168.9.30", "pickup-739", timerLines));
+
+	// The two answers themselves, found by the other leg's SDP each carries.
+	std::string toCaller, toPicker;
+	for (const auto& s : sent)
+	{
+		if (s.raw.rfind("SIP/2.0 200 OK", 0) != 0) continue;
+		if (s.destIp == "192.168.9.10" && s.raw.find("c=IN IP4 192.168.9.30") != std::string::npos) toCaller = s.raw;
+		if (s.destIp == "192.168.9.30" && s.raw.find("c=IN IP4 192.168.9.10") != std::string::npos) toPicker = s.raw;
+	}
+	// Positive control: the pickup completed and both answers were sent.
+	ASSERT_FALSE(toCaller.empty()) << "the caller must be answered with the picker's SDP";
+	ASSERT_FALSE(toPicker.empty()) << "the picker must be answered with the caller's SDP";
+
+	auto expectNoTimer = [](const std::string& answer, const char* who)
+	{
+		EXPECT_EQ(answer.find("\r\nSession-Expires:"), std::string::npos)
+			<< who << ": the phone's own Session-Expires must not be echoed with no refresher\n" << answer;
+		EXPECT_EQ(answer.find("\r\nx:"), std::string::npos)
+			<< who << ": nor its compact form\n" << answer;
+		EXPECT_EQ(answer.find("\r\nRequire:"), std::string::npos)
+			<< who << ": no timer, so no Require: timer\n" << answer;
+	};
+	expectNoTimer(toCaller, "caller's answer");
+	expectNoTimer(toPicker, "picker's answer");
 }
 
 TEST(CallPickup, DirectedPickupOfNonPeerExtensionGets486AndLeavesTargetRinging)
