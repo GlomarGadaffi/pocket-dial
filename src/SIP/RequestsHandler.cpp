@@ -10982,6 +10982,7 @@ void RequestsHandler::tick()
 						// must never trigger.
 						resp->setHeader("SIP/2.0 480 Temporarily Unavailable");
 						resp->clearBody();
+						resp->setTo(toWithTag(invite->getTo(), session->getLocalTag()));   // #1029: the 180's tag
 						resp->setContact(buildContact(std::string(invite->getToNumber())));
 						_outbox.emplace_back(invite->getSource(), std::move(resp));
 					}
