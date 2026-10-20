@@ -5,6 +5,7 @@
 
 #include "IDGen.hpp"
 #include "Session.hpp"
+#include "SessionTimer.hpp"
 #include "SipClient.hpp"
 #include "SipMessage.hpp"
 #include "SipMessagePool.hpp"
@@ -94,6 +95,8 @@ void CallPickup::complete(const std::shared_ptr<SipMessage>& data,
 	okToCaller->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
 	okToCaller->setTo(callerTo);
 	okToCaller->setContact(_env.contactFor(picker->getNumber()));
+	// #739: no timer on a splice, a re-INVITE refresh is relayed into the peer's dialog, not answered.
+	pbx::answerSessionTimer(*okToCaller, *invite, /*grant=*/false);
 	if (!data->getBody().empty()) okToCaller->setSdpContentType();   // #845: the INVITE's own may be absent or not SDP
 	okToCaller->setBody(std::string(data->getBody()));
 	(void)okToCaller->filterAudioCodecs(/*allowWideband=*/true);
@@ -108,6 +111,7 @@ void CallPickup::complete(const std::shared_ptr<SipMessage>& data,
 	okToPicker->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	okToPicker->setTo(toForPicker);
 	okToPicker->setContact(_env.contactFor(ringingExt));
+	pbx::answerSessionTimer(*okToPicker, *data, /*grant=*/false);   // #739, as above
 	if (!invite->getBody().empty()) okToPicker->setSdpContentType();   // #845: the INVITE's own may be absent or not SDP
 	okToPicker->setBody(std::string(invite->getBody()));
 	(void)okToPicker->filterAudioCodecs(/*allowWideband=*/true);

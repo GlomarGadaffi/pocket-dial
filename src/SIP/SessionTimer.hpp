@@ -7,10 +7,12 @@
 #include "SipMessage.hpp"
 
 // RFC 4028 session timers (#198): the 422 floor onInvite() applies, and the
-// Session-Expires on the 2xx the PBX writes itself for the 777, 888, 555, park,
-// trunk-handset and local-UPDATE answers (the 440, CallPickup and SipTrunk
-// carrier-side answers still echo the request's line; follow-up). Kept free of
-// RequestsHandler so ParkOrbit's answers use the same rule.
+// Session-Expires on each 2xx the PBX writes by cloning a phone's INVITE or
+// UPDATE: the 777, 888, 555, 440, park, voicemail, call-pickup (both legs),
+// trunk-handset and local-UPDATE answers all go through answerSessionTimer()
+// (#724, #739). SipTrunk's carrier-side answer is not a clone (it is composed
+// by SipTrunk::buildResponse) and never carries the header. Kept free of
+// RequestsHandler so ParkOrbit's and CallPickup's answers use the same rule.
 namespace pbx
 {
 	// RFC 4028 §4: the smallest Min-SE any element may require, and the value
@@ -41,13 +43,17 @@ namespace pbx
 	// refreshes nor ends the call on a timer nobody services.
 	//
 	// `grant` is false on a leg whose refresh the PBX cannot answer with a 2xx:
-	// 777, 888 and the trunk handset leg (onReinvite answers their re-INVITE
-	// 488), and park (an UPDATE refresh is relayed back to the caller, #709, and
-	// draws 481). RFC 4028 §10 says only a 2xx extends the session, so granting
-	// refresher=uac there makes the phone BYE the call at expiry, a 911 trunk
-	// call included. Those answers carry no timer at all (§7.2), the same rule
-	// as refresher=uas above. It is true on 555 (answerAnchorReinvite answers
-	// the re-INVITE 200) and on a local UPDATE answer.
+	// 777, 888, the 440 tone leg and the trunk handset leg (onReinvite answers
+	// their re-INVITE 488), park (an UPDATE refresh is relayed back to the
+	// caller, #709, and draws 481), voicemail (a re-INVITE is relayed back to
+	// the caller's own address) and call pickup (a spliced dialog relays a
+	// re-INVITE refresh into the peer's dialog, #453). RFC 4028 §10 says only a
+	// 2xx extends the session, so granting refresher=uac there makes the phone
+	// BYE the call at expiry, a 911 trunk call included. Those answers carry no
+	// timer at all (§7.2), the same rule as refresher=uas above. It is true on
+	// the synchronous 555 answer (answerAnchorReinvite answers the re-INVITE
+	// 200) and on a local UPDATE answer. The async anchor answer still passes
+	// false (#739).
 	//
 	// ponytail: "timer" is a substring match on the first Supported (or compact
 	// `k:`) line, kept small for the 4 MB build (#689). No other registered
