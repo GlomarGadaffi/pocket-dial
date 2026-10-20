@@ -57,7 +57,10 @@ namespace
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		ESP_LOGW("tapicfg", "slot %u: stored route DN is an emergency number, slot disabled", static_cast<unsigned>(idx));
 #else
-		std::fprintf(stderr, "tapicfg: slot %u: stored route DN is an emergency number, slot disabled\n", static_cast<unsigned>(idx));
+		if (std::fprintf(stderr, "tapicfg: slot %u: stored route DN is an emergency number, slot disabled\n", static_cast<unsigned>(idx)) < 0)
+		{
+			return;   // stderr is gone: the slot is already disabled, nothing else to do
+		}
 #endif
 	}
 }
