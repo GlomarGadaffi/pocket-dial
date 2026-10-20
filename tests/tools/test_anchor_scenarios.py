@@ -1906,7 +1906,8 @@ class FakeProbeBoard(FakeBoard):
     from what it really sent, a media port that counts RTP, and one anchor call flow per
     mode, each logging the esp_log lines the real board would. Knobs change one thing."""
 
-    NAMES = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age", "ws_upsert")
+    NAMES = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age", "ws_upsert",
+             "get_sock_shutdown")
 
     def __init__(self, mode):
         super().__init__()

@@ -337,6 +337,88 @@ TEST(BenchProbeLogic, AForcedGetStatusReplacesOnlyARealAnswer)
 	EXPECT_EQ(bp::overrideGetStatus(0, 403).status, 0);
 }
 
+TEST(BenchProbeLogic, GetSockShutdownIsAPlainFaultAppendedAfterWsUpsert)
+{
+	// #370/#350: get_sock_shutdown shuts down the socket the rx task published for its GET stream, so the
+	// header read after it finds no response and the loop rebuilds its handle. It takes no value, and it is
+	// appended last: every earlier index, and the harness's PROBE_FAULTS order, stay as they were.
+	Fault f = Fault::Count;
+	ASSERT_TRUE(bp::parseFault("get_sock_shutdown", f));
+	EXPECT_EQ(bp::faultName(f), "get_sock_shutdown");
+	EXPECT_EQ(static_cast<size_t>(f), 6u) << "after ws_upsert";
+	bp::FaultRequest r;
+	EXPECT_EQ(bp::parseFaultRequest("get_sock_shutdown", "", r), Verdict::Ok);
+	EXPECT_EQ(r.fault, f);
+	EXPECT_FALSE(r.hasValue);
+	for (const char* value : {"0", "1", "404", "x"})
+		EXPECT_EQ(bp::parseFaultRequest("get_sock_shutdown", value, r), Verdict::BadRequest) << value;
+
+	// The counters body names it, with the same four counters as every fault.
+	bp::Faults faults;
+	bp::BallastStatus b;
+	char buf[1024];
+	const size_t n = bp::renderStatus(buf, sizeof(buf), faults, b, false, 0);
+	ASSERT_GT(n, 0u) << "the 1024-byte counters buffer must still hold every fault";
+	EXPECT_NE(std::string(buf, n).find("\"get_sock_shutdown\":{\"armed\":false,\"value\":0,\"fired\":0,\"emergencySkips\":0}"),
+	          std::string::npos);
+}
+
+TEST(BenchProbeLogic, GetSockShutdownFiresOnceAndNeverDuringAnEmergency)
+{
+	Fault f = Fault::Count;
+	ASSERT_TRUE(bp::parseFault("get_sock_shutdown", f));
+	bp::FaultRequest r;
+	ASSERT_EQ(bp::parseFaultRequest("get_sock_shutdown", "", r), Verdict::Ok);
+
+	bp::Faults faults;
+	EXPECT_FALSE(faults.armedHint(f));
+	EXPECT_FALSE(faults.fire(f, false, false)) << "not armed: nothing fires and nothing is counted";
+	EXPECT_EQ(faults.fired(f), 0u);
+
+	ASSERT_EQ(faults.arm(r, false), Verdict::Ok);
+	EXPECT_TRUE(faults.armedHint(f));
+	int32_t v = -1;
+	EXPECT_TRUE(faults.fire(f, false, false, &v));
+	EXPECT_EQ(v, 0) << "it carries no value";
+	EXPECT_FALSE(faults.armed(f));
+	EXPECT_FALSE(faults.fire(f, false, false)) << "one-shot";
+	EXPECT_EQ(faults.fired(f), 1u);
+
+	// Rule 5: reaching the site during an emergency fires nothing, disarms every fault and counts a skip.
+	ASSERT_EQ(faults.arm(r, false), Verdict::Ok);
+	ASSERT_EQ(faults.arm(req(Fault::PostStreamFail), false), Verdict::Ok);
+	EXPECT_FALSE(faults.fire(f, false, /*emergencyLive=*/true));
+	EXPECT_EQ(faults.fired(f), 1u);
+	EXPECT_EQ(faults.emergencySkips(f), 1u);
+	EXPECT_FALSE(faults.armed(f));
+	EXPECT_FALSE(faults.armed(Fault::PostStreamFail));
+	// And nothing arms while one is live.
+	EXPECT_EQ(faults.arm(r, /*emergencyLive=*/true), Verdict::EmergencyLive);
+	EXPECT_FALSE(faults.armed(f));
+}
+
+TEST(BenchProbeLogic, ASockShutdownIsDueOnlyForTheClaimedLegWithAPublishedSocket)
+{
+	// The claimed outbound leg, with the fd runRxLoop published: shut it down.
+	EXPECT_TRUE(bp::getSockShutdownDue(true, 7));
+	EXPECT_TRUE(bp::getSockShutdownDue(true, 0)) << "0 is a descriptor; only -1 means none is published";
+	// Nothing published (-1): not due, so the one-shot arm is not spent on a no-op.
+	EXPECT_FALSE(bp::getSockShutdownDue(true, -1));
+	// Not the claimed leg (an inbound call, a PSAP callback): never, whatever fd it has.
+	EXPECT_FALSE(bp::getSockShutdownDue(false, 7));
+	EXPECT_FALSE(bp::getSockShutdownDue(false, -1));
+}
+
+TEST(BenchProbeLogic, AGetLoopNobodyClaimedIsNeverForced)
+{
+	// What takeGetFaults() hands a leg makeCall() did not claim is a default GetLoopFaults.
+	const bp::GetLoopFaults g;
+	EXPECT_EQ(g.forcedStatus, 0);
+	EXPECT_EQ(g.maxAttempts, bp::kGetMaxAttempts);
+	EXPECT_FALSE(g.sockShutdownLeg) << "an unclaimed leg is not the one get_sock_shutdown may act on";
+	EXPECT_FALSE(bp::getSockShutdownDue(g.sockShutdownLeg, 5));
+}
+
 TEST(BenchProbeLogic, TokenAgeMakesTheHeldTokenReadAsExpiring)
 {
 	constexpr int64_t kLife = 3600LL * 1000000;    // a 1 h JWT

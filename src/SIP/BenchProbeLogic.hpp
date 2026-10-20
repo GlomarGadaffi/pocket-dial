@@ -212,7 +212,14 @@ struct GetLoopFaults
 {
 	int forcedStatus = 0;   // 0 = real statuses
 	int maxAttempts = kGetMaxAttempts;
+	bool sockShutdownLeg = true;   // RED-FIRST STUB (#370), wrong on purpose: the next commit makes it false
 };
+
+// RED-FIRST STUB (#370), wrong on purpose: the next commit replaces this body.
+inline bool getSockShutdownDue(bool /*claimedLeg*/, int /*publishedFd*/)
+{
+	return false;
+}
 
 // A forced refusal replaces a real HTTP answer only; no answer parsed is a
 // transport failure (#350) and stays real. A real 200's body is the live audio

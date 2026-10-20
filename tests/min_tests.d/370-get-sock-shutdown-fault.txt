@@ -1,0 +1,2 @@
+# BenchProbeLogic_test.cpp: 4 new TEST blocks (#370/#350 get_sock_shutdown: the registered name, its one-shot lifecycle, the shutdown-due decision, an unclaimed GET loop). The Python cases in tests/tools/test_bench_get_sock_shutdown.py are not gtest cases.
+4
