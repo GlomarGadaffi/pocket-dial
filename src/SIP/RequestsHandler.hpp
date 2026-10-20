@@ -1787,6 +1787,11 @@ public:
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only: the sink wipeAllVoicemail() uses on host. Not owned.
 	void setVoicemailSinkForTest(vmarchive::Sink* sink) { _vmSinkForTest = sink; }
+#if POCKETDIAL_MWI
+	// #756 RED STUB: does nothing yet, so the boot-seed tests compile and fail by
+	// assertion. The next commit gives it the real body.
+	void armMwiSeedForTest(bool cardMounted = true) { (void)cardMounted; }
+#endif
 #endif
 	// Runs every slot's pending retrieval SD job (list/read/delete), a
 	// no-op for any slot not Pending. The ESP+PD_ETH_HAS_SD writer task

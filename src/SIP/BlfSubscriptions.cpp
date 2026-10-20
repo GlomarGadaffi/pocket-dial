@@ -448,4 +448,13 @@ void BlfSubscriptions::mwiDeleted(std::string_view ext)
 {
 	if (MwiBox* b = mwiBox(ext, false); b && b->oldMsgs > 0) b->oldMsgs--;
 }
+
+// #756 RED STUBS: deliberately wrong bodies (nothing is ever requested, nothing is
+// ever applied) so the new tests compile and fail by assertion. The next commit
+// replaces all three.
+void BlfSubscriptions::mwiSeedRequest(std::string_view) {}
+
+std::string_view BlfSubscriptions::mwiSeedNext() const { return {}; }
+
+void BlfSubscriptions::mwiSeedApply(std::string_view, size_t) {}
 #endif

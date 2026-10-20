@@ -402,3 +402,103 @@ TEST(BlfSubscriptions, MwiInDialogRefreshAndUnsubscribeSurviveAnIpChange)
 	blf.refresh();
 	EXPECT_TRUE(env.sent.empty()) << env.sentRaw(0);
 }
+
+// ── MWI boot seed (#756): request -> next -> apply ───────────────────────────
+// The engine asks for each voicemail mailbox's stored-message count once at boot
+// (the SD task answers it), and the answer is counted as NEW (owner ruling
+// 2026-10-19: nothing on the card records what was heard).
+namespace
+{
+	// Phone 201 subscribed to its own mailbox; the initial 0/0 NOTIFY is dropped.
+	void subscribeMwi201(FakePbxEnv& env, BlfSubscriptions& blf)
+	{
+		const sockaddr_in phone = FakePbxEnv::addr("192.168.1.60", 5060);
+		env.registered["201"] = std::make_shared<SipClient>("201", phone);
+		blf.onSubscribe(mwiSubscribe("201", "seed-cid", "Event: message-summary", "w1", "", 3600,
+			phone));
+		env.sent.clear();
+	}
+}
+
+TEST(BlfSubscriptions, MwiSeedCountsStoredMessagesAsNewAndNotifies)
+{
+	FakePbxEnv env;
+	BlfSubscriptions blf(env);
+	subscribeMwi201(env, blf);
+
+	EXPECT_TRUE(blf.mwiSeedNext().empty()) << "nothing was asked for yet";
+	blf.mwiSeedRequest("201");
+	EXPECT_EQ(std::string(blf.mwiSeedNext()), "201");
+	blf.mwiSeedApply("201", 3);
+	EXPECT_TRUE(blf.mwiSeedNext().empty()) << "answered, so no longer wanted";
+
+	blf.refresh();
+	ASSERT_EQ(env.sent.size(), 1u) << "the seed must NOTIFY the subscribed phone";
+	const std::string notify = env.sentRaw(0);
+	EXPECT_NE(notify.find("Messages-Waiting: yes\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 3/0 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+// The owner dialed 796 before the board's count came back: that listing is the
+// truth, and a late seed must not turn the lamp back on over it.
+TEST(BlfSubscriptions, MwiSeedIsIgnoredOnceTheOwnerHasListened)
+{
+	FakePbxEnv env;
+	BlfSubscriptions blf(env);
+	subscribeMwi201(env, blf);
+
+	blf.mwiSeedRequest("201");
+	EXPECT_EQ(std::string(blf.mwiSeedNext()), "201");
+	blf.mwiListened("201", 2);
+	EXPECT_TRUE(blf.mwiSeedNext().empty()) << "the listing answers the seed's question";
+	blf.mwiSeedApply("201", 5);
+
+	blf.refresh();
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string notify = env.sentRaw(0);
+	EXPECT_NE(notify.find("Messages-Waiting: no\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 0/2 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+// A message deposited while the count was still on its way is already one of the
+// stored messages if the card write beat the count, so the seed must not add it
+// again (and must never lower the count).
+TEST(BlfSubscriptions, MwiSeedAfterADepositDoesNotDoubleCount)
+{
+	FakePbxEnv env;
+	BlfSubscriptions blf(env);
+	subscribeMwi201(env, blf);
+
+	blf.mwiSeedRequest("201");
+	EXPECT_EQ(std::string(blf.mwiSeedNext()), "201");
+	blf.mwiDeposit("201");
+	blf.mwiSeedApply("201", 1);
+
+	blf.refresh();
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string notify = env.sentRaw(0);
+	EXPECT_NE(notify.find("Messages-Waiting: yes\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 1/0 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+// An empty answer holds nothing: seeding every mailbox of a card with no
+// messages must leave the whole table free for real counts.
+TEST(BlfSubscriptions, MwiSeedOfEmptyMailboxesDoesNotUseUpTheTable)
+{
+	FakePbxEnv env;
+	BlfSubscriptions blf(env);
+	subscribeMwi201(env, blf);
+
+	for (size_t i = 0; i < static_cast<size_t>(POCKETDIAL_MWI_MAILBOXES); ++i)
+		blf.mwiSeedRequest("e" + std::to_string(i));
+	ASSERT_FALSE(blf.mwiSeedNext().empty()) << "the requests must be kept";
+	for (size_t i = 0; i < static_cast<size_t>(POCKETDIAL_MWI_MAILBOXES); ++i)
+		blf.mwiSeedApply("e" + std::to_string(i), 0);
+	EXPECT_TRUE(blf.mwiSeedNext().empty());
+
+	blf.mwiDeposit("201");
+	blf.refresh();
+	ASSERT_EQ(env.sent.size(), 1u) << "a deposit must still find a free box";
+	const std::string notify = env.sentRaw(0);
+	EXPECT_NE(notify.find("Voice-Message: 1/0 (0/0)\r\n"), std::string::npos) << notify;
+}

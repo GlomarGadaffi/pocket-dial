@@ -50,10 +50,17 @@ public:
 	void mwiDeposit(std::string_view ext);
 	void mwiListened(std::string_view ext, size_t listed);
 	void mwiDeleted(std::string_view ext);
+	// #756 boot seed: request / next / apply (RED STUBS in this commit).
+	void mwiSeedRequest(std::string_view ext);
+	std::string_view mwiSeedNext() const;
+	void mwiSeedApply(std::string_view ext, size_t stored);
 #else
 	void mwiDeposit(std::string_view) {}
 	void mwiListened(std::string_view, size_t) {}
 	void mwiDeleted(std::string_view) {}
+	void mwiSeedRequest(std::string_view) {}
+	std::string_view mwiSeedNext() const { return {}; }
+	void mwiSeedApply(std::string_view, size_t) {}
 #endif
 
 private:
