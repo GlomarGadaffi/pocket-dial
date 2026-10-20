@@ -45,7 +45,7 @@ but not the tenant's own numbers, so a far end equal to the route DN or to a DID
 before the first packet, and any phantom verdict says it holds only if the far end cannot route back.
 
 Probe scenarios (x349_unread_makecall, x379_never_opened, x518_403_clean_giveup,
-x279_degraded_bye, x888_ws_upsert, x370_pressure_rebuild) drive the bench probe image
+x279_degraded_bye, x888_ws_upsert, x370_pressure_rebuild, x370_get_sock_shutdown) drive the bench probe image
 (docs/BENCH_PROBE.md, #384 H1): they need --expect-version with a -probe stamp, read
 /api/bench/fault's counters before and after, arm only their pre-registered faults (never for
 an emergency far end, never while the probe reports an emergency), and always disarm every
@@ -54,10 +54,15 @@ end, and every pre-registered fault must show fired >= 1, or the run is INVALID.
 
 x370_pressure_rebuild (#370) holds a DRAM ballast at the probe's 8192 B floor across one ring, so
 the rx task's rebuild of the GET handle after a transport failure (and the TLS handshake after it)
-runs under pressure. Nothing this scenario arms forces that path: only the ballast can, and only by chance
-(the get_sock_shutdown fault forces it, but no scenario arms it yet), so the witness is the board's own log
-(see x370_witness). The board's HTTP may not answer while the
+runs under pressure. Nothing this scenario arms forces that path: only the ballast can, and only by chance,
+so the witness is the board's own log (see x370_witness). The board's HTTP may not answer while the
 ballast is held, so the run makes no HTTP request between the hold and the release.
+
+x370_get_sock_shutdown (#370, #350) forces that path instead: it arms the probe's get_sock_shutdown fault (with
+get_status=404 and get_max_attempts=8) before the INVITE, and the rx task shuts down its own just-published GET
+socket, so the header read fails, the loop rebuilds its handle and pays a fresh handshake. It holds no ballast
+unless its config names one, so the board's HTTP answers throughout. The witness is x370's, counted only from the
+fault's `applied` line on, and a PASS wants that line with rc=0. It is necessary but weaker evidence for #350.
 
 x952_token_age_held (#952, #945) is the one scenario that holds an answered call for minutes: it arms
 token_age once the call's streams are up, holds past the old 5-minute token margin, hangs up, and reports
@@ -213,6 +218,11 @@ LOG_COUNTERS = {
     "bench_fired": r"BENCHFAULT (\S+) fired",
     "bench_makecall_read_fail": r"BENCHFAULT makecall_read_fail fired",
     "bench_ws_upsert": r"BENCHFAULT ws_upsert fired",
+    "bench_get_sock_shutdown": r"BENCHFAULT get_sock_shutdown fired",
+    # #370/#350: runRxLoop() issued the get_sock_shutdown fault's shutdown() (TelephonyAnchorClient.cpp, after the
+    # GET socket is published); group 1 = what shutdown() returned, 0 for a shutdown and -1 for none.
+    "get_sock_shutdown_applied": r"BENCHFAULT get_sock_shutdown applied: shutdown\(SHUT_RDWR\) on the published GET "
+                                 r"socket, rc=(-?\d+)",
     "bench_emergency": r"BENCHFAULT (?:every fault disarmed: emergency call|ballast released \(emergency\))",
     # #952/#945: the token witnesses main emits (TelephonyAnchorClient.cpp ensureToken(), fetchToken(),
     # requestRestartIfTokenStale(); BenchProbe.cpp fire()). Three carry a U+2014 dash on the board; \S+
@@ -615,7 +625,7 @@ def probe_problems(sc):
         problems.append("%s: hold_s leaves no room for the hangup inside the call cap" % n)
     if "call_fire_wait_s" in sc:
         problems += x888_timing_problems(sc)
-    if "ballast_bytes" in sc:
+    if "ballast_bytes" in sc or sc.get("sock_shutdown"):
         problems += x370_config_problems(sc)
     return problems
 
@@ -2835,8 +2845,8 @@ scenario(name="x888_ws_upsert", issues=("#888",), probe=True, faults=("ws_upsert
 # TelephonyAnchorClient.cpp:3755, called at :3895) and the next open pays a fresh TLS handshake. Under pressure
 # that is where the old CORRUPT HEAP lived. get_status does not force it: it rewrites only a parsed answer,
 # and a parsed answer keeps the handle (:3815-3862), so only a real transport failure reaches :3886-3899, and
-# of the faults this scenario arms only the ballast can cause one (get_sock_shutdown can too, but no scenario
-# arms it yet). get_status=404 keeps the loop in its "not ready" retries instead (a 403 would
+# of the faults this scenario arms only the ballast can cause one (the get_sock_shutdown fault can too, and
+# x370_get_sock_shutdown arms it). get_status=404 keeps the loop in its "not ready" retries instead (a 403 would
 # trip the #902 fail-fast); get_max_attempts keeps the loop, and so the ring, short.
 # The rebuild has no success line of its own (:3895-3899 log only a failure, :3897). Its witness is derived from
 # positive lines that do exist: the failure line before it (:3871, :3882), then the NEXT attempt's line.
@@ -2859,16 +2869,17 @@ def x370_destination_problems(far):
 def x370_config_problems(sc):
     n = sc.get("name", "<unnamed>")
     out = []
-    if sc.get("ballast_bytes", 0) < BALLAST_FLOOR:
-        out.append("%s: ballast_bytes %s is under the probe's %d B floor (it answers 400)"
-                   % (n, sc.get("ballast_bytes"), BALLAST_FLOOR))
     window = sc.get("call_fire_wait_s", 0) + sc.get("cancel_after_fire_s", 0) + CANCEL_FINAL_S
-    dead = sc.get("ballast_deadman_s", 0)
-    if not 1 <= dead <= 600:
-        out.append("%s: ballast_deadman_s %s must be 1-600 (BenchProbeLogic.hpp kDeadmanMaxS)" % (n, dead))
-    elif dead < window:
-        out.append("%s: the dead-man releases the ballast at %g s, before the call can end (up to %.1f s)"
-                   % (n, dead, window))
+    if "ballast_bytes" in sc:                 # x370_get_sock_shutdown holds none unless its config names one
+        if sc.get("ballast_bytes", 0) < BALLAST_FLOOR:
+            out.append("%s: ballast_bytes %s is under the probe's %d B floor (it answers 400)"
+                       % (n, sc.get("ballast_bytes"), BALLAST_FLOOR))
+        dead = sc.get("ballast_deadman_s", 0)
+        if not 1 <= dead <= 600:
+            out.append("%s: ballast_deadman_s %s must be 1-600 (BenchProbeLogic.hpp kDeadmanMaxS)" % (n, dead))
+        elif dead < window:
+            out.append("%s: the dead-man releases the ballast at %g s, before the call can end (up to %.1f s)"
+                       % (n, dead, window))
     if window > AGENT_INVITE_TIMEOUT_S:
         out.append("%s: the CANCEL can be due as late as %.1f s, past the agent's %g s INVITE bound"
                    % (n, window, AGENT_INVITE_TIMEOUT_S))
@@ -2920,6 +2931,51 @@ def x370_path(w):
                       % w["attempts"])
     return None, ("0 'transport failure' or 'open failed' lines: the ballast did not make the GET open fail, so "
                   "recreateGetClient() never ran")
+
+
+def x370s_witness(entries):
+    """x370_witness, counted only from the get_sock_shutdown fault's `applied` line on (#370, #350): a transport
+    failure before the shutdown is not the fault's, so it is not the rebuild's witness. applied: how many
+    `applied` lines the log shows (the fault is one-shot), rcs: what each shutdown() returned. With no `applied`
+    line the whole log is counted, for the summary only: x370s_path calls that INVALID."""
+    rx = _RX["get_sock_shutdown_applied"]
+    rcs, start = [], None
+    for i, (_, line) in enumerate(entries):
+        m = rx.search(line)
+        if m:
+            rcs.append(int(m.group(1)))
+            if start is None:
+                start = i
+    w = x370_witness(entries if start is None else entries[start:])
+    return dict(w, applied=len(rcs), rcs=rcs)
+
+
+def x370s_path(w):
+    """-> (outcome, why), as x370_path, after the checks that tie the failure to the shutdown: exactly one
+    `applied` line, with rc=0 (anything else and no shutdown happened, so a failure after it has another cause),
+    then a transport failure after it. outcome is None when the rebuild is not shown to have run (INVALID)."""
+    if w["applied"] == 0:
+        return None, ("0 'applied' lines: the shutdown is not shown to have been issued (the fault did not fire, or "
+                      "its line was lost), so a transport failure in this log has no cause to name")
+    if w["applied"] > 1:
+        return None, ("%d 'applied' lines for a one-shot fault: the log is not one clean shutdown" % w["applied"])
+    if w["rcs"][0] != 0:
+        return None, ("the 'applied' line shows rc=%d: shutdown() failed, so no shutdown happened and a transport "
+                      "failure after it has another cause" % w["rcs"][0])
+    if not w["attempts"]:
+        return None, ("the shutdown returned rc=0 but no transport failure followed it: the header read still got "
+                      "an answer, or a syslog line was lost; the rebuild did not run")
+    return x370_path(w)
+
+
+def x370_assess(sc, ents):
+    """-> (witness, outcome, why) for the log `ents` of one call: the shutdown's for x370_get_sock_shutdown, the
+    ballast scenario's own otherwise."""
+    if sc.get("sock_shutdown"):
+        w = x370s_witness(ents)
+        return (w,) + x370s_path(w)
+    w = x370_witness(ents)
+    return (w,) + x370_path(w)
 
 
 def x370_alive_problems(baseline, after):
@@ -3019,8 +3075,7 @@ def x370_judge(run, sc, lines):
     c, caller = run.calls[0], run.agents["caller"]
     ents = run.syslog.entries(c["t_start"]) if run.syslog else []
     legs = started_legs(ents)
-    w = x370_witness(ents)
-    outcome, why = x370_path(w)
+    w, outcome, why = x370_assess(sc, ents)
     summary = {"outcome": outcome, "witness": w, "legs": len(legs),
                "rebuild_success_line": "none on main (TelephonyAnchorClient.cpp:3895-3899 logs only the failure): "
                                        "a success is derived from the next attempt's line",
@@ -3028,9 +3083,10 @@ def x370_judge(run, sc, lines):
     c["log"] = w
     if len(legs) != 1:
         failed = sum(len(matches(ents, k)) for k in ("makecall_failed", "post_open_failed", "makecall_status"))
+        pressure = ("; with the ballast held across makeCall's POST that can be the pressure itself"
+                    if sc.get("ballast_bytes") else "")
         invalid.append("%d anchored legs started during the call, not 1 (%d makeCall failure line(s)): the far end "
-                       "never rang; with the ballast held across makeCall's POST that can be the pressure itself"
-                       % (len(legs), failed))
+                       "never rang%s" % (len(legs), failed, pressure))
     elif outcome is None:
         invalid.append(why)
     if matches(ents, "orphaned_349"):
@@ -3082,6 +3138,80 @@ scenario(name="x370_pressure_rebuild", issues=("#370",), part_of="#370",
                      "ORPHAN variant (a billable leg on 3CX) is possible, which the approval excludes "
                      "(docs/BENCH_PROBE.md): desmo's OK for that is part of the RING-REQUIRED OK"),
          path_counter="get_transport_fail", ring_required=True, judge=x370_judge, **X370)(probe_run(x370_run))
+
+
+# -- x370_get_sock_shutdown ---------------------------------------------------------
+# #370, #350: the same rebuild, forced instead of left to a ballast. The probe's get_sock_shutdown fault shuts
+# down the socket the rx task just published, so the header read finds no response, the loop logs a transport
+# failure, rebuilds its handle and pays a fresh handshake. The witness is x370's, from the shutdown on; the
+# `applied` line must show rc=0 (docs/BENCH_PROBE.md). A ballast is held only if the config names one.
+def x370s_run(run, sc):
+    """x370_run with get_sock_shutdown armed too, and a ballast only if sc names one. Every fault is armed before
+    the INVITE (makeCall() claims the leg for the GET faults at its start, so one armed later is never aimed at
+    this call), and before the ballast if there is one."""
+    caller = run.agents["caller"]
+    bad = sorted({p for end in run.far_ends for p in x370_destination_problems(end)})
+    if bad:
+        raise run_soak.Abort("INVALID", "refusing before any arm, ballast or call: " + "; ".join(bad))
+    ballast = bool(sc.get("ballast_bytes"))
+    run.say("1 call %s -> far end with get_sock_shutdown, get_status=%d and get_max_attempts=%d armed before the "
+            "INVITE%s: the rx task's GET socket is shut down after its open, so the rebuild of its handle is "
+            "forced; CANCEL %g s after the first GET transport failure, or at %g s"
+            % (caller.ext, sc["get_status"], sc["get_max_attempts"],
+               (" and a %d B DRAM ballast (dead-man %d s) held across it, no HTTP request before the release"
+                % (sc["ballast_bytes"], sc["ballast_deadman_s"])) if ballast else ", no ballast",
+               sc["cancel_after_fire_s"], sc["call_fire_wait_s"]))
+    run.checkpoint()
+    base = run.session_count()
+    rec = {"call": 1, "t_start": time.monotonic(), "final": None}
+    try:
+        run.arm("get_sock_shutdown")
+        run.arm("get_status", sc["get_status"])
+        run.arm("get_max_attempts", sc["get_max_attempts"])
+        if ballast:
+            run.hold_ballast()
+        run.calls.append(rec)                    # first: an abort keeps the record
+        rec["t_start"] = time.monotonic()
+        dlg = caller.invite(run.far_end, cancel_when=x370_cancel_when(run, sc["cancel_after_fire_s"]),
+                            cancel_when_timeout_s=sc["call_fire_wait_s"])
+        try:
+            rec.update(_call_id=dlg.call_id, final=dlg.final_status, cancel_status=dlg.cancel_status,
+                       cancel_when_expired=bool(dlg.cancel_when_expired),
+                       provisional=[s for _, s in dlg.responses if s < 200])
+        finally:
+            finish_call(caller, dlg, rec)
+    finally:
+        if ballast:
+            x370_release(run)
+    st = x370_recover(run, sc)
+    rec["alive"] = {k: (st or {}).get(k) for k in ("uptime", "resetReason", "version", "freeHeapInternal",
+                                                   "minFreeHeapInternal")}
+    rec["alive_problems"] = x370_alive_problems(run.baseline, st)
+    after_call(run, sc, caller, rec, base)
+    run.watch_call(time.monotonic() + sc["drop_wait_s"], stop_when=lambda: not undropped_legs(run.syslog.lines()))
+    run.say("call 1: final %s, CANCEL answered %s%s; the board %s" % (
+        rec["final"], rec.get("cancel_status"),
+        ", hung up by the harness (BYE %s)" % rec.get("hangup_bye") if "hangup_ms" in rec else "",
+        "answered after the call, uptime %s" % rec["alive"]["uptime"] if st else "did NOT answer after the call"))
+
+
+X370S = {k: v for k, v in X370.items() if not k.startswith("ballast_")}
+X370S.update(faults=("get_sock_shutdown", "get_status", "get_max_attempts"), sock_shutdown=True)
+scenario(name="x370_get_sock_shutdown", issues=("#370", "#350"), part_of="#370",
+         about="test UA 6101 -> the designated far end, one short ring, with get_sock_shutdown, get_status=404 and "
+               "get_max_attempts=8 armed before the INVITE: the probe shuts down the rx task's GET socket right after "
+               "its open, so the header read fails and the rx task rebuilds its GET handle and pays a fresh TLS "
+               "handshake (#370's path, made on demand); CANCELled 2 s after the first transport failure. With no "
+               "ballast held the board's HTTP answers throughout. A PASS needs the shutdown's applied line with rc=0 "
+               "and the rebuild witness after it; no applied line, rc=-1, or no failure after the shutdown is "
+               "INVALID. It is necessary but weaker evidence for #350: a shutdown is not the allocation failure "
+               "behind that bug and nothing squeezes the heap, so #350 also wants a run under pressure",
+         plan_lines=("x370s     get_sock_shutdown is armed BEFORE the INVITE: makeCall() claims the leg for the GET "
+                     "faults at its start, so a fault armed later is never aimed at this call (fired 0, INVALID)",
+                     "x370s     no ballast: nothing squeezes the board, so the #349 ORPHAN variant is not provoked, "
+                     "but a shutdown is the weaker half of #350 (docs/BENCH_PROBE.md)"),
+         path_counter="get_sock_shutdown_applied", ring_required=True, judge=x370_judge,
+         **X370S)(probe_run(x370s_run))
 
 
 # ---------------------------------------------------------------- h947_http_load (#947)

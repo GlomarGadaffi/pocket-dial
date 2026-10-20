@@ -202,15 +202,20 @@ one anchored leg, no second rx task, no `ORPHANED` line, one drop, a CANCEL answ
   rebuild client` (no handshake was made). A `PASS` shows that the rebuilt handle's first handshake survived at that run's
   free heap, on the path #370 recorded: a successful open, no response parsed, a fresh handshake. #370 stays open
   until a valid run exists. The 2026-10-03 closure rule also wants a named scenario whose script computes the
-  verdict, and **no scenario arms this fault yet**: `AnchorRun.arm()` refuses a fault a scenario did not
-  pre-register, so the harness cannot run it today.
+  verdict: `x370_get_sock_shutdown` ([TEST_HARNESS.md](TEST_HARNESS.md)) arms this fault beside `get_status=404` and
+  `get_max_attempts=8` before the INVITE, holds no ballast, and computes the rules above. It counts the witness only
+  from the `applied` line on, so a transport failure before the shutdown is not credited to it, and it calls more than
+  one `applied` line `INVALID`.
 - **#350.** Weaker, as above. A run without ballast shows the rebuild path ran and survived at the board's normal
   free heap. It does not show that it survives pressure, and a shutdown does not make mbedTLS fail the way an
-  allocation failure did. To close #350 the run is repeated with a ballast held from before the INVITE (arm the
-  fault first, then `POST ballast=<bytes>&deadman=<s>`) at a target high enough that the first open still works: at
-  the 8192 floor the 2026-10-10 run answered 503 before any GET handshake, so the fault could not fire (`fired` 0,
-  `INVALID`). The ballast also puts `makeCall()`'s POST under pressure, so the #349 ORPHAN variant is possible: each
-  such run needs desmo's OK, and the board's HTTP may not answer until the ballast is released.
+  allocation failure did. `x370_get_sock_shutdown` is that no-ballast run. To close #350 the run is repeated with a
+  ballast held from before the INVITE (arm the fault first, then `POST ballast=<bytes>&deadman=<s>`) at a target high
+  enough that the first open still works: at the 8192 floor the 2026-10-10 run answered 503 before any GET handshake,
+  so the fault could not fire (`fired` 0, `INVALID`). The scenario's run holds a ballast, after its three arms, when
+  its config has `ballast_bytes` and `ballast_deadman_s` (checked like `x370_pressure_rebuild`'s), but no scenario is
+  registered with one: the target is not known. Take it from the no-ballast run's `freeHeapInternal` reading, then
+  register a variant. The ballast also puts `makeCall()`'s POST under pressure, so the #349 ORPHAN variant is
+  possible: each such run needs desmo's OK, and the board's HTTP may not answer until the ballast is released.
 
 ## Ballast
 
@@ -245,7 +250,8 @@ quoted log line finds its current location.
   handle (`:4197-4245`); `overrideGetStatus()` (`src/SIP/BenchProbeLogic.hpp`) leaves a transport failure (status
   <= 0) real. The rebuild runs only after a real `GET stream transport failure` (`:4253`) or `GET stream open failed`
   (`:4264`) line. The ballast is the only thing this scenario arms that can cause one, and only by chance
-  (`get_sock_shutdown`, [above](#get_sock_shutdown-370-350), causes one on purpose; no scenario arms it yet). In a
+  (`get_sock_shutdown`, [above](#get_sock_shutdown-370-350), causes one on purpose, and `x370_get_sock_shutdown`
+  arms it). In a
   call that is not answered every GET answer is a 404 on a kept connection, so the one handshake under pressure is
   the first open (`startRxIfNeeded()` in
   `makeCall()`, `:603` and its retry at `:614`, before `Successfully initiated call` at `:685`). That is why the
@@ -364,6 +370,10 @@ failure lines the knobs ask for. Not known until a board runs it: whether a ball
 fail at all (the mbedTLS buffers may be in PSRAM), whether `makeCall()`'s POST survives it, whether the board's
 HTTP answers the release, and whether 35 s is a long enough backstop. The rebuild witness is derived from the
 log, not read from a line of its own.
+
+`x370_get_sock_shutdown` (#370, #350) has host tests only: its judge on sample logs
+(`tests/tools/test_anchor_x370_get_sock_shutdown.py`) and a fake board (`X370SockShutdownTest`) whose GET loop logs
+the lines this section says the probe image logs. It has never run on a board.
 
 `get_sock_shutdown` (#370, #350) was written without a build: its pure decisions have host tests
 (`BenchProbeLogic_test.cpp`) and its source wiring is pinned (`tests/tools/test_bench_get_sock_shutdown.py`), but the
