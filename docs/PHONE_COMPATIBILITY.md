@@ -253,6 +253,16 @@ flowchart TD
   [`GET /api/status`](API.md#get-apistatus); an active call appears in `sessions`.
 - If the client pool is full, a new REGISTER receives `503 Service Unavailable`; the phone
   retries on its next refresh ([SCALING.md §4](SCALING.md)).
+- **Session timers (RFC 4028).** The PBX never sends a refresh. On the `440` tone and a call
+  pickup it answers a phone that only *supports* timers (`Supported: timer`, plus a
+  `Session-Expires`) with no `Session-Expires` and no `Require`, so no timer runs on that
+  call. A phone that *requires* them (`Require: timer`, for example pjsua `--use-timer=2`) gets
+  its own `Session-Expires` and `Require: timer` back, because RFC 4028 §9 owes it both and
+  pjsua hung up on a `440` answer without them (`BYE` with `Reason: SIP ;cause=421`). The PBX
+  arms no expiry of its own for either leg (#739). The other answers the PBX writes itself
+  (`777`, `888`, park, voicemail, the trunk handset leg) still carry no timer whatever the
+  phone asked, although §9 owes a phone that requires one a timer there too; that has not been
+  measured on those legs (open, #739).
 - **Provisional responses from the callee are relayed as-is.** A `180 Ringing` that a callee
   sends with an SDP body is forwarded with that body intact. `onRinging` hands it straight to
   `endHandle`. The only bodiless `180`s are the ones the server generates itself: the `777` echo
