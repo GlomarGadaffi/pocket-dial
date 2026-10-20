@@ -49,11 +49,18 @@ namespace pbx
 	// as refresher=uas above. It is true on 555 (answerAnchorReinvite answers
 	// the re-INVITE 200) and on a local UPDATE answer.
 	//
+	// That strip is only legal for a caller that merely SUPPORTS timer. One that
+	// REQUIRES it (Require: timer) is owed Session-Expires and Require: timer in
+	// the 2xx (§9): pjsua --use-timer=2 hung up on a 440 answer without them (BYE,
+	// Reason cause=421; #1042). So a grant=false answer to such a caller keeps the
+	// clone as it arrived, the pre-#724 echo. Nothing arms a reaper from our own 2xx.
+	//
 	// ponytail: "timer" is a substring match on the first Supported (or compact
 	// `k:`) line, kept small for the 4 MB build (#689). No other registered
 	// option tag contains "timer"; tokenise the list if one ever does.
 	inline void answerSessionTimer(SipMessage& response, const SipMessage& request, bool grant)
 	{
+		if (!grant && request.requiresTimer()) return;   // #1042
 		response.removeHeaders("Session-Expires");
 		response.removeHeaders("x");         // compact Session-Expires (RFC 4028 §4)
 		response.removeHeaders("Require");   // the phone's own, cloned in
