@@ -18,6 +18,7 @@
 	// secret-handling model.
 	#include "nvs_flash.h"
 	#include "nvs.h"
+	#include "esp_log.h"
 #else
 	// Host fallback: a plaintext key=value file created with 0600 permissions.
 	#include <sys/stat.h>
@@ -43,6 +44,24 @@ namespace
 	bool validProviderByte(uint8_t v)
 	{
 		return v < static_cast<uint8_t>(TelephonyProviderType::Count);
+	}
+
+	// #1060: a store written before the #1047 refusal can hold an emergency routeDn, and the
+	// boot path copies an enabled slot's routeDn into the anchor config. load() runs this on
+	// each slot it read: such a slot comes up disabled (the stored value is left for the
+	// operator to see and replace). RAM only; the next save writes the table.
+	void refuseStoredEmergencyRouteDn(TelephonyApiConfig::Slot& s, size_t idx)
+	{
+		if (!isEmergencyRouteDn(s.routeDn)) return;
+		s.enabled = false;
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+		ESP_LOGW("tapicfg", "slot %u: stored route DN is an emergency number, slot disabled", static_cast<unsigned>(idx));
+#else
+		if (std::fprintf(stderr, "tapicfg: slot %u: stored route DN is an emergency number, slot disabled\n", static_cast<unsigned>(idx)) < 0)
+		{
+			return;   // stderr is gone: the slot is already disabled, nothing else to do
+		}
+#endif
 	}
 }
 
@@ -373,6 +392,7 @@ void TelephonyApiConfig::load()
 		getStr("id",  s.clientId);
 		getStr("sec", s.secret);
 		getStr("dn",  s.routeDn);
+		refuseStoredEmergencyRouteDn(s, i);
 	}
 	uint8_t act = 0xff;
 	if (nvs_get_u8(h, "active", &act) == ESP_OK && act < kSlots)
@@ -510,6 +530,10 @@ void TelephonyApiConfig::load()
 		else if (field == "id")  s.clientId = val;
 		else if (field == "sec") s.secret = val;
 		else if (field == "dn")  s.routeDn = val;
+	}
+	for (size_t i = 0; i < kSlots; ++i)
+	{
+		refuseStoredEmergencyRouteDn(_slots[i], i);
 	}
 }
 

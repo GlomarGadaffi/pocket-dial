@@ -1024,6 +1024,24 @@ TEST_F(ConfigExportImportTest, EncryptedRoundTrip_RestoresTrunkEmailE911AdminExt
 	EXPECT_EQ(_handler->getAdminExt(), "1002");
 }
 
+// #1060: the import used to drop setTelephonyConfigSlot's refusal and list the telephony config
+// as applied. Enabling a draft with no route DN is refused, so the import says so.
+TEST_F(ConfigExportImportTest, Import_TelephonySlotRefusal_IsReportedNotApplied)
+{
+	TelephonyApiConfig::Slot draft;
+	draft.type = TelephonyProviderType::Telephony;
+	draft.baseUrl = "https://pbx.example.invalid";
+	ASSERT_EQ(_handler->setTelephonyConfigSlot(0, draft, false), "");
+	const std::string blob = "{\"exportVer\":1,\"plaintext\":{\"telephonyConfig\":["
+		"{\"index\":0,\"enabled\":true}]}}";
+	const std::string resp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(blob) + "&confirm=REPLACE", "pd_session=" + _sysop.cookie, _sysop.csrf);
+	ASSERT_EQ(statusOf(resp), 200) << resp;
+	EXPECT_NE(bodyOf(resp).find("telephonyConfig slot 0 (Enabled slot needs a route DN)"), std::string::npos) << resp;
+	EXPECT_EQ(bodyOf(resp).find("telephonyConfig (metadata)"), std::string::npos) << resp;
+	EXPECT_FALSE(_handler->getTelephonyConfigSlot(0).enabled);
+}
+
 // #483: the import holds the trunk to POST /api/trunk's checks. A file that
 // points it at this board (#546) is reported under "skipped", not stored.
 TEST_F(ConfigExportImportTest, Import_TrunkPointedAtThisBoard_IsSkippedNotStored)
