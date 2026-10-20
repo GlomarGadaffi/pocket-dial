@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <string>
@@ -390,4 +391,47 @@ TEST(VoicemailArchiveIndexParsing, ParseEntryLineRejectsAnEmptyNameField)
 {
 	vmarchive::MessageInfo info;
 	EXPECT_FALSE(vmarchive::parseEntryLine(",1000,3,call-1", info));
+}
+
+// ── #1043: more tombstones than the listing window ─────────────────────────
+
+namespace
+{
+// 25 messages m0..m24, then 25 lifetime deletes of all of them.
+std::FILE* indexWithAllDeleted(int n)
+{
+	std::FILE* f = std::tmpfile();
+	for (int i = 0; i < n; ++i) std::fprintf(f, "m%d,%d,100,call-%d\n", i, 1000 + i, i);
+	for (int i = 0; i < n; ++i) std::fprintf(f, "%sm%d\n", vmarchive::kTombstonePrefix, i);
+	return f;
+}
+}
+
+TEST(VoicemailArchiveIndexFile, ListCountsZeroWhenAllMoreThan20AreDeleted)
+{
+	std::FILE* f = indexWithAllDeleted(25);
+	ASSERT_NE(f, nullptr);
+	EXPECT_EQ(vmarchive::listIndexFile(f, nullptr, 40), 0u);   // MWI count-only path
+	std::fclose(f);
+}
+
+TEST(VoicemailArchiveIndexFile, ListKeepsTheLiveOneAmongMoreThan20Tombstones)
+{
+	std::FILE* f = std::tmpfile();
+	ASSERT_NE(f, nullptr);
+	for (int i = 0; i < 26; ++i) std::fprintf(f, "m%d,%d,100,call-%d\n", i, 1000 + i, i);
+	for (int i = 0; i < 25; ++i) std::fprintf(f, "%sm%d\n", vmarchive::kTombstonePrefix, i);
+	vmarchive::MessageInfo out[4];
+	ASSERT_EQ(vmarchive::listIndexFile(f, out, 4), 1u);
+	EXPECT_STREQ(out[0].name, "m25");
+	std::fclose(f);
+}
+
+TEST(VoicemailArchiveIndexFile, HasTombstoneFindsTheTwentyFifthTombstone)
+{
+	std::FILE* f = indexWithAllDeleted(25);
+	ASSERT_NE(f, nullptr);
+	EXPECT_TRUE(vmarchive::indexFileHasTombstone(f, "m24"));
+	EXPECT_FALSE(vmarchive::indexFileHasTombstone(f, "m25"));
+	std::fclose(f);
 }
