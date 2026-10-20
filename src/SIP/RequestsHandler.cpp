@@ -3175,7 +3175,7 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	ok->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 	ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 	ok->setContact(buildContact("440"));
-	pbx::answerSessionTimer(*ok, *data, /*grant=*/false);   // #198, #739: a re-INVITE refresh gets 488
+	pbx::stripSessionTimerUnlessRequired(*ok, *data);   // #198, #739: a re-INVITE refresh gets 488
 	ok->clearBody();
 	// The cloned INVITE's Content-Type need not name SDP, or exist (#838, #845).
 	ok->setSdpContentType();
