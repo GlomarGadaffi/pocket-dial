@@ -1791,6 +1791,10 @@ void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
 	_outbox.emplace_back(data->getSource(), std::move(response));
 }
 
+// #1049: how long a callee that was CANCELled may take to send its 487 before the PBX
+// answers the caller itself: 64*T1 (RFC 3261 s17.1.1.2), as kSpliceTombLife below.
+static constexpr auto kCancelBoundedWait = std::chrono::seconds(32);
+
 void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 {
 #if POCKETDIAL_TRUNK_INBOUND
@@ -1965,8 +1969,17 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// #1049: only a call still ringing gets the bounded wait for the callee's 487. setCallState()
+	// does not guard the transition, so the state is read here. Anything else (answered, refused)
+	// has no ring to bound, and its timer is cleared rather than left to fire into a Cancel.
+	const bool stillRinging = cancelSess.has_value() && cancelSess.value()->getState() == Session::State::Invited;
 	setCallState(data->getCallID(), Session::State::Cancel);
 	setCallDisposition(data->getCallID(), Session::Disposition::Cancel);
+	if (cancelSess.has_value())
+	{
+		if (stillRinging) cancelSess.value()->armRingTimer(std::chrono::steady_clock::now() + kCancelBoundedWait);
+		else cancelSess.value()->clearRingTimer();
+	}
 	endHandle(data->getToNumber(), data);
 }
 
@@ -2109,6 +2122,13 @@ void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 	{
 		ackForwardedFinal(data);
 		return;
+	}
+	// #1049: this 487 answers the CANCEL, so the bounded wait for it is spent. Relayed, the caller's
+	// ACK ends the call; a timer left armed would send the caller a second 487.
+	if (session.value()->getState() == Session::State::Cancel)
+	{
+		session.value()->clearRingTimer();
+		session.value()->setCancelAnswered();
 	}
 	endHandle(data->getFromNumber(), data);
 }
@@ -7503,6 +7523,9 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 
 		if (session.value()->getState() == Session::State::Cancel)
 		{
+			// #1049: a 2xx that crossed the CANCEL answers the call. No bounded-wait 487 may follow it.
+			session.value()->clearRingTimer();
+			session.value()->setCancelAnswered();
 			endHandle(data->getFromNumber(), data);
 			return;
 		}
@@ -10812,15 +10835,22 @@ void RequestsHandler::tick()
 			// end's own transaction timers bound a leg that never answers at all.
 			const bool ringingEmergency =
 				session->getState() == Session::State::Invited && session->isEmergency();
+			// #1049: a caller's CANCEL whose callee never sent its 487 (armed in onCancel, 64*T1).
+			// Never an emergency, an anchor or outbound trunk leg has its own teardown, and a
+			// callee answer already relayed (cancelAnswered) leaves the caller's ACK to end the call.
+			const bool cancelledCallee =
+				session->getState() == Session::State::Cancel && !session->isEmergency() &&
+				!session->isAnchor() && !session->isTrunk() && !session->cancelAnswered();
 #if POCKETDIAL_TRUNK_INBOUND
 			// #398: and a carrier call's cancelled fork whose 487 never came.
 			const bool cancelledTrunkFork =
 				session->getState() == Session::State::Cancel && isTrunkInbound(*session);
 			if (session->isRingExpired(now) && !ringingEmergency &&
-			    (session->getState() == Session::State::Invited || connectedAbandonedAnchor || cancelledTrunkFork))
+			    (session->getState() == Session::State::Invited || connectedAbandonedAnchor || cancelledTrunkFork ||
+			     cancelledCallee))
 #else
 			if (session->isRingExpired(now) && !ringingEmergency &&
-			    (session->getState() == Session::State::Invited || connectedAbandonedAnchor))
+			    (session->getState() == Session::State::Invited || connectedAbandonedAnchor || cancelledCallee))
 #endif
 			{
 				expiredCallIds.push_back(callID);
@@ -10853,6 +10883,32 @@ void RequestsHandler::tick()
 				continue;
 			}
 #endif
+
+			if (session->getState() == Session::State::Cancel)
+			{
+				// #1049: the caller cancelled and the callee's 487 never came in 64*T1 (RFC 3261
+				// s17.1.1.2). The PBX answers the caller's INVITE with its own 487 (RFC 3261 s9.2)
+				// and drops the session. The callee gets no second CANCEL: the caller's already reached it.
+				auto invite = session->getInviteMessage();
+				if (!invite) invite = session->getForwardLegInvite();
+				auto src = session->getSrc();
+				const std::string ringTag = session->getLocalTag();   // #1023: the 180's tag
+				if (invite && src)
+				{
+					// refuseInvite() answers with the INVITE's own To, which has no tag. The 180 carried
+					// ringTag (#1023), so the 487 is built from a copy that has it. Pool exhausted: the
+					// session still ends (#715); the caller's own INVITE timer bounds it.
+					if (auto tagged = getMessageFromPool(*invite))
+					{
+						tagged->setTo(toWithTag(invite->getTo(), ringTag));
+						refuseInvite(*tagged, SipMessageTypes::REQUEST_TERMINATED, src->getNumber());
+					}
+				}
+				queueLog("[Telephony] cancelled call: no 487 from the callee within 32 s -- ended with the caller's 487");
+				endCall(callID, src ? src->getNumber() : std::string(), dialedNumberOf(*session),
+				        "the extension never answered the CANCEL");
+				continue;
+			}
 
 			if (session->isAnchorInbound())
 			{

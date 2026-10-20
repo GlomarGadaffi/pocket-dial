@@ -318,6 +318,10 @@ public:
 	// caller's INVITE, so onReqTerminated() ACKs it instead of relaying it.
 	const std::string& getCancelledLegExt() const { return _cancelledLegExt; }
 	void setCancelledLegExt(const std::string& ext) { _cancelledLegExt = ext; }
+	// #1049: the callee's answer to our CANCEL (its 487, or a 2xx that crossed it) has been
+	// relayed. The bounded wait armed in onCancel() must never answer the caller a second time.
+	bool cancelAnswered() const { return _cancelAnswered; }
+	void setCancelAnswered() { _cancelAnswered = true; }
 
 	// ── Sequential hunt-group progression (Class A sweep) ─────────────
 	// _huntMembers is the ordered list; _huntIndex is the member currently ringing.
@@ -517,6 +521,7 @@ private:
 	// No-answer / hunt timer + forwarding/hunt bookkeeping (Class A sweep).
 	std::chrono::steady_clock::time_point _ringDeadline;
 	bool _ringTimerArmed = false;
+	bool _cancelAnswered = false;   // #1049: the callee answered our CANCEL and that answer was relayed
 	std::string _noAnswerTarget;
 	std::string _cancelledLegExt;
 
