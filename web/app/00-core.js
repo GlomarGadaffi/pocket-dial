@@ -194,6 +194,28 @@ function confirmEnd(ok){
 $("confirm-yes").addEventListener("click",e=>{e.preventDefault();confirmEnd(true);});
 $("confirm-no").addEventListener("click",e=>{e.preventDefault();confirmEnd(false);});
 $("confirm-dlg").addEventListener("close",()=>{confirmEnd(false);});
+/* Turning on an anchor media path defaults to NO. ui.accept() resolves true only when the admin ticks the box
+   and presses "Accept and enable"; Esc, click-away and "No" resolve false. Nothing is remembered: each enable asks. */
+var acceptRes=null;
+ui.accept=()=>{
+ var d=$("accept-dlg");
+ if(acceptRes){var old=acceptRes;acceptRes=null;old(false);}
+ $("accept-ck").checked=false;
+ $("accept-yes").disabled=true;
+ return new Promise(res=>{
+  acceptRes=res;
+  showDlg(d);
+  $("accept-no").focus();});};
+function acceptEnd(ok){
+ var r=acceptRes,d=$("accept-dlg");
+ acceptRes=null;
+ if(d.open)d.close();
+ if(r)r(ok);
+}
+$("accept-ck").addEventListener("change",()=>{$("accept-yes").disabled=!$("accept-ck").checked;});
+$("accept-yes").addEventListener("click",e=>{e.preventDefault();if($("accept-ck").checked)acceptEnd(true);});
+$("accept-no").addEventListener("click",e=>{e.preventDefault();acceptEnd(false);});
+$("accept-dlg").addEventListener("close",()=>{acceptEnd(false);});
 /* ---- gating: data-needs="login" | "owner" ---- */
 function gateAllowed(need){
  if(need==="login")return canWrite();

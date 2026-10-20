@@ -338,6 +338,8 @@ td.row-actions{display:table-cell;white-space:nowrap}
 .gdlg-body>h3{margin:0 -6px}
 .gdlg-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:4px}
 #confirm-d{white-space:pre-line;overflow-wrap:anywhere}
+#accept-d p{margin:0 0 4px;overflow-wrap:anywhere}
+#accept-t{color:var(--p1)}
 .toasts{position:fixed;left:6px;right:6px;bottom:36px;z-index:50;display:flex;flex-direction:column;align-items:flex-end;gap:0;pointer-events:none}
 .toasts>div{width:min(420px,100%)}
 .toasts .toast{position:static;z-index:auto;display:flex;align-items:flex-start;gap:6px;margin:0;min-height:var(--row);padding:4px 6px;border:1px solid var(--dim);font:400 12px/16px var(--f-ui);overflow-wrap:anywhere;white-space:normal;min-width:0;pointer-events:auto}
@@ -433,12 +435,12 @@ td.row-actions{display:table-cell;white-space:nowrap}
 <div class="tile" id="tile-nvs"><div>NVS</div><div class="st" id="st-nvs">· WAIT</div></div>
 </div>
 </fieldset>
-<fieldset role="group" aria-label="Signal path">
-<legend>Signal path</legend>
 )html1";
 
 static const char PD_HTML_2[] =
-R"html2(<div class="sigpath">
+R"html2(<fieldset role="group" aria-label="Signal path">
+<legend>Signal path</legend>
+<div class="sigpath">
 <div class="pane">
 <span class="lbl">WAN UDP:5060</span>
 <div><span class="unit" style="margin:0">rx</span></div>
@@ -1261,6 +1263,23 @@ R"html18(
 </fieldset>
 </form>
 </dialog>
+<dialog id="accept-dlg" class="gdlg" aria-labelledby="accept-t" aria-describedby="accept-d">
+<form method="dialog" class="gdlg-body">
+<fieldset>
+<legend id="accept-t">Enable anchor calling? Default: NO</legend>
+<div id="accept-d">
+<p><b>Not for public deployment.</b> Do not expose this system to the internet or offer it to the public.</p>
+<p><b>E911 has limits.</b> A 911 or 933 call leaves only through the configured Telephony API route. If that route is down or not set up, the call is refused. Read the E911 and demarcation notes before you rely on it.</p>
+<p><b>The deployment is yours.</b> You, the administrator who deploys this, are responsible for how it is used, including emergency calling. Pocket-dial does not take that responsibility.</p>
+</div>
+<label class="opt"><input type="checkbox" id="accept-ck"> I have read this and I accept it.</label>
+<div class="gdlg-actions">
+<button type="submit" class="btn btn-primary" value="no" id="accept-no" autofocus>No, keep it off</button>
+<button type="submit" class="btn" value="yes" id="accept-yes" disabled>Accept and enable</button>
+</div>
+</fieldset>
+</form>
+</dialog>
 <dialog id="login-dlg" class="gdlg" aria-labelledby="login-t">
 <form id="login-form" class="gdlg-body" autocomplete="on">
 <fieldset>
@@ -1436,7 +1455,10 @@ ui.confirm=(title,line,actionLabel)=>{
 var d=$("confirm-dlg");
 if(confirmRes){var old=confirmRes;confirmRes=null;old(false);}
 $("confirm-t").textContent=title;
-$("confirm-d").textContent=line;
+)html18";
+
+static const char PD_HTML_19[] =
+R"html19($("confirm-d").textContent=line;
 $("confirm-yes").textContent=actionLabel||"Confirm";
 return new Promise(res=>{
 confirmRes=res;
@@ -1451,6 +1473,26 @@ if(r)r(ok);
 $("confirm-yes").addEventListener("click",e=>{e.preventDefault();confirmEnd(true);});
 $("confirm-no").addEventListener("click",e=>{e.preventDefault();confirmEnd(false);});
 $("confirm-dlg").addEventListener("close",()=>{confirmEnd(false);});
+var acceptRes=null;
+ui.accept=()=>{
+var d=$("accept-dlg");
+if(acceptRes){var old=acceptRes;acceptRes=null;old(false);}
+$("accept-ck").checked=false;
+$("accept-yes").disabled=true;
+return new Promise(res=>{
+acceptRes=res;
+showDlg(d);
+$("accept-no").focus();});};
+function acceptEnd(ok){
+var r=acceptRes,d=$("accept-dlg");
+acceptRes=null;
+if(d.open)d.close();
+if(r)r(ok);
+}
+$("accept-ck").addEventListener("change",()=>{$("accept-yes").disabled=!$("accept-ck").checked;});
+$("accept-yes").addEventListener("click",e=>{e.preventDefault();if($("accept-ck").checked)acceptEnd(true);});
+$("accept-no").addEventListener("click",e=>{e.preventDefault();acceptEnd(false);});
+$("accept-dlg").addEventListener("close",()=>{acceptEnd(false);});
 function gateAllowed(need){
 if(need==="login")return canWrite();
 if(need==="owner")return canWrite()&&isOwner();
@@ -1467,10 +1509,7 @@ var need=n.getAttribute("data-needs");
 if(!gateAllowed(need)){
 if(!n.hasAttribute("data-gated"))n._t0=n.getAttribute("title")||"";
 n.setAttribute("data-gated","1");
-)html18";
-
-static const char PD_HTML_19[] =
-R"html19(n.setAttribute("aria-disabled","true");
+n.setAttribute("aria-disabled","true");
 n.setAttribute("title",gateReason(need));
 return;}
 if(!n.hasAttribute("data-gated"))return;
@@ -1820,7 +1859,10 @@ setMsg("setup-msg","Login saved. The factory login is retired.","ok");
 return fetchAdminStatus();
 }).then(()=>{
 if(!adminState.loggedIn&&!adminState.needsSetup)openLogin("Login saved. Log in with the new credentials.");
-}).catch(e=>{setMsg("setup-msg","Could not save the login: "+e.message,msgCls(e));});
+)html19";
+
+static const char PD_HTML_20[] =
+R"html20(}).catch(e=>{setMsg("setup-msg","Could not save the login: "+e.message,msgCls(e));});
 }
 var nav={current:""};
 nav.render=()=>{
@@ -1869,10 +1911,7 @@ document.querySelectorAll("#fkey-bar [data-sec]").forEach((b,i)=>{
 var k=FKEY_ORDER[i];
 if(!k)return;
 FKEYS[k]=b.getAttribute("data-sec");
-)html19";
-
-static const char PD_HTML_20[] =
-R"html20(b.setAttribute("aria-keyshortcuts",k);
+b.setAttribute("aria-keyshortcuts",k);
 var f=b.querySelector(".fk");
 if(f)f.textContent=k;});
 document.addEventListener("keydown",e=>{
@@ -2778,6 +2817,17 @@ tnSetOff("tn-tapi-test",!(canWrite()&&s.active&&s.implemented));
 function tnSaveSlot(){
 if(!tnGuard()||!tnSlots.length)return;
 var i=tnSelected;
+var turningOn=$("tn-tapi-enabled").checked&&!(tnSlots[i]&&tnSlots[i].enabled);
+if(turningOn){
+ui.accept().then(ok=>{
+if(ok)tnSaveSlotNow(i);
+else{$("tn-tapi-enabled").checked=false;setMsg(tnSlotMsg,"Not enabled. The slot stays off until you accept the limitations.","");}
+});
+return;
+}
+tnSaveSlotNow(i);
+}
+function tnSaveSlotNow(i){
 var q=new URLSearchParams({
 enabled:$("tn-tapi-enabled").checked?"1":"0",
 baseUrl:$("tn-tapi-baseurl").value.trim(),
@@ -2789,6 +2839,13 @@ tnThen(put("/api/telephony-config/"+i,q),tnSlotMsg,"Slot "+(i+1)+" saved.",()=>t
 }
 function tnActivate(i){
 if(!tnGuard()||!tnSlots.length)return;
+if(tnSlots[i]&&tnSlots[i].active)return;
+ui.accept().then(ok=>{
+if(!ok){setMsg(tnSlotMsg,"Not activated. The slot stays off until you accept the limitations.","");return;}
+tnActivateNow(i);
+});
+}
+function tnActivateNow(i){
 tnThen(post("/api/telephony-config/"+i+"/activate",""),tnSlotMsg,"Slot "+(i+1)+" is now active.",()=>tnFetchSlots(true));
 }
 function tnShowTest(i){

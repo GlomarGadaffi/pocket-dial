@@ -135,6 +135,17 @@ tnSetOff("tn-tapi-test",!(canWrite()&&s.active&&s.implemented));
 function tnSaveSlot(){
 if(!tnGuard()||!tnSlots.length)return;
 var i=tnSelected;
+var turningOn=$("tn-tapi-enabled").checked&&!(tnSlots[i]&&tnSlots[i].enabled);
+if(turningOn){
+ui.accept().then(ok=>{
+if(ok)tnSaveSlotNow(i);
+else{$("tn-tapi-enabled").checked=false;setMsg(tnSlotMsg,"Not enabled. The slot stays off until you accept the limitations.","");}
+});
+return;
+}
+tnSaveSlotNow(i);
+}
+function tnSaveSlotNow(i){
 var q=new URLSearchParams({
 enabled:$("tn-tapi-enabled").checked?"1":"0",
 baseUrl:$("tn-tapi-baseurl").value.trim(),
@@ -146,6 +157,13 @@ tnThen(put("/api/telephony-config/"+i,q),tnSlotMsg,"Slot "+(i+1)+" saved.",()=>t
 }
 function tnActivate(i){
 if(!tnGuard()||!tnSlots.length)return;
+if(tnSlots[i]&&tnSlots[i].active)return;
+ui.accept().then(ok=>{
+if(!ok){setMsg(tnSlotMsg,"Not activated. The slot stays off until you accept the limitations.","");return;}
+tnActivateNow(i);
+});
+}
+function tnActivateNow(i){
 tnThen(post("/api/telephony-config/"+i+"/activate",""),tnSlotMsg,"Slot "+(i+1)+" is now active.",()=>tnFetchSlots(true));
 }
 function tnShowTest(i){
