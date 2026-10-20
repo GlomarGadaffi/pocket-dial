@@ -7,6 +7,7 @@
 // issue #40 hardened is locked in on the host build.
 
 #include <gtest/gtest.h>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -415,8 +416,9 @@ TEST(TelephonyLogic, TokenExpiringSoonTrueWhenLifetimeUnknown)
 // baked into the WS client (set_headers fails unless the client is connected), and 3CX revokes the
 // old token the moment it grants the new one: the reconnect sends a revoked Bearer, gets a 401 and
 // the gate never opens. So the decision also compares the generation of the token the header was
-// built from (wsHeaderGen) with the generation now held (tokenGen). Everything but the clock is a
-// fact the caller read.
+// built from (wsHeaderGen) with the generation now held (tokenGen), and only for a socket that is
+// down (wsConnected false): a socket in a 401 loop never reached CONNECTED. Everything but the clock
+// is a fact the caller read.
 
 constexpr int64_t kSecondUs = 1000000;
 
@@ -424,16 +426,16 @@ TEST(TelephonyLogic, WsRestartQuietWhenTheHeaderIsTheHeldTokenAndItIsFresh)
 {
 	// The negative control: a drop on a healthy token with a current header is an ordinary
 	// reconnect, which the WS client does by itself. A restart here would be a restart loop.
-	EXPECT_EQ(wsRestartDecision(/*running=*/true, /*tokenExpiring=*/false, /*wsHeaderGen=*/3,
-	                            /*tokenGen=*/3, /*now=*/1000 * kSecondUs, /*lastRequest=*/0),
+	EXPECT_EQ(wsRestartDecision(/*running=*/true, /*tokenExpiring=*/false, /*wsConnected=*/false,
+	                            /*wsHeaderGen=*/3, /*tokenGen=*/3, /*now=*/1000 * kSecondUs, /*lastRequest=*/0),
 	          WsRestartReason::None);
 }
 
 TEST(TelephonyLogic, WsRestartForAnExpiringTokenWhoseHeaderIsCurrent)
 {
 	// #343's own case, kept as it was: the header is the held token and the token has run out.
-	EXPECT_EQ(wsRestartDecision(/*running=*/true, /*tokenExpiring=*/true, /*wsHeaderGen=*/3,
-	                            /*tokenGen=*/3, /*now=*/1000 * kSecondUs, /*lastRequest=*/0),
+	EXPECT_EQ(wsRestartDecision(/*running=*/true, /*tokenExpiring=*/true, /*wsConnected=*/false,
+	                            /*wsHeaderGen=*/3, /*tokenGen=*/3, /*now=*/1000 * kSecondUs, /*lastRequest=*/0),
 	          WsRestartReason::TokenExpiring);
 }
 
@@ -441,8 +443,8 @@ TEST(TelephonyLogic, WsRestartForAHeaderBehindAFreshToken)
 {
 	// The gap #343 left: the token was refreshed (generation 3) while the socket was down, so the
 	// header still carries generation 2. By the clock the token is fresh, and the old gate stayed shut.
-	EXPECT_EQ(wsRestartDecision(/*running=*/true, /*tokenExpiring=*/false, /*wsHeaderGen=*/2,
-	                            /*tokenGen=*/3, /*now=*/1000 * kSecondUs, /*lastRequest=*/0),
+	EXPECT_EQ(wsRestartDecision(/*running=*/true, /*tokenExpiring=*/false, /*wsConnected=*/false,
+	                            /*wsHeaderGen=*/2, /*tokenGen=*/3, /*now=*/1000 * kSecondUs, /*lastRequest=*/0),
 	          WsRestartReason::HeaderStale);
 }
 
@@ -450,8 +452,35 @@ TEST(TelephonyLogic, WsRestartKeepsTheExpiringReasonWhenTheHeaderIsAlsoBehind)
 {
 	// Both true is #343's case with something extra: it keeps #343's reason, and so the witness line
 	// the bench counts for it (ws_restart_stale_token).
-	EXPECT_EQ(wsRestartDecision(/*running=*/true, /*tokenExpiring=*/true, /*wsHeaderGen=*/2,
-	                            /*tokenGen=*/3, /*now=*/1000 * kSecondUs, /*lastRequest=*/0),
+	EXPECT_EQ(wsRestartDecision(/*running=*/true, /*tokenExpiring=*/true, /*wsConnected=*/false,
+	                            /*wsHeaderGen=*/2, /*tokenGen=*/3, /*now=*/1000 * kSecondUs, /*lastRequest=*/0),
+	          WsRestartReason::TokenExpiring);
+}
+
+TEST(TelephonyLogic, WsRestartHeaderStaleOnlyWhileTheSocketIsDown)
+{
+	// A socket in a 401 loop never reached CONNECTED, so _connected is false. A socket that is up
+	// completed a handshake with a header 3CX accepted: tearing it down because a counter is behind
+	// would drop a healthy control channel. (A header that missed its update is found at the next drop,
+	// when _connected has been cleared.)
+	const int64_t now = 1000 * kSecondUs;
+	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/false, /*wsConnected=*/true, 2, 3, now, 0),
+	          WsRestartReason::None) << "up: not torn down for a stale header";
+	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/false, /*wsConnected=*/false, 2, 3, now, 0),
+	          WsRestartReason::HeaderStale) << "down: the same facts restart it";
+	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/false, /*wsConnected=*/true, 3, 3, now, 0),
+	          WsRestartReason::None) << "up with a current header";
+}
+
+TEST(TelephonyLogic, WsRestartExpiringTokenIsNotGatedOnTheSocketState)
+{
+	// #343's behaviour is kept: an ERROR or DISCONNECTED with an expiring token restarts the anchor
+	// whatever _connected reads. (A control: it holds on the stub too; it pins what the socket-state
+	// input must not change.)
+	const int64_t now = 1000 * kSecondUs;
+	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/true, /*wsConnected=*/true, 3, 3, now, 0),
+	          WsRestartReason::TokenExpiring);
+	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/true, /*wsConnected=*/true, 2, 3, now, 0),
 	          WsRestartReason::TokenExpiring);
 }
 
@@ -460,21 +489,27 @@ TEST(TelephonyLogic, WsRestartNeverWhileTheAnchorIsNotRunning)
 	// stop() clears _running before it stops the WS client, and that client's last DISCONNECTED
 	// would otherwise ask for a second restart while the first is still tearing down. Both reasons
 	// are refused, and so is the quiet case (nothing to say).
-	EXPECT_EQ(wsRestartDecision(false, /*tokenExpiring=*/true, 3, 3, 1000 * kSecondUs, 0), WsRestartReason::None);
-	EXPECT_EQ(wsRestartDecision(false, /*tokenExpiring=*/false, 2, 3, 1000 * kSecondUs, 0), WsRestartReason::None);
-	EXPECT_EQ(wsRestartDecision(false, false, 3, 3, 1000 * kSecondUs, 0), WsRestartReason::None);
+	EXPECT_EQ(wsRestartDecision(false, /*tokenExpiring=*/true, /*wsConnected=*/false, 3, 3, 1000 * kSecondUs, 0),
+	          WsRestartReason::None);
+	EXPECT_EQ(wsRestartDecision(false, /*tokenExpiring=*/false, /*wsConnected=*/false, 2, 3, 1000 * kSecondUs, 0),
+	          WsRestartReason::None);
+	EXPECT_EQ(wsRestartDecision(false, false, /*wsConnected=*/false, 3, 3, 1000 * kSecondUs, 0),
+	          WsRestartReason::None);
 }
 
 TEST(TelephonyLogic, WsRestartIsRateLimitedForBothReasonsInsideTheInterval)
 {
-	// ERROR fires on every failed retry, every 5 s. A restart that does not heal the cause (a token
-	// whose lifetime is within the margin, say) must not turn that into a restart every 5 s.
+	// ERROR and DISCONNECTED both fire on every failed connect cycle (about every 5 s). A restart
+	// that does not heal the cause (a token whose lifetime is within the margin, say) must not turn
+	// that into a restart every 5 s.
 	const int64_t last = 500 * kSecondUs;
 	const int64_t inside = last + kWsRestartMinIntervalUs - 1;
-	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/true, 3, 3, inside, last), WsRestartReason::None);
-	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/false, 2, 3, inside, last), WsRestartReason::None);
-	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/true, 3, 3, last + 5 * kSecondUs, last),
-	          WsRestartReason::None) << "the next ERROR, 5 s later";
+	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/true, /*wsConnected=*/false, 3, 3, inside, last),
+	          WsRestartReason::None);
+	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/false, /*wsConnected=*/false, 2, 3, inside, last),
+	          WsRestartReason::None);
+	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/true, /*wsConnected=*/false, 3, 3, last + 5 * kSecondUs, last),
+	          WsRestartReason::None) << "the next event, 5 s later";
 }
 
 TEST(TelephonyLogic, WsRestartReopensAtTheIntervalAndTheFirstRequestIsNeverHeld)
@@ -482,11 +517,13 @@ TEST(TelephonyLogic, WsRestartReopensAtTheIntervalAndTheFirstRequestIsNeverHeld)
 	const int64_t last = 500 * kSecondUs;
 	const int64_t at = last + kWsRestartMinIntervalUs;
 	EXPECT_EQ(kWsRestartMinIntervalUs, 60 * kSecondUs);
-	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/true, 3, 3, at, last), WsRestartReason::TokenExpiring)
-	    << "the boundary is open (>=)";
-	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/false, 2, 3, at, last), WsRestartReason::HeaderStale);
+	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/true, /*wsConnected=*/false, 3, 3, at, last),
+	          WsRestartReason::TokenExpiring) << "the boundary is open (>=)";
+	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/false, /*wsConnected=*/false, 2, 3, at, last),
+	          WsRestartReason::HeaderStale);
 	// 0 is "never requested": it holds nothing back, even on a clock still inside one interval.
-	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/true, 3, 3, 5 * kSecondUs, 0), WsRestartReason::TokenExpiring);
+	EXPECT_EQ(wsRestartDecision(true, /*tokenExpiring=*/true, /*wsConnected=*/false, 3, 3, 5 * kSecondUs, 0),
+	          WsRestartReason::TokenExpiring);
 }
 
 TEST(TelephonyLogic, WsHeaderGenerationIsComparedForEqualityNotOrder)
@@ -495,10 +532,43 @@ TEST(TelephonyLogic, WsHeaderGenerationIsComparedForEqualityNotOrder)
 	// somehow ahead of the held token, is still a different token. (The token's obtained-at stamp is
 	// not used for this: the token_age probe rewrites it in place.)
 	const int64_t now = 1000 * kSecondUs;
-	EXPECT_EQ(wsRestartDecision(true, false, 0xFFFFFFFFu, 0u, now, 0), WsRestartReason::HeaderStale);
-	EXPECT_EQ(wsRestartDecision(true, false, 5u, 4u, now, 0), WsRestartReason::HeaderStale);
-	EXPECT_EQ(wsRestartDecision(true, false, 0u, 0u, now, 0), WsRestartReason::None)
+	EXPECT_EQ(wsRestartDecision(true, false, /*wsConnected=*/false, 0xFFFFFFFFu, 0u, now, 0),
+	          WsRestartReason::HeaderStale);
+	EXPECT_EQ(wsRestartDecision(true, false, /*wsConnected=*/false, 5u, 4u, now, 0), WsRestartReason::HeaderStale);
+	EXPECT_EQ(wsRestartDecision(true, false, /*wsConnected=*/false, 0u, 0u, now, 0), WsRestartReason::None)
 	    << "nothing installed and nothing baked is no mismatch";
+}
+
+// ── raiseWsHeaderGen (issue #336) ────────────────────────────────────────────
+// fetchToken() records the generation of a header that landed (set_headers returned ESP_OK) from
+// outside _mutex, so two fetches can finish out of order. The record only ever goes up: a late store
+// of an older generation must not make a current header read as stale (a needless restart). The
+// narrow race left is the opposite order: two set_headers calls where the library keeps the older
+// header, and this record, already at the newer generation, says current.
+
+TEST(TelephonyLogic, RaiseWsHeaderGenNeverLowersIt)
+{
+	std::atomic<uint32_t> slot{5};
+	raiseWsHeaderGen(slot, 3);
+	EXPECT_EQ(slot.load(), 5u) << "a late store of an older generation";
+	raiseWsHeaderGen(slot, 5);
+	EXPECT_EQ(slot.load(), 5u) << "the same generation again";
+	raiseWsHeaderGen(slot, 7);
+	EXPECT_EQ(slot.load(), 7u) << "a newer one";
+	raiseWsHeaderGen(slot, 0);
+	EXPECT_EQ(slot.load(), 7u) << "0 is older than 7";
+}
+
+TEST(TelephonyLogic, RaiseWsHeaderGenIsWrapSafe)
+{
+	// Serial-number order, like the counter it records: 1 follows 0xFFFFFFFF.
+	std::atomic<uint32_t> slot{0xFFFFFFFEu};
+	raiseWsHeaderGen(slot, 0xFFFFFFFFu);
+	EXPECT_EQ(slot.load(), 0xFFFFFFFFu);
+	raiseWsHeaderGen(slot, 1u);
+	EXPECT_EQ(slot.load(), 1u) << "newer across the wrap";
+	raiseWsHeaderGen(slot, 0xFFFFFFFFu);
+	EXPECT_EQ(slot.load(), 1u) << "the generation before the wrap is older now";
 }
 
 // ── the retry after a restart whose start() failed (issue #336) ──────────────

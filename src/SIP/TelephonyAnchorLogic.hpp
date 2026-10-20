@@ -383,14 +383,22 @@ inline constexpr std::int64_t kWsRestartMinIntervalUs = 60LL * 1000000;
 // for the whole of a restart, from stop() to start(), and after a shutdown. tokenExpiring:
 // tokenIsExpiringSoon() with the 5 minute margin. lastRequestUs: when this decision last said yes
 // (0: never). #343's reason wins when both hold, so the line its bench counter reads is unchanged.
-inline WsRestartReason wsRestartDecision(bool running, bool tokenExpiring, std::uint32_t wsHeaderGen,
-                                         std::uint32_t tokenGen, std::int64_t nowUs, std::int64_t lastRequestUs)
+// RED COMMIT (#336 rework): the socket-state input is accepted and ignored, and raiseWsHeaderGen below
+// is a plain store. Both are deliberately wrong; the next commit makes them right.
+inline WsRestartReason wsRestartDecision(bool running, bool tokenExpiring, bool /*wsConnected*/,
+                                         std::uint32_t wsHeaderGen, std::uint32_t tokenGen, std::int64_t nowUs,
+                                         std::int64_t lastRequestUs)
 {
 	if (!running) return WsRestartReason::None;
 	if (lastRequestUs != 0 && nowUs - lastRequestUs < kWsRestartMinIntervalUs) return WsRestartReason::None;
 	if (tokenExpiring) return WsRestartReason::TokenExpiring;
 	if (wsHeaderGen != tokenGen) return WsRestartReason::HeaderStale;
 	return WsRestartReason::None;
+}
+
+inline void raiseWsHeaderGen(std::atomic<std::uint32_t>& slot, std::uint32_t gen)
+{
+	slot.store(gen, std::memory_order_release);   // wrong on purpose: a late older store lowers it
 }
 
 // Issue #336: a restart is stop() then start(). When start() cannot fetch its token (an outage, DRAM

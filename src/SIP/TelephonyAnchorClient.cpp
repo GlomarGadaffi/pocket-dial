@@ -1368,7 +1368,7 @@ void TelephonyAnchorClient::requestRestartIfTokenStale()
 	// obtained-at stamp: the token_age probe rewrites that in place.
 	const int64_t nowUs = esp_timer_get_time();
 	const telephony::WsRestartReason why = telephony::wsRestartDecision(
-	    _running.load(std::memory_order_acquire), tokenExpiringSoon(),
+	    _running.load(std::memory_order_acquire), tokenExpiringSoon(), _connected.load(std::memory_order_acquire),
 	    _wsHeaderGen.load(std::memory_order_acquire), _tokenGen.load(std::memory_order_acquire),
 	    nowUs, _lastWsRestartRequestUs.load(std::memory_order_acquire));
 	if (why == telephony::WsRestartReason::None) return;
