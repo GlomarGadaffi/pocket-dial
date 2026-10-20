@@ -1,0 +1,4 @@
+# RegisteredContact_test.cpp: 2 (CalleeDialogLine: a To at the bound connects and its BYE is built; a To/From over the
+#   bound is refused with a 502) + SipMessageBuilder_test.cpp: 1 (BYE at both dialog-line bounds, worst case, fits)
+#   + EmergencyRoute_test.cpp: 1 (an answered PSAP callback is not refused for an oversize To). #1030.
+4

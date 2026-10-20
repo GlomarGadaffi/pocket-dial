@@ -1083,6 +1083,44 @@ TEST(EmergencyCallback, ACallbackWithAnOversizeFromIsNotRefusedForItsLength)
 	EXPECT_TRUE(s.value()->isEmergency());
 }
 
+TEST(EmergencyCallback, ACallbackAnsweredWithAnOversizeToIsNotRefusedForItsLength)
+{
+	// #1030 must not refuse the answer to an emergency callback for its header length (Rule 5).
+	Bench b;
+	b.handler->handle(makeRegister("102", kOtherIp));
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+	b.handler->handle(makeCall("102", kOtherIp, "101", "er-1030-cb"));
+	ASSERT_TRUE(b.handler->getSession("Call-ID: er-1030-cb").has_value()) << b.dump();
+
+	std::string fork;
+	for (const auto& [addr, raw] : b.sent)
+	{
+		if (addr.sin_addr.s_addr == inet_addr(kHandsetIp) && raw.rfind("INVITE ", 0) == 0) fork = raw;
+	}
+	ASSERT_FALSE(fork.empty()) << "the callback must ring 101:\n" << b.dump();
+	const auto lineOf = [&fork](const std::string& name) {
+		const size_t at = fork.find("\r\n" + name);
+		return fork.substr(at + 2, fork.find("\r\n", at + 2) - at - 2);
+	};
+	const std::string body =
+		"v=0\r\no=- 0 0 IN IP4 " + std::string(kHandsetIp) + "\r\ns=-\r\n"
+		"c=IN IP4 " + std::string(kHandsetIp) + "\r\nt=0 0\r\n"
+		"m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	const std::string ok =
+		"SIP/2.0 200 OK\r\n" + lineOf("Via:") + "\r\n" + lineOf("From:") + "\r\n"
+		"To: <sip:101@server>;tag=" + std::string(600, 't') + "\r\n"
+		"Call-ID: er-1030-cb\r\nCSeq: 1 INVITE\r\n"
+		"Contact: <sip:101@" + std::string(kHandsetIp) + ":5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+	b.handler->handle(RequestsHandler::getMessageFromPool(ok, addrFor(kHandsetIp)));
+
+	EXPECT_EQ(b.count("SIP/2.0 502", kOtherIp), 0u) << b.dump();
+	const auto s = b.handler->getSession("Call-ID: er-1030-cb");
+	ASSERT_TRUE(s.has_value()) << "the answered callback must stay up:\n" << b.dump();
+	EXPECT_EQ(s.value()->getState(), Session::State::Connected);
+}
+
 TEST(EmergencyCallback, ACallbackAfterThirtyMinutesIsNot)
 {
 	Bench b;
