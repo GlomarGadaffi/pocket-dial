@@ -7527,9 +7527,14 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 
 		if (session.value()->getState() == Session::State::Cancel)
 		{
-			// #1049: a 2xx that crossed the CANCEL answers the call. No bounded-wait 487 may follow it.
-			session.value()->clearRingTimer();
-			session.value()->setCancelAnswered();
+			// #1049: a 2xx to the INVITE that crossed the CANCEL answers the call. No bounded-wait 487
+			// may follow it. The callee's own 200 to the CANCEL (CSeq "n CANCEL", RFC 3261 s9.2) answers
+			// nothing: it must leave the 32 s bound armed (found on hardware, RC 3237af5f).
+			if (data->getCSeq().find(SipMessageTypes::INVITE) != std::string::npos)
+			{
+				session.value()->clearRingTimer();
+				session.value()->setCancelAnswered();
+			}
 			endHandle(data->getFromNumber(), data);
 			return;
 		}

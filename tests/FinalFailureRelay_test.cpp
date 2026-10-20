@@ -117,6 +117,22 @@ namespace
 		return RequestsHandler::getMessageFromPool(raw, addrFor(calleeIp));
 	}
 
+	// The callee's mandatory 200 to the PBX's CANCEL (RFC 3261 s9.2): CSeq names CANCEL, no SDP.
+	std::shared_ptr<SipMessage> makeCancelOk(const std::string& fromExt, const std::string& toExt,
+		const std::string& callerIp, const std::string& calleeIp, const std::string& callId,
+		const std::string& branch)
+	{
+		std::string raw =
+			"SIP/2.0 200 OK\r\n"
+			"Via: SIP/2.0/UDP " + callerIp + ":5060;branch=" + branch + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:" + toExt + "@server>;tag=bt" + callId + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 CANCEL\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(calleeIp));
+	}
+
 	// The caller's re-INVITE inside the established dialog (To carries the callee's tag).
 	std::shared_ptr<SipMessage> makeReinvite(const std::string& fromExt, const std::string& toExt,
 		const std::string& srcIp, const std::string& callId, const std::string& branch, int cseq)
@@ -690,6 +706,44 @@ TEST(FinalFailureRelay, AnEmergencyCancelIsNotEndedByTheBoundedWait)
 	EXPECT_EQ(emergency.value()->getState(), Session::State::Cancel);
 	EXPECT_EQ(countSentTo(sent, emergencyCallerAddr, "SIP/2.0 487"), 0)
 		<< "no 487 goes to the emergency caller";
+}
+
+// Found on hardware (.244, RC 3237af5f): a callee that answers the CANCEL with its mandatory
+// 200 but never sends the 487 must still be bounded. That 200 has CSeq "n CANCEL"; it is not a
+// 2xx that answers the call, so it must neither disarm the 32 s window nor mark the cancel answered.
+// RED against 3237af5f: onOk's Cancel branch clears the timer for any 200.
+TEST(FinalFailureRelay, ACalleesOwn200ToTheCancelDoesNotDisarmTheBoundedWait)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.50.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.50.20");
+	handler.handle(makeRegister("401", "192.168.50.20", "reg-401"));
+	handler.handle(makeRegister("402", "192.168.50.21", "reg-402"));
+	handler.handle(makeInvite("401", "402", "192.168.50.20", "cb-6", "z9hG4bKcb6"));
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-6", "z9hG4bKcb6"));
+	const auto afterCancel = TestClock::now();
+
+	handler.handle(makeCancelOk("401", "402", "192.168.50.20", "192.168.50.21", "cb-6", "z9hG4bKcb6"));
+
+	const std::string key = "Call-ID: cb-6";
+	auto session = handler.getSession(key);
+	ASSERT_TRUE(session.has_value());
+	EXPECT_TRUE(session.value()->isRingExpired(afterCancel + std::chrono::seconds(32)))
+		<< "the callee's 200 to the CANCEL must not disarm the 32 s bound";
+	EXPECT_FALSE(session.value()->cancelAnswered())
+		<< "a 200 to the CANCEL does not mean the caller was answered";
+
+	session.value()->armRingTimer(TestClock::now() - std::chrono::seconds(1));
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+	EXPECT_FALSE(handler.getSession(key).has_value())
+		<< "the silent callee's call is still ended once the 32 s are up";
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 487"), 1)
+		<< "exactly one 487 reaches the caller";
 }
 
 // Guard, green after the fix: once the bounded wait has ended the call, the callee's late 487
