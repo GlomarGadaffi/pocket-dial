@@ -3419,7 +3419,9 @@ void HttpServer::sendApiCoreDumpErase(int sock)
 	// Issue #382. Reached only through requireAdmin(..., needCsrf=true).
 	// #1045: the erase is a 128 KiB flash erase, which stalls every flash-resident task as an
 	// OTA flash does (#986). Refuse while any call is up or ringing, with the OTA route's check
-	// and 409 body. No engine attached means no call can exist.
+	// and 409 body. No engine attached means no call can exist. The check runs before the
+	// "not supported" 404, so a board without a coredump partition and a live call answers 409.
+	// A call that starts after this check, while the erase runs, is not covered (same as OTA).
 	if (RequestsHandler* h = _handler.load(std::memory_order_acquire); h && h->hasLiveCall())
 	{
 		sendResponse(sock, 409, "Conflict", "application/json",
