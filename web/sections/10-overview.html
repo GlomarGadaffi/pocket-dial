@@ -1,0 +1,89 @@
+<div class="sec-head">
+  <span class="unit" style="margin:0">MAIN &middot; overview</span>
+  <button type="button" class="rbtn" onclick="refreshNow()" title="Refresh now">REFRESH</button>
+</div>
+
+<!-- Annunciator tiles. The field each tile reads, and the level rules, are in the
+     mapping comment above OV_TILES in app/10-overview.js. A tile with no firmware field is
+     omitted (brief 7b decision, 2026-10-17): SIP BIND, NTP and ANCHOR have no tile, and
+     HEAP / WDT are hidden by the JS on a build whose /api/status carries no reading for them.
+     4-column grid, so the row count stays 2 on both the ESP (7 tiles) and host (5) builds. -->
+<fieldset>
+  <legend>Annunciator</legend>
+  <div class="annunciator" role="group" aria-label="Annunciator">
+    <div class="tile" id="tile-heap"><div>HEAP</div><div class="st" id="st-heap">· WAIT</div></div>
+    <div class="tile" id="tile-pool"><div>POOL</div><div class="st" id="st-pool">· WAIT</div></div>
+    <div class="tile" id="tile-e911"><div>E911</div><div class="st" id="st-e911">· WAIT</div></div>
+    <div class="tile" id="tile-ota"><div>OTA</div><div class="st" id="st-ota">· WAIT</div></div>
+    <div class="tile" id="tile-wdt"><div>WDT</div><div class="st" id="st-wdt">· WAIT</div></div>
+    <div class="tile" id="tile-setup"><div>SETUP</div><div class="st" id="st-setup">· WAIT</div></div>
+    <div class="tile" id="tile-nvs"><div>NVS</div><div class="st" id="st-nvs">· WAIT</div></div>
+  </div>
+</fieldset>
+
+<fieldset role="group" aria-label="Signal path">
+  <legend>Signal path</legend>
+  <div class="sigpath">
+    <div class="pane">
+      <span class="lbl">WAN UDP:5060</span>
+      <div><span class="unit" style="margin:0">rx</span></div>
+      <div><span class="well" id="ov-bus-rx">—</span><span class="unit">pkts</span></div>
+      <div><span class="unit" style="margin:0">drop</span></div>
+      <div><span class="well" id="ov-bus-drop">—</span><span class="unit">pkts</span></div>
+    </div>
+    <div class="bus-w" id="bus-a" aria-hidden="true"></div>
+    <div class="pane">
+      <span class="lbl">SIP CORE</span>
+      <div><span class="unit" style="margin:0">calls</span></div>
+      <div><span class="well" id="ov-bus-sess">—</span><span class="unit">calls</span></div>
+      <div><span class="unit" style="margin:0">parked</span></div>
+      <div><span class="well" id="ov-bus-park">—</span><span class="unit">calls</span></div>
+    </div>
+    <div class="bus-w" id="bus-b" aria-hidden="true"></div>
+    <div class="pane">
+      <span class="lbl">EXT MATRIX</span>
+      <div><span class="unit" style="margin:0">reg</span></div>
+      <div><span class="well" id="ov-bus-reg">—</span><span class="unit">ext</span></div>
+      <div><span class="unit" style="margin:0">dnd</span></div>
+      <div><span class="well" id="ov-bus-dnd">—</span><span class="unit">ext</span></div>
+    </div>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>Readouts</legend>
+  <dl class="kv">
+    <dt>Packets</dt>
+    <dd>
+      <svg width="70" height="20" viewBox="0 0 70 20" aria-hidden="true" focusable="false"><polyline id="sparkline" points=""></polyline></svg>
+      <span class="well" id="ov-pkts">—</span><span class="unit">pkts</span>
+    </dd>
+    <dt>Jacks</dt>
+    <dd><span class="well" id="ov-jacks">—</span><span class="unit">ext</span></dd>
+    <dt>SBC mode</dt>
+    <dd id="ov-mode">loading&hellip;</dd>
+    <dt>E911 notify</dt>
+    <dd><span class="well" id="ov-notify">&mdash;</span><span class="unit">ext</span> <span class="unit" id="ov-notify-note">loading&hellip;</span></dd>
+    <dt>Firmware</dt>
+    <dd id="ov-fw-part">loading&hellip;</dd>
+    <dt>Verify</dt>
+    <dd><span class="st" id="ov-fw-verify">&middot; WAIT</span></dd>
+  </dl>
+</fieldset>
+
+<div class="bay-face" id="board-wrap">
+  <div class="bay-title"><span>Jack Board</span><span><span class="well" id="board-cap">—</span><span class="unit">ext</span></span></div>
+  <div id="jacks" class="jacks" role="group" aria-label="Extensions"></div>
+  <div class="legend">
+    <span class="item"><span class="swatch sw-idle"></span>idle</span>
+    <span class="item"><span class="swatch sw-ringing"></span>ringing</span>
+    <span class="item"><span class="swatch sw-active"></span>active</span>
+    <span class="item"><span class="swatch sw-parked"></span>parked</span>
+    <span class="item"><span class="swatch sw-alert"></span>unavail</span>
+  </div>
+</div>
+
+<div class="panel" id="ov-cdr">
+  <div class="bay-title"><span>Recent calls</span><span><span class="well" id="cdr-count">—</span><span class="unit">calls</span> <span id="cdr-summary"></span></span></div>
+  <p class="hint"><span id="cdr-note">Loading&hellip;</span> <a href="#console">Open Live console</a></p>
+</div>
