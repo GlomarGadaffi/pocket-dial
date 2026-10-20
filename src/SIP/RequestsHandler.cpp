@@ -1977,6 +1977,26 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 	// alive or disarm the reap.
 	const bool stillRinging = cancelSess.has_value() && cancelSess.value()->getState() == Session::State::Invited;
 	const bool alreadyCancelling = cancelSess.has_value() && cancelSess.value()->getState() == Session::State::Cancel;
+	// #1057: RFC 3261 s9.2 -- the PBX is the UAS of the caller's CANCEL and answers it with its own
+	// 200 at once, not with whatever the callee later says. The callee's 200 to the relayed CANCEL is
+	// absorbed in onOk(). Emergency calls take this path unchanged.
+	if (cancelSess.has_value())
+	{
+		if (auto ok = getMessageFromPool(*data))
+		{
+			ok->setHeader(SipMessageTypes::OK);
+			ok->clearBody();
+			ok->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+			std::string to(data->getTo());
+			if (to.find(";tag=") == std::string::npos)
+			{
+				const std::string& tag = cancelSess.value()->getLocalTag();
+				to += ";tag=" + (tag.empty() ? IDGen::GenerateID(9) : tag);
+			}
+			ok->setTo(std::move(to));
+			_outbox.emplace_back(data->getSource(), std::move(ok));
+		}
+	}
 	setCallState(data->getCallID(), Session::State::Cancel);
 	setCallDisposition(data->getCallID(), Session::Disposition::Cancel);
 	if (cancelSess.has_value() && !alreadyCancelling)
@@ -7529,7 +7549,9 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 		{
 			// #1049: a 2xx to the INVITE that crossed the CANCEL answers the call. No bounded-wait 487
 			// may follow it. The callee's own 200 to the CANCEL (CSeq "n CANCEL", RFC 3261 s9.2) answers
-			// nothing: it must leave the 32 s bound armed (found on hardware, RC 3237af5f).
+			// nothing: it must leave the 32 s bound armed (found on hardware, RC 3237af5f). #1057: the
+			// PBX already answered the caller's CANCEL itself, so that 200 is not relayed either.
+			if (data->getCSeq().find(SipMessageTypes::CANCEL) != std::string::npos) return;
 			if (data->getCSeq().find(SipMessageTypes::INVITE) != std::string::npos)
 			{
 				session.value()->clearRingTimer();
