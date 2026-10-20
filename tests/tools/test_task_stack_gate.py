@@ -266,6 +266,9 @@ class Gate(unittest.TestCase):
                ("virtual bool TelephonyAnchorClient::writeAudio(std::string_view, const int16_t*, size_t)", 1120),
                ("bool HoldMusic::loadClip(const std::string&)", 1088),
                ("void RequestsHandler::onRefer(std::shared_ptr<SipMessage>)", 1056),
+               # tick() was 1024 B, the ceiling itself, until #1028 (2993c0dc) added a std::string for the
+               # 480's To tag; BigDog's run on that tree measured 1056 B.
+               ("void RequestsHandler::tick()", 1056),
                ("void RequestsHandler::relayIntoPeerDialog(const std::shared_ptr<SipMessage>&, "
                 "const std::shared_ptr<Session>&)", 1648),
                ("void HttpServer::sendApiConfigExport(int, bool, const std::string&)", 1392),
@@ -339,6 +342,69 @@ class Gate(unittest.TestCase):
                 self.assertEqual(rc, 1, out)
                 self.assertIn("FAIL frame: project function with no frame data (partial --ci-dir?): Foo::", out)
                 self.assertNotIn("FAIL small", out)    # the chain is within budget; only the frame is unknown
+
+    # --- template constructors (#457) -----------------------------------------------------
+    # A constructor template mangles as C1I<template args>E<params>, not C1E<params>, so the
+    # alias rule above did not see it. On the first real CI run that left
+    # telephony::SosStatusClaim (SosStatusGet.hpp, a project type) as "project function with no
+    # frame data", and the std::pair, std::function, std::thread and shared_ptr constructor
+    # templates as library callees with none.
+
+    def test_alias_body_reads_template_ctor_titles(self):
+        frames = {"_ZN3FooC2IiEEOT_": (600, "static")}
+        edges = {"_ZN3FooC1IiEEOT_": {"_ZN3FooC2IiEEOT_"}, "_ZN3FooC1Ev": {"_ZN3FooC2Ev"}}
+        self.assertEqual(g.alias_body("_ZN3FooC1IiEEOT_", edges, frames), "_ZN3FooC2IiEEOT_")
+        # not a constructor: "C1I" inside a length-prefixed name derives a body that is not there
+        self.assertIsNone(g.alias_body("_ZN5AC1Id3fooEv", {"_ZN5AC1Id3fooEv": {"_ZN3barEv"}}, {"_ZN3barEv": (64, "static")}))
+        # and the plain rule is unchanged: no body in frames, or no edge to it, is no alias
+        self.assertIsNone(g.alias_body("_ZN3FooC1Ev", edges, frames))
+        self.assertIsNone(g.alias_body("_ZN3FooC1IiEEOT_", {}, frames))
+
+    def test_ctor_template_alias_is_a_pass_through_to_its_body(self):
+        local = "@ROOT@/src/SIP/X.cpp:"
+        pair = "_ZNSt4pairIiiEC"
+        cases = {
+            "a project constructor template": (
+                bare("_ZN3FooC1IiEEOT_", "Foo::Foo(T&&) [with T = int]")
+                + node("_ZN3FooC2IiEEOT_", "Foo::Foo(T&&) [with T = int]", 600)
+                + edge("leaf", "_ZN3FooC1IiEEOT_") + edge("_ZN3FooC1IiEEOT_", "_ZN3FooC2IiEEOT_"), "1100 B", "600  Foo::Foo"),
+            "a library constructor template under a file-local title": (
+                bare(local + pair + "1IRiS2_Lb1EEEOT_OT0_", "std::pair<int, int>::pair(U1&&, U2&&)", STL_VECTOR_H)
+                + node(local + pair + "2IRiS2_Lb1EEEOT_OT0_", "std::pair<int, int>::pair(U1&&, U2&&)", 80, STL_VECTOR_H)
+                + edge("leaf", local + pair + "1IRiS2_Lb1EEEOT_OT0_")
+                + edge(local + pair + "1IRiS2_Lb1EEEOT_OT0_", local + pair + "2IRiS2_Lb1EEEOT_OT0_"), "580 B", "80  std::pair"),
+        }
+        for why, (text, total, shown) in cases.items():
+            with self.subTest(why):
+                self.put(os.path.join(self.ci, "x.ci"), CI)
+                self.add_ci(text)
+                self.table["tasks"][0]["bytes"] = 4096
+                rc, out = self.run_gate()
+                self.assertEqual(rc, 0, out)
+                self.assertNotIn("FAIL frame", out)
+                self.assertIn("ok   small: " + total, out)       # 200 + 300 + the body, counted once
+                self.assertIn(shown, out)
+
+    def test_a_frameless_ctor_template_still_fails_unless_it_calls_its_own_body(self):
+        body = node("_ZN3FooC2IiEEOT_", "Foo::Foo(T&&) [with T = int]", 600)
+        cases = {
+            "no edge to the C2 body": bare("_ZN3FooC1IiEEOT_", "Foo::Foo(T&&) [with T = int]") + body
+            + edge("leaf", "_ZN3FooC1IiEEOT_"),
+            "body without a frame": bare("_ZN3FooC1IiEEOT_", "Foo::Foo(T&&) [with T = int]")
+            + bare("_ZN3FooC2IiEEOT_", "Foo::Foo(T&&) [with T = int]")
+            + edge("leaf", "_ZN3FooC1IiEEOT_") + edge("_ZN3FooC1IiEEOT_", "_ZN3FooC2IiEEOT_"),
+            "the body is another instantiation's": bare("_ZN3FooC1IiEEOT_", "Foo::Foo(T&&) [with T = int]")
+            + node("_ZN3FooC2IlEEOT_", "Foo::Foo(T&&) [with T = long]", 600)
+            + edge("leaf", "_ZN3FooC1IiEEOT_") + edge("_ZN3FooC1IiEEOT_", "_ZN3FooC2IlEEOT_"),
+        }
+        for why, text in cases.items():
+            with self.subTest(why):
+                self.put(os.path.join(self.ci, "x.ci"), CI)
+                self.add_ci(text)
+                self.table["tasks"][0]["bytes"] = 4096
+                rc, out = self.run_gate()
+                self.assertEqual(rc, 1, out)
+                self.assertIn("FAIL frame: project function with no frame data (partial --ci-dir?): Foo::Foo(T&&)", out)
 
     # --- which functions are this repo's (#457) -----------------------------------------
     # The ceiling and "no frame data" checks are for src/ and main/. The gate used to take
@@ -621,6 +687,114 @@ class Gate(unittest.TestCase):
         self.assertGreaterEqual(row("std::shared_ptr<Session>"), rb(sessions))
         self.assertGreaterEqual(row("basic_string<char>, std::__cxx11::basic_string<char> >"),
                                 rb(nvs_bytes // 32))     # one 32 B NVS entry at least per cached HA1
+
+    # --- what the first real CI run printed (#457) ----------------------------------------
+    # tests/tools/fixtures/task_stack_gate_run_39346846761.json holds the names the gate printed
+    # in the stack-depth-gate job (PR #1031): 195 library callees with no frame data, 8 cycles
+    # with no recursion row, 2 dynamic frames. A red job is meant to mean a project problem, so
+    # each of those needs a row that says why it is modelled the way it is.
+
+    def first_run(self):
+        path = os.path.join(os.path.dirname(__file__), "fixtures", "task_stack_gate_run_39346846761.json")
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def checked_in(self):
+        with open(os.path.join(os.path.dirname(GATE), "task_stacks.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_checked_in_library_defaults_cover_the_first_ci_run(self):
+        run, table = self.first_run(), self.checked_in()
+        self.assertEqual(len(run["library_callees"]), 195)
+        # Each name as a frameless callee of a library file, walked by the gate itself with the
+        # checked-in rows: no "library callee with no frame data" is left.
+        lib = "/tc/include/c++/15.2.0/bits/stl_vector.h:1:1"
+        text = "".join(bare(f"lib{i}", name, lib) + edge("leaf", f"lib{i}")
+                       for i, name in enumerate(run["library_callees"]))
+        self.add_ci(text)
+        self.table["library_defaults"] = table["library_defaults"]
+        self.table["tasks"][0]["bytes"] = 1 << 20          # the budget is not what is under test
+        rc, out = self.run_gate()
+        left = [ln for ln in out.splitlines() if "library callee with no frame data" in ln]
+        self.assertEqual(left, [], "\n".join(left[:10]))
+        self.assertEqual(rc, 0, out[:600])
+
+    def test_each_first_run_callee_matches_exactly_one_library_default(self):
+        # The gate takes the first match in sorted key order; one match per name keeps the table
+        # free of an order nobody can see.
+        run, table = self.first_run(), self.checked_in()
+        rows = list(table["library_defaults"])
+        for name in run["library_callees"]:
+            hits = [k for k in rows if re.search(k, name)]
+            self.assertEqual(len(hits), 1, f"{name[:90]!r} matches {hits}")
+
+    def test_every_library_default_states_its_figure_and_reason(self):
+        table = self.checked_in()
+        reasons = table["_library_defaults_reasons"]
+        for rx, b in table["library_defaults"].items():
+            with self.subTest(rx):
+                why = reasons.get(rx, "")
+                self.assertTrue(why.startswith(f"{b} B"), f"reason must open with its figure, '{b} B': {why[:60]!r}")
+                self.assertGreater(len(why), 60, "a figure needs its provenance")
+        self.assertEqual(sorted(set(reasons) - set(table["library_defaults"])), [], "a reason for a row that is gone")
+
+    def test_library_defaults_still_fail_closed_on_an_unclassified_name(self):
+        # A table of rows is not a blanket: a library function nobody looked at is still a FAIL.
+        table = self.checked_in()
+        for name in ("qsort_r", "void vendor::mystery(int)", "int pvPortMallocCaps(unsigned int)",
+                     "esp_http_client_perform", "mbedtls_ssl_handshake", "std::string std::to_string(long)"):
+            with self.subTest(name):
+                self.assertEqual([k for k in table["library_defaults"] if re.search(k, name)], [])
+
+    def test_checked_in_recursion_rows_cover_the_first_ci_run_cycles(self):
+        run, rows = self.first_run(), self.checked_in()["recursion_allowlist"]
+        self.assertEqual(len(run["cycles"]), 8)
+        claimed = {}
+        for cycle in run["cycles"]:
+            hits = [k for k in rows if any(k in name for name in cycle["shown_members"])]
+            self.assertEqual(len(hits), 1, f"{cycle['shown_members']}: rows {hits}")
+            self.assertNotIn(hits[0], claimed, f"'{hits[0]}' names two cycles")
+            claimed[hits[0]] = cycle["size"]
+
+    def test_cjson_recursion_rows_are_the_nesting_limit_not_a_guess(self):
+        # cJSON refuses nesting past CJSON_NESTING_LIMIT (1000 unless a build sets it, and nothing in
+        # this tree does), and every tree in this firmware comes from cJSON_Parse*, so that limit is the
+        # depth of parse_value <-> parse_array/parse_object and of cJSON_Delete. One level is ~100 B and
+        # no task stack here holds a hundred: the rows say so and the tasks that parse JSON fail
+        # their budget until the limit is lowered. If a build sets it, the rows follow it.
+        rows = self.checked_in()["recursion_allowlist"]
+        limit = 1000
+        for path in ("CMakeLists.txt", os.path.join("main", "CMakeLists.txt")):
+            m = re.search(r"CJSON_NESTING_LIMIT=(\d+)", open(os.path.join(g.REPO, path), encoding="utf-8").read())
+            if m:
+                limit = int(m.group(1))
+        for key in ("parse_value", "cJSON_Delete("):
+            with self.subTest(key):
+                self.assertEqual(rows[key]["depth"], limit)
+                self.assertIn("CJSON_NESTING_LIMIT", rows[key]["reason"])
+
+    def test_checked_in_dynamic_frames_of_the_first_run_are_allowlisted(self):
+        run, table = self.first_run(), self.checked_in()
+        self.assertEqual(len(run["dynamic_frames"]), 2)
+        ext = "/managed_components/espressif__mdns/mdns.c:1:1"
+        self.add_ci("".join(node(f"dyn{i}", name, 96, ext, "dynamic") + edge("leaf", f"dyn{i}")
+                            for i, name in enumerate(run["dynamic_frames"])))
+        self.table["tasks"][0]["bytes"] = 4096
+        rc, out = self.run_gate()
+        self.assertEqual(out.count("dynamic frame, no allowlist entry"), 2, out)      # positive control
+        self.table["frame_allowlist"] = table["frame_allowlist"]
+        rc, out = self.run_gate()
+        self.assertNotIn("dynamic frame", out)
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(all(table["frame_allowlist"][k].strip() for k in table["frame_allowlist"]))
+
+    def test_http_conn_keeps_its_budget(self):
+        # http_conn is the one real red the stack-depth-gate job reports until its stack is fixed
+        # (4768 B + 512 > 4096 B in the first run). Nothing in the table loosens it away.
+        table = self.checked_in()
+        row = [t for t in table["tasks"] if t["name"] == "http_conn"]
+        self.assertEqual([(t["bytes"], t["file"]) for t in row], [(4096, "src/Helpers/HttpServer.cpp")])
+        self.assertEqual((table["margin_bytes"], table["frame_ceiling_bytes"]), (512, 1024))
 
 
 if __name__ == "__main__":
