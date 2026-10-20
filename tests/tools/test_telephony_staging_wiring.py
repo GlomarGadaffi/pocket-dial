@@ -177,11 +177,12 @@ class SingleProducerAndTheCallers(unittest.TestCase):
             ("setTelephonyConfigSlot", "setSlot"), ("setTelephonyConfigActiveSlot", "activateSlot"),
             ("clearTelephonyConfigSlot", "clearSlot"), ("clearAllTelephonyConfig", "clearAll")]))
         # the fifth caller is the SBC route, inside its own lock scope
-        self.assertEqual(len(re.findall(r"_tapiConfig\.(setSlot|clearSlot|clearAll|setActiveSlot|activateSlot)\(", src)), 5,
+        self.assertEqual(len(re.findall(r"_tapiConfig\.(setSlot|clearSlot|clearAll|setActiveSlot|activateSlot)\(", src)), 6,
                          "a sixth writer of the table would be a second producer for the slot")
-        sbc = body(RH, r"std::string RequestsHandler::setSbcMode\(bool enabled, size_t route\)")
+        sbc = body(RH, r"std::string RequestsHandler::setSbcMode\(bool enabled, size_t route, const TelephonyApiConfig::Acceptance\* accept\)")
         self.assertRegex(sbc, r"std::lock_guard<pd::TimedMutex> lock\(_mutex\);\s*if \(enabled\)\s*\{\s*"
-                              r"err = _tapiConfig\.setActiveSlot\(route\);")
+                              r"err = \(route == _tapiConfig\.activeSlot\(\)\) \? _tapiConfig\.setActiveSlot\(route\)\s*"
+                              r": _tapiConfig\.activateSlot\(route, accept\);")
         # and no other file reaches the instance at all
         for root, _, files in os.walk(SRC):
             for name in files:

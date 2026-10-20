@@ -10465,7 +10465,7 @@ std::pair<bool, size_t> RequestsHandler::getSbcMode()
 	return {_cfg.sbcEnabled(), _cfg.sbcRoute()};
 }
 
-std::string RequestsHandler::setSbcMode(bool enabled, size_t route)
+std::string RequestsHandler::setSbcMode(bool enabled, size_t route, const TelephonyApiConfig::Acceptance* accept)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	std::string err;
@@ -10476,7 +10476,10 @@ std::string RequestsHandler::setSbcMode(bool enabled, size_t route)
 			// Validate + activate BEFORE persisting the toggle, so a bad slot
 			// index leaves SBC mode exactly as it was rather than "on" with a
 			// route this build refused.
-			err = _tapiConfig.setActiveSlot(route);
+			// #1073: a switch to another slot is an activation and needs its acceptance; the slot that
+			// is active already (including one enabled before acceptances existed) stays as it is.
+			err = (route == _tapiConfig.activeSlot()) ? _tapiConfig.setActiveSlot(route)
+			                                          : _tapiConfig.activateSlot(route, accept);
 			if (err.empty())
 			{
 				_cfg.setSbcMode(true, route);

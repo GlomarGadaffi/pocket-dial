@@ -535,7 +535,7 @@ TEST_F(TelephonyHandlerStaging, TheHttpSettersStageAndOnlyTheSecretEditWritesASe
 
 TEST_F(TelephonyHandlerStaging, TheSbcRouteStagesTheActiveSlotAndIsRefusedDuringAReset)
 {
-	EXPECT_EQ(_h->setSbcMode(true, 1), "");
+	EXPECT_EQ(_h->setSbcMode(true, 1, &kAccepted), "");
 	EXPECT_EQ(nvswriter::stats().staged, 1u);
 	EXPECT_EQ(lastOf(drain()), (Pair{"active", "1"}));
 	EXPECT_EQ(_h->telephonySecretWritesForTest(), 0u);
@@ -543,7 +543,7 @@ TEST_F(TelephonyHandlerStaging, TheSbcRouteStagesTheActiveSlotAndIsRefusedDuring
 	// A staged write is refused once a reset has begun, so enabling SBC mode answers an error and leaves it off.
 	ASSERT_EQ(_h->setSbcMode(false, 1), "");
 	resetguard::begin();
-	EXPECT_NE(_h->setSbcMode(true, 2), "");
+	EXPECT_NE(_h->setSbcMode(true, 2, &kAccepted), "");
 	EXPECT_FALSE(_h->getSbcMode().first);
 }
 

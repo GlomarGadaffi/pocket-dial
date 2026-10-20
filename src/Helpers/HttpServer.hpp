@@ -468,7 +468,7 @@ private:
 	void sendApiE911Get(int sock);
 	void sendApiE911Set(int sock, const std::string& body);
 	void sendApiSbcModeGet(int sock);
-	void sendApiSbcModeSet(int sock, const std::string& body);
+	void sendApiSbcModeSet(int sock, const std::string& body, uint8_t role);
 	// Issue #800: multicast paging (997). Defined only when POCKETDIAL_MULTICAST_PAGING.
 	void sendApiMulticastPagingGet(int sock);
 	void sendApiMulticastPagingSet(int sock, const std::string& body);

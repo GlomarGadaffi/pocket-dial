@@ -1491,7 +1491,8 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 		// activate route -- this decides where EVERY call goes.
 		if (requireAdmin(clientSock, req, true))
 		{
-			sendApiSbcModeSet(clientSock, req.body);
+			sendApiSbcModeSet(clientSock, req.body,
+				static_cast<uint8_t>(AdminAuth::sessionRole(sessionToken(req))));
 		}
 	}
 #if POCKETDIAL_MULTICAST_PAGING
@@ -4403,7 +4404,7 @@ void HttpServer::sendApiSbcModeGet(int sock)
 	sendResponse(sock, 200, "OK", "application/json", std::string_view(buf, json.len));
 }
 
-void HttpServer::sendApiSbcModeSet(int sock, const std::string& body)
+void HttpServer::sendApiSbcModeSet(int sock, const std::string& body, uint8_t role)
 {
 	// Issue #201. Params: enabled ("1"/"true"/"on"), route (a
 	// TelephonyApiConfig slot index as a decimal string). Enabling with a bad
@@ -4425,11 +4426,16 @@ void HttpServer::sendApiSbcModeSet(int sock, const std::string& body)
 
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
-		std::string err = handler->setSbcMode(enabled, static_cast<size_t>(parsedRoute));
+		// #1073: enabling SBC mode on a slot that is not the active one activates it, so it carries
+		// acceptLimitations=<current version> like POST /api/telephony-config/<slot>/activate.
+		TelephonyApiConfig::Acceptance acceptance;
+		const TelephonyApiConfig::Acceptance* accept = telephonyAcceptanceOf(body, role, acceptance);
+		std::string err = handler->setSbcMode(enabled, static_cast<size_t>(parsedRoute), accept);
 		if (!err.empty())
 		{
-			sendResponse(sock, 400, "Bad Request", "application/json",
-			             "{\"error\":\"" + jsonEscape(err) + "\"}");
+			const bool needsAcceptance = telephonyIsAcceptanceRefusal(err);
+			sendResponse(sock, needsAcceptance ? 409 : 400, needsAcceptance ? "Conflict" : "Bad Request",
+			             "application/json", telephonyErrorBody(err));
 			return;
 		}
 	}

@@ -791,7 +791,10 @@ public:
 	// #997: the activation is staged for the NVS writer like POST .../activate, so
 	// it is refused (and SBC mode stays off) while a factory reset runs or when the
 	// writer is not running; the active slot has changed in RAM all the same.
-	std::string setSbcMode(bool enabled, size_t route);
+	// #1073: selecting a slot that is not already the active one is an activation, so it
+	// takes the same acceptance as POST .../activate ("Acceptance required: ...", SBC mode
+	// left as it was); re-selecting the slot that is active already changes nothing.
+	std::string setSbcMode(bool enabled, size_t route, const TelephonyApiConfig::Acceptance* accept = nullptr);
 
 	// ── RFC 3262 100rel on a forwarded call (Issue #172, step 3) ──────────────
 	// Off in a shipped image; in memory only (see PbxFeatureConfig::setForward100rel()).

@@ -412,6 +412,58 @@ TEST_F(TelephonyConfigHttpTest, ASlotEnabledBeforeTheAcceptanceExistedStaysEnabl
 	EXPECT_NE(after.find("\"anchorAcceptanceMissing\":[false,false,false,false]"), std::string::npos) << after;
 }
 
+// PUT /api/sbc-mode selects the route slot as the active one, the same effect as POST .../activate, so
+// it takes the same acceptance.
+TEST_F(TelephonyConfigHttpTest, SbcModeCannotSelectASlotThatHoldsNoAcceptance)
+{
+	AdminSession a = loginOn(_port);
+	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/2", "enabled=0",
+		"pd_session=" + a.cookie, a.csrf)), 200);
+
+	const std::string refused = httpRaw(_port, "PUT", "/api/sbc-mode", "enabled=1&route=2",
+		"pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(refused), 409) << refused;
+	EXPECT_NE(bodyOf(refused).find("acceptLimitations=1"), std::string::npos) << bodyOf(refused);
+	EXPECT_FALSE(_handler->getSbcMode().first) << "a refused enable leaves SBC mode off";
+	EXPECT_FALSE(_handler->getTelephonyConfigSlot(2).active) << "...and selects nothing";
+
+	const std::string ok = httpRaw(_port, "PUT", "/api/sbc-mode", "enabled=1&route=2&acceptLimitations=1",
+		"pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(ok), 200) << ok;
+	EXPECT_TRUE(_handler->getSbcMode().first);
+	EXPECT_TRUE(_handler->getTelephonyConfigSlot(2).active);
+	EXPECT_TRUE(_handler->getTelephonyConfigSlot(2).accepted);
+
+	// Turning SBC mode off needs none.
+	EXPECT_EQ(statusOf(httpRaw(_port, "PUT", "/api/sbc-mode", "enabled=0&route=2",
+		"pd_session=" + a.cookie, a.csrf)), 200);
+	EXPECT_FALSE(_handler->getSbcMode().first);
+}
+
+TEST_F(TelephonyConfigHttpTest, SbcModeKeepsAnAlreadyActiveLegacySlotAndRefusesAnotherUnacceptedOne)
+{
+	{
+		std::ofstream f(_tapiPath, std::ios::trunc);
+		f << "s1type=1\ns1en=1\ns1url=https://pbx.example.invalid\ns1id=id\n"
+		  << "s1sec=sssh\ns1dn=100\ns3type=1\ns3en=1\ns3url=https://other.example.invalid\ns3id=id\n"
+		  << "s3sec=sssh\ns3dn=300\nactive=1\n";
+	}
+	_handler->setTelephonyStorePathsForTest(_tapiPath, _didPath);
+	AdminSession a = loginOn(_port);
+
+	// Slot 1 is the active slot already (enabled before acceptances existed): re-selecting it is unchanged.
+	EXPECT_EQ(statusOf(httpRaw(_port, "PUT", "/api/sbc-mode", "enabled=1&route=1",
+		"pd_session=" + a.cookie, a.csrf)), 200);
+	EXPECT_TRUE(_handler->getSbcMode().first);
+	EXPECT_TRUE(_handler->getTelephonyConfigSlot(1).enabled);
+
+	// Slot 3 is a second legacy slot that is not active: switching to it is an activation.
+	EXPECT_EQ(statusOf(httpRaw(_port, "PUT", "/api/sbc-mode", "enabled=1&route=3",
+		"pd_session=" + a.cookie, a.csrf)), 409);
+	EXPECT_TRUE(_handler->getTelephonyConfigSlot(1).active);
+	EXPECT_FALSE(_handler->getTelephonyConfigSlot(3).active);
+}
+
 TEST_F(TelephonyConfigHttpTest, OutOfRangeSlotIndexIs400ViaSetSlotsOwnBoundCheck)
 {
 	AdminSession a = loginOn(_port);
