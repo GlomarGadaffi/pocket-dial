@@ -1595,7 +1595,7 @@ TEST_F(ConfigExportImportTest, EncryptedRoundTrip_KeepsTheFirstClaimOrderOfRowsF
 	EXPECT_EQ(locked, std::vector<std::string>{macHex(0x78)});
 }
 
-// ── Issue #483 review, round 2: the sealed block is applied as a whole ──────
+// ── Issue #483 review, round 2: the digest secrets and the bindings stand or fall together ──
 
 // A valid digest-secret list beside an INVALID bindings list changes nothing. The secrets used
 // to be restored (and every secret not in the file cleared) before the bindings were looked at,

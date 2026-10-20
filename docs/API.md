@@ -714,10 +714,13 @@ table's capacity), and if any is refused, or the device table cannot be staged f
 the table is left exactly as it was and one `skipped` entry names the rows (`row 3
 extension`) by number and reason class, never by value. A file whose list is empty
 clears the table; a file with no list (an encrypted export from before bindings
-travelled in it) leaves it alone and says so. The sealed block is applied as a whole:
-the digest secrets in it are written only if the bindings list was not refused, so a
-refused list changes neither the table nor the stored secrets (`extensionSecrets (not
-applied ...)`). Locked and Secured rows come back exactly as the source board had them,
+travelled in it) leaves it alone and says so. The block's digest-secret list and its
+bindings list stand or fall together: the secrets are written only if the bindings list
+was not refused, so a refused list changes neither the table nor the stored secrets
+(`extensionSecrets (not applied ...)`) and `secure` is not applied. The rest of the
+block (the Wi-Fi password, the AP passphrase, the telephony slot fields, the trunk and
+SMTP secrets) and the readable part are applied either way and are not rolled back. A
+failed flash write after the table is staged is not rolled back either. Locked and Secured rows come back exactly as the source board had them,
 so a phone with a different MAC (a replacement) is refused its extension until that row
 is forgotten; the import says so under `skipped`. Sysop-level, with its own `confirm=REPLACE` interlock. It is owner-only when `password` is non-empty (see [Two-Role Privilege Model](#two-role-privilege-model-issue-173)).
 

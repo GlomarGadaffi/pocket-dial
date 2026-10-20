@@ -694,8 +694,8 @@ normal `ctest` pass; see §6.
   short MAC, tab in the extension, Secured without a stored secret, duplicate MAC, bad
   state or flags, wrong shape, one row past capacity) leaving the table as it was with
   the row and reason class reported, and, with a valid digest-secret list beside it, the
-  stored secrets and the registrar mode left alone too (the sealed block is applied as a
-  whole); a Secured row left without a secret never letting `secure` apply; the warning
+  stored secrets and the registrar mode left alone too (the two lists stand or fall
+  together; the rest of the sealed block is not rolled back); a Secured row left without a secret never letting `secure` apply; the warning
   that a phone with another MAC is refused a restored locked or Secured row; refused rows
   listed in row order; an empty list clearing, and a file with no list
   leaving the table alone; a sysop import with a password getting `403`; a table the NVS

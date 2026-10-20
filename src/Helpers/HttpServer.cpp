@@ -6958,12 +6958,15 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		// key is present: an encrypted export from before #482 has no such list,
 		// and must not wipe every secret on the board. The count is capped at the
 		// device's own client capacity, so a crafted file cannot flood the store.
-		// #483 review: the block is applied as a whole. The secret list is PLANNED first (every
-		// entry checked, nothing written), the MAC bindings are then checked and replaced against
-		// the secrets that plan leaves, and only if that has not been refused are the secrets
-		// written. So a refused bindings list changes neither store; before, the secrets were
-		// restored and the stale ones cleared first, which nothing could undo, and the table
-		// kept a Secured row whose phone had lost its secret.
+		// #483 review: the digest-secret list and the MAC bindings stand or fall together. The
+		// secret list is PLANNED first (every entry checked, nothing written), the bindings are
+		// then checked and replaced against the secrets that plan leaves, and only if that has
+		// not been refused are the secrets written. So a refused bindings list changes neither
+		// store; before, the secrets were restored and the stale ones cleared first, which
+		// nothing could undo, and the table kept a Secured row whose phone had lost its secret.
+		// The rest of the block (Wi-Fi, AP PSK, telephony slot fields above; trunk and SMTP
+		// secrets below) is NOT part of this and is not rolled back. Nor is a flash write that
+		// fails after the table is staged: setHa1 writes synchronously, the table asynchronously.
 		const JsonReader::Value* secretsList = secretsValue.find("extensionSecrets");
 		const bool haveSecretList = secretsList != nullptr && secretsList->isArray();
 		const size_t cap = static_cast<size_t>(POCKETDIAL_MAX_CLIENTS);
