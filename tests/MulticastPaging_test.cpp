@@ -719,6 +719,30 @@ TEST(MulticastPaging, ASessionTimerOnTheReinviteIsNotGrantedAndNothingEndsThePag
 	EXPECT_TRUE(b.handler->multicastPageActiveForTest());
 }
 
+// #1042: a page caller that REQUIRES timer (pjsua --use-timer=2) is owed Session-Expires
+// and Require: timer in the 2xx (RFC 4028 §9), on the first answer and on a re-INVITE's.
+TEST(MulticastPaging, ARequiredTimerIsEchoedOnTheFirstAnswerAndOnTheReinviteAnswer)
+{
+	const std::string timer = "Supported: timer\r\nRequire: timer\r\nSession-Expires: 1800\r\nMin-SE: 90\r\n";
+	Bench b;
+	std::string inv = invite("501", "997", "192.168.80.51", "pg-rq");
+	inv.insert(inv.find("Content-Type:"), timer);
+	b.send(inv, "192.168.80.51");
+	const std::string first = b.first();
+	ASSERT_EQ(first.rfind("SIP/2.0 200 OK", 0), 0u) << first;
+	EXPECT_NE(headerLine(first, "Contact").find("sip:997@"), std::string::npos) << first;
+	EXPECT_EQ(headerLine(first, "Session-Expires"), "Session-Expires: 1800") << first;
+	EXPECT_EQ(headerLine(first, "Require"), "Require: timer") << first;
+
+	b.sent.clear();
+	b.send(reinvite("pg-rq", 2, "sendrecv", timer), "192.168.80.51");
+	const std::string r = b.first();
+	ASSERT_EQ(r.rfind("SIP/2.0 200 OK", 0), 0u) << r;
+	EXPECT_NE(r.find("a=sendrecv\r\n"), std::string::npos) << r;
+	EXPECT_EQ(headerLine(r, "Session-Expires"), "Session-Expires: 1800") << r;
+	EXPECT_EQ(headerLine(r, "Require"), "Require: timer") << r;
+}
+
 TEST(MulticastPaging, PoolRefusalOnTheReinviteDropsItAndLeavesThePageUnheld)
 {
 	Bench b;
