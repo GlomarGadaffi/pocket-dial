@@ -4895,11 +4895,61 @@ void RequestsHandler::preemptAnchorCallForEmergency()
 		if (!needBridge || hasBridge) found = &s;
 	}
 	if (!found || (!needBridge && legs < anchorCallLimit())) return;
-	const std::shared_ptr<Session>& victim = *found;
+	endAnchorCallForPreempt(*found, _outbox, "pre-empted by 911");
+}
 
+bool RequestsHandler::preemptAnchorCallForPsapCallback()
+{
+	// #967 (desmo's decision, option A): an inbound PSAP callback that
+	// routeInboundAnchorCall() would refuse ends ONE non-emergency anchored call
+	// and takes its room, as #624 does for an outbound 911/933. Two things refuse
+	// an inbound: every bridge busy, and another anchor inbound ringing or up
+	// ("drop 2", on any build). The one call taken must clear every reason that
+	// applies, and ending it must leave no reason behind:
+	//   * another inbound is in the way: the call taken is that inbound;
+	//   * the bridges are the blocker: the call taken holds a bridge.
+	// When no single call does, or the only candidates are emergency calls (the
+	// original 911 still up, or an earlier callback), nothing is ended and false
+	// comes back: the caller drops the callback as it always did. Ending a call
+	// that still leaves the callback refused would lose both calls.
+	// Caller holds _mutex and runs off the SIP thread (the anchor's event task),
+	// so every send goes to _asyncOutbox.
+	const bool needBridge = allBridgesBusy();
+	unsigned inbounds = 0;
+	for (const auto& [id, s] : _sessions)
+	{
+		if (s->isAnchorInbound() && s->getState() != Session::State::Bye) ++inbounds;
+	}
+	if (!needBridge && inbounds == 0) return true;   // nothing in the way
+	if (inbounds > 1) return false;                  // one call cannot be all of them
+
+	const std::shared_ptr<Session>* found = nullptr;   // valid until endCall() erases it
+	for (const auto& [id, s] : _sessions)
+	{
+		if (!s->isAnchor() || s->getState() == Session::State::Bye || s->isEmergency()) continue;
+		if (inbounds != 0 && !s->isAnchorInbound()) continue;
+		bool hasBridge = false;
+		for (const auto& b : _mediaBridges) hasBridge = hasBridge || b.isForCallId(id);
+		if (needBridge && !hasBridge) continue;
+		found = &s;
+		break;
+	}
+	if (!found) return false;
+
+	endAnchorCallForPreempt(*found, _asyncOutbox, "pre-empted by a PSAP callback");
+	return !allBridgesBusy();   // stopBridge() is synchronous: a bridge is free now
+}
+
+void RequestsHandler::endAnchorCallForPreempt(const std::shared_ptr<Session>& victim,
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outbox, std::string_view reason)
+{
 	// Tell its caller the way each teardown path already does: a 503 or a
 	// CANCEL while it still rings, else a BYE (the #604 sweep's shape). endCall()
 	// then drops the anchor leg and frees the bridge; it also logs the reason.
+	// On a real anchor nothing here does network I/O: the far leg's drop is posted
+	// to the tel_drop lane (asyncDropCall), never made on this thread. `outbox` is
+	// the calling thread's: _outbox on the SIP thread, _asyncOutbox on the
+	// anchor's event task.
 	const std::string callID = victim->getCallID();   // endCall() erases the map's copy
 	const bool inbound = victim->isAnchorInbound();
 	const auto handset = inbound ? victim->getDest() : victim->getSrc();
@@ -4907,10 +4957,10 @@ void RequestsHandler::preemptAnchorCallForEmergency()
 	const std::string& dTo = victim->getDialogTo();
 	if (victim->getState() == Session::State::Invited)
 	{
-		if (!inbound) refuseRingingAnchor(callID, _outbox);
+		if (!inbound) refuseRingingAnchor(callID, outbox);
 		else for (const auto& t : victim->getPendingTargets())
 		{
-			if (auto c = buildInboundCancelTo(victim, t)) _outbox.emplace_back(t->getAddress(), std::move(c));
+			if (auto c = buildInboundCancelTo(victim, t)) outbox.emplace_back(t->getAddress(), std::move(c));
 		}
 	}
 	else if (handset && !dFrom.empty() && !dTo.empty())
@@ -4918,12 +4968,12 @@ void RequestsHandler::preemptAnchorCallForEmergency()
 		const uint32_t cseq = victim->nextServerCSeq();
 		auto bye = buildServerBye(handset->getNumber(), handset->getAddress(), callID,
 			inbound ? dFrom : dTo, inbound ? dTo : dFrom, cseq);
-		if (bye) _outbox.emplace_back(handset->getAddress(), std::move(bye));
+		if (bye) outbox.emplace_back(handset->getAddress(), std::move(bye));
 		victim->noteServerCSeq(cseq);
 	}
 	const std::string farLeg = victim->getAnchorParticipantId();   // endCall()'s release() clears it
 	const std::string_view phone = handset ? std::string_view(handset->getNumber()) : std::string_view();
-	endCall(callID, inbound ? farLeg : phone, inbound ? phone : farLeg, "pre-empted by 911");
+	endCall(callID, inbound ? farLeg : phone, inbound ? phone : farLeg, reason);
 }
 
 bool RequestsHandler::anchorIsSynchronous() const
@@ -6048,27 +6098,6 @@ void RequestsHandler::routeInboundAnchorCall(const std::string& participantId, c
 		return;
 	}
 
-	if (allBridgesBusy())
-	{
-		queueLog("[Telephony] Inbound: all media bridges busy — dropping inbound to " + dn);
-		asyncDropCall(participantId);
-		return;
-	}
-
-	// Refuse a second inbound while one is already ringing/up (keyed by the
-	// inbound flag) — POCKETDIAL_MAX_ANCHOR_CALLS is 1 today, so allBridgesBusy()
-	// above would already have caught this once the first leg is BRIDGED, but a
-	// still-ringing (not yet bridged) first inbound leg holds no bridge yet.
-	for (const auto& [cid, s] : _sessions)
-	{
-		if (s->isAnchorInbound() && s->getState() != Session::State::Bye)
-		{
-			queueLog("[Telephony] Inbound: a call is already in progress — dropping new inbound");
-			asyncDropCall(participantId);
-			return;
-		}
-	}
-
 	// ── Track A's DID -> extension hook ──────────────────────────────────────
 	// DidMapping is a bounded, no-I/O, no-heap linear scan over at most
 	// POCKETDIAL_MAX_DID_MAPPINGS entries — safe to call directly under _mutex,
@@ -6106,6 +6135,47 @@ void RequestsHandler::routeInboundAnchorCall(const std::string& participantId, c
 			}
 		}
 	}
+
+	// #967: whether this is a PSAP callback (#659) is known only now, so the two
+	// reasons to refuse the call are decided here and not before the targets.
+	// ring-all reaches every target, so any one inside its window flags it.
+	const bool psapCallback = std::any_of(targets.begin(), targets.end(),
+		[this](const auto& t) { return isEmergencyCallback(t->getNumber()); });
+
+	// Refuse the call when every bridge is busy, or when another inbound is
+	// already ringing/up (keyed by the inbound flag): a still-ringing (not yet
+	// bridged) inbound leg holds no bridge yet, and this refusal applies whatever
+	// the bridge count. A PSAP callback is not refused while one non-emergency
+	// call can be ended to make room (desmo, option A); anything else, and a
+	// callback with only emergency calls in the way, is dropped as it always was.
+	const bool bridgesBusy = allBridgesBusy();
+	bool inboundLive = false;
+	for (const auto& [cid, s] : _sessions)
+	{
+		if (s->isAnchorInbound() && s->getState() != Session::State::Bye)
+		{
+			inboundLive = true;
+			break;
+		}
+	}
+	if ((bridgesBusy || inboundLive) && !(psapCallback && preemptAnchorCallForPsapCallback()))
+	{
+		if (bridgesBusy)
+		{
+			queueLog("[Telephony] Inbound: all media bridges busy — dropping inbound to " + dn);
+		}
+		else
+		{
+			queueLog("[Telephony] Inbound: a call is already in progress — dropping new inbound");
+		}
+		if (psapCallback)
+		{
+			queueLog("[Telephony] Inbound: PSAP callback NOT routed -- no single non-emergency call to end (#967)", true);
+		}
+		asyncDropCall(participantId);
+		return;
+	}
+
 	if (targets.empty())
 	{
 		queueLog("[Telephony] Inbound: no extensions registered — dropping participant " + participantId, true);
@@ -6156,9 +6226,7 @@ void RequestsHandler::routeInboundAnchorCall(const std::string& participantId, c
 	}
 	session->setAnchor(true);
 	session->setAnchorInbound(true);
-	// #659: ring-all reaches every target, so any one in its window flags it.
-	session->setEmergency(std::any_of(targets.begin(), targets.end(),
-		[this](const auto& t) { return isEmergencyCallback(t->getNumber()); }));
+	session->setEmergency(psapCallback);   // #659, computed above (#967)
 	session->setState(Session::State::Invited);
 	session->setLocalTag(fromTag);
 	session->setUacBranch(branch);
