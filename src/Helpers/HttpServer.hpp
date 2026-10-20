@@ -454,8 +454,8 @@ private:
 	// above (POST for activate since it has no body to speak of, mirroring
 	// sendApiKill's shape).
 	void sendApiTelephonyConfigList(int sock);
-	void sendApiTelephonyConfigSet(int sock, size_t slotIdx, const std::string& body);
-	void sendApiTelephonyConfigActivate(int sock, size_t slotIdx);
+	void sendApiTelephonyConfigSet(int sock, size_t slotIdx, const std::string& body, uint8_t role);
+	void sendApiTelephonyConfigActivate(int sock, size_t slotIdx, const std::string& body, uint8_t role);
 	void sendApiTelephonyConfigTest(int sock, size_t slotIdx);
 	void sendApiTelephonyConfigDelete(int sock, size_t slotIdx);
 	// DID -> extension inbound routing (new). GET lists all configured

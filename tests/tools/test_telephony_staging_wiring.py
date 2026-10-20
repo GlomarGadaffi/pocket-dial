@@ -50,8 +50,8 @@ class TheSecretIsNeverStaged(unittest.TestCase):
         walk = body(TEL, EMIT)
         self.assertNotIn("secret", walk.lower())
         self.assertNotIn('"sec"', walk)
-        self.assertEqual(walk.count("slotKey("), 5, "type, en, url, id, dn")
-        order = [walk.index('"%s")' % f) for f in ("type", "en", "url", "id", "dn")]
+        self.assertEqual(walk.count("slotKey("), 6, "type, en, url, id, dn, acc (#1073)")
+        order = [walk.index('"%s")' % f) for f in ("type", "en", "url", "id", "dn", "acc")]
         self.assertEqual(order, sorted(order), "the keys go out in the old persist() order, minus sec")
         self.assertIn('putU8("active"', walk)
         # the snapshot is checked whole before the first put
@@ -76,7 +76,7 @@ class TheSecretIsNeverStaged(unittest.TestCase):
     def test_the_cell_layout_and_the_slot_cap_come_from_one_place(self):
         hdr = code("SIP/TelephonyApiConfig.hpp")
         for needle in ("kCellLen = kMaxUrlLen + 1",
-                       "kSlotSnapshotLen = 2 + 3 * kCellLen",
+                       "kSlotSnapshotLen = 2 + 3 * kCellLen + kAcceptCellLen",
                        "kSnapshotLen = kSlots * kSlotSnapshotLen + 1",
                        "kSnapshotCap = kSnapshotLen + 1"):
             self.assertIn(needle, hdr)
@@ -84,7 +84,7 @@ class TheSecretIsNeverStaged(unittest.TestCase):
         self.assertIn("kTelephonyCap = TelephonyApiConfig::kSnapshotCap", w)
         self.assertRegex(w, r"kScratchCap = maxOf\(maxOf\(maxOf\(kDevicesCap, kForwardsCap\), kDidMapCap\), kTelephonyCap\)")
         # the memory cost, checked by the compiler: the numbers in the PR body
-        self.assertIn('static_assert(sizeof(Slot<kTelephonyCap>) == 1564', w)
+        self.assertIn('static_assert(sizeof(Slot<kTelephonyCap>) == 1676', w)
         self.assertIn("static_assert(kScratchCap == kForwardsCap", w)
 
 
@@ -109,7 +109,7 @@ class StageFirstThenTheSecret(unittest.TestCase):
                          "the flags clear and the count moves only after a write that succeeded")
 
     def test_setSlot_marks_a_secret_pending_only_when_it_changed(self):
-        b = body(TEL, r"std::string TelephonyApiConfig::setSlot\(size_t idx, const Slot& s, bool keepSecret\)")
+        b = body(TEL, r"std::string TelephonyApiConfig::setSlot\(size_t idx, const Slot& s, bool keepSecret, const Acceptance\* accept\)")
         self.assertRegex(b, r"if \(s\.secret != dst\.secret\)\s*\{\s*_secretPending\[idx\] = true;")
         self.assertLess(b.index("_secretPending[idx] = true"), b.index("scrub(dst.secret)"),
                         "compared before the live value is replaced")
@@ -172,12 +172,12 @@ class SingleProducerAndTheCallers(unittest.TestCase):
         wrappers = re.findall(
             r"RequestsHandler::(setTelephonyConfigSlot|setTelephonyConfigActiveSlot|clearTelephonyConfigSlot|"
             r"clearAllTelephonyConfig)\([^)]*\)\s*\{\s*std::lock_guard<pd::TimedMutex> lock\(_mutex\);\s*"
-            r"return _tapiConfig\.(setSlot|setActiveSlot|clearSlot|clearAll)\(", src)
+            r"return _tapiConfig\.(setSlot|activateSlot|clearSlot|clearAll)\(", src)
         self.assertEqual(sorted(wrappers), sorted([
-            ("setTelephonyConfigSlot", "setSlot"), ("setTelephonyConfigActiveSlot", "setActiveSlot"),
+            ("setTelephonyConfigSlot", "setSlot"), ("setTelephonyConfigActiveSlot", "activateSlot"),
             ("clearTelephonyConfigSlot", "clearSlot"), ("clearAllTelephonyConfig", "clearAll")]))
         # the fifth caller is the SBC route, inside its own lock scope
-        self.assertEqual(len(re.findall(r"_tapiConfig\.(setSlot|clearSlot|clearAll|setActiveSlot)\(", src)), 5,
+        self.assertEqual(len(re.findall(r"_tapiConfig\.(setSlot|clearSlot|clearAll|setActiveSlot|activateSlot)\(", src)), 5,
                          "a sixth writer of the table would be a second producer for the slot")
         sbc = body(RH, r"std::string RequestsHandler::setSbcMode\(bool enabled, size_t route\)")
         self.assertRegex(sbc, r"std::lock_guard<pd::TimedMutex> lock\(_mutex\);\s*if \(enabled\)\s*\{\s*"
@@ -199,8 +199,9 @@ class SingleProducerAndTheCallers(unittest.TestCase):
 
     def test_the_import_can_only_keep_the_secret(self):
         imp = body(HTTP, r"void HttpServer::sendApiConfigImport\(int sock, const std::string& body\)")
-        self.assertEqual(len(re.findall(r"setTelephonyConfigSlot\(idx, s, true\)", imp)), 2, "the two passes")
-        self.assertEqual(len(re.findall(r"setTelephonyConfigSlot\(", imp)), 2)
+        self.assertEqual(len(re.findall(r"setTelephonyConfigSlot\(idx, s, true\)", imp)), 3,
+                         "the two passes, and #1073's retry that imports a slot it may not enable disabled")
+        self.assertEqual(len(re.findall(r"setTelephonyConfigSlot\(", imp)), 3)
         self.assertNotIn("clearAllTelephonyConfig", imp)
         self.assertNotIn("resetguard::begin", imp, "an import never opens the reset guard: its stages would be refused")
 

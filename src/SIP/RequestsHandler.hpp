@@ -765,8 +765,15 @@ public:
 	// writes everything here and now (the reset has begun; a stage would be refused).
 	std::vector<TelephonyApiConfig::SlotView> getTelephonyConfigSlots();
 	TelephonyApiConfig::SlotView getTelephonyConfigSlot(size_t idx);
-	std::string setTelephonyConfigSlot(size_t idx, const TelephonyApiConfig::Slot& s, bool keepSecret);
-	std::string setTelephonyConfigActiveSlot(size_t idx);
+	// #1073: enabling a slot, and activating one, take the caller's acceptance of the
+	// limitations (TelephonyApiConfig.hpp); without one that the slot already holds,
+	// they answer "Acceptance required: ...". The SBC route does not go through here.
+	std::string setTelephonyConfigSlot(size_t idx, const TelephonyApiConfig::Slot& s, bool keepSecret,
+		const TelephonyApiConfig::Acceptance* accept = nullptr);
+	std::string setTelephonyConfigActiveSlot(size_t idx, const TelephonyApiConfig::Acceptance* accept = nullptr);
+	// Bit i set: slot i is enabled without an acceptance of the current warning text.
+	// Lock-free, for /api/status (polled every second).
+	uint8_t telephonyAcceptanceMissingMask() const { return _tapiConfig.acceptanceMissingMask(); }
 	std::string clearTelephonyConfigSlot(size_t idx);
 	std::string clearAllTelephonyConfig();
 

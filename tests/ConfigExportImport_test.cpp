@@ -447,7 +447,8 @@ TEST_F(ConfigExportImportTest, Import_StagesTheTelephonyConfigOnceAndWritesNoSec
 	s.clientId = "imp-client-id";
 	s.secret = secret;
 	s.routeDn = "100";
-	ASSERT_EQ(_handler->setTelephonyConfigSlot(0, s, false), "");
+	const TelephonyApiConfig::Acceptance accepted{TelephonyApiConfig::kAcceptanceVersion, 1, 1760000000};
+	ASSERT_EQ(_handler->setTelephonyConfigSlot(0, s, false, &accepted), "");
 	// Slot 1 is a disabled draft with a secret of its own: the import must leave that one alone too.
 	TelephonyApiConfig::Slot draft = s;
 	draft.enabled = false;
@@ -1040,6 +1041,63 @@ TEST_F(ConfigExportImportTest, Import_TelephonySlotRefusal_IsReportedNotApplied)
 	EXPECT_NE(bodyOf(resp).find("telephonyConfig slot 0 (Enabled slot needs a route DN)"), std::string::npos) << resp;
 	EXPECT_EQ(bodyOf(resp).find("telephonyConfig (metadata)"), std::string::npos) << resp;
 	EXPECT_FALSE(_handler->getTelephonyConfigSlot(0).enabled);
+}
+
+// #1073: a file never carries the acceptance, so it cannot enable a slot the administrator has not
+// accepted. A configured-but-disabled slot is imported disabled and the import says why.
+TEST_F(ConfigExportImportTest, Import_CannotEnableASlotWithoutAnAcceptance_ItIsImportedDisabled)
+{
+	TelephonyApiConfig::Slot draft;
+	draft.type = TelephonyProviderType::Telephony;
+	draft.baseUrl = "https://pbx.example.invalid";
+	draft.clientId = "id";
+	draft.secret = "sssh";
+	draft.routeDn = "100";
+	ASSERT_EQ(_handler->setTelephonyConfigSlot(2, draft, false), "");
+	const std::string blob = "{\"exportVer\":1,\"plaintext\":{\"telephonyConfig\":["
+		"{\"index\":2,\"enabled\":true}]}}";
+	const std::string resp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(blob) + "&confirm=REPLACE", "pd_session=" + _sysop.cookie, _sysop.csrf);
+	ASSERT_EQ(statusOf(resp), 200) << resp;
+	EXPECT_NE(bodyOf(resp).find("telephonyConfig slot 2 (imported disabled: Acceptance required"), std::string::npos) << resp;
+	EXPECT_EQ(bodyOf(resp).find("telephonyConfig (metadata)"), std::string::npos) << resp;
+	EXPECT_FALSE(_handler->getTelephonyConfigSlot(2).enabled);
+	EXPECT_EQ(_handler->getTelephonyConfigSlot(2).baseUrl, "https://pbx.example.invalid") << "the rest of the slot is still there";
+}
+
+// ...a slot that is already enabled and accepted on this board stays so (the round trip), and one
+// enabled before acceptances existed is left exactly as it is, not disabled.
+TEST_F(ConfigExportImportTest, Import_KeepsAnAcceptedSlotEnabledAndLeavesALegacyEnabledSlotAlone)
+{
+	TelephonyApiConfig::Slot s;
+	s.type = TelephonyProviderType::Telephony;
+	s.enabled = true;
+	s.baseUrl = "https://pbx.example.invalid";
+	s.clientId = "id";
+	s.secret = "sssh";
+	s.routeDn = "100";
+	const TelephonyApiConfig::Acceptance accepted{TelephonyApiConfig::kAcceptanceVersion, 1, 1760000000};
+	ASSERT_EQ(_handler->setTelephonyConfigSlot(0, s, false, &accepted), "");
+	{
+		std::ofstream f(_tapiPath, std::ios::trunc);
+		f << "s0type=1\ns0en=1\ns0url=https://pbx.example.invalid\ns0id=id\ns0sec=sssh\ns0dn=100\ns0acc=" 
+		  << static_cast<int>(TelephonyApiConfig::kAcceptanceVersion) << ",1,1760000000\n"
+		  << "s1type=1\ns1en=1\ns1url=https://legacy.example.invalid\ns1id=old\ns1sec=sssh\ns1dn=200\n";
+	}
+	_handler->setTelephonyStorePathsForTest(_tapiPath, _didPath);
+	ASSERT_TRUE(_handler->getTelephonyConfigSlot(1).acceptanceMissing) << "precondition: slot 1 is a legacy slot";
+
+	const std::string blob = "{\"exportVer\":1,\"plaintext\":{\"telephonyConfig\":["
+		"{\"index\":0,\"enabled\":true},{\"index\":1,\"enabled\":true}]}}";
+	const std::string resp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(blob) + "&confirm=REPLACE", "pd_session=" + _sysop.cookie, _sysop.csrf);
+	ASSERT_EQ(statusOf(resp), 200) << resp;
+	EXPECT_TRUE(_handler->getTelephonyConfigSlot(0).enabled);
+	EXPECT_TRUE(_handler->getTelephonyConfigSlot(0).accepted) << "the acceptance this board holds survives the import";
+	EXPECT_TRUE(_handler->getTelephonyConfigSlot(1).enabled) << "a legacy slot is not disabled by an import";
+	EXPECT_EQ(_handler->getTelephonyConfigSlot(1).clientId, "old");
+	EXPECT_NE(bodyOf(resp).find("telephonyConfig slot 1 (left unchanged: Acceptance required"), std::string::npos) << resp;
+	EXPECT_EQ(bodyOf(resp).find("telephonyConfig slot 0"), std::string::npos) << resp;
 }
 
 // #483: the import holds the trunk to POST /api/trunk's checks. A file that

@@ -27,6 +27,7 @@
 #include "RequestsHandler.hpp"
 #include "AdminAuth.hpp"
 #include "ResetGuard.hpp"     // #450: a reset leaves the guard up on host
+#include "TimeSync.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -236,7 +237,7 @@ TEST_F(TelephonyConfigHttpTest, PutSlot_NeverLeaksSecretButReportsSecretSet)
 {
 	AdminSession a = loginOn(_port);
 	std::string put = httpRaw(_port, "PUT", "/api/telephony-config/0",
-		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=abc123&secret=top-secret-value&routeDn=100",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=abc123&secret=top-secret-value&routeDn=100&acceptLimitations=1",
 		"pd_session=" + a.cookie, a.csrf);
 	ASSERT_EQ(statusOf(put), 200);
 	std::string putBody = bodyOf(put);
@@ -256,13 +257,13 @@ TEST_F(TelephonyConfigHttpTest, EmptySecretOnEditKeepsExistingSecret)
 {
 	AdminSession a = loginOn(_port);
 	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/1",
-		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id1&secret=first-secret&routeDn=100",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id1&secret=first-secret&routeDn=100&acceptLimitations=1",
 		"pd_session=" + a.cookie, a.csrf)), 200);
 
 	// Edit clientId only, secret field empty -> "keep existing" per
 	// TelephonyApiConfig::setSlot's keepSecret contract.
 	std::string edit = httpRaw(_port, "PUT", "/api/telephony-config/1",
-		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id2&secret=&routeDn=100",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id2&secret=&routeDn=100&acceptLimitations=1",
 		"pd_session=" + a.cookie, a.csrf);
 	ASSERT_EQ(statusOf(edit), 200);
 	std::string editBody = bodyOf(edit);
@@ -283,10 +284,132 @@ TEST_F(TelephonyConfigHttpTest, EnabledSlotRequiresHttpsElse400)
 		<< "a rejected edit must not have applied";
 
 	std::string good = httpRaw(_port, "PUT", "/api/telephony-config/0",
-		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=100",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=100&acceptLimitations=1",
 		"pd_session=" + a.cookie, a.csrf);
 	EXPECT_EQ(statusOf(good), 200);
 	EXPECT_NE(bodyOf(good).find("\"enabled\":true"), std::string::npos);
+}
+
+// ── #1073: enabling or activating a slot needs an explicit acceptance ──────────
+
+namespace
+{
+	const char* const kEnableBody =
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=100";
+
+	// The JSON object of slot `idx` out of a GET /api/telephony-config body.
+	std::string slotObject(const std::string& body, size_t idx)
+	{
+		const size_t at = body.find("\"index\":" + std::to_string(idx));
+		if (at == std::string::npos) return "";
+		return body.substr(at, body.find('}', at) - at);
+	}
+}
+
+TEST_F(TelephonyConfigHttpTest, EnablingASlotWithoutAcceptLimitationsIs409NamingTheField)
+{
+	AdminSession a = loginOn(_port);
+	const std::string refused = httpRaw(_port, "PUT", "/api/telephony-config/0", kEnableBody,
+		"pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(refused), 409) << refused;
+	EXPECT_NE(bodyOf(refused).find("acceptLimitations=1"), std::string::npos) << bodyOf(refused);
+	EXPECT_FALSE(_handler->getTelephonyConfigSlot(0).enabled) << "a refused enable must not apply";
+	EXPECT_FALSE(_handler->getTelephonyConfigSlot(0).secretSet) << "...nor store the rest of the edit";
+
+	// The wrong warning-text version is no acceptance.
+	const std::string wrong = httpRaw(_port, "PUT", "/api/telephony-config/0",
+		std::string(kEnableBody) + "&acceptLimitations=99", "pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(wrong), 409) << wrong;
+	EXPECT_FALSE(_handler->getTelephonyConfigSlot(0).enabled);
+
+	// The right one enables, and the slot records who and when.
+	const std::string ok = httpRaw(_port, "PUT", "/api/telephony-config/0",
+		std::string(kEnableBody) + "&acceptLimitations=1", "pd_session=" + a.cookie, a.csrf);
+	ASSERT_EQ(statusOf(ok), 200) << ok;
+	EXPECT_NE(bodyOf(ok).find("\"acceptanceMissing\":false"), std::string::npos) << bodyOf(ok);
+	EXPECT_NE(bodyOf(ok).find("\"acceptedBy\":\"sysop\""), std::string::npos) << bodyOf(ok);
+	const auto v = _handler->getTelephonyConfigSlot(0);
+	EXPECT_TRUE(v.enabled);
+	EXPECT_TRUE(v.accepted);
+	EXPECT_EQ(v.acceptedVersion, TelephonyApiConfig::kAcceptanceVersion);
+	EXPECT_EQ(v.acceptedRole, static_cast<uint8_t>(AdminAuth::Role::Sysop));
+	EXPECT_EQ(v.acceptedAt, timesync::epochSeconds()) << "the existing time source; 0 on a board that has not synced";
+
+	// Already enabled and accepted: an edit needs no new acceptance.
+	const std::string edit = httpRaw(_port, "PUT", "/api/telephony-config/0",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id2&secret=&routeDn=100",
+		"pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(edit), 200) << edit;
+	EXPECT_EQ(_handler->getTelephonyConfigSlot(0).clientId, "id2");
+	EXPECT_TRUE(_handler->getTelephonyConfigSlot(0).accepted);
+
+	// Disabling needs none, and the next enable asks again.
+	EXPECT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/0", "enabled=0",
+		"pd_session=" + a.cookie, a.csrf)), 200);
+	EXPECT_FALSE(_handler->getTelephonyConfigSlot(0).accepted);
+	EXPECT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/0",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id2&secret=&routeDn=100",
+		"pd_session=" + a.cookie, a.csrf)), 409);
+}
+
+TEST_F(TelephonyConfigHttpTest, ActivatingASlotWithNoStoredAcceptanceIs409)
+{
+	AdminSession a = loginOn(_port);
+	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/2", "enabled=0",
+		"pd_session=" + a.cookie, a.csrf)), 200);
+
+	const std::string refused = httpRaw(_port, "POST", "/api/telephony-config/2/activate", "",
+		"pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(refused), 409) << refused;
+	EXPECT_NE(bodyOf(refused).find("acceptLimitations=1"), std::string::npos) << bodyOf(refused);
+	EXPECT_FALSE(_handler->getTelephonyConfigSlot(2).active);
+
+	const std::string ok = httpRaw(_port, "POST", "/api/telephony-config/2/activate", "acceptLimitations=1",
+		"pd_session=" + a.cookie, a.csrf);
+	EXPECT_EQ(statusOf(ok), 200) << ok;
+	EXPECT_TRUE(_handler->getTelephonyConfigSlot(2).active);
+	EXPECT_TRUE(_handler->getTelephonyConfigSlot(2).accepted);
+
+	// Now that it holds one, activating it again needs none.
+	EXPECT_EQ(statusOf(httpRaw(_port, "POST", "/api/telephony-config/2/activate", "",
+		"pd_session=" + a.cookie, a.csrf)), 200);
+}
+
+TEST_F(TelephonyConfigHttpTest, ASlotEnabledBeforeTheAcceptanceExistedStaysEnabledAndIsFlaggedInTheListAndStatus)
+{
+	{
+		std::ofstream f(_tapiPath, std::ios::trunc);
+		f << "s1type=1\ns1en=1\ns1url=https://pbx.example.invalid\ns1id=id\n"
+		  << "s1sec=sssh\ns1dn=100\nactive=1\n";
+	}
+	_handler->setTelephonyStorePathsForTest(_tapiPath, _didPath);
+	AdminSession a = loginOn(_port);
+
+	const std::string list = bodyOf(httpGet(_port, "/api/telephony-config", "pd_session=" + a.cookie));
+	const std::string s1 = slotObject(list, 1);
+	EXPECT_NE(s1.find("\"enabled\":true"), std::string::npos) << s1;
+	EXPECT_NE(s1.find("\"acceptanceMissing\":true"), std::string::npos) << s1;
+	EXPECT_NE(slotObject(list, 0).find("\"acceptanceMissing\":false"), std::string::npos) << "an unused slot is not flagged";
+	EXPECT_NE(list.find("\"acceptanceVersion\":1"), std::string::npos) << "the dashboard sends back the version it was shown";
+
+	const std::string status = bodyOf(httpGet(_port, "/api/status", "pd_session=" + a.cookie));
+	EXPECT_NE(status.find("\"anchorAcceptanceMissing\":[false,true,false,false]"), std::string::npos) << status;
+
+	// Still enabled, still active; an edit that does not carry an acceptance is refused and leaves it so.
+	EXPECT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/1",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=other&secret=&routeDn=100",
+		"pd_session=" + a.cookie, a.csrf)), 409);
+	const auto v = _handler->getTelephonyConfigSlot(1);
+	EXPECT_TRUE(v.enabled);
+	EXPECT_TRUE(v.active);
+	EXPECT_EQ(v.clientId, "id");
+
+	// Accepting it records the acceptance and clears the flag.
+	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/1",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=&routeDn=100&acceptLimitations=1",
+		"pd_session=" + a.cookie, a.csrf)), 200);
+	const std::string after = bodyOf(httpGet(_port, "/api/status", "pd_session=" + a.cookie));
+	EXPECT_NE(after.find("\"anchorAcceptanceMissing\":[false,false,false,false]"), std::string::npos) << after;
 }
 
 TEST_F(TelephonyConfigHttpTest, OutOfRangeSlotIndexIs400ViaSetSlotsOwnBoundCheck)
@@ -311,7 +434,7 @@ TEST_F(TelephonyConfigHttpTest, ActivateFlipsExactlyOneSlotsActiveFlag)
 	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/2",
 		"enabled=0&baseUrl=&clientId=&secret=&routeDn=", "pd_session=" + a.cookie, a.csrf)), 200);
 
-	std::string act = httpRaw(_port, "POST", "/api/telephony-config/2/activate", "",
+	std::string act = httpRaw(_port, "POST", "/api/telephony-config/2/activate", "acceptLimitations=1",
 	                          "pd_session=" + a.cookie, a.csrf);
 	ASSERT_EQ(statusOf(act), 200);
 	EXPECT_NE(bodyOf(act).find("\"activeIndex\":2"), std::string::npos);
@@ -342,9 +465,9 @@ TEST_F(TelephonyConfigHttpTest, TestDialSucceedsOnTheActiveSlotThroughTheLoopbac
 	// against LoopbackAnchorClient::lastMakeCallDestination().
 	AdminSession a = loginOn(_port);
 	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/1",
-		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=rcv2",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=rcv2&acceptLimitations=1",
 		"pd_session=" + a.cookie, a.csrf)), 200);
-	ASSERT_EQ(statusOf(httpRaw(_port, "POST", "/api/telephony-config/1/activate", "",
+	ASSERT_EQ(statusOf(httpRaw(_port, "POST", "/api/telephony-config/1/activate", "acceptLimitations=1",
 		"pd_session=" + a.cookie, a.csrf)), 200);
 
 	std::string resp = httpRaw(_port, "POST", "/api/telephony-config/1/test", "",
@@ -364,7 +487,7 @@ TEST_F(TelephonyConfigHttpTest, TestDialRefusesANonActiveSlotWithoutCallingTheAn
 {
 	AdminSession a = loginOn(_port);
 	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/0",
-		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=100",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=100&acceptLimitations=1",
 		"pd_session=" + a.cookie, a.csrf)), 200);
 	// Slot 0 is configured but never activated -- activeSlot() still names
 	// whatever it defaulted to (or nothing), so testing slot 0 must refuse.
@@ -418,9 +541,9 @@ TEST_F(TelephonyConfigHttpTest, TestDialRejectsCrossOriginAndRequiresCsrf)
 {
 	AdminSession a = loginOn(_port);
 	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/1",
-		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=rcv2",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=rcv2&acceptLimitations=1",
 		"pd_session=" + a.cookie, a.csrf)), 200);
-	ASSERT_EQ(statusOf(httpRaw(_port, "POST", "/api/telephony-config/1/activate", "",
+	ASSERT_EQ(statusOf(httpRaw(_port, "POST", "/api/telephony-config/1/activate", "acceptLimitations=1",
 		"pd_session=" + a.cookie, a.csrf)), 200);
 
 	EXPECT_EQ(statusOf(httpRaw(_port, "POST", "/api/telephony-config/1/test", "",
@@ -438,7 +561,7 @@ TEST_F(TelephonyConfigHttpTest, DeleteClearsSlotAndSubsequentGetShowsItCleared)
 {
 	AdminSession a = loginOn(_port);
 	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/0",
-		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=abc123&secret=top-secret-value&routeDn=100",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=abc123&secret=top-secret-value&routeDn=100&acceptLimitations=1",
 		"pd_session=" + a.cookie, a.csrf)), 200);
 	ASSERT_TRUE(_handler->getTelephonyConfigSlot(0).secretSet);
 
@@ -475,7 +598,7 @@ TEST_F(TelephonyConfigHttpTest, DeleteSlotRejectsCrossOriginAndRequiresCsrf)
 {
 	AdminSession a = loginOn(_port);
 	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/0",
-		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=100",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=100&acceptLimitations=1",
 		"pd_session=" + a.cookie, a.csrf)), 200);
 
 	EXPECT_EQ(statusOf(httpRaw(_port, "DELETE", "/api/telephony-config/0", "",
@@ -497,7 +620,7 @@ TEST_F(TelephonyConfigHttpTest, FactoryResetWipesTelephonyConfigAndDidMapping)
 	// Populate both bounded tables the factory-reset audit found untouched:
 	// a live carrier credential slot and a DID -> extension mapping.
 	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/telephony-config/0",
-		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=abc123&secret=top-secret-value&routeDn=100",
+		"enabled=1&baseUrl=https%3A%2F%2Fexample.invalid&clientId=abc123&secret=top-secret-value&routeDn=100&acceptLimitations=1",
 		"pd_session=" + a.cookie, a.csrf)), 200);
 	ASSERT_EQ(statusOf(httpRaw(_port, "PUT", "/api/did-mapping",
 		"did=%2B1555&extension=101", "pd_session=" + a.cookie, a.csrf)), 200);

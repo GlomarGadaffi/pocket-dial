@@ -12,6 +12,7 @@
 #include "CallDetailRecord.hpp"
 #include "CdrArchive.hpp"  // Issue #194 Stage 1: SD CDR archive wipe on factory reset
 #include "AdminAuth.hpp"
+#include "TimeSync.hpp"
 #include "CoreDumpStore.hpp"   // Issue #382: /api/coredump*
 #include "FactoryReset.hpp"    // Issue #363: the secrets factory reset must erase
 #include "DeviceConfig.hpp"
@@ -1430,14 +1431,16 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 	{
 		if (requireAdmin(clientSock, req, true))
 		{
-			sendApiTelephonyConfigSet(clientSock, telSlotIdx, req.body);
+			sendApiTelephonyConfigSet(clientSock, telSlotIdx, req.body,
+				static_cast<uint8_t>(AdminAuth::sessionRole(sessionToken(req))));
 		}
 	}
 	else if (req.method == "POST" && parseTelephonyConfigActivatePath(req.path, telSlotIdx))
 	{
 		if (requireAdmin(clientSock, req, true))
 		{
-			sendApiTelephonyConfigActivate(clientSock, telSlotIdx);
+			sendApiTelephonyConfigActivate(clientSock, telSlotIdx, req.body,
+				static_cast<uint8_t>(AdminAuth::sessionRole(sessionToken(req))));
 		}
 	}
 	else if (req.method == "POST" && parseTelephonyConfigTestPath(req.path, telSlotIdx))
@@ -2514,6 +2517,19 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	if (emergencyRoute != nullptr)
 	{
 		json.s("\"emergencyRoute\":\"").s(emergencyRoute).s("\",");
+	}
+	// #1073: which telephony slots are enabled without an acceptance of the limitations. Behind the
+	// session like the rest of the slot table; the lock-free mirror, since this is polled every second.
+	if (authenticated && handler != nullptr)
+	{
+		const uint8_t missing = handler->telephonyAcceptanceMissingMask();
+		json.s("\"anchorAcceptanceMissing\":[");
+		for (size_t i = 0; i < TelephonyApiConfig::kSlots; ++i)
+		{
+			if (i > 0) json.s(",");
+			json.b((missing >> i) & 1u);
+		}
+		json.s("],");
 	}
 	json.s("\"uptime\":").n(uptimeSec).s(",");
 #if defined(ESP_PLATFORM)
@@ -4097,8 +4113,52 @@ static std::string telephonySlotJson(size_t idx, const TelephonyApiConfig::SlotV
 	     << ",\"clientId\":\"" << jsonEscape(v.clientId) << "\""
 	     << ",\"routeDn\":\"" << jsonEscape(v.routeDn) << "\""
 	     << ",\"secretSet\":" << (v.secretSet ? "true" : "false")
+	     << ",\"accepted\":" << (v.accepted ? "true" : "false")
+	     << ",\"acceptanceMissing\":" << (v.acceptanceMissing ? "true" : "false")
+	     << ",\"acceptedVersion\":" << static_cast<unsigned>(v.acceptedVersion)
+	     << ",\"acceptedBy\":\"" << (v.acceptedRole == static_cast<uint8_t>(AdminAuth::Role::Owner) ? "owner" :
+	                                  v.acceptedRole == static_cast<uint8_t>(AdminAuth::Role::Sysop) ? "sysop" : "") << "\""
+	     << ",\"acceptedAt\":" << v.acceptedAt
 	     << "}";
 	return json.str();
+}
+
+// #1073: the acceptance a request carries, acceptLimitations=<warning-text version>, stamped with
+// the session's role and the wall clock (0 until the board has synced; there is no RTC). A missing
+// or non-numeric value is no acceptance; a number that is not the current version is passed on and
+// refused by TelephonyApiConfig.
+static const TelephonyApiConfig::Acceptance* telephonyAcceptanceOf(
+	const std::string& body, uint8_t role, TelephonyApiConfig::Acceptance& out)
+{
+	const std::string v = getFormParam(body, "acceptLimitations");
+	char* end = nullptr;
+	const long n = std::strtol(v.c_str(), &end, 10);
+	if (v.empty() || *end != '\0' || n < 1 || n > 255)
+	{
+		return nullptr;
+	}
+	out.version = static_cast<uint8_t>(n);
+	out.role = role;
+	out.epoch = timesync::epochSeconds();
+	return &out;
+}
+
+// A refusal from setSlot()/activateSlot(): 400, except the missing acceptance, which is a 409 that
+// also names the version to send back.
+static bool telephonyIsAcceptanceRefusal(const std::string& err)
+{
+	return err.rfind(TelephonyApiConfig::kAcceptanceRequiredPrefix, 0) == 0;
+}
+
+static std::string telephonyErrorBody(const std::string& err)
+{
+	std::string out = "{\"error\":\"" + jsonEscape(err) + "\"";
+	if (telephonyIsAcceptanceRefusal(err))
+	{
+		out += ",\"acceptanceRequired\":true,\"acceptanceVersion\":" +
+		       std::to_string(TelephonyApiConfig::kAcceptanceVersion);
+	}
+	return out + "}";
 }
 
 void HttpServer::sendApiTelephonyConfigList(int sock)
@@ -4110,7 +4170,8 @@ void HttpServer::sendApiTelephonyConfigList(int sock)
 	}
 
 	std::ostringstream json;
-	json << "{\"slots\":[";
+	json << "{\"acceptanceVersion\":" << static_cast<unsigned>(TelephonyApiConfig::kAcceptanceVersion)
+	     << ",\"slots\":[";
 	for (size_t i = 0; i < slots.size(); ++i)
 	{
 		if (i > 0) json << ",";
@@ -4120,7 +4181,7 @@ void HttpServer::sendApiTelephonyConfigList(int sock)
 	sendResponse(sock, 200, "OK", "application/json", json.str());
 }
 
-void HttpServer::sendApiTelephonyConfigSet(int sock, size_t slotIdx, const std::string& body)
+void HttpServer::sendApiTelephonyConfigSet(int sock, size_t slotIdx, const std::string& body, uint8_t role)
 {
 	// Params: enabled ("1"/"true"/"on", same convention as sendApiDnd's "on"),
 	// baseUrl, clientId, secret, routeDn. An empty secret means "keep existing"
@@ -4145,15 +4206,20 @@ void HttpServer::sendApiTelephonyConfigSet(int sock, size_t slotIdx, const std::
 	s.secret   = secret;
 	s.routeDn  = routeDn;
 	const bool keepSecret = secret.empty();
+	// #1073: enabling needs acceptLimitations=<current version>; disabling and editing an
+	// already-accepted slot do not.
+	TelephonyApiConfig::Acceptance acceptance;
+	const TelephonyApiConfig::Acceptance* accept = telephonyAcceptanceOf(body, role, acceptance);
 
 	TelephonyApiConfig::SlotView view;
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
-		std::string err = handler->setTelephonyConfigSlot(slotIdx, s, keepSecret);
+		std::string err = handler->setTelephonyConfigSlot(slotIdx, s, keepSecret, accept);
 		if (!err.empty())
 		{
-			sendResponse(sock, 400, "Bad Request", "application/json",
-			             "{\"error\":\"" + jsonEscape(err) + "\"}");
+			const bool needsAcceptance = telephonyIsAcceptanceRefusal(err);
+			sendResponse(sock, needsAcceptance ? 409 : 400, needsAcceptance ? "Conflict" : "Bad Request",
+			             "application/json", telephonyErrorBody(err));
 			return;
 		}
 		view = handler->getTelephonyConfigSlot(slotIdx);
@@ -4177,15 +4243,19 @@ void HttpServer::sendApiTelephonyConfigSet(int sock, size_t slotIdx, const std::
 	             "{\"status\":\"ok\",\"slot\":" + telephonySlotJson(slotIdx, view) + "}");
 }
 
-void HttpServer::sendApiTelephonyConfigActivate(int sock, size_t slotIdx)
+void HttpServer::sendApiTelephonyConfigActivate(int sock, size_t slotIdx, const std::string& body, uint8_t role)
 {
+	// #1073: a slot with no stored acceptance activates only with acceptLimitations=<current version>.
+	TelephonyApiConfig::Acceptance acceptance;
+	const TelephonyApiConfig::Acceptance* accept = telephonyAcceptanceOf(body, role, acceptance);
 	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
 	{
-		std::string err = handler->setTelephonyConfigActiveSlot(slotIdx);
+		std::string err = handler->setTelephonyConfigActiveSlot(slotIdx, accept);
 		if (!err.empty())
 		{
-			sendResponse(sock, 400, "Bad Request", "application/json",
-			             "{\"error\":\"" + jsonEscape(err) + "\"}");
+			const bool needsAcceptance = telephonyIsAcceptanceRefusal(err);
+			sendResponse(sock, needsAcceptance ? 409 : 400, needsAcceptance ? "Conflict" : "Bad Request",
+			             "application/json", telephonyErrorBody(err));
 			return;
 		}
 	}
@@ -6646,8 +6716,22 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 			s.routeDn = existing.routeDn;
 			// #1060: a refusal (an emergency routeDn, an enabled slot without its identity) is
 			// reported, not listed as applied. A persist error leaves the edit live: not a refusal.
-			const std::string err = handler->setTelephonyConfigSlot(idx, s, /*keepSecret=*/true);
-			if (!err.empty() && err.rfind("Telephony config not persisted", 0) != 0)
+			std::string err = handler->setTelephonyConfigSlot(idx, s, /*keepSecret=*/true);
+			if (telephonyIsAcceptanceRefusal(err))
+			{
+				// #1073: a file carries no acceptance, so it cannot turn a slot on. A slot that was off
+				// is imported off; one already on (enabled before acceptances existed) is not touched.
+				const bool wasOn = existing.enabled;
+				if (!wasOn)
+				{
+					s.enabled = false;
+					(void)handler->setTelephonyConfigSlot(idx, s, /*keepSecret=*/true);
+				}
+				skipped.push_back("telephonyConfig slot " + std::to_string(idx) +
+					(wasOn ? " (left unchanged: " : " (imported disabled: ") + err + ")");
+				telRefused = true;
+			}
+			else if (!err.empty() && err.rfind("Telephony config not persisted", 0) != 0)
 			{
 				skipped.push_back("telephonyConfig slot " + std::to_string(idx) + " (" + err + ")");
 				telRefused = true;
@@ -6719,7 +6803,13 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 				// comment). An operator restoring a trunk config re-enters
 				// that one field once, same as fresh setup.
 				const std::string err = handler->setTelephonyConfigSlot(idx, s, /*keepSecret=*/true);
-				if (!err.empty() && err.rfind("Telephony config not persisted", 0) != 0)
+				if (telephonyIsAcceptanceRefusal(err))
+				{
+					// #1073: an enabled slot with no acceptance (enabled before they existed) is left as it is.
+					skipped.push_back("telephonyConfig slot " + std::to_string(idx) + " identity (left unchanged: " + err + ")");
+					telIdRefused = true;
+				}
+				else if (!err.empty() && err.rfind("Telephony config not persisted", 0) != 0)
 				{
 					skipped.push_back("telephonyConfig slot " + std::to_string(idx) + " identity (" + err + ")");
 					telIdRefused = true;

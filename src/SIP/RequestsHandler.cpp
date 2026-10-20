@@ -10432,16 +10432,17 @@ RequestsHandler::TestDialResult RequestsHandler::testDialSlot(size_t idx)
 	return TestDialResult{true, ownLeg, ""};
 }
 
-std::string RequestsHandler::setTelephonyConfigSlot(size_t idx, const TelephonyApiConfig::Slot& s, bool keepSecret)
+std::string RequestsHandler::setTelephonyConfigSlot(size_t idx, const TelephonyApiConfig::Slot& s, bool keepSecret,
+	const TelephonyApiConfig::Acceptance* accept)
 {
 	std::lock_guard<pd::TimedMutex> lock(_mutex);
-	return _tapiConfig.setSlot(idx, s, keepSecret);
+	return _tapiConfig.setSlot(idx, s, keepSecret, accept);
 }
 
-std::string RequestsHandler::setTelephonyConfigActiveSlot(size_t idx)
+std::string RequestsHandler::setTelephonyConfigActiveSlot(size_t idx, const TelephonyApiConfig::Acceptance* accept)
 {
 	std::lock_guard<pd::TimedMutex> lock(_mutex);
-	return _tapiConfig.setActiveSlot(idx);
+	return _tapiConfig.activateSlot(idx, accept);
 }
 
 std::string RequestsHandler::clearTelephonyConfigSlot(size_t idx)
