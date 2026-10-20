@@ -29,6 +29,7 @@
 // declare pd_sd_mounted()).
 
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -203,6 +204,13 @@ bool parseTombstoneLine(const char* line, char* nameOut, size_t nameCap);
 // separate first pass, since a tombstone can appear AFTER the entry row
 // it retires.
 bool parseEntryLine(const char* line, MessageInfo& info);
+
+// The index.csv half of Source::listMessages(), over an already-open file
+// (rewound by the call). `out` may be nullptr: count only (#756).
+size_t listIndexFile(std::FILE* f, MessageInfo* out, size_t maxCount);
+
+// True if any tombstone row anywhere in `f` names `name` (rewinds `f`).
+bool indexFileHasTombstone(std::FILE* f, const char* name);
 
 class Source
 {
