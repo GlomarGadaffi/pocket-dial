@@ -7529,6 +7529,23 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		}
 	}
 
+	// No session holds this Call-ID: RFC 3261 s12.2.2, answer 481 rather than relay it to
+	// the registered phone the To names (endhandle audit row 20). A dialog the trunk or the register beep
+	// owns keeps its old path, and so does emergency traffic (Rule 5).
+	if (!session.has_value() && findClient(data->getToNumber()).has_value() &&
+		!_sipTrunk.ownsCallID(data->getCallID()) &&
+		!_beeper.ownsCallID(data->getCallID()) && !isEmergencyTraffic(*data))
+	{
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader("SIP/2.0 481 Call/Transaction Does Not Exist");
+		response->clearBody();
+		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		queueLog("BYE for unknown dialog " + std::string(data->getCallID()) + " answered 481", true);
+		return;
+	}
+
 	setCallState(data->getCallID(), Session::State::Bye);
 	// #798: the sender addressed this BYE to the PBX. The far phone gets its own
 	// registered Contact, or a Snom answers 481 for want of its ;line= (RFC 3261
