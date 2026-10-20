@@ -354,6 +354,34 @@ inline bool tokenIsExpiringSoon(int64_t nowUs, int64_t obtainedUs, int64_t lifet
 	return age >= (lifetimeUs - marginUs);
 }
 
+// Issue #336, RED COMMIT: stubs for the pure decisions the next commit implements (the WS restart
+// decision, the start() retry delay, restartDue). Every body and constant is deliberately wrong, so
+// that tests/TelephonyAnchorLogic_test.cpp compiles and fails at its EXPECT lines. The next commit
+// replaces this block whole; nothing calls it yet.
+enum class WsRestartReason : std::uint8_t { None, TokenExpiring, HeaderStale };
+
+inline constexpr std::int64_t kWsRestartMinIntervalUs = 0;
+
+inline WsRestartReason wsRestartDecision(bool /*running*/, bool tokenExpiring, std::uint32_t /*wsHeaderGen*/,
+                                         std::uint32_t /*tokenGen*/, std::int64_t /*nowUs*/,
+                                         std::int64_t /*lastRequestUs*/)
+{
+	return tokenExpiring ? WsRestartReason::None : WsRestartReason::TokenExpiring;   // wrong on purpose
+}
+
+inline constexpr std::int64_t kStartRetryFirstUs = 0;
+inline constexpr std::int64_t kStartRetryMaxUs   = 0;
+
+inline std::int64_t startRetryDelayUs(std::uint32_t /*failures*/)
+{
+	return 0;   // wrong on purpose
+}
+
+inline bool restartDue(std::int64_t /*nowUs*/, std::int64_t /*notBeforeUs*/)
+{
+	return false;   // wrong on purpose
+}
+
 // Issues #349/#350: did the transport actually deliver a parsed HTTP response?
 //
 // This is the distinction both of those bugs turned on, and getting it wrong cost
