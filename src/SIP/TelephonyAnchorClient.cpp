@@ -537,9 +537,14 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		// window closes (telephony::unreadMakecallStep): on .244 3CX had placed the
 		// call and one such read was taken as "no call".
 		int listStatus = 0;
+		int listsRead = 0;   // #977: the reads that showed 3CX's list at all
 		telephony::ListLegCounts counts;
 		const telephony::UnreadWindow window = telephony::readOwnLegWindow(
-			[&] { return resolveOutboundLeg(std::string(), destination, &listStatus, &ownLegSource, &counts, /*skipOurs=*/true); },
+			[&] {
+				std::string leg = resolveOutboundLeg(std::string(), destination, &listStatus, &ownLegSource, &counts, /*skipOurs=*/true);
+				if (counts.read) ++listsRead;
+				return leg;
+			},
 			[] { return esp_timer_get_time(); },
 			[this] { return _running.load(std::memory_order_acquire); },
 			[&](int readNo) {
@@ -555,7 +560,8 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		// #948: the window and its outcome are host-tested (SosStatusGet.hpp). Every read failing is
 		// the same refusal for a 911/933 as for any call, however the reads failed (a list over the sos
 		// arena, a short read, the claim held by an overlapping 911): the operator ruled to keep the
-		// 503 here. Adopting an unkeyed leg on the 911 lane instead is #977.
+		// 503 here. #977 (option 2) keeps it: nothing is adopted and the caller is answered no sooner
+		// or later. What it adds is below, after the refusal is logged: a sweep that drops the orphan.
 		const telephony::UnreadOutcome outcome = telephony::unreadOutcome(!ownLeg.empty());
 		if (outcome == telephony::UnreadOutcome::Adopt)
 		{
@@ -577,6 +583,12 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 				"%d an earlier call's; direct_control false %d, absent %d, not a bool %d) — "
 				"a call may be ORPHANED on 3CX (#349/#328)", reads, listStatus, counts.listed, counts.controllable, counts.claimed,
 				counts.oursAlready, counts.dcFalse, counts.dcAbsent, counts.dcNotBool);
+			// #977: no read showed the list, so 3CX may hold a live call to the PSAP that this unit cannot
+			// see. Arm the sweep that drops it; the return below is unchanged. Lock-free and I/O-free.
+			if (telephony::orphanSweepWanted(sosLane, outcome, reads, listsRead))
+			{
+				armOrphanSweep(postSeq);
+			}
 		}
 	}
 
@@ -1939,6 +1951,7 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 			}
 		}
 	}
+	counts.read = true;   // #977: 3CX's list was fetched and parsed as an array, whatever it held
 	if (countsOut) *countsOut = counts;
 
 	if (!ownPartyDnLeg.empty())
@@ -2198,6 +2211,7 @@ void TelephonyAnchorClient::maintTaskTrampoline(void* arg)
 	{
 		uint32_t jobs = 0;
 		xTaskNotifyWait(0, UINT32_MAX, &jobs, portMAX_DELAY);
+		if (jobs & kMaintOrphanSweep) orphanSweepTaskTrampoline(arg);   // #977: first, it runs against a deadline
 		if (jobs & kMaintRestart)   restartTaskTrampoline(arg);
 		if (jobs & kMaintRewarm)    rewarmTaskTrampoline(arg);
 		if (jobs & kMaintReconcile) reconcileTaskTrampoline(arg);
@@ -2227,6 +2241,139 @@ void TelephonyAnchorClient::maintRefreshTaskTrampoline(void* arg)
 	}
 	// Single exit: release the one-shot slot so tick() can re-arm.
 	self->_maintRefreshInFlight.store(false, std::memory_order_release);
+}
+
+// #977: the orphan sweep (decisions in SosStatusGet.hpp, host-tested by SosStatusGet_test.cpp). A 911/933's
+// makecall POST reached 3CX, no participant-list read of the #349 window showed the list, and the caller was
+// refused (503) as on main. 3CX may still hold a live call to the PSAP. makeCall() arms this with three atomic
+// stores and a wake: no lock, no I/O, no wait, so the caller's 503 is not delayed by it.
+void TelephonyAnchorClient::armOrphanSweep(uint64_t postSeq)
+{
+	const int64_t nowUs = esp_timer_get_time();
+	_orphanPostSeq.store(postSeq, std::memory_order_relaxed);
+	_orphanHoldUntilUs.store(telephony::orphanHoldUntil(nowUs), std::memory_order_release);
+	_orphanArmedUs.store(nowUs, std::memory_order_release);
+	if (!wakeMaint(kMaintOrphanSweep))
+	{
+		// No tel_maint task: nothing will sweep, so take the hold back.
+		_orphanArmedUs.store(0, std::memory_order_release);
+		_orphanHoldUntilUs.store(0, std::memory_order_release);
+		_orphanWitness.noteNoWorker();
+	}
+}
+
+void TelephonyAnchorClient::orphanSweepTaskTrampoline(void* arg)
+{
+	static_cast<TelephonyAnchorClient*>(arg)->orphanSweepBody();
+}
+
+// Runs on tel_maint, after the 503 has gone. Reads the list again on the ORDINARY status lane (an empty
+// destination: the sos handle's claim is a 911's own GET, and a sweep read holding it would make an
+// overlapping 911's status GET fast-fail) and drops the one leg that shows.
+//
+//   Bound. A read STARTS only inside telephony::kOrphanSweepWindowUs of the arm, with vTaskDelay between
+//   reads (no spin), and the hold lapses with it. A read in flight still runs to its HTTP timeouts and the
+//   drop to performCtrl()'s own (two attempts), so the whole sweep can run to about 5 to 7 s (#379's figure
+//   for a stalled drop), not 4.
+//   Locks. The sweep takes none of its own across I/O, but the two calls it makes do, as every status read and
+//   every drop does today: resolveOutboundLeg()'s ordinary status GET holds _statusMutex for its read (the
+//   reconcile watchdog's does too) and dropCall()'s performCtrl() holds _ctrlMutex for the drop POST. Those
+//   are the #949 holds a PSAP callback's caller-name GET or answerCall() can queue behind. No 911/933 status
+//   read takes _statusMutex (#941).
+//   Heap. This allocates after init, unlike the 911 lane's own GET: the status GET's vector, cJSON and the
+//   strings, as the reconcile watchdog's do. It is off the 911 lane, and a std::bad_alloc is a failed read.
+//   Delay. It delays no call and no drop: only tel_maint's other jobs, which run after it.
+void TelephonyAnchorClient::orphanSweepBody()
+{
+	// Take the arm. A wake whose arm an earlier pass already took finds 0 and returns.
+	const uint64_t postSeq = _orphanPostSeq.load(std::memory_order_relaxed);
+	const int64_t armedUs = _orphanArmedUs.exchange(0, std::memory_order_acq_rel);
+	if (armedUs == 0) return;
+	const int64_t holdUntilUs = telephony::orphanHoldUntil(armedUs);
+
+	// Every exit ends this sweep's hold, unless a newer arm has replaced it.
+	struct HoldEnd
+	{
+		std::atomic<int64_t>& hold;
+		int64_t               until;
+		~HoldEnd() { hold.compare_exchange_strong(until, 0, std::memory_order_acq_rel); }
+	} holdEnd{_orphanHoldUntilUs, holdUntilUs};
+
+	telephony::OrphanSweepResult r;   // GaveUp, no reads, if an allocation fails below
+	try
+	{
+		r = telephony::runOrphanSweep(
+			armedUs,
+			[this]() -> telephony::OrphanRead {
+				telephony::OrphanRead rd;
+				// A makeCall in flight (a redialed 911 among them) has a leg 3CX lists before it keys it, and a
+				// lone candidate is dropped: no decision while one is pending, before the read or after it, or
+				// if one began and ended during it. An empty read is a read again.
+				const int64_t pendingSinceUs = _outboundPendingSinceUs.load(std::memory_order_acquire);
+				if (_outboundPending.load(std::memory_order_acquire) > 0) return rd;
+				int listStatus = 0;
+				telephony::OwnLegSource source = telephony::OwnLegSource::FirstControllable;
+				telephony::ListLegCounts counts;
+				try
+				{
+					rd.leg = resolveOutboundLeg(std::string(), std::string(), &listStatus, &source, &counts, /*skipOurs=*/true);
+					rd.candidates = counts.candidates;
+				}
+				catch (const std::bad_alloc&)
+				{
+					rd = telephony::OrphanRead{};   // a failed read, not a terminate: the ordinary lane rethrows
+				}
+				if (_outboundPending.load(std::memory_order_acquire) > 0 ||
+				    _outboundPendingSinceUs.load(std::memory_order_acquire) != pendingSinceUs)
+				{
+					rd = telephony::OrphanRead{};
+				}
+				return rd;
+			},
+			[] { return esp_timer_get_time(); },
+			[this] { return _running.load(std::memory_order_acquire); },
+			[] { vTaskDelay(pdMS_TO_TICKS(telephony::kOrphanSweepPollMs)); },
+			[this, postSeq, holdUntilUs](const std::string& leg) {
+				// Ours before the drop goes out and before the hold ends: 3CX repeats the orphan's upsert while
+				// the drop is in flight, and with no hold it would be announced as an inbound call.
+				{
+					std::lock_guard<std::mutex> lock(_mutex);
+					_ownLegs.noteNamed(leg, esp_timer_get_time(), postSeq);
+				}
+				int64_t until = holdUntilUs;
+				_orphanHoldUntilUs.compare_exchange_strong(until, 0, std::memory_order_acq_rel);
+			},
+			[this](const std::string& leg) {
+				try
+				{
+					return dropCall(leg);
+				}
+				catch (const std::bad_alloc&)
+				{
+					return false;
+				}
+			});
+	}
+	catch (const std::bad_alloc&)
+	{
+		ESP_LOGE(TAG, "orphan sweep: out of memory, ended (#977)");
+	}
+
+	_orphanWitness.noteEnd(r.end);
+	if (r.end == telephony::OrphanSweepEnd::Dropped)
+	{
+		ESP_LOGI(TAG, "orphan sweep: dropped leg %s after %d read(s) (#977)", r.leg.c_str(), r.reads);
+	}
+	else if (r.end == telephony::OrphanSweepEnd::DropFailed || r.end == telephony::OrphanSweepEnd::Ambiguous)
+	{
+		ESP_LOGE(TAG, "orphan sweep: ended after %d read(s) without dropping (drop failed or more than one candidate), "
+			"leg '%s': a call may still be on 3CX (#977)", r.reads, r.leg.c_str());
+	}
+	else
+	{
+		ESP_LOGW(TAG, "orphan sweep: ended after %d read(s), nothing dropped (gave up, stopping or too late): "
+			"a call may still be on 3CX (#977)", r.reads);
+	}
 }
 
 // One-shot worker: if _outboundActive has been stuck past the grace window, ask Telephony what is
@@ -3261,7 +3408,10 @@ int TelephonyAnchorClient::countOutboundLocked(std::string* inflight, size_t inf
 		}
 		++nin;
 	}
-	pending = _outboundPending.load(std::memory_order_acquire);
+	// #977: a 911/933's orphan sweep (armOrphanSweep) counts as a pending makeCall until it ends or its bound
+	// passes, so the orphan's repeat upsert after the 503 is ignored here, not promoted to an inbound call.
+	pending = telephony::pendingWithOrphanHold(_outboundPending.load(std::memory_order_acquire),
+	                                           _orphanHoldUntilUs.load(std::memory_order_acquire), esp_timer_get_time());
 	return nin;
 }
 

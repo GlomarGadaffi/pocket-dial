@@ -369,6 +369,21 @@ private:
 	static constexpr uint32_t kMaintTokenRefresh = 1u << 3;
 	std::atomic<bool>    _maintRefreshInFlight{false};
 	std::atomic<int64_t> _lastMaintRefreshUs{0};
+	// #977: the orphan sweep. A 911/933 whose #349 window ended with every participant-list read errored is still
+	// refused (503), as on main. makeCall() then arms a sweep (telephony::orphanSweepWanted) with three atomic
+	// stores and a wake: no lock, no I/O, no wait, so the caller's 503 is not delayed. The sweep, on tel_maint,
+	// reads the list again on the ordinary status lane within telephony::kOrphanSweepWindowUs of the arm and
+	// DROPS the one leg that shows (never two: one may be a PSAP callback). Until it ends, or the bound passes,
+	// _orphanHoldUntilUs makes the WS classifier ignore an unmatched upsert as it does while a makeCall is
+	// pending, so the orphan's repeat upsert is not promoted to an inbound call before the drop.
+	static constexpr uint32_t kMaintOrphanSweep = 1u << 4;
+	std::atomic<int64_t>  _orphanArmedUs{0};       // 0: nothing armed; the sweep takes it with an exchange
+	std::atomic<uint64_t> _orphanPostSeq{0};       // _wsSeq at the POST that may have created the leg
+	std::atomic<int64_t>  _orphanHoldUntilUs{0};   // esp_timer time the hold lasts to; 0: no hold
+	telephony::OrphanSweepWitness _orphanWitness;
+	void armOrphanSweep(uint64_t postSeq);
+	void orphanSweepBody();
+	static void orphanSweepTaskTrampoline(void* arg);
 	std::atomic<TaskHandle_t> _maintHandle{nullptr};
 	static void maintTaskTrampoline(void* arg);
 	static void maintRefreshTaskTrampoline(void* arg);

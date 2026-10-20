@@ -353,8 +353,9 @@ UnreadWindow readOwnLegWindow(ReadFn&& readOnce, NowFn&& nowUs, KeepFn&& keepGoi
 // What makeCall() does when that window ends. Adopt: a leg was listed. Fail: none was, and the call
 // is refused (503, NOT ROUTED), for a 911/933 as for any call, exactly as before #948. A read that
 // failed (a list over the arena, a short read, the claim held by an overlapping 911) is a read that
-// showed no leg. The operator ruled on #948 to keep the 503 here; adopting an unkeyed leg on the 911
-// lane instead is #977, which needs a decision before any code.
+// showed no leg. The operator ruled on #948 to keep the 503 here, and on #977 (option 2) that it stays:
+// a 911/933 whose every read failed is still refused at the end of the window and adopts nothing. The
+// orphan sweep below only looks for a leg 3CX may hold, to drop it.
 enum class UnreadOutcome : uint8_t { Adopt, Fail };
 
 inline UnreadOutcome unreadOutcome(bool legFound)
@@ -388,30 +389,37 @@ static_assert(kOrphanSweepWindowUs <= 5'000'000, "#888: the hold on unmatched up
 // After the #349 window: is there an orphan to look for? Only for a 911/933 whose window ended with no leg
 // and in which NO read showed 3CX's list at all (listsRead counts the reads that fetched and parsed it). A
 // read that showed a list with no leg is 3CX's answer, as it is on main.
-inline bool orphanSweepWanted(bool /*sosLane*/, UnreadOutcome /*outcome*/, int /*reads*/, int /*listsRead*/)
+inline bool orphanSweepWanted(bool sosLane, UnreadOutcome outcome, int reads, int listsRead)
 {
-	return false;   // STUB (#977, red first): deliberately wrong
+	return sosLane && outcome == UnreadOutcome::Fail && reads > 0 && listsRead == 0;
 }
 
 // What one sweep read says to do. candidates is the number of legs that read listed as candidates
 // (resolveOutboundLeg's ListLegCounts::candidates); sinceArmUs is the time from the arm to the end of the read.
 enum class OrphanSweepStep : uint8_t { Drop, ReadAgain, GiveUp, Ambiguous };
 
-inline OrphanSweepStep orphanSweepStep(int /*candidates*/, int64_t /*sinceArmUs*/)
+inline OrphanSweepStep orphanSweepStep(int candidates, int64_t sinceArmUs)
 {
-	return OrphanSweepStep::GiveUp;   // STUB (#977, red first): deliberately wrong
+	if (candidates == 1) return OrphanSweepStep::Drop;
+	if (candidates > 1) return OrphanSweepStep::Ambiguous;
+	// The window's own rule (unreadMakecallStep): no read starts once another poll gap would pass the bound.
+	if (sinceArmUs + int64_t{kOrphanSweepPollMs} * 1000 < kOrphanSweepWindowUs) return OrphanSweepStep::ReadAgain;
+	return OrphanSweepStep::GiveUp;
 }
 
 // The hold: the time it lasts to, and the pending-makeCall count the WS classifier sees with it. The
 // classifier promotes an unmatched upsert to an inbound call only when that count is 0.
-inline int64_t orphanHoldUntil(int64_t /*armedUs*/)
+inline int64_t orphanHoldUntil(int64_t armedUs)
 {
-	return 0;   // STUB (#977, red first): deliberately wrong
+	return armedUs + kOrphanSweepWindowUs;   // from the arm: a sweep tel_maint is late to cannot stretch it
 }
 
-inline int pendingWithOrphanHold(int outboundPending, int64_t /*holdUntilUs*/, int64_t /*nowUs*/)
+// holdUntilUs 0: no sweep is armed. The hold counts as one pending makeCall when none is, and never changes
+// a real count.
+inline int pendingWithOrphanHold(int outboundPending, int64_t holdUntilUs, int64_t nowUs)
 {
-	return outboundPending;   // STUB (#977, red first): deliberately wrong
+	const bool held = holdUntilUs != 0 && nowUs < holdUntilUs;
+	return (held && outboundPending < 1) ? 1 : outboundPending;
 }
 
 enum class OrphanSweepEnd : uint8_t { Dropped, DropFailed, GaveUp, Ambiguous, Stopped, TooLate };
@@ -436,10 +444,47 @@ struct OrphanSweepResult
 // anchor is stopping; pause() sleeps one poll gap; holdLeg(leg) notes the leg as ours; dropLeg(leg) -> bool
 // drops it. The order is the contract: holdLeg, then dropLeg, once each, and only for a single candidate.
 template <class ReadFn, class NowFn, class KeepFn, class PauseFn, class HoldFn, class DropFn>
-OrphanSweepResult runOrphanSweep(int64_t /*armedUs*/, ReadFn&& /*readOnce*/, NowFn&& /*nowUs*/, KeepFn&& /*keepGoing*/,
-                                 PauseFn&& /*pause*/, HoldFn&& /*holdLeg*/, DropFn&& /*dropLeg*/)
+OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& nowUs, KeepFn&& keepGoing,
+                                 PauseFn&& pause, HoldFn&& holdLeg, DropFn&& dropLeg)
 {
-	return OrphanSweepResult{};   // STUB (#977, red first): deliberately wrong
+	OrphanSweepResult r;
+	for (;;)
+	{
+		if (!keepGoing())
+		{
+			r.end = OrphanSweepEnd::Stopped;
+			break;
+		}
+		// tel_maint was busy past the bound (a restart job ahead of this one): the hold has lapsed, so a
+		// read now has no hold to protect it. Inside the bound it reads at least once.
+		if (r.reads == 0 && nowUs() - armedUs >= kOrphanSweepWindowUs)
+		{
+			r.end = OrphanSweepEnd::TooLate;
+			break;
+		}
+		const OrphanRead rd = readOnce();
+		++r.reads;
+		const OrphanSweepStep step = orphanSweepStep(rd.leg.empty() ? 0 : rd.candidates, nowUs() - armedUs);
+		if (step == OrphanSweepStep::Drop)
+		{
+			r.leg = rd.leg;
+			holdLeg(r.leg);   // ours before the drop goes out: its upserts are not inbound calls
+			r.end = dropLeg(r.leg) ? OrphanSweepEnd::Dropped : OrphanSweepEnd::DropFailed;
+			break;
+		}
+		if (step == OrphanSweepStep::Ambiguous)
+		{
+			r.end = OrphanSweepEnd::Ambiguous;
+			break;
+		}
+		if (step == OrphanSweepStep::GiveUp)
+		{
+			r.end = OrphanSweepEnd::GaveUp;
+			break;
+		}
+		pause();
+	}
+	return r;
 }
 
 // Counts how each sweep ended; writes the first kLinesPerEnd lines of each kind, so a stuck unit cannot flood
@@ -451,15 +496,41 @@ public:
 	static constexpr std::size_t kEnds     = 6;
 
 	// True when this one wrote a line.
-	bool noteEnd(OrphanSweepEnd /*end*/)
+	bool noteEnd(OrphanSweepEnd end)
 	{
-		return false;   // STUB (#977, red first): deliberately wrong
+		const uint32_t seen = _n[static_cast<std::size_t>(end)].fetch_add(1, std::memory_order_relaxed);
+		if (seen >= kLinesPerEnd) return false;
+		switch (end)
+		{
+			case OrphanSweepEnd::Dropped:
+				PD_WITNESS_I("anchor", "911 orphan sweep: the leg left on 3CX was found and dropped (#977)");
+				break;
+			case OrphanSweepEnd::DropFailed:
+				PD_WITNESS_W("anchor", "911 orphan sweep: the leg left on 3CX was found, the drop failed (#977)");
+				break;
+			case OrphanSweepEnd::GaveUp:
+				PD_WITNESS_W("anchor", "911 orphan sweep: no leg listed within the bound, none dropped (#977)");
+				break;
+			case OrphanSweepEnd::Ambiguous:
+				PD_WITNESS_W("anchor", "911 orphan sweep: more than one candidate leg, none dropped (#977)");
+				break;
+			case OrphanSweepEnd::Stopped:
+				PD_WITNESS_W("anchor", "911 orphan sweep: anchor stopping, ended (#977)");
+				break;
+			case OrphanSweepEnd::TooLate:
+				PD_WITNESS_W("anchor", "911 orphan sweep: tel_maint reached it after the bound, nothing read (#977)");
+				break;
+		}
+		return true;
 	}
 
 	// makeCall() armed a sweep and there was no tel_maint task to wake: the hold was taken back.
 	bool noteNoWorker()
 	{
-		return false;   // STUB (#977, red first): deliberately wrong
+		const uint32_t seen = _noWorker.fetch_add(1, std::memory_order_relaxed);
+		if (seen >= kLinesPerEnd) return false;
+		PD_WITNESS_W("anchor", "911 orphan sweep: no tel_maint task, not armed (#977)");
+		return true;
 	}
 
 	uint32_t count(OrphanSweepEnd end) const { return _n[static_cast<std::size_t>(end)].load(std::memory_order_relaxed); }
