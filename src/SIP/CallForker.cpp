@@ -271,6 +271,7 @@ void CallForker::routePageZone(const std::shared_ptr<SipMessage>& data,
 		if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
 		responseObj->setHeader(SipMessageTypes::UNAVAILABLE);
 		responseObj->clearBody();
+		responseObj->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));   // #1023
 		responseObj->setContact(_env.contactFor(caller->getNumber()));
 		_env.enqueue(data->getSource(), std::move(responseObj));
 		return;
@@ -310,6 +311,7 @@ void CallForker::routeRingGroup(const std::shared_ptr<SipMessage>& data,
 		if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
 		responseObj->setHeader(SipMessageTypes::UNAVAILABLE);
 		responseObj->clearBody();
+		responseObj->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));   // #1023
 		responseObj->setContact(_env.contactFor(caller->getNumber()));
 		// Was RequestsHandler::endHandle(data->getFromNumber(), responseObj) before
 		// this move: endHandle's "clone + 404 if not registered" fallback could
@@ -356,7 +358,10 @@ void CallForker::routeRingGroup(const std::shared_ptr<SipMessage>& data,
 	ringing->clearBody();
 	std::string activeIp = _env.localIp();
 	ringing->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
-	ringing->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
+	// #1023: kept on the session, so the 480 that ends a spent hunt stays in this early dialog.
+	const std::string ringTag = IDGen::GenerateID(9);
+	newSession->setLocalTag(ringTag);
+	ringing->setTo(std::string(data->getTo()) + ";tag=" + ringTag);
 	ringing->setContact(_env.contactFor(groupExt));
 	_env.enqueue(data->getSource(), std::move(ringing));
 
