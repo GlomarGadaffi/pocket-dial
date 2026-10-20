@@ -132,6 +132,8 @@ intentional scope boundary (a relayed response, an `OPTIONS` ping,
 `REGISTER`, `ACK`) or a specific, logged degrade path (pool exhaustion, an
 oversized message, an unACKed 2xx) — not a missing layer.
 
+**A callee that never answers the forwarded `CANCEL`.** A session in the Cancel state whose callee sends no final answer to the relayed `CANCEL` is ended after 32 s (the Timer F figure), and the caller then gets its `487`. The bound is armed once, by the caller's first `CANCEL`; neither a retransmitted `CANCEL` nor the callee's own `200` to the `CANCEL` (`CSeq` `n CANCEL`) disarms it. A ringing 911/933 is excluded. On a board the caller's `487` arrived about 34 s after the `CANCEL` (1.5 s CANCEL delay plus the 32 s bound) (#1049, v1.6.0).
+
 ## 2. Core Task Topology & Affinity Splits
 
 To limit render frame drops and network packet loss, **pocket-dial** pins its real-time SIP, UDP-receive and media tasks away from the LVGL render loop where it can. The split is not strict: `tel_media_rx` shares Core 1 with LVGL, and the HTTP threads and several workers are unpinned (see the note after the task tables).
