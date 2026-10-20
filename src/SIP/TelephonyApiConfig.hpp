@@ -55,8 +55,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace nvswriter { class BlobWriter; }
+
+// True for a route DN that must never be originated to: an emergency number (the
+// classifyEmergencyDial() set, with or without the trunk-access 9) or 112/113. setSlot()
+// refuses it, and testDialSlot() refuses it again, because a store written before #1047
+// can still hold one and load() reads it back unchecked. Defined in TelephonyApiConfig.cpp.
+bool isEmergencyRouteDn(std::string_view dn);
 
 class TelephonyApiConfig
 {

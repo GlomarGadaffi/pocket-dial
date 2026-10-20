@@ -10283,6 +10283,14 @@ RequestsHandler::TestDialResult RequestsHandler::testDialSlot(size_t idx)
 		destination = _tapiConfig.view(idx).routeDn;
 	}
 
+	// #1047: routeDn is the number self-dialled below. A store written before the setSlot
+	// refusal can still hold an emergency number there (load() does not check it), so it is
+	// refused here too, before makeCall(). Nothing is dialled.
+	if (isEmergencyRouteDn(destination))
+	{
+		return TestDialResult{false, "", "route DN is an emergency number, so no test call was placed"};
+	}
+
 	// Deliberately outside _mutex: for a real (non-Loopback) provider, makeCall()/
 	// dropCall() are blocking TLS HTTP round trips (same reasoning asyncMakeCall()'s
 	// worker-thread wrapping documents) — holding the engine's one shared mutex
