@@ -149,6 +149,8 @@ class AgentCase(unittest.TestCase):
         a = sip_agent.Agent("6101", "127.0.0.1", peer.port, local_ip="127.0.0.1", timeout=2.0,
                             invite_timeout=4.0, **kw)
         self.addCleanup(a.close)
+        a.allow_outside(FAR, FAR2)      # the dial guard (sip_agent.target_allowed): the fictional far ends,
+        a.allow_targets("6102")         # and the peer's extension, are dialed on purpose against a fake
         return a
 
     def peer(self, on_msg):

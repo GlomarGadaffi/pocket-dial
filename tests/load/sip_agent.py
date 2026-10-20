@@ -35,8 +35,18 @@ keeps the behaviour above:
   * Dialog.bye_log: each BYE that reached the dialog, with its Request-URI (rule 1);
   * reject_invites=<code>: every new incoming INVITE is refused and recorded.
 
+Dial guard (target_allowed): invite() raises DialRefused, before anything is built or sent, for a target that
+could leave the board through the anchor. Allowed: an extension a UA of this process registered; the PBX's own
+service numbers (SERVICE_LITERALS, park 700-709, *8, **<ext>); extensions named by allow_targets() or
+SIP_AGENT_ALLOW_TARGETS, which is also how a page zone (980-989) is allowed: the board claims a zone only when it
+is configured, so none is allowed by default. 911, 933, 112, 113 and 555 (the anchor bridge) are refused whatever
+is listed. A leading '+' or 7 or more digits is an outside number: refused unless that exact string was
+opted in with allow_outside() or SIP_AGENT_ALLOW_OUTSIDE (the approved anchor runs do it for their far end).
+A re-INVITE inside a dialog is no new call.
+
 stdlib only.
 """
+import os
 import random
 import re
 import socket
@@ -50,6 +60,140 @@ T2 = 4.0
 COMPACT = {"i": "call-id", "f": "from", "t": "to", "v": "via", "m": "contact",
            "l": "content-length", "c": "content-type", "k": "supported",
            "s": "subject", "e": "content-encoding", "o": "event", "x": "session-expires"}
+
+
+# ---- dial guard ---------------------------------------------------------------------------------
+# In SBC mode the board sends a dialed string that is neither registered nor claimed by its dial plan out
+# the anchor (src/SIP/CallForker.cpp:416-436, reached only after every reserved extension, ring group and
+# dial rule), so a number this harness does not know to be local can cost a real carrier call. On
+# 2026-10-19 about ten calls went out as INVITE sip:+6102@... because a script dialed 6102 with no UA
+# registered for it. Agent.invite() is the one place this harness starts a call, so the check lives there.
+
+class DialRefused(Exception):
+    """Agent.invite() was asked for a number the dial guard does not allow. Nothing was sent.
+
+    Not a ValueError on purpose: callers that catch ValueError for a bad argument must not swallow it."""
+
+
+ALLOW_TARGETS_ENV = "SIP_AGENT_ALLOW_TARGETS"    # comma separated extensions: registered elsewhere, or a real phone
+ALLOW_OUTSIDE_ENV = "SIP_AGENT_ALLOW_OUTSIDE"    # comma separated EXACT outside numbers a run is approved to dial
+
+# (b) Numbers the board answers itself, copied from the firmware. tests/tools/test_sip_agent_dial_guard.py
+# fails if pbx::isReservedExtension() (src/SIP/PbxConfig.hpp:299-304) gains or loses a literal, or the park
+# or page range moves, so a change there is a decision here. All of them are claimed in onInvite ahead of
+# the dial plan and its SBC fallback (src/SIP/RequestsHandler.cpp:2641-2759), so none of them can leave
+# through the anchor. docs/PHONE_COMPATIBILITY.md:88-100 is the operator-facing list.
+SERVICE_LITERALS = frozenset((
+    "777",   # echo test: src/SIP/RequestsHandler.cpp:2486; docs/PHONE_COMPATIBILITY.md:92
+    "999",   # all-page broadcast to every registered phone: RequestsHandler.cpp:2641; PHONE_COMPATIBILITY.md:93
+    "440",   # server tone stream: RequestsHandler.cpp:2682; PHONE_COMPATIBILITY.md:94
+    "888",   # meet-me conference, ConferenceRoom::EXT: RequestsHandler.cpp:2689; PHONE_COMPATIBILITY.md:96
+    "997",   # multicast paging, off by default (refused locally when off): RequestsHandler.cpp:127,2697; :97
+    "796",   # voicemail retrieval dial-in (#246): RequestsHandler.cpp:124,2713; PbxConfig.hpp:282
+))
+# Firmware-reserved literals the guard does NOT allow. 555 is the anchored-media bridge: dialing it makes the
+# board's AnchorClient place a call (RequestsHandler.cpp:118,2705; PbxConfig.hpp:290-296). 911/933 are the
+# emergency number and its test number (src/SIP/EmergencyCall.hpp:67-68).
+FIRMWARE_RESERVED_REFUSED = frozenset(("555", "911", "933"))
+# 700-709: park orbits, POCKETDIAL_PARK_SLOTS = 10 (src/SIP/PoolConfig.hpp:125-126; DialPlan.hpp:198-207;
+# RequestsHandler.cpp:2724-2733). A board built with fewer slots does not claim the top ones.
+PARK_ORBITS = frozenset("70%d" % i for i in range(10))
+# 980-989: paging zones (PbxConfig.hpp:226-232; RequestsHandler.cpp:2670-2680). NOT allowed by default: the board
+# claims a zone only when it is configured (`_cfg.findPageZone`); an unconfigured 98x falls through to normal
+# routing, which in SBC mode is the anchor. The guard cannot see the board's zones, so a zone is refused unless
+# it is listed with allow_targets() or SIP_AGENT_ALLOW_TARGETS. The range is kept here only so the drift test
+# can pin it to the firmware's isPageZoneExt().
+PAGE_ZONES = frozenset("98%d" % i for i in range(10))
+# *8 group pickup and **<ext> directed pickup: always answered locally (PbxConfig.hpp:363-378;
+# RequestsHandler.cpp:2735-2759; PHONE_COMPATIBILITY.md:100).
+PICKUP_GROUP = "*8"
+_DIRECTED_PICKUP = re.compile(r"\*\*[0-9]+")
+
+# Refused whatever is registered or listed: 911, 933 (EmergencyCall.hpp:67-68), the harness's own never-dial pair
+# 112, 113 (113 is the owner's phone; anchor_scenarios.NEVER_EXACT), and 555, the anchored-media bridge (dialing
+# it makes the board place an anchor call: RequestsHandler.cpp:2705; load_profile.ANCHORED). Bare or behind one
+# trunk-access digit '9' (kTrunkAccessDigit, EmergencyCall.hpp:71), a superset of what the board classifies.
+_NEVER_DIAL = frozenset(("911", "933", "112", "113", "555"))
+_DIAL_STRING = re.compile(r"\+?[0-9*#]+")
+
+_REGISTERED = set()                  # (a) extensions a UA of THIS process holds a confirmed binding for
+_REGISTERED_LOCK = threading.Lock()
+
+
+def _note_registered(ext, registered):
+    with _REGISTERED_LOCK:
+        (_REGISTERED.add if registered else _REGISTERED.discard)(ext)
+
+
+def registered_extensions():
+    """A snapshot of the extensions a UA of this process has registered and not yet released."""
+    with _REGISTERED_LOCK:
+        return frozenset(_REGISTERED)
+
+
+def _csv(name):
+    return frozenset(p.strip() for p in os.environ.get(name, "").split(",") if p.strip())
+
+
+def _never_dial(s):
+    d = s.lstrip("+")
+    return d in _NEVER_DIAL or (len(d) == 4 and d[0] == "9" and d[1:] in _NEVER_DIAL)
+
+
+def _outside_looking(s):
+    return s.startswith("+") or sum(c in "0123456789" for c in s) >= 7
+
+
+def _is_service(s):
+    return (s in SERVICE_LITERALS or s in PARK_ORBITS or s == PICKUP_GROUP
+            or _DIRECTED_PICKUP.fullmatch(s) is not None)      # not PAGE_ZONES: see there
+
+
+def target_allowed(target, registered, extra=(), outside=()):
+    """May the harness INVITE `target`? Returns (ok, reason). Pure: no socket, no clock, no environment.
+
+    registered: extensions a UA of this process registered. extra: extensions the caller listed.
+    outside: outside numbers the caller opted in, matched as EXACT strings. In this order:
+      refused  empty, or not made only of digits, '*' and '#' (and one leading '+');
+      refused  911, 933, 112, 113, 555, bare or behind one '9', whatever is registered or listed;
+      allowed  a string in `outside` (an exact opt-in; the approved anchor runs use it for their far end);
+      refused  a leading '+' or 7 or more digits (looks like an outside number) that is not in `outside`;
+      allowed  registered, a PBX service number, or in `extra`;
+      refused  everything else: the board would send it out the anchor in SBC mode."""
+    s = "" if target is None else str(target)
+    if not s:
+        return False, "empty target"
+    if not _DIAL_STRING.fullmatch(s):
+        return False, "not a dial string: only digits, '*' and '#' (and one leading '+') are dialed"
+    if _never_dial(s):
+        return False, ("emergency or never-dial number (911, 933, 112, 113; 555 is the anchored-media bridge and "
+                       "makes the board place an anchor call): refused whatever is listed")
+    if s in frozenset(map(str, outside)):
+        return True, "outside number opted in with allow_outside() or %s" % ALLOW_OUTSIDE_ENV
+    if _outside_looking(s):
+        return False, ("looks like an outside number (a leading '+', or 7 or more digits): refused unless that "
+                       "exact number is opted in with allow_outside() or %s" % ALLOW_OUTSIDE_ENV)
+    if s in frozenset(map(str, registered)):
+        return True, "registered by a UA of this process"
+    if _is_service(s):
+        return True, "PBX service number"
+    if s in frozenset(map(str, extra)):
+        return True, "listed with allow_targets() or %s" % ALLOW_TARGETS_ENV
+    return False, ("not registered by a UA of this process, not a PBX service number and not listed: in SBC mode "
+                   "the board sends an unclaimed number out the anchor (list it with allow_targets() or %s "
+                   "if another process or a real phone registered it)" % ALLOW_TARGETS_ENV)
+
+
+def _shown(target):
+    """The target as it may appear in a message: emergency numbers and short extensions as they are, anything
+    that could be a real person's number (a leading '+', or 7 or more digits) as its shape only."""
+    s = "" if target is None else str(target)
+    if s and _DIAL_STRING.fullmatch(s) and _never_dial(s):
+        return repr(s)
+    if s.startswith("+") or sum(c in "0123456789" for c in s) >= 7:
+        return "a number of %d digits%s (value withheld)" % (
+            sum(c in "0123456789" for c in s), " with a leading '+'" if s.startswith("+") else "")
+    return repr(s[:32] + ("..." if len(s) > 32 else ""))
 
 
 def rand_hex(n):
@@ -379,6 +523,9 @@ class Dialog:
 class Agent:
     """One virtual phone: a REGISTER binding, outgoing calls, and an auto-answer UAS."""
 
+    _allow_extra = frozenset()      # allow_targets(): extensions this agent may dial besides the guard's own
+    _allow_outside = frozenset()    # allow_outside(): exact outside numbers this agent may dial
+
     def __init__(self, ext, host, port, local_ip=None, rtp_pump=None,
                  timeout=8.0, invite_timeout=16.0, ack_wait=8.0,
                  contact_params="", strict_dialogs=False, reject_invites=None):
@@ -519,7 +666,27 @@ class Agent:
             self.registered = False
         elif expires > 0:
             self.registered = False
+        _note_registered(self.ext, self.registered)      # the dial guard's (a): only a confirmed binding counts
         return status
+
+    # ---- dial guard ----------------------------------------------------
+    def allow_targets(self, *exts):
+        """Let this agent INVITE these extensions although no UA of this process registered them (another
+        process did, or a real phone). Never lifts the refusals: see target_allowed()."""
+        self._allow_extra = self._allow_extra | frozenset(str(e).strip() for e in exts)
+
+    def allow_outside(self, *numbers):
+        """Let this agent INVITE exactly these outside numbers (a leading '+', or 7 or more digits): the exact
+        strings only, never a pattern or a prefix. For a run approved to dial through the anchor."""
+        self._allow_outside = self._allow_outside | frozenset(str(n).strip() for n in numbers)
+
+    def _check_dial(self, target):
+        """Raise DialRefused unless target_allowed(). The environment is read now, not at construction."""
+        ok, why = target_allowed(target, registered_extensions(),
+                                 self._allow_extra | _csv(ALLOW_TARGETS_ENV),
+                                 self._allow_outside | _csv(ALLOW_OUTSIDE_ENV))
+        if not ok:
+            raise DialRefused("refusing to INVITE %s from %s: %s" % (_shown(target), self.ext, why))
 
     def invite(self, target_user, cancel_after_ms=None, cancel_when=None, cancel_when_timeout_s=None,
                invite_timeout=None):
@@ -540,12 +707,15 @@ class Agent:
         The two ways of timing a CANCEL exclude each other.
 
         invite_timeout: this call's INVITE transaction bound in s (default: the agent's), so that a CANCEL
-        due after the agent's own bound can still read its 487."""
+        due after the agent's own bound can still read its 487.
+
+        Raises DialRefused, with nothing built or sent, if the dial guard does not allow target_user."""
         if cancel_when is not None:
             if cancel_after_ms is not None:
                 raise ValueError("cancel_after_ms and cancel_when are two ways to time the CANCEL: use one")
             if not cancel_when_timeout_s or cancel_when_timeout_s <= 0:
                 raise ValueError("cancel_when needs a positive cancel_when_timeout_s: the wait is always bounded")
+        self._check_dial(target_user)
         dlg = Dialog(self, "uac", "%s@%s" % (rand_hex(16), self.lip), rand_hex(8))
         dlg.remote_uri = "sip:%s@%s" % (target_user, self.host)
         dlg.invite_cseq = dlg.local_cseq
@@ -808,6 +978,7 @@ class Agent:
     def close(self):
         for dlg in self.live_dialogs():
             dlg.close()
+        _note_registered(self.ext, False)
         self._closed.set()
         try:
             self.sock.close()
