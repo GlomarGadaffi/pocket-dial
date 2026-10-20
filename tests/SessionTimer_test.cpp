@@ -38,6 +38,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cctype>
 #include <string>
 #include <utility>
 #include <vector>
@@ -751,6 +752,21 @@ namespace
 			<< what << ": RFC 4028 §9 requires Require: timer with refresher=uac\n" << ok;
 	}
 
+	// True when some Require line of `raw` (any case, any position in a list) names
+	// the timer option tag.
+	bool requireNamesTimer(const std::string& raw)
+	{
+		std::string low = raw;
+		for (char& ch : low) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+		for (size_t p = low.find("\r\nrequire:"); p != std::string::npos; p = low.find("\r\nrequire:", p + 2))
+		{
+			const size_t eol = low.find("\r\n", p + 2);
+			const std::string line = low.substr(p, eol == std::string::npos ? std::string::npos : eol - p);
+			if (line.find("timer") != std::string::npos) return true;
+		}
+		return false;
+	}
+
 	// No Session-Expires (full or compact) and no Require: RFC 4028 §7.2's "no
 	// session expiration". The caller checks the answer itself as positive control.
 	void expectNoTimer(const std::string& ok, const std::string& what)
@@ -794,18 +810,52 @@ TEST(SessionTimer, TheConferenceAnswerCarriesNoTimerBecauseItsRefreshIsRefused)
 }
 
 // #739: onReinvite() answers a 440 re-INVITE 488 (the tone leg has no peer), so
-// the 440 answer grants no timer either. It is built from a clone of the INVITE,
-// so it must also shed the phone's own Require: timer.
-TEST(SessionTimer, The440AnswerCarriesNoTimerBecauseItsRefreshIsRefused)
+// the 440 answer grants no timer to a caller that merely SUPPORTS one (Supported:
+// timer and a Session-Expires, no Require): that caller is owed none (RFC 4028
+// §7.2). The answer is a clone of the INVITE, so it must shed the echoed line.
+TEST(SessionTimer, The440AnswerToACallerThatOnlySupportsTimerCarriesNone)
 {
 	Rig r;
-	r.handler.handle(timerRequest("INVITE", "100", kCaller, "440", "se-440",
-		std::string(kTimerOffer) + "Require: timer\r\n"));
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "440", "se-440", kTimerOffer));
 	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
 	expectNoTimer(ok, "440 answer");
 	// Positive control: it is 440's own answer, carrying the tone's SDP, that was inspected.
 	EXPECT_NE(headerValue(ok, "Contact").find("sip:440@"), std::string::npos) << ok;
 	EXPECT_NE(ok.find("c=IN IP4 " + std::string(kServerIp) + "\r\n"), std::string::npos) << ok;
+}
+
+// #739: a caller that REQUIRES timer (Require: timer) cannot be answered without
+// one. RFC 4028 §9 puts Session-Expires and Require: timer in its 2xx, and pjsua
+// --use-timer=2 ends the call itself (BYE, Reason cause=421 "Failed processing
+// session timer response") when they are missing. So the 440 answer keeps what
+// the caller sent, in each shape a Require can take: a bare tag, a list in any
+// case, and a second Require line. The PBX arms no timer of its own for the leg.
+TEST(SessionTimer, The440AnswerToACallerThatRequiresTimerKeepsItsSessionExpiresAndRequire)
+{
+	struct Case { const char* callId; const char* require; };
+	const Case cases[] = {
+		{"se-440-req",  "Require: timer\r\n"},
+		{"se-440-list", "Require: replaces, TIMER\r\n"},
+		{"se-440-two",  "Require: replaces\r\nRequire: timer\r\n"},
+	};
+	for (const Case& c : cases)
+	{
+		Rig r;
+		r.handler.handle(timerRequest("INVITE", "100", kCaller, "440", c.callId,
+			std::string(kTimerOffer) + c.require));
+		const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+		// Positive control: it is still 440's own answer, carrying the tone's SDP.
+		ASSERT_FALSE(ok.empty()) << c.callId << ": the call must still be answered";
+		EXPECT_NE(headerValue(ok, "Contact").find("sip:440@"), std::string::npos) << c.callId << "\n" << ok;
+		EXPECT_NE(ok.find("c=IN IP4 " + std::string(kServerIp) + "\r\n"), std::string::npos) << c.callId << "\n" << ok;
+		EXPECT_EQ(headerValue(ok, "Session-Expires").rfind("1800", 0), 0u)
+			<< c.callId << ": a caller that requires a timer is owed one (RFC 4028 §9)\n" << ok;
+		EXPECT_TRUE(requireNamesTimer(ok)) << c.callId << ": nor may Require: timer be dropped\n" << ok;
+		auto session = r.handler.getSession("Call-ID: " + std::string(c.callId));
+		ASSERT_TRUE(session.has_value()) << c.callId;
+		EXPECT_EQ(session.value()->getSessionExpiresSeconds(), 0u)
+			<< c.callId << ": the PBX arms no expiry for this leg";
+	}
 }
 
 // Positive control for the grant: 555 answers its own re-INVITE with a 200
