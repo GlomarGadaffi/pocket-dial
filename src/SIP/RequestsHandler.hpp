@@ -2169,7 +2169,9 @@ private:
 
 	// True iff every POCKETDIAL_MAX_ANCHOR_CALLS bridge slot is active — the
 	// capacity gate for both a fresh 555 dial (onAnchorInvite) and a fresh
-	// inbound anchor call (routeInboundAnchorCall). Caller holds _mutex.
+	// inbound anchor call (routeInboundAnchorCall). A PSAP callback is the one
+	// inbound that may still pre-empt a call to get past it (#967). Caller holds
+	// _mutex.
 	bool allBridgesBusy() const;
 
 	// How many anchored calls may run at once: min(what the plugged-in provider
@@ -2185,6 +2187,22 @@ private:
 	// #624: when the anchor is full, end one non-emergency anchored call so a
 	// 911/933 can take its room. Caller holds _mutex.
 	void preemptAnchorCallForEmergency();
+
+	// #967: an inbound PSAP callback that routeInboundAnchorCall() would refuse
+	// (every bridge busy, or another anchor inbound ringing or up) ends ONE
+	// non-emergency anchored call that clears every reason that applies, or ends
+	// none. True iff nothing is in the way now; false means drop the callback as
+	// before (only emergency calls in the way, or no single call makes room).
+	// Runs on the anchor's event task, so its sends go to _asyncOutbox. Caller
+	// holds _mutex.
+	bool preemptAnchorCallForPsapCallback();
+
+	// The teardown both pre-emptions share: tell the victim's phone (503, CANCEL
+	// or BYE) on `outbox`, then endCall() with `reason`. `outbox` is _outbox on
+	// the SIP thread and _asyncOutbox off it. `victim` refers into _sessions and
+	// is dead after the call. Caller holds _mutex.
+	void endAnchorCallForPreempt(const std::shared_ptr<Session>& victim,
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outbox, std::string_view reason);
 
 	// True iff the currently-selected anchor provider is Loopback — the boundary
 	// between the two calling conventions this port has to support:
