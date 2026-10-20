@@ -329,3 +329,25 @@ To protect the registrar from UDP flood denial-of-service (DoS) attacks, the `Re
 * Bounded table: at most **256** buckets; a new source IP arriving when the table is full is dropped outright (`RequestsHandler.cpp:11445-11448`).
 * Eviction cycle: To prevent memory leak accumulation from transient spoofed IPs, buckets idle for 60 s are evicted from `tick()` (`RequestsHandler.cpp:11134-11145`).
 * **Warning:** subnet (CIDR) filtering is not implemented, so do not plan a deployment around it. The macro `-DPOCKETDIAL_ALLOW_CIDR` does not exist anywhere in the tree. The matching runtime state exists but is inert: `_allowNet` and `_allowMask` (`src/SIP/RequestsHandler.hpp:3101-3102`) are initialised to `0` and no code path assigns them. There is no setter, no constructor argument, no HTTP route and no NVS key. `RequestsHandler::ipAllowed()` (`RequestsHandler.cpp:11430-11434`) therefore takes its `if (_allowMask == 0) return true;` early exit on every packet, so every source IP is allowed. The token bucket above is real and does run. The subnet filter is scaffolding that was never wired up, so segment isolation has to come from the network: a VLAN, a firewall, or simply not routing the board's link.
+
+## 6. Origins
+
+pocket-dial began as a fork of [BarGabriel/SipServer](https://github.com/BarGabriel/SipServer), an MIT-licensed SIP server. That credit is kept in [NOTICE](../NOTICE) and the original licence text in [LICENSE-MIT](../LICENSE-MIT) (Copyright (c) 2022 BarGabriel). Everything added or changed since the fork is Apache 2.0 ([LICENSE](../LICENSE)); [CHANGELOG.md](../CHANGELOG.md) records the relicensing of the project from MIT to Apache 2.0.
+
+What the upstream project was: at its default branch (`master`, last pushed 2024-05-31) it holds 25 files and 33 commits, all under `src/SIP`, `src/Helpers`, `main.cpp`, `CMakeLists.txt` and the usual README, LICENSE and `.gitignore`. The upstream names that matter here are `SipServer`, `RequestsHandler`, `Session`, `SipClient`, `SipMessage`, `SipMessageFactory`, `SipSdpMessage`, `UdpServer` and `IDGen`.
+
+What survives: 24 of those 25 upstream paths still exist in this tree; only `src/SIP/SipMessageHeaders.h` is gone. Comparing git blob hashes, exactly one of the 24 is byte-identical to upstream, the vendored `src/Helpers/cxxopts.hpp`. The other 23 have been rewritten. For scale, upstream `src/SIP/RequestsHandler.cpp` is 8,953 bytes and the current file is 663,338 bytes. The file names carry over; the contents mostly do not, so read this section as lineage, not as a claim about how many lines are upstream's.
+
+What was added since: the current tree has 215 C/C++ source and header files under `src/` and `main/`. Named subsystems with no counterpart in the upstream file list include the registrar (`Registrar`), the SIP transaction layer (`TransactionLayer`), call forking (`CallForker`), parking (`ParkOrbit`), conferencing (`ConferenceRoom`, `MixBus`), voicemail (`VoicemailLeg`, `VoicemailMenu`), SIP trunks (`SipTrunk`, `TrunkResolver`), the telephony anchor clients (`AnchorClient`, `TelephonyAnchorClient`, `ApidazeAnchorClient`), plug-and-play provisioning (`PnpResponder`), OTA update (`OtaUpdater`), admin authentication (`AdminAuth`), and the ESP32 firmware entry points under `main/` (`esp_main*.cpp`). Upstream has no `main/` directory, no `web/` directory and no `tests/` directory.
+
+How the history is recorded: this repository was created on 2026-04-12 and is not a GitHub-marked fork (the API reports `fork: false`). Upstream's 33 commits are not in this repository's history. Its oldest commit reachable in a shallow clone is `c96dc048` (2026-08-28), a merge whose tree already holds 202 files, so the days of work before it are one undifferentiated commit as far as `git log` here can tell. The first tag is `v1.0.0` (`53ea00c6`, 2026-05-29). As of 2026-10-20 GitHub reports 781 commits on `main` and 506 merged pull requests, 245 of those commits dated on or before 2026-08-28. Counts move; the commands below reproduce them.
+
+Reproduce:
+
+```
+git log --diff-filter=A --format='%h %ad %s' --date=short -- LICENSE-MIT NOTICE
+gh api 'repos/BarGabriel/SipServer/git/trees/HEAD?recursive=1' --jq '.tree[]|select(.type=="blob")|"\(.sha) \(.path)"'
+git hash-object <path>          # compare against the upstream blob sha
+gh api 'repos/GlomarGadaffi/pocket-dial/commits?per_page=1' -i       # Link rel="last" = commit count
+gh api 'search/issues?q=repo:GlomarGadaffi/pocket-dial+is:pr+is:merged&per_page=1' --jq .total_count
+```
