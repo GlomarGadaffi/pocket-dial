@@ -62,8 +62,12 @@ namespace
 			out[0] = '\0';
 			return;
 		}
-		std::snprintf(out, cap, "%u,%u,%llu", static_cast<unsigned>(a.version), static_cast<unsigned>(a.role),
-		              static_cast<unsigned long long>(a.epoch));
+		const int n = std::snprintf(out, cap, "%u,%u,%llu", static_cast<unsigned>(a.version), static_cast<unsigned>(a.role),
+		                            static_cast<unsigned long long>(a.epoch));
+		if (n < 0 || static_cast<size_t>(n) >= cap)
+		{
+			out[0] = '\0';   // cannot happen (the cell fits the worst case); no acceptance rather than a cut one
+		}
 	}
 
 	// The inverse, for a store this build did not write: anything that is not exactly
