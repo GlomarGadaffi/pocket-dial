@@ -416,8 +416,9 @@ BlfSubscriptions::MwiBox* BlfSubscriptions::mwiBox(std::string_view ext, bool cr
 	for (auto& b : _mwiBoxes)
 	{
 		if (ext == b.ext) return &b;
-		// A free box, or one whose counts are both zero, holds nothing worth keeping.
-		if (!spare && b.newMsgs == 0 && b.oldMsgs == 0) spare = &b;
+		// A free box, or one whose counts are both zero, holds nothing worth keeping
+		// -- unless its boot count is still on its way (#756): that request lives here.
+		if (!spare && b.newMsgs == 0 && b.oldMsgs == 0 && !b.seedPending) spare = &b;
 	}
 	if (!create) return nullptr;
 	if (!spare)
@@ -439,6 +440,7 @@ void BlfSubscriptions::mwiListened(std::string_view ext, size_t listed)
 {
 	if (MwiBox* b = mwiBox(ext, listed > 0))
 	{
+		b->seedPending = false;   // the listing is the truth; a boot count would be older (#756)
 		b->newMsgs = 0;
 		b->oldMsgs = static_cast<uint16_t>(listed < UINT16_MAX ? listed : UINT16_MAX);
 	}
@@ -449,12 +451,33 @@ void BlfSubscriptions::mwiDeleted(std::string_view ext)
 	if (MwiBox* b = mwiBox(ext, false); b && b->oldMsgs > 0) b->oldMsgs--;
 }
 
-// #756 RED STUBS: deliberately wrong bodies (nothing is ever requested, nothing is
-// ever applied) so the new tests compile and fail by assertion. The next commit
-// replaces all three.
-void BlfSubscriptions::mwiSeedRequest(std::string_view) {}
+// #756 boot seed. See the header for the three-step contract.
+void BlfSubscriptions::mwiSeedRequest(std::string_view ext)
+{
+	if (MwiBox* b = mwiBox(ext, true)) b->seedPending = true;
+}
 
-std::string_view BlfSubscriptions::mwiSeedNext() const { return {}; }
+std::string_view BlfSubscriptions::mwiSeedNext() const
+{
+	for (const auto& b : _mwiBoxes)
+	{
+		if (b.seedPending) return b.ext;
+	}
+	return {};
+}
 
-void BlfSubscriptions::mwiSeedApply(std::string_view, size_t) {}
+void BlfSubscriptions::mwiSeedApply(std::string_view ext, size_t stored)
+{
+	MwiBox* b = mwiBox(ext, false);
+	if (b == nullptr || !b->seedPending) return;   // a 796 listing answered it first
+	b->seedPending = false;
+	const uint16_t n = static_cast<uint16_t>(stored < UINT16_MAX ? stored : UINT16_MAX);
+	// max(), not +: a deposit that landed while the count was on its way is either
+	// already one of `stored` (the card write beat the count) or not yet written;
+	// adding would double count the first case, and a count must never go down.
+	if (n <= b->newMsgs) return;
+	b->newMsgs = n;
+	_env.log("MWI: mailbox " + std::string(ext) + " holds " + std::to_string(n)
+		+ " message(s) on the SD card, counted as new until 796 is dialed");
+}
 #endif

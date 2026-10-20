@@ -346,7 +346,8 @@ namespace
 				}
 				if (skip) continue;
 
-				out[count++] = info;
+				if (out != nullptr) out[count] = info;   // #756: nullptr = count only
+				++count;
 			}
 			std::fclose(f);
 			return count;
