@@ -1,0 +1,62 @@
+# Files tools/gen_index_html.py inlines into src/Helpers/index_html.h.
+# One path per line, relative to web/. '#' starts a comment. Order matters for
+# the JS files (they become one <script> in this order) and must match the
+# <script src> order in index.html. Every sections/NN-name.html needs a matching
+# <section id="sec-name" hidden></section> in index.html, or a <div id="NAME-slot"></div>
+# in an unguarded fragment.
+# A line '@if NAME' (or '@if NAME!=0' for a 0/1 macro) before a path guards that one file: ESP builds
+# compile it out unless the macro is set. '@unless NAME' is the inverse (compiled out when the macro is
+# set). Guard lines stack as AND. A guarded fragment that owns a <section> takes the section tags with
+# it. '@only NAME' is the strict '@if': compiled in only when the macro is set, with no host fallback
+# (the desktop/host build never carries it); it stands alone. See tools/gen_index_html.py.
+# POCKETDIAL_PROFILE_SBC (main/CMakeLists.txt): 3CX owns routing, call handling, audio and DID mapping,
+# so those pages are compiled out and the SBC copy (05-sbc) is compiled in, on SBC builds only.
+index.html
+app.css
+
+app/00-core.js
+@only POCKETDIAL_PROFILE_SBC
+app/05-sbc.js
+app/10-overview.js
+app/20-extensions.js
+app/30-devices.js
+app/40-trunks-numbers.js
+@unless POCKETDIAL_PROFILE_SBC
+app/41-did.js
+@unless POCKETDIAL_PROFILE_SBC
+app/50-routing.js
+@unless POCKETDIAL_PROFILE_SBC
+app/60-call-handling.js
+@if POCKETDIAL_MULTICAST_PAGING!=0
+@unless POCKETDIAL_PROFILE_SBC
+app/61-paging.js
+@unless POCKETDIAL_PROFILE_SBC
+app/70-audio.js
+app/80-security.js
+app/85-maintenance.js
+@if POCKETDIAL_HAS_WIFI
+app/86-wifi.js
+app/90-console.js
+
+@only POCKETDIAL_PROFILE_SBC
+sections/05-sbc.html
+sections/10-overview.html
+sections/20-extensions.html
+sections/30-devices.html
+sections/40-trunks-numbers.html
+@unless POCKETDIAL_PROFILE_SBC
+sections/41-did.html
+@unless POCKETDIAL_PROFILE_SBC
+sections/50-routing.html
+@unless POCKETDIAL_PROFILE_SBC
+sections/60-call-handling.html
+@if POCKETDIAL_MULTICAST_PAGING!=0
+@unless POCKETDIAL_PROFILE_SBC
+sections/61-paging.html
+@unless POCKETDIAL_PROFILE_SBC
+sections/70-audio.html
+sections/80-security.html
+sections/85-maintenance.html
+@if POCKETDIAL_HAS_WIFI
+sections/86-wifi.html
+sections/90-console.html

@@ -1,0 +1,11 @@
+<h3>Multicast paging</h3>
+<p class="hint">Paging is dialed as 997. The group is an IPv4 address in 224.0.0.0/4, outside 224.0.0.0/24. A blank group or port keeps the stored value.</p>
+<div class="msg" id="ch-mc-state" role="status">Paging settings not loaded yet.</div>
+<div class="field"><label class="lbl" for="ch-mc-enabled"><input id="ch-mc-enabled" type="checkbox"> Paging enabled</label></div>
+<div class="field"><label class="lbl" for="ch-mc-group">Multicast group (dotted IPv4)</label><input id="ch-mc-group" type="text" autocomplete="off"></div>
+<div class="field"><label class="lbl" for="ch-mc-port">Port (1-65535)</label><input id="ch-mc-port" type="text" inputmode="numeric" autocomplete="off"></div>
+<div class="btns">
+  <button class="btn btn-primary" id="ch-mc-save" aria-disabled="true" onclick="chSaveMulticast()">Save paging</button>
+  <button class="btn" onclick="chLoadMulticast()">Reload paging</button>
+</div>
+<div class="msg" id="ch-mc-msg" role="status"></div>
