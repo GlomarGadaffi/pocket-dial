@@ -2004,7 +2004,10 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 		if (stillRinging) cancelSess.value()->armRingTimer(std::chrono::steady_clock::now() + kCancelBoundedWait);
 		else cancelSess.value()->clearRingTimer();
 	}
-	endHandle(data->getToNumber(), data);
+	// A CFU/CFB/CFNA forward rings the target, not the number the CANCEL's To names. Emergency
+	// calls are never forwarded, so they keep the To (empty target).
+	const bool forwarded = cancelSess.has_value() && !cancelSess.value()->getForwardLegTarget().empty();
+	endHandle(forwarded ? std::string_view(cancelSess.value()->getForwardLegTarget()) : data->getToNumber(), data);
 }
 
 void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
