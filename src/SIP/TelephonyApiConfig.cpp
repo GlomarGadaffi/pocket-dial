@@ -1,5 +1,6 @@
 #include "TelephonyApiConfig.hpp"
 
+#include "EmergencyCall.hpp"
 #include "NvsWriter.hpp"
 #include "ResetGuard.hpp"
 
@@ -81,6 +82,14 @@ const TelephonyApiConfig::Slot* TelephonyApiConfig::bootSlot(size_t idx) const
 	return (idx < kSlots) ? &_slots[idx] : nullptr;
 }
 
+bool isEmergencyRouteDn(std::string_view dn)
+{
+	// 112 and 113 are not in classifyEmergencyDial()'s set (EmergencyCall.hpp), so they are
+	// listed here and only here. This decides the test dial and the slot write; it does not
+	// touch the real 911/933 routing.
+	return pbx::classifyEmergencyDial(dn).isEmergency || dn == "112" || dn == "113";
+}
+
 std::string TelephonyApiConfig::setSlot(size_t idx, const Slot& s, bool keepSecret)
 {
 	if (idx >= kSlots)
@@ -99,6 +108,12 @@ std::string TelephonyApiConfig::setSlot(size_t idx, const Slot& s, bool keepSecr
 	    s.routeDn.size() > kMaxFieldLen)
 	{
 		return "Field too long";
+	}
+	if (isEmergencyRouteDn(s.routeDn))
+	{
+		// #1047: testDialSlot() self-dials routeDn, so an emergency number here would have the
+		// provider place a real emergency call. Refused enabled or not, before anything is staged.
+		return "Route DN may not be an emergency number";
 	}
 	if (s.enabled && s.type != TelephonyProviderType::Loopback)
 	{
