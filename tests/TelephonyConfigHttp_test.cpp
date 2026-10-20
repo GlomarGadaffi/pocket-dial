@@ -41,6 +41,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <thread>
 
@@ -378,6 +379,39 @@ TEST_F(TelephonyConfigHttpTest, TestDialRefusesANonActiveSlotWithoutCallingTheAn
 	ASSERT_NE(loopback, nullptr);
 	EXPECT_TRUE(loopback->lastMakeCallDestination().empty())
 		<< "a refused test-dial must never reach the anchor client at all";
+}
+
+TEST_F(TelephonyConfigHttpTest, TestDialRefusesAnEmergencyRouteDnStoredByAnEarlierBuild)
+{
+	// #1047: setSlot() refuses an emergency routeDn now, but a store written before
+	// that fix still holds one, and load() reads it back unchecked. The self-dial
+	// places a call to routeDn, so testDialSlot() must refuse it on its own, before
+	// makeCall(). The store is written directly here, which is exactly how such a
+	// value would reach the handler: the HTTP PUT for it is refused.
+	for (const char* dn : {"911", "933", "9911", "9933", "112", "113"})
+	{
+		{
+			std::ofstream f(_tapiPath, std::ios::trunc);
+			f << "s1type=1\ns1en=1\ns1url=https://pbx.example.invalid\ns1id=id\n"
+			  << "s1sec=sssh\ns1dn=" << dn << "\nactive=1\n";
+		}
+		_handler->setTelephonyStorePathsForTest(_tapiPath, _didPath);
+		ASSERT_EQ(_handler->getTelephonyConfigSlot(1).routeDn, dn)
+			<< "precondition: the stored routeDn loaded";
+		ASSERT_TRUE(_handler->getTelephonyConfigSlot(1).active)
+			<< "precondition: slot 1 is the active slot, so the refusal is the only gate";
+
+		const RequestsHandler::TestDialResult r = _handler->testDialSlot(1);
+		EXPECT_FALSE(r.ok) << "routeDn " << dn << " must not be self-dialled";
+		EXPECT_EQ(r.error, "route DN is an emergency number, so no test call was placed")
+			<< "routeDn " << dn;
+		EXPECT_TRUE(r.participantId.empty()) << "routeDn " << dn;
+
+		auto* loopback = dynamic_cast<LoopbackAnchorClient*>(_handler->anchorClientForTest());
+		ASSERT_NE(loopback, nullptr);
+		EXPECT_TRUE(loopback->lastMakeCallDestination().empty())
+			<< "routeDn " << dn << ": makeCall() must not have been reached";
+	}
 }
 
 TEST_F(TelephonyConfigHttpTest, TestDialRejectsCrossOriginAndRequiresCsrf)

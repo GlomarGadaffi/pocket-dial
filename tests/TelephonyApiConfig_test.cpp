@@ -137,6 +137,43 @@ TEST_F(TelephonyApiConfigTest, EnabledRealSlotRefusesIncompleteIdentity)
 	EXPECT_EQ(_cfg.setSlot(2, loop, false), "");
 }
 
+TEST_F(TelephonyApiConfigTest, EmergencyRouteDnIsRefusedEnabledOrDraft)
+{
+	// #1047: routeDn is the number testDialSlot() self-dials, so an emergency number
+	// there would have the provider place a real 911/933 call from a connectivity
+	// probe. setSlot refuses it, enabled or not. The set is every spelling the
+	// emergency classifier knows (the bare codes and the trunk-prefixed 9911/9933)
+	// plus 112 and 113, which classifyEmergencyDial does not recognise.
+	TelephonyApiConfig::Slot base;
+	base.type = TelephonyProviderType::Telephony;
+	base.baseUrl = "https://pbx.example.invalid";
+	base.clientId = "id";
+	base.secret = "sssh";
+	base.enabled = true;
+
+	for (const char* dn : {"911", "933", "9911", "9933", "112", "113"})
+	{
+		TelephonyApiConfig::Slot s = base;
+		s.routeDn = dn;
+		EXPECT_EQ(_cfg.setSlot(0, s, false), "Route DN may not be an emergency number")
+			<< "an enabled slot with routeDn " << dn << " must be refused";
+		EXPECT_FALSE(_cfg.view(0).enabled)
+			<< "a refused routeDn " << dn << " must not have been saved";
+
+		TelephonyApiConfig::Slot draft = s;
+		draft.enabled = false;
+		EXPECT_EQ(_cfg.setSlot(1, draft, false), "Route DN may not be an emergency number")
+			<< "a disabled slot with routeDn " << dn << " must be refused too";
+		EXPECT_EQ(_cfg.view(1).routeDn, "")
+			<< "a refused routeDn " << dn << " must not have been saved";
+	}
+
+	// A real route DN still saves, so the refusal is narrow.
+	base.routeDn = "100";
+	EXPECT_EQ(_cfg.setSlot(0, base, false), "");
+	EXPECT_TRUE(_cfg.view(0).enabled);
+}
+
 TEST_F(TelephonyApiConfigTest, SecretNeverAppearsInView)
 {
 	TelephonyApiConfig::Slot s;
