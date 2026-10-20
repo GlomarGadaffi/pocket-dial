@@ -23,12 +23,12 @@ function extStateOf(e){
 
 function extModel(d){
   var m=Object.create(null);
-  function ens(n){var k=String(n);if(!m[k])m[k]={reg:false,dnd:false,vm:false,st:"",parked:false,fwd:{always:"",busy:"",noanswer:""}};return m[k];}
+  function ens(n){var k=String(n);if(!m[k])m[k]={reg:false,dnd:false,vm:false,st:"",parked:false,fwd:{always:"",busy:"",noanswer:"",timeout:""}};return m[k];}
   (d.clients||[]).forEach(c=>{ens(c.number).reg=true;});
   (d.dnd||[]).forEach(n=>{ens(n).dnd=true;});
   (d.voicemail||[]).forEach(n=>{ens(n).vm=true;});
   (d.forwards||[]).forEach(f=>{
-    ens(f.extension).fwd={always:String(f.always||""),busy:String(f.busy||""),noanswer:String(f.noanswer||"")};
+    ens(f.extension).fwd={always:String(f.always||""),busy:String(f.busy||""),noanswer:String(f.noanswer||""),timeout:f.noAnswerSeconds?String(f.noAnswerSeconds):""};
   });
   (d.sessions||[]).forEach(s=>{ens(s.caller).st=s.state||"";ens(s.callee).st=s.state||"";});
   (d.parkedCalls||[]).forEach(p=>{ens(p.parkedExt).parked=true;});
@@ -60,13 +60,13 @@ function extMakeCard(k){
   tog.appendChild(dnd.label);tog.appendChild(vm.label);
   var fwdBox=mk("div");fwdBox.className="rep";
   var fwd={};
-  [["always","Always"],["busy","Busy"],["noanswer","No answer"]].forEach(p=>{
+  [["always","Always"],["busy","Busy"],["noanswer","No answer"],["timeout","Ring time (s)"]].forEach(p=>{
     var row=mk("div");row.className="rep-row";
     var f=mk("div");f.className="field";
     var l=mk("span");l.className="lbl";l.textContent=p[1];
     var inp=mk("input");inp.type="text";inp.setAttribute("inputmode","numeric");
-    inp.placeholder="target ext";inp.setAttribute("data-needs","login");
-    inp.setAttribute("aria-label",p[1]+" forward target for "+k);inp.setAttribute("data-fwd",p[0]);
+    inp.placeholder=p[0]==="timeout"?"20":"target ext";inp.setAttribute("data-needs","login");
+    inp.setAttribute("aria-label",(p[0]==="timeout"?"Ring time in seconds for ":p[1]+" forward target for ")+k);inp.setAttribute("data-fwd",p[0]);
     var b=mk("button");b.type="button";b.className="btn";b.textContent="Set";
     b.setAttribute("data-needs","login");
     b.setAttribute("data-act","fwd");b.setAttribute("data-trigger",p[0]);
@@ -95,7 +95,7 @@ function extUpdateCard(c,e){
   c.word.textContent=s.word;
   extSyncToggle(c.dnd,e.dnd);
   extSyncToggle(c.vm,e.vm);
-  ["always","busy","noanswer"].forEach(t=>{
+  ["always","busy","noanswer","timeout"].forEach(t=>{
     var f=c.fwd[t];
     if(document.activeElement!==f.input&&f.input.dataset.dirty!=="1")f.input.value=e.fwd[t];
   });
@@ -138,7 +138,7 @@ function extSaveForward(ext,trig,inp){
   post("/api/forward","extension="+encodeURIComponent(ext)+"&trigger="+trig+"&target="+encodeURIComponent(t))
     .then(()=>{
       inp.dataset.dirty="";
-      setMsg("ext-msg",trig+" forward "+(t?("\u2192 "+t):"cleared")+" for "+ext,"ok");
+      setMsg("ext-msg",trig==="timeout"?("Ring time "+(t?(t+" s"):"reset to 20 s")+" for "+ext):(trig+" forward "+(t?("\u2192 "+t):"cleared")+" for "+ext),"ok");
     })
     .catch(fm("ext-msg"));
 }

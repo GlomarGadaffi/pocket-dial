@@ -74,7 +74,7 @@
           <div class="field"><label for="setup-user">Username <span class="req" aria-hidden="true">*</span></label><input id="setup-user" name="username" autocomplete="username" value="admin" required></div>
           <div class="field"><label for="setup-pass">Password, 8 or more characters <span class="req" aria-hidden="true">*</span></label><input id="setup-pass" name="password" type="password" autocomplete="new-password" minlength="8" required></div>
           <div class="field"><label for="setup-pass2">Repeat password <span class="req" aria-hidden="true">*</span></label><input id="setup-pass2" type="password" autocomplete="new-password" required></div>
-          <div class="field"><label for="setup-pin">DTMF PIN, 4 to 16 digits (optional)</label><input id="setup-pin" name="dtmfPin" inputmode="numeric" autocomplete="off" pattern="[0-9]{4,16}"></div>
+          <div class="field"><label for="setup-pin">DTMF PIN, 4 to 16 digits (optional; must not start with 11, 60, 69, 72, 73 or 80, the star codes that would fire first)</label><input id="setup-pin" name="dtmfPin" inputmode="numeric" autocomplete="off" pattern="[0-9]{4,16}"></div>
           <div class="btns"><button type="submit" class="btn btn-primary">Save login</button></div>
           <p class="msg" id="setup-msg"></p>
         </fieldset>

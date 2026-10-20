@@ -19,7 +19,7 @@
 
   <h3>DTMF admin PIN</h3>
   <p class="hint">The phone-keypad admin menu stays off until a PIN is set. Enter 4 to 16 digits.</p>
-  <div class="field"><label class="lbl" for="sec-cred-pin">New DTMF PIN (4 to 16 digits)</label><input id="sec-cred-pin" type="password" inputmode="numeric" autocomplete="off"></div>
+  <div class="field"><label class="lbl" for="sec-cred-pin">New DTMF PIN (4 to 16 digits; must not start with 11, 60, 69, 72, 73 or 80, the star codes that would fire first)</label><input id="sec-cred-pin" type="password" inputmode="numeric" autocomplete="off"></div>
   <div class="btns"><button class="btn btn-primary" onclick="securityChangeDtmfPin()">Save PIN</button></div>
   <div class="msg" id="sec-pin-msg" role="status"></div>
 

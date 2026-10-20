@@ -410,7 +410,7 @@ td.row-actions{display:table-cell;white-space:nowrap}
 <div class="field"><label for="setup-user">Username <span class="req" aria-hidden="true">*</span></label><input id="setup-user" name="username" autocomplete="username" value="admin" required></div>
 <div class="field"><label for="setup-pass">Password, 8 or more characters <span class="req" aria-hidden="true">*</span></label><input id="setup-pass" name="password" type="password" autocomplete="new-password" minlength="8" required></div>
 <div class="field"><label for="setup-pass2">Repeat password <span class="req" aria-hidden="true">*</span></label><input id="setup-pass2" type="password" autocomplete="new-password" required></div>
-<div class="field"><label for="setup-pin">DTMF PIN, 4 to 16 digits (optional)</label><input id="setup-pin" name="dtmfPin" inputmode="numeric" autocomplete="off" pattern="[0-9]{4,16}"></div>
+<div class="field"><label for="setup-pin">DTMF PIN, 4 to 16 digits (optional; must not start with 11, 60, 69, 72, 73 or 80, the star codes that would fire first)</label><input id="setup-pin" name="dtmfPin" inputmode="numeric" autocomplete="off" pattern="[0-9]{4,16}"></div>
 <div class="btns"><button type="submit" class="btn btn-primary">Save login</button></div>
 <p class="msg" id="setup-msg"></p>
 </fieldset>
@@ -435,13 +435,13 @@ td.row-actions{display:table-cell;white-space:nowrap}
 </fieldset>
 <fieldset role="group" aria-label="Signal path">
 <legend>Signal path</legend>
-<div class="sigpath">
-<div class="pane">
-<span class="lbl">WAN UDP:5060</span>
 )html1";
 
 static const char PD_HTML_2[] =
-R"html2(<div><span class="unit" style="margin:0">rx</span></div>
+R"html2(<div class="sigpath">
+<div class="pane">
+<span class="lbl">WAN UDP:5060</span>
+<div><span class="unit" style="margin:0">rx</span></div>
 <div><span class="well" id="ov-bus-rx">—</span><span class="unit">pkts</span></div>
 <div><span class="unit" style="margin:0">drop</span></div>
 <div><span class="well" id="ov-bus-drop">—</span><span class="unit">pkts</span></div>
@@ -951,7 +951,7 @@ R"html16(
 <div class="msg" id="sec-cred-msg" role="status"></div>
 <h3>DTMF admin PIN</h3>
 <p class="hint">The phone-keypad admin menu stays off until a PIN is set. Enter 4 to 16 digits.</p>
-<div class="field"><label class="lbl" for="sec-cred-pin">New DTMF PIN (4 to 16 digits)</label><input id="sec-cred-pin" type="password" inputmode="numeric" autocomplete="off"></div>
+<div class="field"><label class="lbl" for="sec-cred-pin">New DTMF PIN (4 to 16 digits; must not start with 11, 60, 69, 72, 73 or 80, the star codes that would fire first)</label><input id="sec-cred-pin" type="password" inputmode="numeric" autocomplete="off"></div>
 <div class="btns"><button class="btn btn-primary" onclick="securityChangeDtmfPin()">Save PIN</button></div>
 <div class="msg" id="sec-pin-msg" role="status"></div>
 <h3>Owner login</h3>
@@ -2247,12 +2247,12 @@ return {cls:"standby",glyph:"\u25a0",word:"not registered"};
 }
 function extModel(d){
 var m=Object.create(null);
-function ens(n){var k=String(n);if(!m[k])m[k]={reg:false,dnd:false,vm:false,st:"",parked:false,fwd:{always:"",busy:"",noanswer:""}};return m[k];}
+function ens(n){var k=String(n);if(!m[k])m[k]={reg:false,dnd:false,vm:false,st:"",parked:false,fwd:{always:"",busy:"",noanswer:"",timeout:""}};return m[k];}
 (d.clients||[]).forEach(c=>{ens(c.number).reg=true;});
 (d.dnd||[]).forEach(n=>{ens(n).dnd=true;});
 (d.voicemail||[]).forEach(n=>{ens(n).vm=true;});
 (d.forwards||[]).forEach(f=>{
-ens(f.extension).fwd={always:String(f.always||""),busy:String(f.busy||""),noanswer:String(f.noanswer||"")};
+ens(f.extension).fwd={always:String(f.always||""),busy:String(f.busy||""),noanswer:String(f.noanswer||""),timeout:f.noAnswerSeconds?String(f.noAnswerSeconds):""};
 });
 (d.sessions||[]).forEach(s=>{ens(s.caller).st=s.state||"";ens(s.callee).st=s.state||"";});
 (d.parkedCalls||[]).forEach(p=>{ens(p.parkedExt).parked=true;});
@@ -2282,13 +2282,13 @@ var vm=extMakeCheck(k,"vm","Voicemail");
 tog.appendChild(dnd.label);tog.appendChild(vm.label);
 var fwdBox=mk("div");fwdBox.className="rep";
 var fwd={};
-[["always","Always"],["busy","Busy"],["noanswer","No answer"]].forEach(p=>{
+[["always","Always"],["busy","Busy"],["noanswer","No answer"],["timeout","Ring time (s)"]].forEach(p=>{
 var row=mk("div");row.className="rep-row";
 var f=mk("div");f.className="field";
 var l=mk("span");l.className="lbl";l.textContent=p[1];
 var inp=mk("input");inp.type="text";inp.setAttribute("inputmode","numeric");
-inp.placeholder="target ext";inp.setAttribute("data-needs","login");
-inp.setAttribute("aria-label",p[1]+" forward target for "+k);inp.setAttribute("data-fwd",p[0]);
+inp.placeholder=p[0]==="timeout"?"20":"target ext";inp.setAttribute("data-needs","login");
+inp.setAttribute("aria-label",(p[0]==="timeout"?"Ring time in seconds for ":p[1]+" forward target for ")+k);inp.setAttribute("data-fwd",p[0]);
 var b=mk("button");b.type="button";b.className="btn";b.textContent="Set";
 b.setAttribute("data-needs","login");
 b.setAttribute("data-act","fwd");b.setAttribute("data-trigger",p[0]);
@@ -2313,7 +2313,7 @@ c.g.textContent=s.glyph;
 c.word.textContent=s.word;
 extSyncToggle(c.dnd,e.dnd);
 extSyncToggle(c.vm,e.vm);
-["always","busy","noanswer"].forEach(t=>{
+["always","busy","noanswer","timeout"].forEach(t=>{
 var f=c.fwd[t];
 if(document.activeElement!==f.input&&f.input.dataset.dirty!=="1")f.input.value=e.fwd[t];
 });
@@ -2353,7 +2353,7 @@ var t=inp.value.trim();
 post("/api/forward","extension="+encodeURIComponent(ext)+"&trigger="+trig+"&target="+encodeURIComponent(t))
 .then(()=>{
 inp.dataset.dirty="";
-setMsg("ext-msg",trig+" forward "+(t?("\u2192 "+t):"cleared")+" for "+ext,"ok");
+setMsg("ext-msg",trig==="timeout"?("Ring time "+(t?(t+" s"):"reset to 20 s")+" for "+ext):(trig+" forward "+(t?("\u2192 "+t):"cleared")+" for "+ext),"ok");
 })
 .catch(fm("ext-msg"));
 }
@@ -2366,17 +2366,17 @@ post("/api/kill","extension="+encodeURIComponent(ext))
 });
 }
 function extOnChange(ev){
-var t=ev.target;
+)html22";
+
+static const char PD_HTML_23[] =
+R"html23(var t=ev.target;
 var act=t.getAttribute?t.getAttribute("data-act"):null;
 if(act!=="dnd"&&act!=="vm")return;
 extSetFlag(t.closest(".card").getAttribute("data-ext"),act,t);
 }
 function extOnClick(ev){
 var b=ev.target.closest("button[data-act]");
-)html22";
-
-static const char PD_HTML_23[] =
-R"html23(if(!b)return;
+if(!b)return;
 var card=b.closest(".card");
 var ext=card.getAttribute("data-ext");
 var act=b.getAttribute("data-act");
