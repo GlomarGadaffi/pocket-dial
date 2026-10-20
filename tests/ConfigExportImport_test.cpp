@@ -1169,7 +1169,8 @@ TEST_F(ConfigExportImportTest, EncryptedRoundTrip_ReproducesBindingsRegistrarMod
 	slot.clientId = "bk-client-id";
 	slot.secret = slotSecret;
 	slot.routeDn = "100";
-	ASSERT_EQ(_handler->setTelephonyConfigSlot(0, slot, /*keepSecret=*/false), "");
+	const TelephonyApiConfig::Acceptance accepted{TelephonyApiConfig::kAcceptanceVersion, 1, 1760000000};
+	ASSERT_EQ(_handler->setTelephonyConfigSlot(0, slot, /*keepSecret=*/false, &accepted), "");
 	const std::vector<std::string> want = bindingsOf(*_handler);
 	ASSERT_EQ(want.size(), 3u);
 
@@ -1206,6 +1207,8 @@ TEST_F(ConfigExportImportTest, EncryptedRoundTrip_ReproducesBindingsRegistrarMod
 	EXPECT_EQ(report.find("registrarMode=secure"), std::string::npos) << report;
 
 	const TelephonyApiConfig::SlotView view = _handler->getTelephonyConfigSlot(0);
+	// #1078: a file carries no acceptance; the slot stays enabled only because this board still holds
+	// the acceptance it was given above (the import-disabled path is pinned by the #1073 tests).
 	EXPECT_TRUE(view.enabled);
 	EXPECT_EQ(view.baseUrl, slot.baseUrl);
 	EXPECT_EQ(view.clientId, slot.clientId);
