@@ -93,8 +93,9 @@ No build measurement of the RAM or flash savings is recorded in this repository.
 ### 5. Emergency (E911) policy
 
 - All programmable media anchor providers must register emergency caller service profiles.
-- If an anchor provider does not support Kari's Law / RAY BAUM'S Act compliant emergency routing, the PBX enforces local dispatch notification and fallback routing per Rule 5, except on a far-side board (see the note below).
-- **Far-side boards.** A far-side board is dedicated: its one provider, chosen at boot, takes the place of the 3CX anchor. That provider is not on the `telephonyProviderPlacesRealCalls` allowlist, which admits only the Telephony provider, so `RequestsHandler::emergencyRoute()` reports `none` and the board has no 911 route. On that board, 911 and 933 are answered `503 Emergency Call Not Routable`, and the Kari's Law on-site notification is triggered. This is the owner's decision of 2026-10-20, recorded in #1046. Other boards are not covered by this note.
+- If an anchor provider does not support Kari's Law / RAY BAUM'S Act compliant emergency routing, the PBX enforces local dispatch notification and fallback routing per Rule 5.
+- **Far-side boards (owner decision, 2026-10-20, #1046).** A far-side board is dedicated to one provider, chosen at boot, which takes the place of the 3CX anchor. The owner decided that such a board has no 911 route: 911 and 933 are answered `503 Emergency Call Not Routable`, and the Kari's Law on-site notification is triggered. The owner's note says that this section states the PBX enforces fallback routing, and that this board does not do that. Other boards are not covered by this note.
+- **Code rule.** A board whose boot-selected provider is not on the `telephonyProviderPlacesRealCalls` allowlist reports `emergencyRoute()` as `None`, and 911 and 933 are answered `503 Emergency Call Not Routable` on that board. Today the allowlist admits only the 3CX provider (`TelephonyProviderType::Telephony`). The owner's decision above is that a far-side board is such a board.
 
 ## Consequences
 
