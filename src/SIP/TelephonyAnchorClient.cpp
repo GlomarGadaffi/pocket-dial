@@ -4166,6 +4166,33 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 					slot->getFd = esp_http_client_get_socket(_getClient);
 				}
 				if (!keepRunning()) break;
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+				// #370/#350 get_sock_shutdown (docs/BENCH_PROBE.md): shut down the socket just published,
+				// before the header read below, so that read finds no response. That is the transport
+				// failure that sends this loop to rebuild its handle and pay a fresh handshake. Only on the
+				// leg makeCall() claimed. fire() runs once a socket is there to shut down, so "fired" means
+				// a shutdown was issued. getMutex is held across that one call, as
+				// stopMediaStreams does: closePostClient can close this handle from another task, and a
+				// shutdown outside the lock could hit a descriptor that was closed and reused.
+				if (benchGet.sockShutdownLeg && pd::benchprobe::armedHint(pd::benchprobe::Fault::GetSockShutdown))
+				{
+					bool benchShut = false;
+					int benchRc = -1;
+					{
+						std::lock_guard<std::mutex> lock(_getMutex);
+						if (pd::benchprobe::getSockShutdownDue(benchGet.sockShutdownLeg, slot->getFd) &&
+						    pd::benchprobe::fire(pd::benchprobe::Fault::GetSockShutdown))
+						{
+							benchRc = shutdown(slot->getFd, SHUT_RDWR);
+							benchShut = true;
+						}
+					}
+					if (benchShut)
+					{
+						ESP_LOGW(TAG, "BENCHFAULT get_sock_shutdown applied: shutdown(SHUT_RDWR) on the published GET socket, rc=%d", benchRc);
+					}
+				}
+#endif
 			}
 			if (err == ESP_OK)
 			{

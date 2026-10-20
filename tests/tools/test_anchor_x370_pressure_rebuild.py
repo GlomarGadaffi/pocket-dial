@@ -224,7 +224,7 @@ class WiredToTheFirmwareTest(unittest.TestCase):
         self.assertIn("could not rebuild client", block)
 
     def test_a_forced_status_only_rewrites_a_parsed_answer(self):
-        # why no fault drives the rebuild: a transport failure (status <= 0) stays real
+        # why get_status does not drive the rebuild: a transport failure (status <= 0) stays real
         self.assertRegex(self.logic, r"if \(forcedStatus == 0 \|\| realStatus <= 0\) return \{realStatus, false\};")
         self.assertIn("telephony::httpResponseParsed(status)", self.loop)
 

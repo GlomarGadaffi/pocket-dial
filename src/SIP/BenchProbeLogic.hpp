@@ -20,13 +20,22 @@
 
 namespace pd::benchprobe {
 
-enum class Fault : uint8_t { MakecallReadFail, GetStatus, GetMaxAttempts, PostStreamFail, TokenAge, WsUpsert, Count };
+enum class Fault : uint8_t
+{
+	MakecallReadFail, GetStatus, GetMaxAttempts, PostStreamFail, TokenAge, WsUpsert,
+	GetSockShutdown,   // appended last: the indices before it, and the harness's PROBE_FAULTS order, stay
+	Count
+};
 inline constexpr size_t kFaultCount = static_cast<size_t>(Fault::Count);
 // The names POST /api/bench/fault takes and the counters body reports. There is
 // no ws_drop: esp_websocket_client has no documented call that drops the
 // transport and keeps its own reconnect (stop() and close() end the client).
+// The counters body (renderStatus) goes through one static 1024-byte buffer in HttpServer.cpp
+// (sendApiBenchFault): with these seven it is 756 bytes idle and 995 by the widest-counter estimate in
+// BenchProbeLogic_test.cpp, which pins the fit, so an eighth fault needs that buffer raised first.
 inline constexpr std::string_view kFaultNames[kFaultCount] = {
-	"makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age", "ws_upsert"};
+	"makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age", "ws_upsert",
+	"get_sock_shutdown"};
 
 inline std::string_view faultName(Fault f)
 {
@@ -74,7 +83,7 @@ struct FaultRequest
 inline constexpr int kWsUpsertCases = 3;
 
 // get_status takes a refusal (400-599), get_max_attempts a budget (1-240), ws_upsert a case (1-3); the
-// others take no value.
+// others, get_sock_shutdown among them, take no value.
 inline Verdict parseFaultRequest(std::string_view name, std::string_view value, FaultRequest& out)
 {
 	FaultRequest r;
@@ -207,18 +216,23 @@ private:
 	size_t _len = 0;
 };
 
-// The rx loop's view of get_status / get_max_attempts for one stream.
+// The rx loop's view of get_status / get_max_attempts / get_sock_shutdown for one stream.
 struct GetLoopFaults
 {
 	int forcedStatus = 0;   // 0 = real statuses
 	int maxAttempts = kGetMaxAttempts;
-	bool sockShutdownLeg = true;   // RED-FIRST STUB (#370), wrong on purpose: the next commit makes it false
+	// True only for the leg makeCall() claimed: get_sock_shutdown may act on this stream. It is not fired
+	// when the leg is taken; the rx loop fires it at the shutdown, so "fired" means one was issued.
+	bool sockShutdownLeg = false;
 };
 
-// RED-FIRST STUB (#370), wrong on purpose: the next commit replaces this body.
-inline bool getSockShutdownDue(bool /*claimedLeg*/, int /*publishedFd*/)
+// get_sock_shutdown (#370, #350): the rx loop shuts down the socket it just published, before it reads the
+// response headers, so that read finds no response and the loop rebuilds its handle. Due only on the claimed
+// outbound leg (never an inbound call, a PSAP callback or a 911/933) and only with a socket to shut down:
+// -1 is "none published", and a due check that fails leaves the one-shot arm for the next attempt.
+inline bool getSockShutdownDue(bool claimedLeg, int publishedFd)
 {
-	return false;
+	return claimedLeg && publishedFd >= 0;
 }
 
 // A forced refusal replaces a real HTTP answer only; no answer parsed is a

@@ -54,8 +54,9 @@ end, and every pre-registered fault must show fired >= 1, or the run is INVALID.
 
 x370_pressure_rebuild (#370) holds a DRAM ballast at the probe's 8192 B floor across one ring, so
 the rx task's rebuild of the GET handle after a transport failure (and the TLS handshake after it)
-runs under pressure. No fault forces that path: only the ballast can, and only by chance, so the
-witness is the board's own log (see x370_witness). The board's HTTP may not answer while the
+runs under pressure. Nothing this scenario arms forces that path: only the ballast can, and only by chance
+(the get_sock_shutdown fault forces it, but no scenario arms it yet), so the witness is the board's own log
+(see x370_witness). The board's HTTP may not answer while the
 ballast is held, so the run makes no HTTP request between the hold and the release.
 
 x952_token_age_held (#952, #945) is the one scenario that holds an answered call for minutes: it arms
@@ -569,7 +570,7 @@ def host_problems(host):
 
 # ---------------------------------------------------------------- the bench probe's numbers
 PROBE_FAULTS = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age",
-                "ws_upsert")
+                "ws_upsert", "get_sock_shutdown")
 BENCH_PATH = "/api/bench/fault"
 PROBE_IMAGE = "anchor-bench-probe"
 GET_MAX_ATTEMPTS = 240               # BenchProbeLogic.hpp kGetMaxAttempts; get_max_attempts only shrinks it
@@ -2832,9 +2833,10 @@ scenario(name="x888_ws_upsert", issues=("#888",), probe=True, faults=("ws_upsert
 # -- x370_pressure_rebuild ----------------------------------------------------------
 # #370: runRxLoop() rebuilds the GET handle after a transport failure (recreateGetClient,
 # TelephonyAnchorClient.cpp:3755, called at :3895) and the next open pays a fresh TLS handshake. Under pressure
-# that is where the old CORRUPT HEAP lived. No probe fault forces it: get_status rewrites only a parsed answer,
+# that is where the old CORRUPT HEAP lived. get_status does not force it: it rewrites only a parsed answer,
 # and a parsed answer keeps the handle (:3815-3862), so only a real transport failure reaches :3886-3899, and
-# only the ballast can cause one. get_status=404 keeps the loop in its "not ready" retries instead (a 403 would
+# of the faults this scenario arms only the ballast can cause one (get_sock_shutdown can too, but no scenario
+# arms it yet). get_status=404 keeps the loop in its "not ready" retries instead (a 403 would
 # trip the #902 fail-fast); get_max_attempts keeps the loop, and so the ring, short.
 # The rebuild has no success line of its own (:3895-3899 log only a failure, :3897). Its witness is derived from
 # positive lines that do exist: the failure line before it (:3871, :3882), then the NEXT attempt's line.
@@ -3072,8 +3074,8 @@ scenario(name="x370_pressure_rebuild", issues=("#370",), part_of="#370",
          about="test UA 6101 -> the designated far end, one short ring, with a DRAM ballast at the probe's 8192 B "
                "floor, get_status=404 and get_max_attempts=8: the rx task's rebuild of the GET handle after a "
                "transport failure, and the TLS handshake after it, under pressure; CANCELled 2 s after the first "
-               "transport failure; the ballast is released the moment the call returns. No fault forces the "
-               "rebuild: a run whose log shows none is INVALID",
+               "transport failure; the ballast is released the moment the call returns. Nothing it arms forces "
+               "the rebuild: a run whose log shows none is INVALID",
          plan_lines=("x370      NO HTTP request to the board between the ballast hold and its release; the dead-man "
                      "(%d s) is the backstop" % X370["ballast_deadman_s"],
                      "x370      the ballast is held across makeCall's POST too: if its response is lost the #349 "
