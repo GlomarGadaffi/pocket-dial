@@ -1199,3 +1199,52 @@ TEST(ToneCallCap, AHeldToneCallIsExemptAndTheClockRestartsWhenItResumes)
 	b.tickAfter("tone-held", std::chrono::seconds(601));
 	EXPECT_FALSE(b.alive("tone-held"));
 }
+
+// *11 and *69 pressed over SIP INFO repoint a live call's dest at a virtual 777 peer (DtmfFeatureCodes.cpp),
+// and the tone stream goes on holding the one RtpSender slot. The dest number is therefore not a tone call's
+// identity; the call has to be marked as one when it is answered.
+namespace
+{
+	// One DTMF digit as a SIP INFO from the phone on this dialog. `n` numbers the INFO: its CSeq counts up
+	// from the INVITE's and its branch is its own, so no two digits look like a retransmission.
+	std::shared_ptr<SipMessage> makeInfoDigit(const std::string& ext, const std::string& ip,
+		const std::string& callId, char digit, int n)
+	{
+		const std::string body = std::string("Signal=") + digit + "\r\nDuration=100\r\n";
+		std::string raw =
+			"INFO sip:server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKd" + callId + std::to_string(n) + "\r\n"
+			"From: <sip:" + ext + "@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: " + std::to_string(1 + n) + " INFO\r\n"
+			"Content-Type: application/dtmf-relay\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(ip));
+	}
+}
+
+TEST(ToneCallCap, A440CallThatPressedStar11IsStillEndedAtTenMinutes)
+{
+	ReapBench b;
+	ASSERT_FALSE(b.dial("501", "192.168.7.51", "tone-s11", "440").empty());
+	b.handler.tick();
+
+	int n = 1;
+	for (const char digit : std::string("*11")) b.handler.handle(makeInfoDigit("501", "192.168.7.51", "tone-s11", digit, n++));
+
+	auto s = b.session("tone-s11");
+	ASSERT_NE(s, nullptr);
+	ASSERT_TRUE(s->getDest());
+	ASSERT_EQ(s->getDest()->getNumber(), "777") << "precondition: *11 moved the call's destination to the virtual echo peer";
+	b.sent.clear();
+	ASSERT_TRUE(b.dial("502", "192.168.7.52", "tone-s11-busy", "440").empty());
+	ASSERT_TRUE(sentBusy(b)) << "precondition: the tone stream still holds the one slot";
+
+	b.tickAfter("tone-s11", std::chrono::seconds(601));
+
+	EXPECT_FALSE(b.alive("tone-s11")) << "601 s into a tone call that pressed *11: the cap still ends it";
+	EXPECT_EQ(b.byesTo("192.168.7.51").size(), 1u) << "and tells the phone";
+	EXPECT_FALSE(b.dial("502", "192.168.7.52", "tone-s11-again", "440").empty())
+		<< "the stream slot is free again";
+}
