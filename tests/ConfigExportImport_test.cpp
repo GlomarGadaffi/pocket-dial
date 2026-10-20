@@ -47,6 +47,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace
 {
@@ -1111,4 +1112,136 @@ TEST_F(ConfigExportImportTest, Import_TrunkPointedAtThisBoard_IsSkippedNotStored
 	ASSERT_EQ(statusOf(resp), 200) << resp;
 	EXPECT_NE(bodyOf(resp).find("trunk (the trunk host must be the carrier"), std::string::npos) << resp;
 	EXPECT_TRUE(TrunkConfigStore::load().host.empty());
+}
+
+// ── Issue #483: MAC bindings and the telephony slot ─────────────────────────
+namespace
+{
+	// Every adopted device as one comparable row: MAC, extension, state, lock. `online` is
+	// left out: the seed marks a row online, and a restored row is offline until it registers.
+	std::vector<std::string> bindingsOf(RequestsHandler& h)
+	{
+		std::vector<std::string> rows;
+		for (const auto& d : h.getAdoptedDevices())
+		{
+			rows.push_back(d.mac + " " + d.extension +
+				(d.state == RequestsHandler::DeviceState::Secured ? " secured" : " learned") +
+				(d.locked ? " locked" : " unlocked"));
+		}
+		std::sort(rows.begin(), rows.end());
+		return rows;
+	}
+}
+
+// A board is reproduced section by section from the Owner's encrypted export: the MAC
+// bindings with their state and lock, the registrar mode the Secured one allows, and the
+// telephony slot. The slot's client secret is the one deliberate exception: it is not
+// restored and the import says so, because a second board holding the first one's secret
+// would take over its control WebSocket (#396).
+TEST_F(ConfigExportImportTest, EncryptedRoundTrip_ReproducesBindingsRegistrarModeAndTelephonySlot)
+{
+	SecuredExts secured;   // 101 and 102 hold digest secrets; the Secured binding needs one
+	_handler->adoptDeviceForTest("0200000000a1", "101", RequestsHandler::DeviceState::Secured);
+	_handler->adoptDeviceForTest("0200000000a2", "102", RequestsHandler::DeviceState::Learned, /*locked=*/true);
+	_handler->adoptDeviceForTest("0200000000a3", "103");
+	_handler->setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+	const std::string slotSecret = "test-secret-not-real";
+	TelephonyApiConfig::Slot slot;
+	slot.type = TelephonyProviderType::Telephony;
+	slot.enabled = true;
+	slot.baseUrl = "https://pbx.example.invalid";
+	slot.clientId = "bk-client-id";
+	slot.secret = slotSecret;
+	slot.routeDn = "100";
+	ASSERT_EQ(_handler->setTelephonyConfigSlot(0, slot, /*keepSecret=*/false), "");
+	const std::vector<std::string> want = bindingsOf(*_handler);
+	ASSERT_EQ(want.size(), 3u);
+
+	AdminSession owner = loginOwner();
+	const std::string exportResp = httpRaw(_port, "POST", "/api/config/export",
+		"password=exportpass123", "pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(exportResp), 200) << exportResp;
+	const std::string blob = bodyOf(exportResp);
+	EXPECT_NE(blob.find("\"secretSet\":true"), std::string::npos) << "the pairing: the export does say the slot has a secret";
+	EXPECT_EQ(blob.find(slotSecret), std::string::npos) << "...and never what it is";
+
+	// A replacement board: a new engine with no bindings, no slot and the default mode,
+	// and no digest secrets in the store.
+	SipSecretStore::clearSecret("101");
+	SipSecretStore::clearSecret("102");
+	std::remove(_tapiPath.c_str());
+	std::remove(_didPath.c_str());
+	auto fresh = std::make_unique<RequestsHandler>("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	fresh->setTelephonyStorePathsForTest(_tapiPath, _didPath);
+	_server->attachHandler(fresh.get());
+	_handler = std::move(fresh);
+	ASSERT_TRUE(_handler->getAdoptedDevices().empty());
+	ASSERT_EQ(_handler->getRegistrarMode(), RequestsHandler::RegistrarMode::Learn);
+	ASSERT_FALSE(_handler->getTelephonyConfigSlot(0).secretSet);
+	ASSERT_FALSE(SipSecretStore::hasSecret("101"));
+
+	const std::string importResp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(blob) + "&password=exportpass123&confirm=REPLACE",
+		"pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(importResp), 200) << importResp;
+	const std::string report = bodyOf(importResp);
+
+	EXPECT_EQ(bindingsOf(*_handler), want) << report;
+	EXPECT_NE(report.find("extensions (3 MAC bindings)"), std::string::npos) << report;
+	EXPECT_EQ(report.find("no import accessor"), std::string::npos) << report;
+	EXPECT_TRUE(SipSecretStore::hasSecret("101")) << "the Secured binding's digest secret came back with it";
+	// Decided last: with no Secured row yet the guard would have refused it as a lockout.
+	EXPECT_EQ(_handler->getRegistrarMode(), RequestsHandler::RegistrarMode::Secure) << report;
+	EXPECT_EQ(report.find("registrarMode=secure"), std::string::npos) << report;
+
+	const TelephonyApiConfig::SlotView view = _handler->getTelephonyConfigSlot(0);
+	EXPECT_TRUE(view.enabled);
+	EXPECT_EQ(view.baseUrl, slot.baseUrl);
+	EXPECT_EQ(view.clientId, slot.clientId);
+	EXPECT_EQ(view.routeDn, slot.routeDn);
+	EXPECT_FALSE(view.secretSet) << "the first board's client secret is not activated on this one";
+	EXPECT_NE(report.find("telephonyConfig client secrets"), std::string::npos) << report;
+}
+
+// A sysop-level (plaintext) import cannot create the rows that decide who may register an
+// extension: bindings, the locked and Secured ones above all, come only from the Owner-gated
+// secretsEnc block. The import names them under "skipped" and says why.
+TEST_F(ConfigExportImportTest, PlaintextImport_NeverAdoptsMacBindings_AndSaysWhy)
+{
+	const std::string blob =
+		R"({"exportVer":1,"plaintext":{"extensions":[)"
+		R"({"mac":"0200000000c1","extension":"201","state":"secured"},)"
+		R"({"mac":"0200000000c2","extension":"202","state":"learned"}]}})";
+	const std::string importResp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(blob) + "&confirm=REPLACE", "pd_session=" + _sysop.cookie, _sysop.csrf);
+	ASSERT_EQ(statusOf(importResp), 200) << importResp;
+	const std::string report = bodyOf(importResp);
+	EXPECT_TRUE(_handler->getAdoptedDevices().empty()) << "a sysop-level file must not create a Secured or locked row";
+	EXPECT_NE(report.find("MAC bindings travel only in the password-encrypted export"), std::string::npos) << report;
+	EXPECT_EQ(report.find("see PR description"), std::string::npos) << report;
+}
+
+// REPLACE means replace. A row on the board being restored that the file does not carry
+// (here a LOCKED claim on 102 by another phone) must not survive beside the file's own:
+// two locked rows for one extension reject each other's phone.
+TEST_F(ConfigExportImportTest, EncryptedRestore_ReplacesMacBindingsNotInTheFile)
+{
+	_handler->adoptDeviceForTest("0200000000b1", "102", RequestsHandler::DeviceState::Learned, /*locked=*/true);
+	AdminSession owner = loginOwner();
+	const std::string exportResp = httpRaw(_port, "POST", "/api/config/export",
+		"password=exportpass123", "pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(exportResp), 200) << exportResp;
+
+	// After the export the phone is replaced, so another MAC holds 102, and a stray row appears.
+	ASSERT_TRUE(_handler->forgetDevice("0200000000b1"));
+	_handler->adoptDeviceForTest("0200000000b2", "102", RequestsHandler::DeviceState::Learned, /*locked=*/true);
+	_handler->adoptDeviceForTest("0200000000b3", "104");
+
+	const std::string importResp = httpRaw(_port, "POST", "/api/config/import",
+		"blob=" + urlEncode(bodyOf(exportResp)) + "&password=exportpass123&confirm=REPLACE",
+		"pd_session=" + owner.cookie, owner.csrf);
+	ASSERT_EQ(statusOf(importResp), 200) << importResp;
+	const std::vector<std::string> want = {"0200000000b1 102 learned locked"};
+	EXPECT_EQ(bindingsOf(*_handler), want) << bodyOf(importResp);
 }
