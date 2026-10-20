@@ -2452,10 +2452,13 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// refused here. Emergency traffic is exempt, as isEmergencyTraffic() defines it (a 911,
 	// a PSAP callback, a request on a live 911 dialog): a 400 there would fail a real call
 	// (Rule 5). A To tag is a dialog's own request, not an initial INVITE, and is not refused.
-	// Not covered: the callee's 2xx can add a To tag that pushes the stored To past the bound.
-	// The 420 below is hand-derived: 820 B worst-case BYE minus 2 * 200 B of From/To values.
-	static_assert(2 * SipLimits::kMaxDialogLineBytes + 420 <= sipb::kMaxByeBytes,
-		"a BYE with two dialog lines at the bound must fit sipb::kMaxByeBytes (#870)");
+	// The callee's 2xx is bounded where it is stored (onOk, #1030), not here.
+	// The 420 below is hand-derived: 820 B worst-case BYE minus 2 * 200 B of From/To values. The
+	// "- 2" is the shortest header name the builder strips ("f:", "t:"); the To line may be 15 B
+	// longer (SipLimits::kMaxDialogToLineBytes, #1030).
+	static_assert(420 + (SipLimits::kMaxDialogLineBytes - 2) + (SipLimits::kMaxDialogToLineBytes - 2) <
+		sipb::kMaxByeBytes,
+		"a BYE with a From at the bound and a To at its bound must fit sipb::kMaxByeBytes (#870, #1030)");
 	if (!isEmergencyTraffic(*data) &&
 		std::string_view(data->getTo()).find("tag=") == std::string_view::npos &&
 		(data->getFrom().size() > SipLimits::kMaxDialogLineBytes ||
@@ -7738,6 +7741,31 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 				responseObj->setContact(buildContact(data->getToNumber()));
 				endHandle(data->getToNumber(), responseObj);
 				endCall(data->getCallID(), data->getFromNumber(), data->getToNumber(), "SDP parse error.");
+				return;
+			}
+			// #1030: the dialog lines stored below are the callee's 2xx, not the INVITE's, so the
+			// #870 gate never saw them: a To tag the callee chose, or a padded From, can make the
+			// BYE unbuildable. Refused, not cut: a BYE with a cut tag gets a 481 and the far leg is
+			// still never told. Emergency traffic is exempt (Rule 5). The caller gets a final; the
+			// callee's 2xx goes unACKed and ends on its own timer (the BYE that would end it is the
+			// unbuildable one).
+			if (!isEmergencyTraffic(*data) &&
+				(data->getFrom().size() > SipLimits::kMaxDialogLineBytes ||
+				 data->getTo().size() > SipLimits::kMaxDialogToLineBytes))
+			{
+				queueLog("200 OK from " + client.value()->getNumber() + " refused: its From/To line is "
+					"longer than the BYE for it could be built (#1030).", true);
+				if (const auto invite = session.value()->getInviteMessage())
+				{
+					if (auto resp = getMessageFromPool(*invite))   // pool exhausted: the caller's INVITE timer ends its side
+					{
+						resp->setHeader("SIP/2.0 502 Bad Gateway");
+						resp->clearBody();
+						resp->setTo(toWithTag(invite->getTo(), session.value()->getLocalTag()));
+						_outbox.emplace_back(invite->getSource(), std::move(resp));
+					}
+				}
+				endCall(data->getCallID(), data->getFromNumber(), data->getToNumber(), "callee dialog line too long");
 				return;
 			}
 			session->get()->setDest(client.value());
