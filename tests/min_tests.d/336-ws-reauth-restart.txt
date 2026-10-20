@@ -1,0 +1,2 @@
+# TelephonyAnchorLogic_test.cpp: TelephonyLogic.WsRestart* (7) + WsHeaderGenerationIsComparedForEqualityNotOrder (1) + StartRetryDelay* (2) + ARestartIsHeldBackUntilItsNotBeforeStampHasPassed (1) (#336: a dropped control WebSocket restarts the anchor on an expiring token or a header behind the held token, rate limited; a failed restart's start() retries on a capped backoff)
+11

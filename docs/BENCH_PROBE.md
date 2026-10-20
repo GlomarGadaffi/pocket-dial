@@ -91,7 +91,8 @@ Notes:
   way to drop the transport and keep the library's own reconnect, which is the
   DISCONNECTED/ERROR path #336 needs. `esp_websocket_client_stop()` and `_close()`
   end the client, cannot run from its event handler, and expose no socket. Variant A
-  of `x336_ws_reauth` needs another way to cut the WS (for example, at the network).
+  of `x336_ws_reauth` needs another way to cut the WS (for example, at the network). That run is
+  written down [below](#x336_ws_reauth-336-run-by-hand).
 
 An application-level fault is weaker evidence for #350 than a real network fault. That bug lives in
 mbedTLS's failed-read state after an allocation failure (`esp-aes: Failed to allocate memory`, read error
@@ -216,6 +217,71 @@ one anchored leg, no second rx task, no `ORPHANED` line, one drop, a CANCEL answ
   registered with one: the target is not known. Take it from the no-ballast run's `freeHeapInternal` reading, then
   register a variant. The ballast also puts `makeCall()`'s POST under pressure, so the #349 ORPHAN variant is
   possible: each such run needs desmo's OK, and the board's HTTP may not answer until the ballast is released.
+
+### `x336_ws_reauth` (#336), run by hand
+
+Not a registered scenario, and not run yet. `ws_drop` does not exist and the harness has no step that cuts the
+rig's network, so `tests/load` does not define `x336_ws_reauth` (`tests/tools/test_anchor_scenarios.py` asserts
+that). This is the procedure for the operator, with the probe image on **one** board, checked out under #428.
+No call, no dial, no SIP is sent. Do not point two boards at the same route point: they fight for the control
+WebSocket, and a second grant revokes the first board's token.
+
+What it exercises, all in `TelephonyAnchorClient` and decided in `TelephonyAnchorLogic.hpp`:
+
+- **A** (#343): a control-WebSocket drop while the token reads as expiring restarts the anchor once, however many
+  ERROR events follow (`wsRestartDecision`, 60 s floor).
+- **B**: a restart whose `start()` cannot fetch a token retries, 15 s after the first failure and then 30, 60,
+  120, 240 and every 300 s (`startRetryDelayUs`), until it can. Before this the anchor stayed down until a reboot.
+- **C**: a drop while the WS header was built from a token other than the one held restarts it too. See below:
+  a cut cannot force this one.
+
+Steps for A and B:
+
+1. Baseline: a `-probe` stamp, `GET /api/bench/fault` with nothing armed, `/api/status` with the anchor
+   connected, syslog being captured.
+2. Cut the board's path to the tenant on the rig network. The WebSocket and the token endpoint are the same host,
+   so both go. Note the time.
+3. `POST fault=token_age`. The next tick logs `BENCHFAULT token_age fired`: the token now reads as expiring, and
+   the background refresh is due. With the path cut it fails, at most once a minute (`token_fetch_failed`).
+4. The WS notices: a blackholed socket takes up to about 40 s (20 s ping interval, 20 s pong timeout). Then
+   `Control channel: Websocket disconnected`, and an ERROR event every 5 s. Expect exactly one `WS
+   disconnected/errored with an expiring token — requesting anchor restart to refresh it`
+   (`ws_restart_stale_token`).
+5. The restart runs with the path still cut: `Failed to retrieve OAuth token`, then `anchor restart: start()
+   failed (1 in a row) -- retrying in 15 s`. Keep the path cut until `(2 in a row) -- retrying in 30 s` has
+   shown, or B was not exercised.
+6. Restore the path. Within the retry interval: `Retrieved access token`, `Control channel: Websocket connected`,
+   `anchor restart: complete, socket pool reclaimed`, and `/api/status` shows the anchor connected.
+7. Wait 10 minutes: no further `requesting anchor restart` line and no further `anchor restart:` line.
+8. `POST fault=disarm`, read `/api/bench/fault` back (`token_age` `fired: 1`), CHECK-IN with a release image.
+
+`PASS`: one `ws_restart_stale_token` line, two or more `start() failed` lines, then the recovery lines of step 6
+in that order, the anchor connected, and a quiet 10 minutes. `FAIL`: the anchor still down 6 minutes after the
+restore (the retry did not run); a second `requesting anchor restart` line inside a minute of the first; or a
+restart that completes and then a `Websocket disconnected` loop with no `connected` (a 401 loop). `INVALID`: no
+`BENCHFAULT token_age fired`, no WS drop seen, or the path restored before the restart's `start()` ran (A is shown,
+B is not).
+
+C (a header behind a fresh token) needs a token refresh to succeed while the socket is not connected. A full cut
+cannot do that on purpose: the refresh cannot succeed while the path is cut, and when it can (a minute later) the
+WS has usually reconnected on its still valid token, so `set_headers` lands. The window is the time between the
+restore and the WS reconnect (the 5 s reconnect timer plus the handshake), and the refresh's own 60 s floor must
+expire inside it, so restore 55-58 s after the last `token_fetch_failed` line. If a run gets there the lines are
+`WebSocket Authorization header not confirmed (<error>, socket down): the next WS drop restarts the anchor` after
+`Retrieved access token`, then `WS disconnected/errored with a stale Authorization header (token gen N, header gen
+M); requesting anchor restart to refresh it`, then the recovery lines of step 6. A run that never shows them says
+nothing about C: `INVALID`, not `PASS`. Two things it settles when it does:
+
+- The first line names what `esp_websocket_client_set_headers` returned for a client that is not connected. The
+  comments in `connectWs()` and `fetchToken()` say it is an error; the #343 comment says it silently does
+  nothing. The library source was not read for this change, so the code counts the header as landed only when the
+  call returned `ESP_OK` **and** the socket is up. `ESP_OK, socket down` in that line is the second reading, and
+  the guard is what makes C work under it. A refresh that lands with the socket down, **no** such line, and then
+  a 401 loop would mean the socket was reported up when it was not: file it.
+- `ws_restart_stale_token` counts only the expiring-token line. C has its own line and no harness counter yet.
+
+Revoking the board's token from off the board (a second grant for the same client) would test the header the other
+way round. It needs the tenant OAuth client credentials on the bench host, which the #384 approval does not cover.
 
 ## Ballast
 

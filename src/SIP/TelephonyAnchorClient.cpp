@@ -1159,6 +1159,7 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 					// redundant and drop the atomics.
 					esp_websocket_client_handle_t ws = nullptr;
 					bool installed = false;
+					uint32_t gen = 0;   // #336: this install's generation, set under the lock
 					{
 						std::lock_guard<std::mutex> lock(_mutex);
 						// Decided under the same lock as the assignment, so two landings cannot interleave.
@@ -1168,6 +1169,7 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 							_bearerHeader.set(tokenStr);
 							_tokenObtainedUs = esp_timer_get_time();
 							_tokenLifetimeUs = lifetimeUs;
+							gen = _tokenGen.fetch_add(1, std::memory_order_acq_rel) + 1;
 							ws = _wsClient;
 						}
 					}
@@ -1189,6 +1191,9 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 						// requestRestartIfTokenStale()/WEBSOCKET_EVENT_DISCONNECTED below is what
 						// actually handles the disconnected case, via a full stop()/start() that
 						// rebuilds wsCfg.headers fresh at init time rather than patching this handle.
+						// That restart is asked for when the token is expiring (#343) and, since the
+						// background refresh keeps it ahead of that, when this call's set_headers did not
+						// land: _wsHeaderGen below stays behind _tokenGen (telephony::wsRestartDecision).
 						//
 						// #862: called with _mutex RELEASED. set_headers takes the WS client's own lock
 						// with portMAX_DELAY (verified in the esp_websocket_client component), which the
@@ -1203,7 +1208,23 @@ bool TelephonyAnchorClient::fetchToken(telephony::TokenLane lane, bool waitForAr
 						const char* wsHeaders = telephony::wsAuthHeaderInPlace(lease.data(), lease.capacity(), tokenStr);
 						if (wsHeaders)
 						{
-							esp_websocket_client_set_headers(ws, wsHeaders);
+							// #336: only a header that landed is the socket's header now. The comments here and in
+							// connectWs() say set_headers returns an error unless the client is CONNECTED; the
+							// #343 comment says it silently does nothing. Trust neither: it counts as landed
+							// only if it returned ESP_OK AND the socket is up, so under either reading a
+							// refresh that missed leaves _wsHeaderGen behind _tokenGen, and the next WS drop
+							// restarts the anchor (at worst one extra, rate-limited restart).
+							const esp_err_t headerErr = esp_websocket_client_set_headers(ws, wsHeaders);
+							const bool wsUp = _connected.load(std::memory_order_acquire);
+							if (headerErr == ESP_OK && wsUp)
+							{
+								_wsHeaderGen.store(gen, std::memory_order_release);
+							}
+							else
+							{
+								ESP_LOGW(TAG, "WebSocket Authorization header not confirmed (%s, socket %s): the next WS drop restarts the anchor",
+								         esp_err_to_name(headerErr), wsUp ? "up" : "down");
+							}
 						}
 						else
 						{
@@ -1334,12 +1355,36 @@ void TelephonyAnchorClient::requestRestartIfTokenStale()
 	// since restartTaskTrampoline's stop() clears it before start() sets it
 	// again. handleWsEvent's WEBSOCKET_EVENT_DATA case already gates the same
 	// way for the analogous reason (line ~2400).
-	if (!_running.load(std::memory_order_acquire)) return;
-	if (!tokenExpiringSoon()) return;
+	//
+	// The decision is telephony::wsRestartDecision (host-tested): the _running
+	// gate above, a 60 s floor between requests (ERROR fires every 5 s and a
+	// restart that does not heal its cause must not repeat at that rate), then
+	// two reasons. The token is expiring (#343), or the header baked into this
+	// WS client is not the token now held. The second is what #343 missed: the
+	// background refresh keeps the token ten minutes ahead of its expiry, so the
+	// clock never says yes, and a refresh that landed while the socket was down
+	// could not reach the header (set_headers failed) while 3CX revoked the old
+	// token. Every retry then sent a revoked Bearer. Generations, not the
+	// obtained-at stamp: the token_age probe rewrites that in place.
+	const int64_t nowUs = esp_timer_get_time();
+	const telephony::WsRestartReason why = telephony::wsRestartDecision(
+	    _running.load(std::memory_order_acquire), tokenExpiringSoon(),
+	    _wsHeaderGen.load(std::memory_order_acquire), _tokenGen.load(std::memory_order_acquire),
+	    nowUs, _lastWsRestartRequestUs.load(std::memory_order_acquire));
+	if (why == telephony::WsRestartReason::None) return;
+	_lastWsRestartRequestUs.store(nowUs, std::memory_order_release);
 	// _restartInFlight is checked by tick(), not here -- storing true again
 	// while a restart is already running is a harmless redundant request,
 	// same as the #65 leak-count path above already relies on.
 	_restartRequested.store(true, std::memory_order_release);
+	if (why == telephony::WsRestartReason::HeaderStale)
+	{
+		ESP_LOGW(TAG, "WS disconnected/errored with a stale Authorization header (token gen %u, header gen %u); "
+		              "requesting anchor restart to refresh it",
+		         static_cast<unsigned>(_tokenGen.load(std::memory_order_acquire)),
+		         static_cast<unsigned>(_wsHeaderGen.load(std::memory_order_acquire)));
+		return;
+	}
 	ESP_LOGW(TAG, "WS disconnected/errored with an expiring token — requesting anchor restart to refresh it");
 }
 
@@ -1348,10 +1393,12 @@ bool TelephonyAnchorClient::connectWs()
 	// Convert base https:// URL to wss:// for call control websocket
 	std::string wsUrl;
 	std::string bearerHeader;
+	uint32_t headerGen = 0;   // #336: the generation of the token this header is built from
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		wsUrl = _baseUrl;
 		bearerHeader = _bearerHeader;
+		headerGen = _tokenGen.load(std::memory_order_acquire);   // read with the bearer, under the lock fetchToken() installs under
 	}
 
 	if (wsUrl.rfind("https://", 0) == 0)
@@ -1412,6 +1459,9 @@ bool TelephonyAnchorClient::connectWs()
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_wsClient = wsClient;
+		// #336: the header this client was initialised with. A token installed since the copy above
+		// (headerGen < _tokenGen) could not reach this client, so the next drop restarts the anchor.
+		_wsHeaderGen.store(headerGen, std::memory_order_release);
 	}
 
 	err = esp_websocket_client_start(wsClient);
@@ -2052,8 +2102,11 @@ void TelephonyAnchorClient::tick()
 	// stop()/start() reclaim OFF this task (stop()/start() block on TLS I/O). _restartInFlight
 	// is a one-shot gate so repeated ticks can't stack restart workers. Checked before the
 	// outboundActive gate because a leak can accumulate independent of an active outbound call.
+	// #336: a restart whose start() failed is re-armed with a not-before stamp (restartTaskTrampoline);
+	// restartDue holds it back until then. The timer is read only when a restart is requested.
 	if (_restartRequested.load(std::memory_order_acquire) &&
-	    !_restartInFlight.load(std::memory_order_acquire))
+	    !_restartInFlight.load(std::memory_order_acquire) &&
+	    telephony::restartDue(esp_timer_get_time(), _restartNotBeforeUs.load(std::memory_order_acquire)))
 	{
 		_restartInFlight.store(true, std::memory_order_release);
 		if (!wakeMaint(kMaintRestart))
@@ -2505,10 +2558,23 @@ void TelephonyAnchorClient::restartTaskTrampoline(void* arg)
 
 	if (!self->start())
 	{
-		ESP_LOGE(TAG, "anchor restart: start() failed — will retry on the next reconnect cycle");
+		// #336: a failed start() (no token: an outage, DRAM pressure) leaves no WS client, so no
+		// event will ever ask for another restart, and nothing else calls start() after boot. Re-arm
+		// this one instead, held back by a capped backoff (telephony::startRetryDelayUs). It retries
+		// until it succeeds: giving up would leave the anchor down until a reboot.
+		uint32_t failures = self->_startFailures.load(std::memory_order_relaxed);
+		if (failures < 1000) ++failures;   // saturating; the delay is capped long before this
+		self->_startFailures.store(failures, std::memory_order_relaxed);
+		const int64_t delayUs = telephony::startRetryDelayUs(failures);
+		self->_restartNotBeforeUs.store(esp_timer_get_time() + delayUs, std::memory_order_release);
+		self->_restartRequested.store(true, std::memory_order_release);
+		ESP_LOGE(TAG, "anchor restart: start() failed (%u in a row) -- retrying in %lld s",
+		         static_cast<unsigned>(failures), static_cast<long long>(delayUs / 1000000));
 	}
 	else
 	{
+		self->_startFailures.store(0, std::memory_order_relaxed);
+		self->_restartNotBeforeUs.store(0, std::memory_order_release);
 		ESP_LOGI(TAG, "anchor restart: complete, socket pool reclaimed");
 	}
 

@@ -354,32 +354,67 @@ inline bool tokenIsExpiringSoon(int64_t nowUs, int64_t obtainedUs, int64_t lifet
 	return age >= (lifetimeUs - marginUs);
 }
 
-// Issue #336, RED COMMIT: stubs for the pure decisions the next commit implements (the WS restart
-// decision, the start() retry delay, restartDue). Every body and constant is deliberately wrong, so
-// that tests/TelephonyAnchorLogic_test.cpp compiles and fails at its EXPECT lines. The next commit
-// replaces this block whole; nothing calls it yet.
+// Issue #336: what a dropped or errored control WebSocket does about the Authorization header it
+// will send on its next handshake. The header is baked into the WS client at init, and the client's
+// own reconnect resends it unchanged, so a token that has moved on can only be picked up by a full
+// anchor stop()/start(). Two reasons ask for one:
+//   TokenExpiring  #343: the held token is within the refresh margin of its expiry (a clock test).
+//   HeaderStale    the header was built from a token other than the one now held. Since #945 the
+//                  background refresh keeps the token ten minutes ahead of its expiry, so the clock
+//                  never says yes; a refresh that lands while the socket is not connected cannot reach
+//                  the header (connectWs() records that esp_websocket_client_set_headers fails unless
+//                  the client is connected; fetchToken() does not rely on that, it counts a header as
+//                  landed only if the call returned ESP_OK and the socket is up), and 3CX revokes the
+//                  old token when it grants the new one. The reconnect then sends a revoked Bearer, gets
+//                  a 401 on every retry, and the clock gate stays shut.
+// wsHeaderGen and tokenGen count token installs: the generation the header was built from, and the
+// generation held now. They are compared for equality only. The token's obtained-at stamp is not
+// usable for this: the token_age bench fault rewrites it in place.
 enum class WsRestartReason : std::uint8_t { None, TokenExpiring, HeaderStale };
 
-inline constexpr std::int64_t kWsRestartMinIntervalUs = 0;
+// The least time between two restart requests from the socket's events. ERROR fires on every failed
+// retry, every 5 s, so a restart that does not heal its cause (a token whose lifetime is within the
+// margin, say) would otherwise repeat at that rate, each one a full stop()/start() with a token fetch.
+// The same floor as the background refresh's (kMaintRefreshRetryUs, below).
+inline constexpr std::int64_t kWsRestartMinIntervalUs = 60LL * 1000000;
 
-inline WsRestartReason wsRestartDecision(bool /*running*/, bool tokenExpiring, std::uint32_t /*wsHeaderGen*/,
-                                         std::uint32_t /*tokenGen*/, std::int64_t /*nowUs*/,
-                                         std::int64_t /*lastRequestUs*/)
+// running: the anchor's _running flag. stop() clears it before it stops the WS client, whose last
+// DISCONNECTED would otherwise ask for a second restart while the first is tearing down. It is false
+// for the whole of a restart, from stop() to start(), and after a shutdown. tokenExpiring:
+// tokenIsExpiringSoon() with the 5 minute margin. lastRequestUs: when this decision last said yes
+// (0: never). #343's reason wins when both hold, so the line its bench counter reads is unchanged.
+inline WsRestartReason wsRestartDecision(bool running, bool tokenExpiring, std::uint32_t wsHeaderGen,
+                                         std::uint32_t tokenGen, std::int64_t nowUs, std::int64_t lastRequestUs)
 {
-	return tokenExpiring ? WsRestartReason::None : WsRestartReason::TokenExpiring;   // wrong on purpose
+	if (!running) return WsRestartReason::None;
+	if (lastRequestUs != 0 && nowUs - lastRequestUs < kWsRestartMinIntervalUs) return WsRestartReason::None;
+	if (tokenExpiring) return WsRestartReason::TokenExpiring;
+	if (wsHeaderGen != tokenGen) return WsRestartReason::HeaderStale;
+	return WsRestartReason::None;
 }
 
-inline constexpr std::int64_t kStartRetryFirstUs = 0;
-inline constexpr std::int64_t kStartRetryMaxUs   = 0;
+// Issue #336: a restart is stop() then start(). When start() cannot fetch its token (an outage, DRAM
+// pressure) the anchor is left with no WS client, so no event can ever ask again, and nothing else
+// calls start() after boot. The failed restart re-arms itself instead, held back by this delay: 15 s
+// after the first failure, doubling, capped at 5 minutes. Capped rather than counted: giving up leaves
+// the anchor down until a reboot, which is the bug, and an attempt every 5 minutes is one token fetch
+// (a TLS handshake the S3 does in software) while the tenant is unreachable. failures is how many
+// starts have failed in a row; 0 is read as 1.
+inline constexpr std::int64_t kStartRetryFirstUs = 15LL * 1000000;
+inline constexpr std::int64_t kStartRetryMaxUs   = 300LL * 1000000;
 
-inline std::int64_t startRetryDelayUs(std::uint32_t /*failures*/)
+inline std::int64_t startRetryDelayUs(std::uint32_t failures)
 {
-	return 0;   // wrong on purpose
+	std::int64_t delay = kStartRetryFirstUs;
+	for (std::uint32_t i = 1; i < failures && delay < kStartRetryMaxUs; ++i) delay *= 2;
+	return delay < kStartRetryMaxUs ? delay : kStartRetryMaxUs;
 }
 
-inline bool restartDue(std::int64_t /*nowUs*/, std::int64_t /*notBeforeUs*/)
+// tick()'s test before it spawns a requested restart: the not-before stamp the failed restart set
+// has passed. 0 holds nothing back, so a restart the leak count or a stale token asks for is not delayed.
+inline bool restartDue(std::int64_t nowUs, std::int64_t notBeforeUs)
 {
-	return false;   // wrong on purpose
+	return nowUs >= notBeforeUs;
 }
 
 // Issues #349/#350: did the transport actually deliver a parsed HTTP response?
