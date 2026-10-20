@@ -37,12 +37,15 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -106,6 +109,61 @@ def http_json(path, timeout=5):
             return json.loads(r.read().decode("utf-8", "replace"))
     except Exception:
         return None
+
+
+def pbx_http(method, path, form=None, headers=None, timeout=10):
+    """(status, headers, body) of a request to the PBX's web port, `form` sent as a
+    urlencoded body. Status 0 when nothing answered. Loopback only (PBX_IP)."""
+    data = urllib.parse.urlencode(form).encode() if form is not None else None
+    req = urllib.request.Request("http://%s:%d%s" % (PBX_IP, PBX_WEB_PORT, path),
+                                 data=data, headers=headers or {}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.headers, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read().decode("utf-8", "replace")
+    except Exception:
+        return 0, None, ""
+
+
+def pbx_admin_login():
+    """Request headers for an admin POST, or None when the PBX would not let us in.
+
+    The host PBX starts unprovisioned: it takes the shipped default login, then
+    refuses every admin action until that login is replaced (requireAdmin(),
+    tests/http/test_api.sh TC-AUTH-04..07). So this logs in, completes that setup with
+    a password drawn at random for this run (held in memory only, never written
+    anywhere), and returns the session cookie and CSRF token. The PBX is a fresh
+    process per run (credentials are not persisted on host), and the web port is
+    loopback."""
+    code, hdrs, body = pbx_http("POST", "/api/admin/login",
+                                {"username": "admin", "password": "admin"})
+    if code != 200 or hdrs is None:
+        return None
+    cookie = re.search(r"pd_session=([0-9a-fA-F]+)", " ".join(hdrs.get_all("Set-Cookie") or []))
+    try:
+        info = json.loads(body)
+    except ValueError:
+        return None
+    if not cookie or not info.get("csrf"):
+        return None
+    auth = {"Cookie": "pd_session=" + cookie.group(1), "X-CSRF": info["csrf"]}
+    if info.get("needsSetup"):
+        code, _, _ = pbx_http("POST", "/api/admin/set-credential",
+                              {"username": "admin", "password": secrets.token_hex(16)}, auth)
+        if code != 200:
+            return None
+    return auth
+
+
+def pbx_set_group(auth, ext, members):
+    """POST /api/group: ring group `ext` = `members` (comma list); "" deletes it.
+    True when the PBX answered 200. Pickup eligibility is ring-group co-membership
+    (PbxConfig.hpp, 'Directed / group call pickup'), and there is no other way to
+    set a group on the host binary."""
+    code, _, _ = pbx_http("POST", "/api/group",
+                          {"extension": ext, "members": members, "mode": "ringall"}, auth)
+    return code == 200
 
 
 def wait_for(predicate, timeout, interval=0.2):
@@ -1027,6 +1085,145 @@ def sc_mwi(env):
                   % (accepted, bool(got), acked))
 
 
+# --- #739: the 2xx the PBX writes itself must not echo the phone's timer -------
+#
+# pjsua at log level 5 prints every SIP message whole: a "TX|RX n bytes ..."
+# line, the message, then "--end msg--". These helpers read the headers of one
+# message off that trace. S and K (below) insist on a session timer
+# (--use-timer=2: Supported and Require: timer, Session-Expires on every
+# INVITE). The 440 tone leg and a call pickup cannot answer the refresh a timer
+# would promise (440 declines a re-INVITE 488; a pickup relays it into the peer's
+# dialog), and RFC 4028 s10 counts only a 2xx as a refresh, so their 200 must
+# name no timer at all (s7.2): no Session-Expires, no Require. Echoing the
+# phone's line with no refresher was the defect (s9).
+TIMER_UA_OPTS = ["--use-timer=2", "--timer-se=1800", "--timer-min-se=90"]
+
+
+def sip_messages(log, head):
+    """Whole text of each SIP message in a pjsua log whose trace line starts with
+    `head`, a regex such as r"RX \\d+ bytes Response msg 200/INVITE/cseq=\\d+"."""
+    return [m.group(0) for m in re.finditer(head + r"[^\n]*\n.*?--end msg--", log, re.S)]
+
+
+def timer_lines(msg):
+    """The Session-Expires (full or compact `x:`) and Require lines of one message."""
+    return [l.strip() for l in
+            re.findall(r"^(?:Session-Expires|x|Require)[ \t]*:[^\r\n]*", msg, re.M | re.I)]
+
+
+def timer_offered(invite):
+    """True when an INVITE carries a Session-Expires AND a Require naming timer, so
+    the answer's silence is a decision of the PBX's and not of a UA that never asked."""
+    lines = timer_lines(invite)
+    return any(re.match(r"(?:session-expires|x)\s*:", l, re.I) for l in lines) and \
+        any(re.match(r"require\s*:.*\btimer\b", l, re.I) for l in lines)
+
+
+def sc_440(env):
+    """#739: the 440 tone answer carries no timer, and the call still connects.
+
+    Passes only when ALL of: S's INVITE offered Session-Expires and Require: timer
+    (else the result would say nothing about the PBX: reported as HARNESS); pjsua
+    reached CONFIRMED; every 200/INVITE S received carries no Session-Expires,
+    compact x: or Require, and is 440's own (it has an SDP body and a
+    sip:440@ Contact, the positive control); and S saw no DISCONNECTED in the
+    2 s after CONFIRMED (a UA that tears down a timer-less 2xx did not establish).
+    RTP is not judged: the loopback RTP counters read 0 under WSL."""
+    name = "session_timer_440"
+    s = env["S"]
+    if not s.registered():
+        return report(name, "FAIL", "S never registered")
+    m = s.mark()
+    s.call("440")
+    if not s.wait_log(r"state changed to CONFIRMED", 10, m):
+        s.hangup_all()
+        return report(name, "FAIL", "440 never reached CONFIRMED")
+    m_up = s.mark()
+    time.sleep(2.0)
+    survived = re.search(r"(is|to) DISCONNECTED", s.log_since(m_up)) is None
+    log = s.log_since(m)
+    invites = sip_messages(log, r"TX \d+ bytes Request msg INVITE/cseq=\d+")
+    oks = sip_messages(log, r"RX \d+ bytes Response msg 200/INVITE/cseq=\d+")
+    offered = bool(invites) and timer_offered(invites[0])
+    leaked = [l for ok in oks for l in timer_lines(ok)]
+    # The Contact line, not the To: the To carries sip:440@ whatever answers.
+    own = bool(oks) and all("v=0" in ok and re.search(r"^Contact[ \t]*:[^\r\n]*sip:440@", ok, re.M | re.I)
+                            for ok in oks)
+    s.hangup_all()
+    s.wait_log(r"(is|to) DISCONNECTED", 6, m_up)     # frees 440's single stream slot
+    ok = offered and bool(oks) and own and not leaked and survived
+    detail = ("pjsua INVITE offered Session-Expires+Require=%s, 440 200s=%d (own SDP+Contact=%s), "
+              "timer lines in the 200=%s, call survived=%s"
+              % (offered, len(oks), own, leaked or "none", survived))
+    if not offered:
+        detail = "HARNESS: S's INVITE carried no Session-Expires/Require: timer -- " + detail
+    return report(name, "OK" if ok else "FAIL", detail)
+
+
+def sc_pickup(env):
+    """#739: both call-pickup answers carry no timer, and both legs connect.
+
+    S (608) dials R (604), which rings and never answers. K (609), in a ring group
+    with R (pickup eligibility is ring-group co-membership, set over the web API
+    and removed again), dials **604. The PBX completes S's still-open INVITE with
+    K's SDP and K's INVITE with S's (CallPickup::complete; directed code
+    PbxConfig.hpp directedPickupTarget). Every UA is registered in this run; no
+    number outside it is dialled and nothing leaves loopback.
+
+    Passes only when ALL of: both INVITEs offered Session-Expires and Require: timer
+    (else HARNESS); S and K both reached CONFIRMED; every 200/INVITE each received
+    carries no Session-Expires, compact x: or Require; each 200 is the pickup
+    answer (S's carries K's media address, K's carries S's: the positive control);
+    and neither saw DISCONNECTED in the 2 s after both CONFIRMED. RTP is not judged."""
+    name = "session_timer_pickup"
+    s, k, r = env["S"], env["K"], env["R"]
+    if not (s.registered() and k.registered() and r.registered()):
+        return report(name, "FAIL", "S, K or R never registered")
+    auth = pbx_admin_login()
+    if not auth:
+        return report(name, "FAIL", "HARNESS: could not log in to the PBX web API to make the pickup group")
+    group = "610"
+    if not pbx_set_group(auth, group, "%s,%s" % (r.ext, k.ext)):
+        return report(name, "FAIL", "HARNESS: POST /api/group refused the pickup group")
+    try:
+        ms, mk, mr = s.mark(), k.mark(), r.mark()
+        s.call(r.ext)
+        if not r.wait_log(REINVITE_RX, 8, mr):
+            return report(name, "FAIL", "the ringing UA never got the INVITE (nothing to pick up)")
+        time.sleep(0.8)                  # as cancel_ringing: R's 180 is up, the PBX session is Invited
+        k.call("**" + r.ext)
+        s_up = s.wait_log(r"state changed to CONFIRMED", 10, ms) is not None
+        k_up = k.wait_log(r"state changed to CONFIRMED", 10, mk) is not None
+        if not (s_up and k_up):
+            return report(name, "FAIL", "pickup did not connect: caller CONFIRMED=%s, picker CONFIRMED=%s"
+                          % (s_up, k_up))
+        ms_up, mk_up = s.mark(), k.mark()
+        time.sleep(2.0)
+        survived = re.search(r"(is|to) DISCONNECTED", s.log_since(ms_up) + k.log_since(mk_up)) is None
+        slog, klog = s.log_since(ms), k.log_since(mk)
+        invites = [sip_messages(slog, r"TX \d+ bytes Request msg INVITE/cseq=\d+"),
+                   sip_messages(klog, r"TX \d+ bytes Request msg INVITE/cseq=\d+")]
+        offered = all(bool(i) and timer_offered(i[0]) for i in invites)
+        s_oks = sip_messages(slog, r"RX \d+ bytes Response msg 200/INVITE/cseq=\d+")
+        k_oks = sip_messages(klog, r"RX \d+ bytes Response msg 200/INVITE/cseq=\d+")
+        leaked = [l for ok in s_oks + k_oks for l in timer_lines(ok)]
+        own = bool(s_oks) and bool(k_oks) and \
+            all(re.search(r"c=IN IP4 %s\b" % re.escape(k.ip), ok) for ok in s_oks) and \
+            all(re.search(r"c=IN IP4 %s\b" % re.escape(s.ip), ok) for ok in k_oks)
+        ok = offered and own and not leaked and survived
+        detail = ("INVITEs offered Session-Expires+Require=%s, 200s caller/picker=%d/%d (each carries "
+                  "the other leg's SDP=%s), timer lines in the 200s=%s, both calls survived=%s"
+                  % (offered, len(s_oks), len(k_oks), own, leaked or "none", survived))
+        if not offered:
+            detail = "HARNESS: an INVITE carried no Session-Expires/Require: timer -- " + detail
+        return report(name, "OK" if ok else "FAIL", detail)
+    finally:
+        for ua in (s, k, r):
+            ua.hangup_all()
+        pbx_set_group(auth, group, "")   # the group must not outlive the scenario
+        time.sleep(1.0)
+
+
 SCENARIOS = [
     ("register", sc_register),
     ("echo777_rtp", sc_echo777_rtp),
@@ -1043,6 +1240,9 @@ SCENARIOS = [
     ("mixed_stack", sc_mixed_stack),
     ("heap_telemetry", sc_heap_telemetry),
     ("mwi", sc_mwi),
+    # #739: S and K insist on session timers; the PBX's 440 and pickup 200s must name none.
+    ("session_timer_440", sc_440),
+    ("session_timer_pickup", sc_pickup),
 ]
 
 
@@ -1106,6 +1306,11 @@ def main():
         # it to the PBX's test port instead.
         PjsuaUA("M", "607", 17, 5177, 6700, 2317,
                 extra=["--mwi", "--proxy=sip:%s:%d;lr" % (PBX_IP, PBX_SIP_PORT)]),
+        # S and K send Supported + Require: timer and a Session-Expires on every INVITE
+        # (#739: session_timer_440, session_timer_pickup). Their own UAs, so no other
+        # scenario's calls carry a required timer.
+        PjsuaUA("S", "608", 18, 5178, 6800, 2318, extra=TIMER_UA_OPTS),
+        PjsuaUA("K", "609", 19, 5179, 6900, 2319, extra=TIMER_UA_OPTS),
     ]
     for ua in uas:
         env[ua.name] = ua.start(pjsua)
