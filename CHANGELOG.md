@@ -2,9 +2,72 @@
 
 ## Unreleased
 
-### Build
+## v1.6.0 — 2026-10-20
 
-- The constrained build (`SIP_CONSTRAINED=1`) is anchor-only. `SIP_OUTSIDE_LINE=trunk` is refused at configure time, so the constrained leg no longer builds a SIP trunk (#933; part of #731; committee findings #938).
+114 PRs since `v1.5.1`. Scope, exit tests and accepted gaps are in #1050. Hardware evidence is stated per item below; anything not marked "bench" was covered by host tests and the interop suite only.
+
+### Highlights
+
+- 114 pull requests merged since v1.5.1, each one a small vote for leaving it running.
+- A call that rings and rings now stops at the ring limit and hangs up for you, forwarded calls included.
+- A 440 tone call ends by itself after 600 seconds, so nobody has to hang up on a tone.
+- A cancelled call whose far end never answers is swept away after 32 seconds instead of lingering.
+- Firmware uploads and crash-dump erasing politely decline to run while a call is live.
+- The test-dial button has learned to keep its hands to itself: it can no longer place an emergency call by accident.
+
+### Emergency (911 and 933)
+
+- A 911 or 933 is never placed over a SIP trunk (#956). A trunk 911 that drew any provisional is never timed out (#894). A carrier final after the 2xx never tears down a live trunk call (#895).
+- The header gate yields to every emergency route: trunk-dialog Call-IDs, PSAP callbacks and rule-produced 911s (#877). One INVITE sees one registration snapshot (#891). A 911 whose anchor leg never comes up is refused and reported NOT ROUTED (#878).
+- Anchor token handling: the token body is read into a fixed arena with a separate 911 lane (#945); `fetchToken` own-code allocations are gone and a lifetime fallback rule applies (#978); an unparseable JWT lifetime falls back to 5 minutes, not 50 (#984); the status GET has a bounded arena and teardown bound (#976).
+- The `pbx-911` alert is staged under the lock and sent after unlock (#987). The admin DTMF PIN verify runs on a worker task (#992), and the web login hashes with the admin mutex released (#996).
+- `setSlot` and the telephony test dial refuse an emergency `routeDn`, so a test dial can no longer place a 911 through the anchor (#1047).
+
+### Call legs
+
+- Plain direct calls and forwarded CFU, CFB and CFNA legs are bounded by the ring time and CANCEL the callee (#1022, #1025). A no-answer forward CANCELs the ringing callee (#1013). Each extension has a no-answer timeout, default 20 s (#1010).
+- A 440 tone call ends after 600 s (#1038; bench on .244 against `3b74bc2a`). An 888 conference leg whose phone stopped sending RTP is ended (#1014).
+- PBX-built 480s carry a To tag (#1028; benched on hardware at `2993c0dc`).
+- A session in Cancel state whose callee never answers the forwarded CANCEL is ended after 32 s, and the caller gets its 487 (#1049; host-tested, bench owed).
+- Splice failures re-ACK a retransmitted 200 and BYE the refusing leg (#927, #928). Pickup absorbs the caller and picker ACKs on bridged sessions (#916). A leg the PBX dropped is never announced as an inbound call (#883). An oversize From or To is refused at ingress so a BYE can always be built (#931).
+
+### Memory, stack and HTTP
+
+- HTTP: the per-connection read buffer comes from PSRAM (#974); 3 concurrent connections, 2 per source, and the 4th gets 503 (#981); parser depth is 5 (#917).
+- Persistence: one `flash_writer` task for the CDR ring and the NVS writer (#1012); NVS writes for device adoption, DID mappings, config import and the telephony config move off the SIP thread's lock (#990, #995, #1015).
+- Boot checks every `xTaskCreate` in `main/` (#1019). The SD sweeps feed the task watchdog (#1018). No CDR line or voicemail reaches the SD card after a factory reset's wipe (#855).
+- Ethernet: `CONFIG_ETH_TRANSMIT_MUTEX` is on (#1002) and a failed L2 transmit is retried once (#1001).
+- A firmware upload is refused while a call is live, with HTTP 409 (#1037). A coredump erase is refused the same way (#1045).
+
+### SIP
+
+- `Supported: timer` is advertised (#914). 100rel and PRACK are honoured on the 777 echo (#953), and an optional 100rel takeover on a forwarded extension call is available, default off (#960).
+- The URI of a name-addr with a stray quote is parsed correctly (#857). `SipMessageBuilder` builds OPTIONS and BYE without heap (#763, #869).
+
+### Registrar, devices and features
+
+- Learn mode: a locked phone's REGISTER after a reboot is no longer refused for an expired ARP entry (#867); an unlocked row never moves and the device API refuses an ambiguous extension (#852); `GET /api/registrar` and the dashboard show locked and shared devices (#887).
+- Mailbox counts are seeded from the SD card at boot, as new (#1039). An offline authenticated voicemail extension stays off the trunk in SBC mode (#1027).
+- Host-only: IVR digit-menu state machine (#944). Conference VAD gating, default off (#957).
+
+### Trunk and build
+
+- The inbound carrier path exists and is experimental (#847, #848, #849, #850). The trunk is compiled out when disabled (#922), and the constrained build is anchor-only; `SIP_OUTSIDE_LINE=trunk` is refused at configure time (#933).
+
+### Tools, bench and docs
+
+- Bench probe, fault-injection runner and the anchor scenarios (#868, #881, #925, #959, #980, #1041). The harness refuses a dial that could leave the board through the anchor (#1032). The probe is never in a release image (`tools/ci/check_no_bench_probe.py`).
+- Docs: ADR-002 for the programmable media anchor (#923), the E911 compliance audit (#926), design notes for federation, HTTPS dashboard, far-leg adapter and ring pool (#963 to #966), and a restyled site and README (#1000, #1004, #1008, #1017).
+
+### Known gaps
+
+- An inbound PSAP callback via the anchor can be dropped while the media bridge is busy (#967, Rule 5). Accepted for this release and fixed in v1.7.0. Do not rely on this unit as the only callback path.
+- The session-timer strip still breaks callers that send `Require: timer` on 777, 888, 997, voicemail, park, the trunk handset answer and the async anchor answer (#1042).
+- The 440 and call-pickup answers still strip `Session-Expires` for every caller, including a caller that sends `Require: timer`, which then hangs up; the fix is held for v1.7.0 (#739, #1034). A config export does not yet restore MAC bindings (#483, #1036; v1.9.0).
+- A far-side or loopback-only board has no 911 route: 911 and 933 get `503 Emergency Call Not Routable` and the Kari's Law notification (#1046).
+- A telephony slot saved by an older build with an emergency `routeDn` still loads at boot. This release refuses saving one and test-dialing one (#1047); it does not refuse loading one.
+- `http_conn` has 128 B of stack headroom on `GET /api/config/export` (#1044). A TASK_WDT was seen under an OTA upload with orphaned 888 legs (#1016). The 20-tombstone voicemail cap can light phantom messages (#1043). The heap audit lists 85 high-severity allocation sites on call paths (#1048).
+- Hardware evidence is two boards: .244 (LilyGO T-ETH-Elite) and .195 (Waveshare ESP32-S3-ETH). There is no Waveshare release image; build it from source with `PD_ETH_BOARD=waveshare`.
 
 ## v1.5.1 — 2026-10-03
 
