@@ -1116,6 +1116,17 @@ public:
 	bool forgetDevice(const std::string& macOrExt);
 	// #515: forget every Learned device at once; Secured ones stay. Thread-safe + persisted.
 	size_t forgetLearnedDevices();
+	// #483: replace the whole device table with a restored config export's rows, all or
+	// nothing (Registrar::replaceDevices; only the Owner-gated import calls this), in ONE
+	// _mutex hold with one persist and one snapshot rebuild. Each extension must pass what
+	// onRegister() demands before it adopts one: the AOR charset and length, the engine's
+	// service names, the reserved / emergency / PSTN-shaped identities. `hasSecret` says
+	// whether an extension has a stored digest secret AS THE CALLER WILL LEAVE THE STORE,
+	// so a Secured row is judged with the secrets that come with it. `faults` may already
+	// hold rows the caller could not read; with any fault left on return (Refused) the table
+	// is untouched, and so it is for NotStaged. Thread-safe + persisted.
+	Registrar::ReplaceResult replaceBindings(const std::vector<Registrar::Binding>& rows,
+		FunctionRef<bool(const std::string&)> hasSecret, std::vector<Registrar::BindingFault>& faults);
 
 private:
 	void initHandlers();

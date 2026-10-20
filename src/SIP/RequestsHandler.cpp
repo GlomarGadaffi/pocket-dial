@@ -10680,6 +10680,29 @@ size_t RequestsHandler::forgetLearnedDevices()
 	return removed;
 }
 
+Registrar::ReplaceResult RequestsHandler::replaceBindings(const std::vector<Registrar::Binding>& rows,
+	FunctionRef<bool(const std::string&)> hasSecret, std::vector<Registrar::BindingFault>& faults)
+{
+	// What onRegister() demands before it adopts an extension: the charset and length, then
+	// the engine's own service names (a REGISTER as "pbx" is refused 403, so a row for one
+	// can never have existed, and findProvisioningInfo() would serve it a config), then the
+	// reserved, emergency and PSTN-shaped identities. A restored file gets no weaker checks.
+	auto extensionOk = [this](const std::string& ext) {
+		return isValidAor(ext) && !pbx::isServiceName(ext) && !pbx::isReservedOrPstnAor(ext);
+	};
+	std::vector<std::pair<bool, std::string>> localLogs;
+	Registrar::ReplaceResult result = Registrar::ReplaceResult::Refused;
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		result = _registrar.replaceDevices(rows, extensionOk, hasSecret, faults);
+		applyDeviceChange(_registrar.consumeDevicesChange());
+		localLogs = std::move(_logQueue);
+		_logQueue.clear();
+	}
+	printLogs(localLogs);
+	return result;
+}
+
 // ── Outbound SIP MESSAGE (STAGE 2) ────────────────────────────────────────────
 
 bool RequestsHandler::sendMessageTo(const std::string& ext, const std::string& text)

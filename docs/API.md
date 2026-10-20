@@ -647,9 +647,12 @@ A single-file JSON backup/restore for the whole device, split into an
 (AES-256-GCM, PBKDF2-SHA256-derived key, 200000 iterations). See
 `src/Helpers/HttpServer.cpp`'s `sendApiConfigExport()`/`sendApiConfigImport()` for the
 authoritative field-by-field accounting of what is plaintext, what is gated, and the
-two data gaps neither direction can close (per-extension digest secrets and
-MAC bindings export but cannot import; a trunk slot's client secret is never exported
-at all).
+one thing neither direction carries on purpose: a telephony client secret is never
+exported (a second board given the first one's secret would connect as the same device
+and fight it for the control WebSocket), so the import names it under `skipped` and it
+is entered again on the board. The per-extension digest secrets and the MAC bindings
+(each with its lock) travel only in the password-encrypted block, and an Owner-level
+import restores them.
 
 ### `GET /api/config/export`
 
@@ -670,8 +673,12 @@ curl -s "http://$DEV/api/config/export" -b "pd_session=$SESSION" > backup.json
 
 Same plaintext body as the `GET`, plus (only when `password` is non-empty) an
 encrypted `secretsEnc` block carrying the Wi-Fi upstream password, the SoftAP WPA2
-passphrase, and each telephony-trunk slot's `baseUrl`/`clientId`/`routeDn` (never the
-slot's secret; see the data gaps above). **Owner-gated, but only when a
+passphrase, each telephony-trunk slot's `baseUrl`/`clientId`/`routeDn` (never the
+slot's secret; see above), each secured extension's digest secret, the trunk and SMTP
+passwords, and the MAC bindings: one `["<mac>","<extension>",<state 0|1>,<flags>]` row
+each, in adoption order (the order decides which phone holds an extension's first
+claim), with `flags` bit 0 = locked and bit 1 = shared; about 27 bytes a row, 28 with
+its comma, before the encryption doubles it into hex. **Owner-gated, but only when a
 non-empty `password` is sent**; an empty/absent `password` behaves exactly like the
 `GET` (sysop-level, plaintext only), so a single dashboard form can drive both.
 
@@ -699,8 +706,23 @@ curl -s -X POST "http://$DEV/api/config/export" \
 
 Restores config from a blob produced by either export route above.
 Replace-not-merge: for every table this can restore (ring groups, call-forward,
-DND, page zones, dial plan, DID mappings), an entry present on the device but absent
-from the blob is **removed**, not left behind. Sysop-level, with its own `confirm=REPLACE` interlock. It is owner-only when `password` is non-empty (see [Two-Role Privilege Model](#two-role-privilege-model-issue-173)).
+DND, page zones, dial plan, DID mappings, and the MAC bindings), an entry present on the
+device but absent from the blob is **removed**, not left behind. The MAC bindings are
+restored only from the password-encrypted block, and **all or nothing**: every row is
+checked first (MAC form, extension, duplicate MAC, a Secured row's digest secret, the
+table's capacity), and if any is refused, or the device table cannot be staged for flash,
+the table is left exactly as it was and one `skipped` entry names the rows (`row 3
+extension`) by number and reason class, never by value. A file whose list is empty
+clears the table; a file with no list (an encrypted export from before bindings
+travelled in it) leaves it alone and says so. The block's digest-secret list and its
+bindings list stand or fall together: the secrets are written only if the bindings list
+was not refused, so a refused list changes neither the table nor the stored secrets
+(`extensionSecrets (not applied ...)`) and `secure` is not applied. The rest of the
+block (the Wi-Fi password, the AP passphrase, the telephony slot fields, the trunk and
+SMTP secrets) and the readable part are applied either way and are not rolled back. A
+failed flash write after the table is staged is not rolled back either. Locked and Secured rows come back exactly as the source board had them,
+so a phone with a different MAC (a replacement) is refused its extension until that row
+is forgotten; the import says so under `skipped`. Sysop-level, with its own `confirm=REPLACE` interlock. It is owner-only when `password` is non-empty (see [Two-Role Privilege Model](#two-role-privilege-model-issue-173)).
 
 * Requires Same-Origin Check + CSRF Token: Yes
 * Requires `pd_session` cookie: Yes (sysop)
@@ -711,17 +733,22 @@ from the blob is **removed**, not left behind. Sysop-level, with its own `confir
   * `confirm` (Required): must be the literal string `REPLACE`.
 * Response Content-Type: `application/json`
 * Response Status Codes:
-  * `200 OK`: `{"status":"ok","applied":[...],"skipped":[...]}`. For `forwards`, `didMappings` and `telephonyConfig`, `applied` means accepted and staged for the NVS writer, not yet on flash (see the notes under [`POST /api/forward`](#post-apiforward), [`PUT /api/did-mapping`](#put-apidid-mapping) and [`PUT /api/telephony-config/<slot>`](#put-apitelephony-configslot) for the power-fail window); the burst of per-entry writes an import makes coalesces into one flash write, the last table, for as long as the writer has not yet taken the previous one (it runs at priority 1 and may wake between entries under light load, in which case an intermediate table is written first; the last table is always written last). An import never carries or changes a telephony client secret, so it writes none. (#1073) Nor does it carry an acceptance of the limitations, so it cannot enable a slot that is not already enabled and accepted on this board: such a slot is imported **disabled** and listed under `skipped` (`telephonyConfig slot N (imported disabled: Acceptance required: ...)`); a slot already enabled without an acceptance is left exactly as it is (`left unchanged`). The other settings an import applies (ring groups, voicemail, page zones, dial plan, registrar mode, E911, admin extension) are still written to flash before their setter returns. The response is not a bare `204`. This feature cannot restore everything a plaintext-capable export can carry, and a bare `204` would tell the operator "fully restored" when it was not.
+  * `200 OK`: `{"status":"ok","applied":[...],"skipped":[...]}`. For `forwards`, `didMappings` and `telephonyConfig`, `applied` means accepted and staged for the NVS writer, not yet on flash (see the notes under [`POST /api/forward`](#post-apiforward), [`PUT /api/did-mapping`](#put-apidid-mapping) and [`PUT /api/telephony-config/<slot>`](#put-apitelephony-configslot) for the power-fail window); the burst of per-entry writes an import makes coalesces into one flash write, the last table, for as long as the writer has not yet taken the previous one (it runs at priority 1 and may wake between entries under light load, in which case an intermediate table is written first; the last table is always written last). An import never carries or changes a telephony client secret, so it writes none. (#1073) Nor does it carry an acceptance of the limitations, so it cannot enable a slot that is not already enabled and accepted on this board: such a slot is imported **disabled** and listed under `skipped` (`telephonyConfig slot N (imported disabled: Acceptance required: ...)`); a slot already enabled without an acceptance is left exactly as it is (`left unchanged`). The MAC bindings (`extensions`) are staged the same way: `applied` means the device table is accepted and staged, and a table the writer refuses is reported under `skipped`, not claimed. The other settings an import applies (ring groups, voicemail, page zones, dial plan, registrar mode, E911, admin extension) are still written to flash before their setter returns. The response is not a bare `204`. This feature does not restore everything an export can carry (MAC bindings and digest secrets only from a password-encrypted file, a telephony client secret and provider type never), and a bare `204` would tell the operator "fully restored" when it was not.
   * `400 Bad Request`: `{"error":"import requires confirm=REPLACE"}` / `"missing blob parameter"` / `"malformed export blob"` / `"export blob is missing a plaintext object"` / `"unsupported exportVer"` / `"malformed secretsEnc block"`.
   * `422 Unprocessable Entity`: `{"error":"bad password or corrupted secrets block"}`. A wrong password and a tampered/corrupted `secretsEnc` block are **deliberately indistinguishable** (the GCM tag check fails identically either way). A `400`/`422` leaves the device completely untouched; the whole blob is validated (and decrypted, if a password was given) before the first setter runs.
   * `401`/`403`: gates 1-3 as in §0.1.
 
 Switching the registrar to `secure` mode via an imported blob is refused (reported
-`skipped`, not an error) when the device has no secured extensions after the
-import (the same guard [`POST /api/registrar`](#post-apiregistrar) already applies to
-a live switch), since restoring `secure` onto a board whose per-extension digest
-secrets could not be restored (see the data gaps above) would digest-challenge every
-`REGISTER` with no working handset left to notice.
+`skipped`, not an error) when no secured extension on the device has a stored digest
+secret after the import (the live switch, [`POST /api/registrar`](#post-apiregistrar),
+counts secured extensions only), since restoring `secure` onto a board whose secured
+extensions could not be restored (a plaintext-only import carries neither their MAC
+bindings nor their digest secrets) would digest-challenge every `REGISTER` with no
+working handset left to notice. A Secured row left without a secret is named under
+`skipped`. The mode is decided last, after the bindings and digest secrets, so an
+Owner-level import of an encrypted file brings the Secured rows back first and `secure`
+applies. It is not applied at all when the file's bindings list was refused: the board's
+table is then not the one the file's `secure` was made for.
 
 ```bash
 curl -s -X POST "http://$DEV/api/config/import" \

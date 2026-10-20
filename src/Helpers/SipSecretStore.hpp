@@ -71,6 +71,11 @@ namespace SipSecretStore
 	// setSecret(); false on an invalid extension or a malformed HA1.
 	bool setHa1(const std::string& ext, const std::string& ha1);
 
+	// True iff setHa1(ext, ha1) would accept the pair on validation grounds (a failed
+	// write aside). Touches nothing: the config import checks a whole file, bindings
+	// and secrets together, before it changes either store (#483).
+	bool isValidHa1Entry(const std::string& ext, const std::string& ha1);
+
 	// Generate a fresh random secret for `ext`, store its HA1, and return the
 	// PLAINTEXT secret (the only chance to read it — only HA1 is persisted) so the
 	// caller can show/deliver it. Returns std::nullopt on failure.
