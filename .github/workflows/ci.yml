@@ -732,10 +732,22 @@ jobs:
   # and is never the shipping build's) stays incremental. The only `needs` is
   # site-gate, like the other leaf jobs, and nothing waits for this job.
   #
-  # Expected red on its first runs (library callees with no library_defaults row,
-  # frames that moved since the allowlist was written; #457). A signal, not a
-  # gate: do not add it to a required-checks list (desmo 2026-10-09), and there
-  # is no continue-on-error to hide the red. It uploads nothing.
+  # What red means. The first run (PR #1031) printed 261 FAIL lines. Almost all
+  # were not project problems: prebuilt libc/libstdc++/ROM callees with no frame
+  # data, recursion cycles in IDF, lwIP and mbedtls, dynamic frames in mdns, and
+  # a constructor template the C1/C2 alias rule missed. Those are modelled now in
+  # tools/ci/task_stacks.json, each row with its provenance; estimates say so.
+  # Two findings stay red on purpose:
+  #   * http_conn: 4768 B + 512 B margin against its 4096 B stack. 2048 B of that
+  #     is the newlib snprintf estimate at the end of the chain (sendApiKill ->
+  #     forceDisconnect -> endCall -> cdrarchive::record -> formatLine ->
+  #     formatRfc3339), so read stackHwm_http_conn before changing the stack.
+  #   * smtp_worker, tel_maint, tel_wsw: cJSON's parser and cJSON_Delete recurse
+  #     to its nesting limit, 1000, which no stack here holds. Lowering
+  #     CJSON_NESTING_LIMIT in the build lowers the two recursion rows.
+  # A signal, not a gate: do not add it to a required-checks list (desmo
+  # 2026-10-09), and there is no continue-on-error to hide the red. It uploads
+  # nothing.
   stack-depth-gate:
     name: Stack Depth Gate (esp32s3 / eth, #457)
     runs-on: ubuntu-latest

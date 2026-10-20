@@ -78,7 +78,15 @@ An alias is not a missing frame: GCC emits one body for the complete- and
 base-object constructor (C1/C2) and destructor (D1/D2) and reports the C1/D1
 name as a node with no frame and an edge to the body. Such a node is a 0 B
 pass-through, but only when it calls a C2/D2 title that has a frame; any other
-frameless node is still unknown, not zero.
+frameless node is still unknown, not zero. That includes a constructor template,
+whose C1I<args> title aliases its C2I<args> body the same way.
+
+library_defaults charges a callee GCC never saw defined (prebuilt newlib, libgcc,
+libstdc++, ROM): a figure per name pattern, each with its provenance in
+_library_defaults_reasons. A figure is measured only where its reason says so;
+the rest are estimates of the callee's frame plus the prebuilt code below it,
+which this walk cannot see. Estimates are conservative, never 0 without a stated
+reason, and stackHwm_* stays the ground truth.
 """
 
 import argparse
@@ -148,15 +156,17 @@ def is_project(label, roots):
     return False
 
 
-ALIAS_RE = re.compile(r"([CD])1E")   # Itanium C1/D1 right before the nested name's end
+# Itanium C1/D1, followed by the nested name's end (E) or a constructor template's arguments (I).
+ALIAS_RE = re.compile(r"([CD])1(?=[EI])")
 
 
 def alias_body(title, edges, frames):
     """The C2/D2 title that this C1/D1 title is an alias of, or None. Only when the
     alias calls it and it has a frame, so an unknown function never reads as 0 B.
-    D0 (the deleting destructor) is a function of its own and never matches."""
+    D0 (the deleting destructor) is a function of its own and never matches. A
+    constructor template mangles as C1I<args>E<params>, not C1E<params>."""
     for m in ALIAS_RE.finditer(title):
-        body = title[:m.start()] + m.group(1) + "2E" + title[m.end():]
+        body = title[:m.start()] + m.group(1) + "2" + title[m.end():]
         if body in frames and body in edges.get(title, ()):
             return body
     return None
