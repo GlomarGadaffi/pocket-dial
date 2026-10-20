@@ -1972,10 +1972,14 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 	// #1049: only a call still ringing gets the bounded wait for the callee's 487. setCallState()
 	// does not guard the transition, so the state is read here. Anything else (answered, refused)
 	// has no ring to bound, and its timer is cleared rather than left to fire into a Cancel.
+	// A retransmitted CANCEL (state already Cancel) leaves the timer alone: it neither clears the
+	// bound the first CANCEL armed nor pushes it out, so a retransmit every T1 cannot keep a call
+	// alive or disarm the reap.
 	const bool stillRinging = cancelSess.has_value() && cancelSess.value()->getState() == Session::State::Invited;
+	const bool alreadyCancelling = cancelSess.has_value() && cancelSess.value()->getState() == Session::State::Cancel;
 	setCallState(data->getCallID(), Session::State::Cancel);
 	setCallDisposition(data->getCallID(), Session::Disposition::Cancel);
-	if (cancelSess.has_value())
+	if (cancelSess.has_value() && !alreadyCancelling)
 	{
 		if (stillRinging) cancelSess.value()->armRingTimer(std::chrono::steady_clock::now() + kCancelBoundedWait);
 		else cancelSess.value()->clearRingTimer();

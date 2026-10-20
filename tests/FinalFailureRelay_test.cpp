@@ -692,6 +692,43 @@ TEST(FinalFailureRelay, AnEmergencyCancelIsNotEndedByTheBoundedWait)
 		<< "no 487 goes to the emergency caller";
 }
 
+// Guard, green after the fix: once the bounded wait has ended the call, the callee's late 487
+// and a stray CANCEL find no session and send nothing more (teardown runs exactly once).
+TEST(FinalFailureRelay, ALate487OrCancelAfterTheBoundedReapSendsNothingMore)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.50.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.50.20");
+	const sockaddr_in calleeAddr = addrFor("192.168.50.21");
+	handler.handle(makeRegister("401", "192.168.50.20", "reg-401"));
+	handler.handle(makeRegister("402", "192.168.50.21", "reg-402"));
+	handler.handle(makeInvite("401", "402", "192.168.50.20", "cb-5", "z9hG4bKcb5"));
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-5", "z9hG4bKcb5"));
+
+	auto session = handler.getSession("Call-ID: cb-5");
+	ASSERT_TRUE(session.has_value());
+	session.value()->armRingTimer(TestClock::now() - std::chrono::seconds(1));
+	handler.forceNextTickForTest();
+	handler.tick();
+	ASSERT_FALSE(handler.getSession("Call-ID: cb-5").has_value()) << "reaped at 32 s";
+
+	sent.clear();
+	handler.handle(makeFinal(487, "401", "402", "192.168.50.20", "192.168.50.21",
+		"cb-5", "z9hG4bKcb5"));
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-5", "z9hG4bKcb5"));
+	handler.forceNextTickForTest();
+	handler.tick();
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 487"), 0)
+		<< "no second 487 reaches the caller after the reap";
+	EXPECT_EQ(countSentTo(sent, callerAddr, "BYE "), 0);
+	EXPECT_EQ(countSentTo(sent, calleeAddr, "BYE "), 0)
+		<< "no BYE or drop follows a reaped call";
+	EXPECT_FALSE(handler.getSession("Call-ID: cb-5").has_value());
+}
+
 // Guard, green on main and after the fix: the callee's 487 ends the call through the
 // relay, and the bounded wait afterwards sends nothing more and leaves nothing behind.
 TEST(FinalFailureRelay, TheCalleesRequestTerminatedEndsACancelledCallWithNoSecond487)
