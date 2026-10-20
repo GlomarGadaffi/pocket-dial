@@ -570,8 +570,9 @@ the S1 pin and the far-end check, which are made against the board:
 `Agent.invite()` raises `DialRefused`, before anything is sent, for a target that could leave the board through
 the anchor (in SBC mode an unregistered, unclaimed string does; 2026-10-19: about ten calls to `+6102`).
 Allowed: an extension a UA of this process registered; the PBX's service numbers (777, 888, 440, 796, 997, 999, park
-700-709, page 980-989 if the zone is configured, `*8`, `**<ext>`); extensions named by `Agent.allow_targets()` or
-`SIP_AGENT_ALLOW_TARGETS`. 911, 933, 112, 113 and 555 (the anchor bridge) are refused whatever is listed. A leading
+700-709, `*8`, `**<ext>`); extensions named by `Agent.allow_targets()` or `SIP_AGENT_ALLOW_TARGETS`, which is also how
+a page zone (980-989) is allowed: the board claims a zone only when it is configured, so none is allowed by default.
+911, 933, 112, 113 and 555 (the anchor bridge) are refused whatever is listed. A leading
 `+` or 7 or more digits is refused unless that exact string is opted in with `Agent.allow_outside()` or
 `SIP_AGENT_ALLOW_OUTSIDE`; `anchor_scenarios.py` opts in its own far end(s) once, where it builds its agents.
 Self-test: `tests/tools/test_sip_agent_dial_guard.py`. `sip_stress.py`'s own UA can only INVITE 777.

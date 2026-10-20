@@ -34,8 +34,10 @@ ENV_TARGETS = "SIP_AGENT_ALLOW_TARGETS"
 ENV_OUTSIDE = "SIP_AGENT_ALLOW_OUTSIDE"
 SERVICE = ("777", "888", "440", "796", "997", "999",
            "700", "701", "702", "703", "704", "705", "706", "707", "708", "709",
-           "980", "981", "982", "983", "984", "985", "986", "987", "988", "989",
            "*8", "**6101")
+# The board claims a page zone only when it is configured; an unconfigured one falls through to normal routing,
+# which in SBC mode is the anchor (RequestsHandler.cpp:2670-2680). So no zone is allowed unless listed.
+PAGE_ZONES = tuple("98%d" % i for i in range(10))
 
 
 class Reached(Exception):
@@ -188,6 +190,15 @@ class TargetAllowedTest(unittest.TestCase):
                 self.assertTrue(ok)
                 self.assertIn("service", why)
 
+    def test_a_page_zone_is_refused_unless_it_is_listed(self):
+        for t in PAGE_ZONES:
+            with self.subTest(target=t):
+                ok, why = sip_agent.target_allowed(t, set(), (), ())
+                self.assertFalse(ok)
+                self.assertIn("not registered", why)
+                self.assertTrue(sip_agent.target_allowed(t, set(), {t}, ())[0], "a listed zone is allowed")
+        self.assertFalse(sip_agent.target_allowed("985", set(), {"986"}, ())[0], "one zone does not open the others")
+
     def test_numbers_next_to_a_service_range_are_not_service_numbers(self):
         # 555 is the anchored-media bridge: dialing it hands the call to the anchor.
         for t in ("555", "710", "699", "979", "990", "70", "7000", "98", "9800", "**", "*", "#", "**ab", "*80", "88"):
@@ -224,6 +235,19 @@ class InviteGuardTest(GuardCase):
         for t in SERVICE:
             with self.subTest(target=t):
                 self.allow(t)
+
+    def test_a_page_zone_is_refused_with_no_opt_in_and_allowed_only_when_listed(self):
+        e = self.refuse("985")
+        self.assertIn("985", str(e))
+        self.assertIn("not registered", str(e))
+        self.caller.allow_targets("985")
+        self.allow("985")
+        self.refuse("986")                 # listing one configured zone does not open the others
+        self.refuse("985", agent=make_agent("6105"))
+        os.environ[ENV_TARGETS] = "986,987"
+        self.allow("986")
+        self.allow("987")
+        self.refuse("988")
 
     def test_emergency_and_never_dial_numbers_are_refused_even_when_listed_everywhere(self):
         self.caller.allow_targets(*NEVER)

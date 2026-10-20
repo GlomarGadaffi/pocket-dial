@@ -37,9 +37,10 @@ keeps the behaviour above:
 
 Dial guard (target_allowed): invite() raises DialRefused, before anything is built or sent, for a target that
 could leave the board through the anchor. Allowed: an extension a UA of this process registered; the PBX's own
-service numbers (SERVICE_LITERALS, park 700-709, page 980-989 if the zone is configured, *8, **<ext>); extensions
-named by allow_targets() or SIP_AGENT_ALLOW_TARGETS. 911, 933, 112, 113 and 555 (the anchor bridge) are refused
-whatever is listed. A leading '+' or 7 or more digits is an outside number: refused unless that exact string was
+service numbers (SERVICE_LITERALS, park 700-709, *8, **<ext>); extensions named by allow_targets() or
+SIP_AGENT_ALLOW_TARGETS, which is also how a page zone (980-989) is allowed: the board claims a zone only when it
+is configured, so none is allowed by default. 911, 933, 112, 113 and 555 (the anchor bridge) are refused whatever
+is listed. A leading '+' or 7 or more digits is an outside number: refused unless that exact string was
 opted in with allow_outside() or SIP_AGENT_ALLOW_OUTSIDE (the approved anchor runs do it for their far end).
 A re-INVITE inside a dialog is no new call.
 
@@ -97,9 +98,11 @@ FIRMWARE_RESERVED_REFUSED = frozenset(("555", "911", "933"))
 # 700-709: park orbits, POCKETDIAL_PARK_SLOTS = 10 (src/SIP/PoolConfig.hpp:125-126; DialPlan.hpp:198-207;
 # RequestsHandler.cpp:2724-2733). A board built with fewer slots does not claim the top ones.
 PARK_ORBITS = frozenset("70%d" % i for i in range(10))
-# 980-989: paging zones (PbxConfig.hpp:226-232; RequestsHandler.cpp:2670-2680). UNSURE: a zone is claimed only
-# when it is configured on the board; an unconfigured 98x falls through to normal routing, which in SBC mode is
-# the anchor. The guard cannot see the board's zones: list only zones that are configured.
+# 980-989: paging zones (PbxConfig.hpp:226-232; RequestsHandler.cpp:2670-2680). NOT allowed by default: the board
+# claims a zone only when it is configured (`_cfg.findPageZone`); an unconfigured 98x falls through to normal
+# routing, which in SBC mode is the anchor. The guard cannot see the board's zones, so a zone is refused unless
+# it is listed with allow_targets() or SIP_AGENT_ALLOW_TARGETS. The range is kept here only so the drift test
+# can pin it to the firmware's isPageZoneExt().
 PAGE_ZONES = frozenset("98%d" % i for i in range(10))
 # *8 group pickup and **<ext> directed pickup: always answered locally (PbxConfig.hpp:363-378;
 # RequestsHandler.cpp:2735-2759; PHONE_COMPATIBILITY.md:100).
@@ -142,8 +145,8 @@ def _outside_looking(s):
 
 
 def _is_service(s):
-    return (s in SERVICE_LITERALS or s in PARK_ORBITS or s in PAGE_ZONES or s == PICKUP_GROUP
-            or _DIRECTED_PICKUP.fullmatch(s) is not None)
+    return (s in SERVICE_LITERALS or s in PARK_ORBITS or s == PICKUP_GROUP
+            or _DIRECTED_PICKUP.fullmatch(s) is not None)      # not PAGE_ZONES: see there
 
 
 def target_allowed(target, registered, extra=(), outside=()):
