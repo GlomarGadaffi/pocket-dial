@@ -190,7 +190,7 @@ size_t listIndexFile(std::FILE* f, MessageInfo* out, size_t maxCount)
 
 		const long resume = std::ftell(f);
 		const bool dead = indexFileHasTombstone(f, info.name);
-		std::fseek(f, resume, SEEK_SET);
+		if (resume < 0 || std::fseek(f, resume, SEEK_SET) != 0) break;   // cannot resume the walk
 		if (dead) continue;
 
 		if (out != nullptr) out[count] = info;   // #756: nullptr = count only
