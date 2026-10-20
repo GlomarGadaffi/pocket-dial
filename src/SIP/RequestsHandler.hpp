@@ -1604,6 +1604,10 @@ private:
 	// one-way RTP tone stream to the caller's RTP address. ONE concurrent stream: a
 	// 2nd dial while busy is rejected 486 Busy Here. Caller holds _mutex.
 	void onMediaInvite(std::shared_ptr<SipMessage> data, const std::shared_ptr<SipClient>& caller);
+	// #1003: BYE the phone and end the 440 tone call once it has run k440MaxCallDuration
+	// (600 s, desmo's ruling), so an orphaned call frees the one RtpSender slot. Caller
+	// holds _mutex.
+	void sweepToneCall(std::chrono::steady_clock::time_point now);
 
 	// ── Local N-way conference: virtual extension 888 (server-mixed RTP) ─────────
 	// onInvite() routes a dial of 888 here (Issue #75). The server answers 200 OK
