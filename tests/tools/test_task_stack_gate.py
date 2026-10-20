@@ -248,7 +248,10 @@ class Gate(unittest.TestCase):
         self.assertEqual([t["entry"] for t in table["tasks"] if (t["entry"] or "").startswith("^")], [])
 
     def test_checked_in_allowlist_covers_the_measured_frames(self):
-        # Project frames over the ceiling on the Xtensa eth image (#457, #685 @ ebdc919).
+        # Project frames over the ceiling on the Xtensa eth image (#457): the first 11 from the
+        # run on #685 @ ebdc919 (2026-09-29), the last 7 from the combined-tree run of 2026-10-04
+        # (issue comment 5976074325). No .ci was at hand for the 7: their labels are written from
+        # the source signatures, which is all the allowlist's `Class::name(` keys match on.
         table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
         big = [("sdp::Verdict sdp::parse(std::string_view, Session&)", 3488),
                ("SmtpDialogue::SendResult SmtpDialogue::run(Transport&, const Config&, const Message&)", 3408),
@@ -262,7 +265,15 @@ class Gate(unittest.TestCase):
                ("bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>&)", 1184),
                ("virtual bool TelephonyAnchorClient::writeAudio(std::string_view, const int16_t*, size_t)", 1120),
                ("bool HoldMusic::loadClip(const std::string&)", 1088),
-               ("void RequestsHandler::onRefer(std::shared_ptr<SipMessage>)", 1056)]
+               ("void RequestsHandler::onRefer(std::shared_ptr<SipMessage>)", 1056),
+               ("void RequestsHandler::relayIntoPeerDialog(const std::shared_ptr<SipMessage>&, "
+                "const std::shared_ptr<Session>&)", 1648),
+               ("void HttpServer::sendApiConfigExport(int, bool, const std::string&)", 1392),
+               ("bool SipTrunk::handleCancel(const std::shared_ptr<SipMessage>&)", 1248),
+               ("void SipTrunk::releaseAsTimeout(SipTrunk::Dialog&)", 1152),
+               ("void RequestsHandler::onBye(std::shared_ptr<SipMessage>)", 1120),
+               ("bool RequestsHandler::handleSpliceResponse(const std::shared_ptr<SipMessage>&)", 1072),
+               ("void HttpServer::sendApiConfigImport(int, const std::string&)", 1040)]
         self.put(os.path.join(self.ci, "x.ci"), "".join(node(f"f{i}", n, b) for i, (n, b) in enumerate(big)))
         open(os.path.join(self.tmp.name, "src", "SIP", "X.cpp"), "w").write("")
         self.table = {"margin_bytes": 512, "frame_ceiling_bytes": table["frame_ceiling_bytes"],
