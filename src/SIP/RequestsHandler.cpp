@@ -3164,6 +3164,7 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	}
 
 	newSession->setDest(dummy440);
+	newSession->setToneCall(true);   // #1003: the 600 s cap keys on this; *11/*69 repoint dest at a 777 peer
 	_sessions.emplace(data->getCallID(), newSession);
 	newSession->setState(Session::State::Connected);
 
@@ -3220,7 +3221,9 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 // apart; the orphan streams 50 packets/s to a dead port and holds the one RtpSender slot
 // until the registration lease runs out. So the bound is on duration, and it ends a healthy
 // long call too. The clock is the #604 watch with no packet counter to move it, so it reads
-// pure elapsed time from the first tick that finds the call Connected. A Held call is
+// pure elapsed time from the first tick that finds the call Connected. A tone call is
+// found by Session::isToneCall(), set at setup, not by its dest: *11 and *69 over SIP INFO
+// repoint a live call's dest at a virtual 777 peer and the stream keeps the slot. A Held call is
 // disarmed by that sweep and resume restarts the clock (a 440 re-INVITE is declined, so a
 // real call never holds). A session flagged emergency is never cut (Rule 5; 911/933 never
 // use 440). Its own function so tick()'s frame does not grow (#457); noinline for the same
@@ -3236,9 +3239,8 @@ void RequestsHandler::sweepToneCall(std::chrono::steady_clock::time_point now)
 	for (const auto& entry : _sessions)
 	{
 		const std::shared_ptr<Session>& session = entry.second;
-		if (session->getState() != Session::State::Connected || session->isEmergency()) continue;
-		const auto dest = session->getDest();
-		if (!dest || dest->getNumber() != "440") continue;
+		if (!session->isToneCall() || session->getState() != Session::State::Connected ||
+		    session->isEmergency()) continue;
 		if (session->rtpSilence(0, 0, now) >= k440MaxCallDuration)
 		{
 			over = session;

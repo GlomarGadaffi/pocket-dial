@@ -98,6 +98,13 @@ public:
 	bool isVoicemail() const { return _isVoicemail; }
 	void setVoicemail(bool val) { _isVoicemail = val; }
 
+	// True for a call answered as the 440 tone (#1003, onMediaInvite()), for its whole life. Set at
+	// setup because the dest number cannot say it later: *11 and *69 over SIP INFO repoint a live
+	// call's dest at a virtual 777 peer while the tone stream goes on holding the one RtpSender slot.
+	// sweepToneCall()'s 600 s cap keys on this, never on the dest.
+	bool isToneCall() const { return _isToneCall; }
+	void setToneCall(bool val) { _isToneCall = val; }
+
 	// Which _vmLegs[]/_vmRtpReceivers[]/_vmRtpSenders[] slot this session
 	// claimed (-1 if none) -- onBye()/onCancel() need this to release the
 	// slot back to the pool; VoicemailLeg itself carries no callId until
@@ -476,6 +483,7 @@ private:
 	bool _isBroadcast = false;
 	bool _isAnchor = false;
 	bool _isVoicemail = false;
+	bool _isToneCall = false;   // #1003
 	int  _voicemailLegSlot = -1;
 	bool _isTrunk = false;
 	int  _trunkRelaySlot = -1;
