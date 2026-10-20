@@ -6631,6 +6631,7 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 		// NVS writer, so the burst of them leaves the writer one snapshot, and with
 		// keepSecret=true none of them writes a secret either: the import holds
 		// _mutex for no telephony flash I/O at all. A "" means staged, not on flash.
+		bool telRefused = false;
 		for (const auto& slot : pt->arrayOr("telephonyConfig"))
 		{
 			int idxI = slot.intOr("index", -1);
@@ -6643,9 +6644,16 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 			s.baseUrl = existing.baseUrl;
 			s.clientId = existing.clientId;
 			s.routeDn = existing.routeDn;
-			handler->setTelephonyConfigSlot(idx, s, /*keepSecret=*/true);
+			// #1060: a refusal (an emergency routeDn, an enabled slot without its identity) is
+			// reported, not listed as applied. A persist error leaves the edit live: not a refusal.
+			const std::string err = handler->setTelephonyConfigSlot(idx, s, /*keepSecret=*/true);
+			if (!err.empty() && err.rfind("Telephony config not persisted", 0) != 0)
+			{
+				skipped.push_back("telephonyConfig slot " + std::to_string(idx) + " (" + err + ")");
+				telRefused = true;
+			}
 		}
-		applied.push_back("telephonyConfig (metadata)");
+		if (!telRefused) applied.push_back("telephonyConfig (metadata)");
 	}
 	else
 	{
@@ -6693,6 +6701,7 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 
 		if (handler)
 		{
+			bool telIdRefused = false;
 			for (const auto& slot : secretsValue.arrayOr("telephonyConfig"))
 			{
 				int idxI = slot.intOr("index", -1);
@@ -6709,9 +6718,14 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 				// (SlotView masks it -- see gap 2 in sendApiConfigExport's
 				// comment). An operator restoring a trunk config re-enters
 				// that one field once, same as fresh setup.
-				handler->setTelephonyConfigSlot(idx, s, /*keepSecret=*/true);
+				const std::string err = handler->setTelephonyConfigSlot(idx, s, /*keepSecret=*/true);
+				if (!err.empty() && err.rfind("Telephony config not persisted", 0) != 0)
+				{
+					skipped.push_back("telephonyConfig slot " + std::to_string(idx) + " identity (" + err + ")");
+					telIdRefused = true;
+				}
 			}
-			applied.push_back("telephonyConfig (baseUrl/clientId/routeDn)");
+			if (!telIdRefused) applied.push_back("telephonyConfig (baseUrl/clientId/routeDn)");
 		}
 
 		// #482: per-extension digest secrets, restored from the encrypted block

@@ -19,6 +19,7 @@
 #include "TelephonyProvider.hpp"
 
 #include <cstdio>
+#include <fstream>
 #include <string>
 
 namespace
@@ -172,6 +173,39 @@ TEST_F(TelephonyApiConfigTest, EmergencyRouteDnIsRefusedEnabledOrDraft)
 	base.routeDn = "100";
 	EXPECT_EQ(_cfg.setSlot(0, base, false), "");
 	EXPECT_TRUE(_cfg.view(0).enabled);
+}
+
+TEST_F(TelephonyApiConfigTest, StoredEmergencyRouteDnIsDisabledOnLoad)
+{
+	// #1060: a store written before the #1047 refusal can hold an emergency routeDn in an
+	// enabled slot, and the boot path copies an enabled slot's routeDn into the anchor
+	// config. load() disables such a slot; a slot with a real routeDn is left alone.
+	for (const char* dn : {"911", "933", "9911", "9933", "112", "113"})
+	{
+		{
+			std::ofstream f(_path, std::ios::trunc);
+			const char* dns[] = {dn, "100"};
+			for (size_t i = 0; i < 2; ++i)
+			{
+				const std::string k = "s" + std::to_string(i);
+				f << k << "type=" << static_cast<int>(TelephonyProviderType::Telephony) << "\n"
+				  << k << "en=1\n"
+				  << k << "url=https://pbx.example.invalid\n"
+				  << k << "id=id\n"
+				  << k << "sec=sssh\n"
+				  << k << "dn=" << dns[i] << "\n";
+			}
+			f << "active=0\n";
+		}
+		TelephonyApiConfig loaded;
+		loaded.setStorePath(_path);
+		loaded.load();
+
+		EXPECT_FALSE(loaded.view(0).enabled) << "routeDn " << dn << " must load disabled";
+		EXPECT_FALSE(loaded.bootSlot(0)->enabled) << "the boot path reads bootSlot(): " << dn;
+		EXPECT_TRUE(loaded.view(1).enabled) << "a real routeDn still loads enabled";
+		EXPECT_EQ(loaded.view(1).routeDn, "100");
+	}
 }
 
 TEST_F(TelephonyApiConfigTest, SecretNeverAppearsInView)
