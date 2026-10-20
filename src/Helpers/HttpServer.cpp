@@ -3417,6 +3417,16 @@ void HttpServer::sendApiCoreDump(int sock)
 void HttpServer::sendApiCoreDumpErase(int sock)
 {
 	// Issue #382. Reached only through requireAdmin(..., needCsrf=true).
+	// #1045: the erase is a 128 KiB flash erase, which stalls every flash-resident task as an
+	// OTA flash does (#986). Refuse while any call is up or ringing, with the OTA route's check
+	// and 409 body. No engine attached means no call can exist.
+	if (RequestsHandler* h = _handler.load(std::memory_order_acquire); h && h->hasLiveCall())
+	{
+		sendResponse(sock, 409, "Conflict", "application/json",
+		             "{\"error\":\"busy\",\"message\":\"call in progress; coredump erase "
+		             "refused until no call is up or ringing\"}");
+		return;
+	}
 	const CoreDumpStore::Info info = CoreDumpStore::query();
 	if (!info.supported)
 	{
