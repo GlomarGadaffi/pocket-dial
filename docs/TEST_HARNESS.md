@@ -565,6 +565,19 @@ the S1 pin and the far-end check, which are made against the board:
 - **Ring-required:** until the far end is confirmed automated, a run against real 3CX needs
   desmo's OK for that run. The script prints this but does not enforce it.
 
+### Dial guard (`tests/load/sip_agent.py`)
+
+`Agent.invite()` raises `DialRefused`, before anything is sent, for a target that could leave the board through
+the anchor (in SBC mode an unregistered, unclaimed string does; 2026-10-19: about ten calls to `+6102`).
+Allowed: an extension a UA of this process registered; the PBX's service numbers (777, 888, 440, 796, 997, 999, park
+700-709, page 980-989 if the zone is configured, `*8`, `**<ext>`); extensions named by `Agent.allow_targets()` or
+`SIP_AGENT_ALLOW_TARGETS`. 911, 933, 112, 113 and 555 (the anchor bridge) are refused whatever is listed. A leading
+`+` or 7 or more digits is refused unless that exact string is opted in with `Agent.allow_outside()` or
+`SIP_AGENT_ALLOW_OUTSIDE`; `anchor_scenarios.py` opts in its own far end(s) once, where it builds its agents.
+Self-test: `tests/tools/test_sip_agent_dial_guard.py`. `sip_stress.py`'s own UA can only INVITE 777.
+`.smoke/office_smoke.py` has its own UA and is NOT covered by this guard (it dials 850 and 999 among others): do not
+run it against a board in SBC mode until it is.
+
 ### Evidence
 
 With `--set-syslog`, the board's syslog points at the run's UDP listener

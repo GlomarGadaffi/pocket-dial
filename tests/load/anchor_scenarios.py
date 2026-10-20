@@ -1582,7 +1582,10 @@ class AnchorRun:
             if opts.pop("rtp", False):
                 self.rtp_pump = self.rtp_pump or sip_agent.RtpPump()
                 opts["rtp_pump"] = self.rtp_pump
+            # sip_agent's dial guard refuses an outside number unless it is opted in as that exact string:
+            # this run's own far end(s) are the only ones it may dial (911/933/112/113 stay refused).
             self.agents[role] = self.agent_factory(ext, **opts) if opts else self.agent_factory(ext)
+            self.agents[role].allow_outside(*self.far_ends)
         why = self.register_all(self.a.register_expires)
         if why:
             raise run_soak.Abort("INVALID", "preflight: " + why)
