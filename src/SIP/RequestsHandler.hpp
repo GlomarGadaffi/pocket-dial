@@ -1798,6 +1798,17 @@ public:
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only: the sink wipeAllVoicemail() uses on host. Not owned.
 	void setVoicemailSinkForTest(vmarchive::Sink* sink) { _vmSinkForTest = sink; }
+#if POCKETDIAL_MWI
+	// Test-only (#756): the boot seed's arming step, run after a test has enabled
+	// voicemail on some extensions. The constructor runs the same step on the
+	// device, but only there: the persisted voicemail list it reads is empty on
+	// host at construction time. `cardMounted` is what pd_sd_mounted() answers.
+	void armMwiSeedForTest(bool cardMounted = true)
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		armMwiSeedLocked(cardMounted);
+	}
+#endif
 #endif
 	// Runs every slot's pending retrieval SD job (list/read/delete), a
 	// no-op for any slot not Pending. The ESP+PD_ETH_HAS_SD writer task
@@ -1808,12 +1819,16 @@ public:
 	// writer task needed -- same public-for-the-lambda reasoning as
 	// drainVoicemailFlush() above (a plain xTaskCreatePinnedToCore callback
 	// is not a member function and cannot reach a private method).
+	// Also runs the boot-time MWI count job (#756), if one is waiting.
 	void runVoicemailSdJobs(vmarchive::Source& source)
 	{
 		for (size_t i = 0; i < POCKETDIAL_MAX_VOICEMAIL_LEGS; ++i)
 		{
 			runVoicemailSdJob(static_cast<int>(i), source);
 		}
+#if POCKETDIAL_MWI
+		runMwiSeedJob(source);   // #756: the boot-time MWI count, if one is waiting
+#endif
 	}
 	// Test-only seam, same reasoning as RtpReceiver::dispatchDtmf() being
 	// public "so host tests can reach it": RtpReceiver::start() is a no-op
@@ -2699,6 +2714,38 @@ private:
 	};
 	VmSdJob _vmSdJob[POCKETDIAL_MAX_VOICEMAIL_LEGS];
 	std::atomic<VmSdJobState> _vmSdJobState[POCKETDIAL_MAX_VOICEMAIL_LEGS]{};
+
+#if POCKETDIAL_MWI
+	// ── Boot-time MWI seed (#756) ───────────────────────────────────────────
+	// The MWI counts are RAM-only, so after a reboot every message-waiting lamp
+	// would read "no" until the owner dialed 796. At boot each voicemail-enabled
+	// mailbox is therefore asked how many messages the card holds, and
+	// BlfSubscriptions counts them as NEW (owner ruling 2026-10-19: nothing on the
+	// card records what was heard, and none is added).
+	//
+	// ONE job slot, handed over exactly like a VmSdJob but deliberately NOT one: a
+	// VmSdJob belongs to a call's leg and carries its Call-ID. The SIP thread picks
+	// the next mailbox still waiting (BlfSubscriptions::mwiSeedNext), fills
+	// _mwiSeedExt and release-stores Pending; the vm_archive task runs a COUNT-ONLY
+	// listMessages() (no MessageInfo buffer, no message bodies), writes
+	// _mwiSeedCount and release-stores Done; the next sweepVoicemailLegs() applies
+	// the count under _mutex and issues the following mailbox. About one mailbox per
+	// 1 Hz tick, boot only. No task, no queue, no flash writer, and no heap beyond the
+	// constructor's one-shot snapshot vector and one log line per seeded mailbox:
+	// 40 bytes of members here (32-bit target) plus 2 per MWI box (64 in all).
+	std::atomic<VmSdJobState> _mwiSeedState{VmSdJobState::Idle};
+	char   _mwiSeedExt[33] = {};   // BlfSubscriptions::MwiBox::ext's size
+	size_t _mwiSeedCount = 0;
+	// Ask for the count of every voicemail-enabled mailbox -- or, with no card
+	// mounted, say so once and ask for nothing. Constructor (single-threaded) or
+	// caller holds _mutex.
+	void armMwiSeedLocked(bool cardMounted);
+	// SIP thread, from sweepVoicemailLegs(), _mutex held: apply a finished count,
+	// then hand the next waiting mailbox to the vm_archive task.
+	void pumpMwiSeed();
+	// vm_archive task: run the Pending count, if any. SD I/O, never under _mutex.
+	void runMwiSeedJob(vmarchive::Source& source);
+#endif
 
 	// This slot's fetched mailbox listing, valid once a List job for it has
 	// gone Done. Fixed-size (POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX per

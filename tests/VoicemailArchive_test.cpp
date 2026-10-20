@@ -90,7 +90,8 @@ namespace
 			{
 				if (s.deleted) continue;
 				if (count >= maxCount) break;
-				out[count++] = s.info;
+				if (out != nullptr) out[count] = s.info;   // #756: nullptr = count only
+				++count;
 			}
 			return count;
 		}

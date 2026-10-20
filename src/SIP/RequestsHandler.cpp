@@ -43,6 +43,13 @@
 #include "ArpLookup.hpp"
 #include "PsramTask.hpp"   // PD_TASK_STACK_CAPS / xTaskCreateWithCaps / vTaskDeleteWithCaps (ESP-only)
 
+#if defined(PD_ETH_HAS_SD)
+// Defined in main/esp_main_eth.cpp, which owns the card -- declared rather than
+// included, same as CdrArchive.cpp and HttpServer.cpp. #756: the MWI boot seed
+// reads the card, so it asks first whether one mounted.
+extern "C" bool pd_sd_mounted(void);
+#endif
+
 // inet_pton for the service-extension loopback address (Issue #202). RequestsHandler.hpp
 // already pulls in the platform socket header; on POSIX and Win32 the ADDRESS-CONVERSION
 // declarations live in a second header, which is what these add. lwip/sockets.h carries
@@ -745,6 +752,14 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	loadVoicemailGreeting();
 
 #if defined(PD_ETH_HAS_SD)
+#if POCKETDIAL_MWI
+	// #756: queue the boot-time MWI count for every voicemail-enabled mailbox. The
+	// list was loaded from NVS by _cfg.loadPbxConfig() above and the card was mounted
+	// before this object existed (main/esp_main_eth.cpp: sd_mount(), then the SIP
+	// task). Construction is single-threaded, so no lock; the vm_archive task below
+	// answers the requests and tick() applies the answers.
+	armMwiSeedLocked(pd_sd_mounted());
+#endif
 	// The SD-flush writer task -- mirrors CdrArchive.cpp's writerTaskBody
 	// shape (poll the queue every 200ms, drain whatever's there) but spawned
 	// HERE rather than from a free-function init(), since this queue and its
@@ -4069,6 +4084,51 @@ void RequestsHandler::runVoicemailSdJob(int slot, vmarchive::Source& source)
 	_vmSdJobState[slot].store(VmSdJobState::Done, std::memory_order_release);
 }
 
+#if POCKETDIAL_MWI
+void RequestsHandler::armMwiSeedLocked(bool cardMounted)
+{
+	if (!cardMounted)
+	{
+		// The card was decided before this object existed, so this is final: say it
+		// once and ask for nothing (an absent index.csv would count as 0 anyway).
+		queueLog("MWI: no SD card mounted, mailbox counts start at 0/0 until a deposit or a listing");
+		return;
+	}
+	// Init-time only (constructor): the snapshot vector is a one-shot allocation.
+	for (const std::string& ext : _cfg.voicemailSnapshot())
+	{
+		_blf.mwiSeedRequest(ext);
+	}
+}
+
+void RequestsHandler::runMwiSeedJob(vmarchive::Source& source)
+{
+	if (_mwiSeedState.load(std::memory_order_acquire) != VmSdJobState::Pending) return;
+	// nullptr = count only (VoicemailArchive.hpp), capped like the listing a 796 call
+	// gets, so a mailbox seeds at most POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX. A
+	// card that fails to open the index reads as 0: nothing is seeded.
+	_mwiSeedCount = source.listMessages(_mwiSeedExt, nullptr, POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX);
+	_mwiSeedState.store(VmSdJobState::Done, std::memory_order_release);
+}
+
+void RequestsHandler::pumpMwiSeed()
+{
+	if (_mwiSeedState.load(std::memory_order_acquire) == VmSdJobState::Done)
+	{
+		_blf.mwiSeedApply(_mwiSeedExt, _mwiSeedCount);
+		_mwiSeedState.store(VmSdJobState::Idle, std::memory_order_release);
+	}
+	if (_mwiSeedState.load(std::memory_order_acquire) != VmSdJobState::Idle) return;
+
+	const std::string_view next = _blf.mwiSeedNext();
+	if (next.empty()) return;
+	// MwiBox::ext is 33 bytes with its NUL, the same size as _mwiSeedExt.
+	std::memcpy(_mwiSeedExt, next.data(), next.size());
+	_mwiSeedExt[next.size()] = '\0';
+	_mwiSeedState.store(VmSdJobState::Pending, std::memory_order_release);
+}
+#endif
+
 bool RequestsHandler::handleVoicemailSdJobDone(int slot, const std::string& callID,
 	const std::shared_ptr<Session>& session)
 {
@@ -4313,6 +4373,11 @@ void RequestsHandler::sweepVoicemailLegs(std::chrono::steady_clock::time_point n
 		if (it == _sessions.end()) continue;
 		sendVoicemailBye(callID, it->second);
 	}
+
+#if POCKETDIAL_MWI
+	// #756: apply a finished boot count and hand the next mailbox to vm_archive.
+	pumpMwiSeed();
+#endif
 
 	// MWI: deposit/listen/delete above (and a deposit from a forceDisconnect()
 	// since the last packet) only moved counts; NOTIFY the changed mailboxes on

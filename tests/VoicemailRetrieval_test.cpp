@@ -139,7 +139,8 @@ namespace
 			{
 				if (s.deleted) continue;
 				if (count >= maxCount) break;
-				out[count++] = s.info;
+				if (out != nullptr) out[count] = s.info;   // #756: nullptr = count only
+				++count;
 			}
 			return count;
 		}
@@ -610,4 +611,242 @@ TEST(VoicemailMwi, UnsubscribeStopsNotifies)
 	depositFrom811(handler, "809", "192.168.47.19", "mwi-dep-4");
 	EXPECT_TRUE(findMwiNotify(sent, phone).empty())
 		<< "no NOTIFY after the phone unsubscribed";
+}
+
+// ── MWI boot seed (#756): the lamp survives a reboot ─────────────────────────
+// Desmo's ruling (2026-10-19): at boot every voicemail-enabled mailbox counts the
+// messages stored on the card as NEW, so a mailbox holding messages relights its
+// lamp until the owner dials 796. The tests stand in for the boot: nothing here
+// heard or marked anything, and the handler starts with RAM counts of 0/0.
+namespace
+{
+	// `n` stored messages for `ext` on the fake card.
+	void stockMailbox(FakeSource& source, const std::string& ext, int n)
+	{
+		for (int i = 0; i < n; ++i)
+		{
+			const std::string name = "seed" + std::to_string(i);
+			source.deposit(ext, name.c_str(), 5000 + static_cast<uint64_t>(i), "seed-call", {1, 2});
+		}
+	}
+
+	// The boot, minus the clock: arm one count-only job per voicemail-enabled
+	// mailbox, then alternate the SIP thread (sweep: consume a finished count, issue
+	// the next, one mailbox per pass) with the vm_archive task (run the job).
+	void bootSeed(RequestsHandler& handler, FakeSource& source, int mailboxes)
+	{
+		handler.armMwiSeedForTest();
+		for (int i = 0; i <= mailboxes; ++i)
+		{
+			handler.sweepVoicemailLegsForTest();
+			handler.runVoicemailSdJobs(source);
+		}
+		handler.sweepVoicemailLegsForTest();
+	}
+
+	// A phone's view of its mailbox right now: SUBSCRIBE (a fresh Call-ID each time)
+	// and read the immediate NOTIFY.
+	std::string lampNow(RequestsHandler& handler, SentList& sent, const std::string& ext,
+		const std::string& ip, const std::string& callId)
+	{
+		sent.clear();
+		handler.handle(makeMwiSubscribe(ext, ip, callId, 3600));
+		return findMwiNotify(sent, addrFor(ip));
+	}
+
+	int countOf(const std::string& hay, const std::string& needle)
+	{
+		int n = 0;
+		for (size_t p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + needle.size())) ++n;
+		return n;
+	}
+}
+
+// A phone already subscribed when the counts land is NOTIFYed by the tick.
+TEST(VoicemailMwiSeed, StoredMessagesLightASubscribedLampAsNew)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.101", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("821", "192.168.47.111", "reg-s1"));
+	handler.setVoicemail("821", true);
+	handler.handle(makeMwiSubscribe("821", "192.168.47.111", "mwi-seed-1", 3600));
+	const sockaddr_in phone = addrFor("192.168.47.111");
+	ASSERT_NE(findMwiNotify(sent, phone).find("Voice-Message: 0/0 (0/0)\r\n"), std::string::npos)
+		<< "a rebooted board starts with the lamp dark";
+
+	FakeSource source;
+	stockMailbox(source, "821", 3);
+	sent.clear();
+	bootSeed(handler, source, 1);
+
+	const std::string notify = findMwiNotify(sent, phone);
+	ASSERT_FALSE(notify.empty()) << "the seed must NOTIFY the subscribed phone";
+	EXPECT_NE(notify.find("Messages-Waiting: yes\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 3/0 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+// The usual real order: the phone re-SUBSCRIBEs after the board is up.
+TEST(VoicemailMwiSeed, ASubscribeAfterTheSeedIsToldTheCount)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.102", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("822", "192.168.47.112", "reg-s2"));
+	handler.setVoicemail("822", true);
+	FakeSource source;
+	stockMailbox(source, "822", 2);
+	bootSeed(handler, source, 1);
+
+	const std::string notify = lampNow(handler, sent, "822", "192.168.47.112", "mwi-seed-2");
+	ASSERT_FALSE(notify.empty());
+	EXPECT_NE(notify.find("Messages-Waiting: yes\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 2/0 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+// One boot, three mailboxes: 831 has messages, 832 is empty, 833 has messages but
+// voicemail is off for it. Only 831 may light; the other two stay 0/0.
+TEST(VoicemailMwiSeed, OnlyAVoicemailMailboxWithMessagesIsSeeded)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.103", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("831", "192.168.47.121", "reg-s3a"));
+	handler.handle(makeRegister("832", "192.168.47.122", "reg-s3b"));
+	handler.handle(makeRegister("833", "192.168.47.123", "reg-s3c"));
+	handler.setVoicemail("831", true);
+	handler.setVoicemail("832", true);   // 833 stays disabled
+	FakeSource source;
+	stockMailbox(source, "831", 2);
+	stockMailbox(source, "833", 4);      // left over from before voicemail was turned off
+	bootSeed(handler, source, 2);
+
+	std::string notify = lampNow(handler, sent, "831", "192.168.47.121", "mwi-seed-3a");
+	ASSERT_FALSE(notify.empty());
+	EXPECT_NE(notify.find("Messages-Waiting: yes\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 2/0 (0/0)\r\n"), std::string::npos) << notify;
+
+	notify = lampNow(handler, sent, "832", "192.168.47.122", "mwi-seed-3b");
+	ASSERT_FALSE(notify.empty());
+	EXPECT_NE(notify.find("Messages-Waiting: no\r\n"), std::string::npos)
+		<< "an empty mailbox stays dark:\n" << notify;
+	EXPECT_NE(notify.find("Voice-Message: 0/0 (0/0)\r\n"), std::string::npos) << notify;
+
+	notify = lampNow(handler, sent, "833", "192.168.47.123", "mwi-seed-3c");
+	ASSERT_FALSE(notify.empty());
+	EXPECT_NE(notify.find("Messages-Waiting: no\r\n"), std::string::npos)
+		<< "voicemail is off for 833, its card leftovers are not counted:\n" << notify;
+	EXPECT_NE(notify.find("Voice-Message: 0/0 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+// The listing window is POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX; the seed uses
+// the same bound, so a fuller mailbox saturates at it (796 then resyncs the same way).
+TEST(VoicemailMwiSeed, TheSeededCountSaturatesAtTheListingCap)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.104", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("841", "192.168.47.131", "reg-s4"));
+	handler.setVoicemail("841", true);
+	FakeSource source;
+	stockMailbox(source, "841", POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX + 5);
+	bootSeed(handler, source, 1);
+
+	const std::string notify = lampNow(handler, sent, "841", "192.168.47.131", "mwi-seed-4");
+	ASSERT_FALSE(notify.empty());
+	EXPECT_NE(notify.find("Voice-Message: " + std::to_string(POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX)
+		+ "/0 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+// A real deposit after the seed is one more new message: no double count, no reset.
+TEST(VoicemailMwiSeed, ADepositAfterTheSeedAddsOne)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.105", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("851", "192.168.47.141", "reg-s5"));
+	handler.setVoicemail("851", true);
+	handler.handle(makeMwiSubscribe("851", "192.168.47.141", "mwi-seed-5", 3600));
+	const sockaddr_in phone = addrFor("192.168.47.141");
+	FakeSource source;
+	stockMailbox(source, "851", 2);
+	bootSeed(handler, source, 1);
+	ASSERT_NE(findMwiNotify(sent, phone).find("Voice-Message: 2/0 (0/0)\r\n"), std::string::npos)
+		<< "the seed must have landed first";
+
+	sent.clear();
+	depositFrom811(handler, "851", "192.168.47.141", "mwi-seed-dep");
+	const std::string notify = findMwiNotify(sent, phone);
+	ASSERT_FALSE(notify.empty()) << "a deposit must NOTIFY the subscribed phone";
+	EXPECT_NE(notify.find("Messages-Waiting: yes\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 3/0 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+// Dialing 796 after the seed clears the new count exactly as it does today: the
+// listing moves everything to old and the lamp goes out.
+TEST(VoicemailMwiSeed, DialingTheMailboxAfterTheSeedClearsTheNewCount)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.106", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("861", "192.168.47.151", "reg-s6"));
+	handler.setVoicemail("861", true);
+	handler.handle(makeMwiSubscribe("861", "192.168.47.151", "mwi-seed-6", 3600));
+	const sockaddr_in phone = addrFor("192.168.47.151");
+	FakeSource source;
+	stockMailbox(source, "861", 2);
+	bootSeed(handler, source, 1);
+	ASSERT_NE(findMwiNotify(sent, phone).find("Messages-Waiting: yes\r\n"), std::string::npos)
+		<< "the seed must have lit the lamp first";
+
+	handler.handle(makeInvite("861", "796", "192.168.47.151", "mwi-seed-listen", "z9hG4bKmwisl"));
+	sent.clear();
+	handler.runVoicemailSdJobs(source);
+	handler.sweepVoicemailLegsForTest();
+
+	const std::string notify = findMwiNotify(sent, phone);
+	ASSERT_FALSE(notify.empty()) << "listening must NOTIFY the lamp off";
+	EXPECT_NE(notify.find("Messages-Waiting: no\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 0/2 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+// No card mounted at boot: nothing is seeded and the board says so exactly once.
+TEST(VoicemailMwiSeed, NoCardSeedsNothingAndLogsOnce)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.107", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("871", "192.168.47.161", "reg-s7"));
+	handler.setVoicemail("871", true);
+	FakeSource source;
+	stockMailbox(source, "871", 2);   // would light the lamp if the pass ran
+
+	testing::internal::CaptureStdout();
+	handler.armMwiSeedForTest(/*cardMounted=*/false);
+	for (int i = 0; i < 3; ++i)
+	{
+		handler.sweepVoicemailLegsForTest();
+		handler.runVoicemailSdJobs(source);
+	}
+	handler.sweepVoicemailLegsForTest();
+	const std::string printed = testing::internal::GetCapturedStdout();
+
+	EXPECT_EQ(countOf(printed, "no SD card"), 1) << printed;
+	const std::string notify = lampNow(handler, sent, "871", "192.168.47.161", "mwi-seed-7");
+	ASSERT_FALSE(notify.empty());
+	EXPECT_NE(notify.find("Voice-Message: 0/0 (0/0)\r\n"), std::string::npos) << notify;
 }
