@@ -756,22 +756,38 @@ class Gate(unittest.TestCase):
             self.assertNotIn(hits[0], claimed, f"'{hits[0]}' names two cycles")
             claimed[hits[0]] = cycle["size"]
 
+    def cjson_nesting_limit(self):
+        """CJSON_NESTING_LIMIT as the firmware build gives it to the cjson component (top-level
+        CMakeLists.txt, after project()), or None when nothing does."""
+        with open(os.path.join(g.REPO, "CMakeLists.txt"), encoding="utf-8") as f:
+            text = f.read()
+        lib = re.search(r"idf_component_get_property\(\s*(\w+)\s+espressif__cjson\s+COMPONENT_LIB\s*\)", text)
+        m = lib and re.search(r"target_compile_definitions\(\s*\$\{" + lib.group(1) +
+                              r"\}\s+PRIVATE\s+\"?CJSON_NESTING_LIMIT=(\d+)\"?\s*\)", text)
+        if m:
+            self.assertLess(text.index('project("SipServer")'), m.start(), "the cjson target exists only after project()")
+        return int(m.group(1)) if m else None
+
+    def test_cjson_nesting_limit_is_a_compile_definition_of_the_cjson_component(self):
+        # cJSON parses and deletes recursively and refuses nesting only past CJSON_NESTING_LIMIT,
+        # 1000 by default: no task stack here holds that. desmo's decision (#457): 16, as a
+        # compile definition of the cjson component (only cJSON.c reads it).
+        self.assertEqual(self.cjson_nesting_limit(), 16)
+
     def test_cjson_recursion_rows_are_the_nesting_limit_not_a_guess(self):
-        # cJSON refuses nesting past CJSON_NESTING_LIMIT (1000 unless a build sets it, and nothing in
-        # this tree does), and every tree in this firmware comes from cJSON_Parse*, so that limit is the
-        # depth of parse_value <-> parse_array/parse_object and of cJSON_Delete. One level is ~100 B and
-        # no task stack here holds a hundred: the rows say so and the tasks that parse JSON fail
-        # their budget until the limit is lowered. If a build sets it, the rows follow it.
+        # Every tree in this firmware comes from cJSON_Parse*, and cJSON checks its depth counter on
+        # entry to parse_array and parse_object, so at most `limit` containers are open at once. The
+        # gate's depth counts live activations of one member: parse_value is live once per open
+        # container plus once for the innermost value, and cJSON_Delete once per tree level likewise.
+        # That is limit + 1, as the JsonReader rows are kMaxDepth + 1. The rows follow the define.
         rows = self.checked_in()["recursion_allowlist"]
-        limit = 1000
-        for path in ("CMakeLists.txt", os.path.join("main", "CMakeLists.txt")):
-            m = re.search(r"CJSON_NESTING_LIMIT=(\d+)", open(os.path.join(g.REPO, path), encoding="utf-8").read())
-            if m:
-                limit = int(m.group(1))
+        limit = self.cjson_nesting_limit()
+        self.assertIsNotNone(limit, "no CJSON_NESTING_LIMIT define: cJSON would accept 1000 levels")
         for key in ("parse_value", "cJSON_Delete("):
             with self.subTest(key):
-                self.assertEqual(rows[key]["depth"], limit)
+                self.assertEqual(rows[key]["depth"], limit + 1)
                 self.assertIn("CJSON_NESTING_LIMIT", rows[key]["reason"])
+                self.assertIn("CMakeLists.txt", rows[key]["reason"])
 
     def test_checked_in_dynamic_frames_of_the_first_run_are_allowlisted(self):
         run, table = self.first_run(), self.checked_in()
