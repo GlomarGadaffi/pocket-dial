@@ -15,8 +15,8 @@ with this document.
 - **inferred** - follows from read code, no run. Not to be quoted as a defect
   without a red test.
 
-The task text said "about 40 sites". There are **25 call sites**; the other 15
-`endHandle(` hits in the file are comments. `CallForker.cpp` only mentions it in a
+The task text said "about 40 sites". There are **25 call sites**; the other
+`endHandle(` hits in the file are 14 comments and the definition at 9616. `CallForker.cpp` only mentions it in a
 comment (the call was moved off it).
 
 ## 1. What endHandle does, and the two facts everything else hangs on
@@ -37,8 +37,9 @@ Two properties matter more than the 404:
    ~1587) does this with **no `endCall()` for that extension's sessions**
    (`sweepExpired()` and `forceDisconnect()` do end them first; the explicit
    de-REGISTER does not). Every session that held the slot now reports number
-   `""`, and the next registrant takes the slot (`allocateClient` "first free
-   slot") and silently becomes that call's src or dest. Proven (A2, A9).
+   `""`, and the next registrant takes the slot (`allocateClient` hands out the *first free* slot, so
+   it takes over only when the released slot is the first free one, as in A2 and A9)
+   and silently becomes that call's src or dest. Proven (A2, A9).
 2. **`findClient("")` matches a free slot.** `""` equals the number of every
    unused slot, so `endHandle(session->getSrc()->getNumber(), ...)` on a
    released slot is routed to the first free slot's stale address, not a 404.
@@ -66,27 +67,27 @@ then registry lookup (pooled-slot identity).
 | 6 | 2299 | onFinalFailure, final to a relayed re-INVITE | 491/488 etc., CSeq INVITE | the *requesting* leg of a hold/resume | source address picks src or dest, then **re-resolves that client's number** via reg | peer is found by address, then looked up again by number: if the slot was released/reused in between, wrong peer or `""`. Two legs sharing an address pick `dest` always. | FinalFailureRelay `A491ToARelayedReInvite...` | SUSPECT |
 | 7 | 2917 | onInvite, DND 480 | 480, CSeq INVITE | caller's new INVITE | reg/From (caller resolved at 2387, same pass) | cannot miss; #497 already refuses an INVITE whose source is not the registered address (log seen in A6), so reg address == source | none found that pins the DND 480 route; A6 (proven OK) | OK |
 | 8 | 2931 | onInvite, unknown callee 404 | 404, CSeq INVITE | caller | reg/From | same | none found for this branch (A6 covers the same lookup) | OK |
-| 9 | 2948 | onInvite, no SDP 400 | 400 | caller | reg/From | same | none direct for this branch | OK |
-| 10 | 2960 | onInvite, session pool 503 | 503 | caller | reg/From | same | none found for this branch | OK |
-| 11 | 3022 | onInvite, the relay | INVITE request | caller's INVITE to callee | reg/To; `called` resolved at 2922 | cannot miss | FinalFailureRelay, GroupInDialog, many | OK |
+| 9 | 2948 | onInvite, no SDP 400 | 400, CSeq INVITE | caller | reg/From | same | none direct for this branch | OK |
+| 10 | 2960 | onInvite, session pool 503 | 503, CSeq INVITE | caller | reg/From | same | none found for this branch | OK |
+| 11 | 3022 | onInvite, the relay | INVITE request | caller's INVITE to callee | reg/To; `called` resolved at 2922 | cannot miss | `FinalFailureRelay.CalleeRefusalIsRelayedToTheCallerAndItsAckReachesTheCallee` | OK |
 | 12 | 6641 | onTrying | 100, CSeq INVITE | callee's 100 to caller | reg/From | no blind-transfer-leg (`isBlindXferLeg`) or transfer-bridge claim, unlike onRinging (6771): the PBX-as-UAC leg's 100 is relayed to the *transferee* (From impersonates it) under a Call-ID it never held; attended splice re-INVITE's 100 goes to the dropped transferor. Harmless 100, but it is the exact leak onRinging closes. | none for blind/attended legs (NoReplyToResponse covers beep/park only) | SUSPECT (inferred) |
 | 13 | 6810 | onRinging | 180, CSeq INVITE | callee's 180 to caller | reg/From | beep, MoH, trunk, inbound anchor, blind leg, broadcast all intercepted before it | Forward100rel, FinalFailureRelay | OK |
 | 14 | 6880 | onBusy, hunt exhausted | 486, CSeq INVITE | caller leg | session-src | as #3 | FinalFailureRelay hunt | SUSPECT |
-| 15 | 6891 | onBusy, all targets busy | 486 | caller leg | session-src | as #3 | FinalFailureRelay `RingAllFailsTheCallerWhenEveryMember...` | SUSPECT |
-| 16 | 6972 | onBusy, ordinary | 486 | callee's final | reg/From | CFB handled above via To (#256); dereg of caller: silent | CallForwardBusy | OK |
-| 17 | 7034 | onUnavailable, hunt exhausted | 480 | caller leg | session-src | as #3 | FinalFailureRelay | SUSPECT |
-| 18 | 7045 | onUnavailable, all unavailable | 480 | caller leg | session-src | as #3 | FinalFailureRelay | SUSPECT |
-| 19 | 7071 | onUnavailable, ordinary | 480 | callee's final | reg/From | as #16 | FinalFailureRelay (480 via ring-all); AnchorRouting 480 tests | OK |
+| 15 | 6891 | onBusy, all targets busy | 486, CSeq INVITE | caller leg | session-src | as #3 | FinalFailureRelay `RingAllFailsTheCallerWhenEveryMember...` | SUSPECT |
+| 16 | 6972 | onBusy, ordinary | 486, CSeq INVITE | callee's final | reg/From | CFB handled above via To (#256); dereg of caller: silent | CallForwardBusy | OK |
+| 17 | 7034 | onUnavailable, hunt exhausted | 480, CSeq INVITE | caller leg | session-src | as #3 | FinalFailureRelay | SUSPECT |
+| 18 | 7045 | onUnavailable, all unavailable | 480, CSeq INVITE | caller leg | session-src | as #3 | FinalFailureRelay | SUSPECT |
+| 19 | 7071 | onUnavailable, ordinary | 480, CSeq INVITE | callee's final | reg/From | as #16 | FinalFailureRelay (480 via ring-all); AnchorRouting 480 tests | OK |
 | 20 | 7541 | onBye fall-through | BYE request, CSeq BYE | whatever the To names | reg/To | reached when no session exists, or when From matches neither session leg number (any released/reused slot). **A BYE for a Call-ID the PBX does not hold is relayed to the registered To extension instead of 481 (proven A10).** `isDialogSourceAuthorized` waves a no-session BYE through as "harmless". | GroupInDialog BYE tests (session present) | **DEFECT** (proven, low impact) |
 | 21 | 7631 | onOk, 2xx while state Cancel | 2xx to INVITE crossing the CANCEL | callee's answer to caller | reg/From | 2xx still relayed so the caller can ACK+BYE; CANCEL 200s absorbed above | FinalFailureRelay `A2xxThatCrossesTheCancel...` | OK |
 | 22 | 7768 | onOk, ring-group/page/hunt winner | 200, CSeq INVITE | winning member's answer to caller | **session-src** | caller de-registered, another phone takes the slot: **the new registrant receives the answer (proven A9: "Session Created between 404 and 402", 200 to 404)**. Caller released and slot free: routed by `""` to a free slot. | GroupInDialog, BroadcastHoldResume (live caller) | **DEFECT** (proven) |
-| 23 | 7832 | onOk, 200 without SDP | 400 to the callee | callee | reg/To | resolved at 7798 | none | OK |
-| 24 | 7873 | onOk, ordinary 200 | 200, CSeq INVITE | callee's answer to caller | reg/From for the send; **callee identity is `findClient(To)` with no source check** | any host can answer a ringing call: a 200 from .99 with the ringing Call-ID and `To: 402` is accepted, sets dest=402, connects the session and is relayed to the caller (proven A7). Caller dereg first: session connected with src `""`, the 404 is dropped by #424, callee neither told nor BYE'd (A3, log `Session Created between  and 402`). | FinalFailureRelay, many (live phones) | **DEFECT** (proven) |
+| 23 | 7832 | onOk, 200 without SDP | 400 clone of the callee's 200, CSeq INVITE | callee | reg/To (resolved at 7798) | target is right (the callee), outcome is not: the clone carries the caller's Via so the callee should discard it, it is `markRelay`'d so the #424 guard does not stop it, the caller gets **no final response at all** (INVITE timer), and `endCall` follows. Read; not run. | none | SUSPECT (inferred) |
+| 24 | 7873 | onOk, ordinary 200 | 200, CSeq INVITE | callee's answer to caller | reg/From for the send; **callee identity is `findClient(To)` with no source check** | any host can answer a ringing call: a 200 from .99 with the ringing Call-ID and `To: 402` is accepted, sets dest=402, connects the session and is relayed to the caller (proven A7). Caller dereg first: session connected with src `""`, the 404 is dropped by #424, callee neither told nor BYE'd (A3, log `Session Created between  and 402`). | `FinalFailureRelay.CalleeRefusalIsRelayedToTheCallerAndItsAckReachesTheCallee` (live phones; nothing covers the hijack) | **DEFECT** (proven) |
 | 25 | 7973 | onAck | ACK request, CSeq ACK | caller's ACK to callee | reg/To | after CFU/CFB the 200's To is the target, so it follows; callee de-registered: 404 minted, dropped by #424 (A11 passes), ACK lost, session stays | FinalFailureRelay `...ItsAckReachesTheCallee`, GroupInDialog ACK | OK |
 
-Totals: 4 DEFECT (1, 20, 22, 24), 8 SUSPECT (3, 4, 6, 12, 14, 15, 17, 18), 13 OK. Of
+Totals: 4 DEFECT (1, 20, 22, 24), 9 SUSPECT (3, 4, 6, 12, 14, 15, 17, 18, 23), 12 OK. Of
 the suspects, six (3, 4, 14, 15, 17, 18) are the same `session-src` mechanism
-proven at 22; 6 and 12 are separate.
+proven at 22; 6, 12 and 23 are separate.
 
 ## 3. Other places that route by number, address or pooled client
 
@@ -137,7 +138,7 @@ Throwaway tests were not committed.
 - **A8 Admin kills a park retriever (section 5.2).** 401 INVITE 700 (park), 403
   INVITE 700 (retrieve), `forceDisconnect("403")`, `tick()`. Expected a BYE to 401
   carrying the park Call-ID (`pk1`); actual a BYE to 401 carrying the retriever's
-  Call-ID (`pk2`), a dialog 401 never saw. The park session `pk1` is not ended.
+  Call-ID (`pk2`), a dialog 401 never saw. The test asserted only the BYE Call-ID. That the park session `pk1` is not ended is **read**, not run.
 - **A4 Session::reset leaks (section 6).** Unit level: `setForwardLeg`,
   `setCancelledLegExt`, `markDegradedReported()`, then `reset()`. After reset
   `getForwardLegTarget()` is still `"403"`, `getCancelledLegExt()` still `"403"`,
@@ -147,9 +148,24 @@ Throwaway tests were not committed.
 - **A11 (cleared).** Callee de-registers, caller ACKs: the 404 is dropped by #424.
   Site 25 stands.
 
-Not run (inferred only): row 12 stray 100 Trying on a blind/attended leg; rows
-3, 4, 14, 15, 17, 18 individually (mechanism proven via row 22); rows 6, and the
-fork-loser 200 in section 7.
+### Reproducers for the SUSPECT rows (none run)
+
+- **Rows 3, 14, 17 (hunt exhausted).** Register 401, 402. `setRingGroup("600","402","hunt")`.
+  401 INVITE 600. 401 `REGISTER Expires: 0`. 404 registers (takes the freed slot).
+  402 refuses (603 at 2247, 486 at 6880, 480 at 7034). Expected: nothing
+  delivered to 404. Predicted: the final goes to 404 (`endHandle(src number)`).
+- **Rows 4, 15, 18 (ring-all, everyone refused).** Same, members `402,403`
+  `ringall`, both refuse with 603 / 486 / 480. Predicted: the last refusal goes to 404.
+- **Row 6.** 401 and 402 connected. 401 sends a hold re-INVITE (relayed to 402).
+  401 de-REGISTERs; 403 takes the slot. 402 answers 491 from .21. The source matches
+  `dest`, so the peer is `src` (now 403) and `endHandle("403")` delivers the 491 to 403.
+- **Row 12.** 401 and 402 connected; 401 blind-REFERs to 403. 403 answers the
+  PBX's INVITE with `100 Trying` (CSeq INVITE, the leg's Call-ID). onTrying has no
+  blind-leg claim, so it is relayed `endHandle(From)` to the transferee 402.
+- **Row 23.** 401 calls 402; 402's 200 OK carries no SDP. Predicted: 401 gets
+  nothing, 402 receives a 400 it discards, the session is ended.
+- **Fork-loser 200 (section 7).** Ring-all 600 = 402,403. 402 answers 200; before
+  the CANCEL lands, 403's 200 arrives. Predicted: no ACK and no BYE to 403.
 
 ## 5. Following one BYE through four paths (addendum 1)
 
@@ -197,7 +213,7 @@ carries `isParkUac()` only so *some* readers can invert, and several do not.
   BYEs the parked phone on the retrieve session's Call-ID (it holds only the
   park Call-ID), and the park session itself is not "involved" (its src is the
   parked party, not 403), so it is never ended. The ring-back session's
-  dest BYE additionally carries From=parker, To=PBX, inverted. The session
+  dest BYE additionally carries From=parker, To=PBX, inverted (read, not run). The session
   timer sweep cannot reach park-spliced sessions (grant=false), so only the admin
   path is exposed.
 
@@ -272,10 +288,11 @@ first pool slot whose Call-ID is empty or absent from `_sessions`, and calls
   ACKs and swallows a genuine 487 from that extension instead of relaying it.
   The field is proven stale by A4 (unit); the end-to-end 487 swallow is inferred.
 - **`_degradedReported`** (#906, Rule 5 relevant): `markDegradedReported()`
-  returns false once set, and nothing resets it. A recycled slot that once
-  reported a degraded 911/933 never reports a later one. **Proven (A4).** This
-  is the most serious of the stale fields: it silently drops an
-  emergency-degraded notification.
+  returns false once set, and nothing resets it. A4 **proves** only that the flag survives `reset()`. That a later degraded
+  911/933 on a recycled slot is then never reported follows from reading
+  RequestsHandler.cpp:11341 (`!markDegradedReported()` => `continue`); it was not
+  run end to end. It is the most serious stale field (Rule 5: a degraded
+  emergency call goes unreported).
 - `_wasTransferorSrc`, `_transferorCseqAtRefer`: always written before read
   (section 5.3); `_rtpMark*`: guarded by `_rtpWatchArmed`, which reset clears.
 
@@ -290,7 +307,7 @@ documented reason is only voicemail and trunk (endCall reads
 after `release()`). The rest survive by omission. Readers after release: endCall
 (above); nothing else was found, but the aliasing hazard is real in the other
 direction: callers that hold a `shared_ptr<Session>` across `endCall` see the
-*reset* object (the CFNA reap copies `ringTag` first for that reason).
+*released* object (the CFNA reap copies `ringTag` first for that reason).
 
 **`setState(Connected)` before the `_dest` check.** `_state` is assigned, then
 the dest check only logs (Session.cpp). Every `setState(Connected)` caller was
@@ -298,7 +315,7 @@ checked (RequestsHandler 589, 2683, 3264, 3493, 3602, 3935, 4149, 5583, 6590,
 7747, 7862, 8809, 8939, 12301, 12501, 13963, 14371; CallPickup 124, 133;
 ParkOrbit 132, 189, 364): all set a dest first, or are Held->Connected (which
 returns before the check), or restore an existing Connected session. No
-caller reaches it with a null dest. `_src->getNumber()` in the same log line is
+caller reaches it with a null dest (13963 and 14371 traced too: the trunk-inbound path sets the handset at 13868, the outbound trunk path sets `dummyTrunk` at 14166). `_src->getNumber()` in the same log line is
 unguarded, which only matters if a future caller passes a null src.
 
 ## 7. Fork matching (CallForker)
@@ -327,7 +344,7 @@ unguarded, which only matters if a future caller passes a null src.
 ## 8. Required closing items
 
 **(a) Count by verdict (25 endHandle sites):** DEFECT 4 (rows 1, 20, 22, 24),
-SUSPECT 8 (3, 4, 6, 12, 14, 15, 17, 18), OK 13. Outside the table: DEFECT, proven
+SUSPECT 9 (3, 4, 6, 12, 14, 15, 17, 18, 23), OK 12. Outside the table: DEFECT, proven
 at the onBye generic far leg (A2), the CFNA reap (A5), the session-timer and
 force-disconnect BYE for park (A8), and Session::reset (A4); inferred: fork-loser 200.
 
@@ -354,22 +371,30 @@ tags, own From/To as sent, role}` removes 1-4 and fixes the aliasing outright
 stores its own dialog headers in as-sent orientation so the BYE builder takes a
 leg and nothing else; if headers stay on Session, those two patterns just migrate.
 
-**(c) Ranked suspects to turn into red tests (v1.7.0 / v1.8.0):**
+**(c) Ranked suspects to turn into red tests.** Milestones: v1.7.0 is teardown / wrong
+leg; v1.8.0 is memory pressure.
 
-1. De-REGISTER (`Expires: 0`) must end that extension's sessions through
-   `endCall()` (A2, A9, A3). Highest: wrong-peer BYE/answer to a stranger.
-2. `Session::reset` clears `_degradedReported`, `_forwardInvite`, `_forwardTarget`,
-   `_cancelledLegExt` (A4); then A5 as the end-to-end. `_degradedReported` touches
-   Rule 5.
-3. CANCEL after CFU/CFB/CFNA reaches the forward target (A1).
-4. forceDisconnect of a park retriever BYEs the parked phone on its own Call-ID
-   and ends the park session (A8).
-5. An INVITE 200 only counts from the callee's leg (A7).
-6. A BYE with no session is answered 481, not relayed (A10).
-7. A fork loser whose 200 crosses the winner's gets ACK+BYE (section 7).
-8. Hunt/ring-all exhausted and all-refused answer the caller after the caller's
-   slot changed (rows 3, 4, 14-18).
-9. 100 Trying on a blind/attended leg is not relayed (row 12).
+1. *(v1.7.0, Rule 5 applies)* A de-registered caller's call must never be routed to
+   another phone, and a live 911/933 must stay up (`sweepExpired` exempts
+   emergencies on purpose, #712). Two fix shapes: end the extension's calls
+   through `endCall()` with the same emergency exemption, or do not free or
+   rename a pool slot that a session still holds. Reds: A2, A9, A3.
+2. *(v1.7.0, Rule 5)* `Session::reset` must clear `_degradedReported`, so a
+   later degraded 911/933 on a recycled slot is reported again (A4 unit red; add
+   the end-to-end through the `degradedEmergencyCallIds` loop).
+3. *(v1.7.0 and v1.8.0)* `Session::reset` clears `_forwardInvite`, `_forwardTarget`,
+   `_cancelledLegExt` (A4); end-to-end A5. v1.8.0 because a stale `_forwardInvite`
+   pins a SipMessage pool entry on every recycled slot.
+4. *(v1.7.0)* CANCEL after CFU/CFB/CFNA reaches the forward target (A1).
+5. *(v1.7.0)* forceDisconnect of a park retriever BYEs the parked phone on its own
+   Call-ID and ends the park session (A8, second half read only).
+6. *(v1.7.0)* An INVITE 200 only counts from the callee's leg (A7).
+7. *(v1.7.0)* A BYE with no session is answered 481, not relayed (A10).
+8. *(v1.7.0)* A fork loser whose 200 crosses the winner's gets ACK+BYE (section 7).
+9. *(v1.7.0)* Hunt/ring-all exhausted and all-refused answer the caller after the
+   caller's slot changed (rows 3, 4, 14-18); row 6 likewise.
+10. *(v1.7.0)* 200 without SDP: the caller gets a final (row 23). 100 Trying on a
+    blind/attended leg is not relayed (row 12).
 
 **(d) Relation to the Call-ID-keyed session map.** `_sessions` maps one Call-ID to
 one `Session`, and a `Session` is one call with two *numbers*, not two legs.
