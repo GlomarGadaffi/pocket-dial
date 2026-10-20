@@ -28,7 +28,7 @@
 - Plain direct calls and forwarded CFU, CFB and CFNA legs are bounded by the ring time and CANCEL the callee (#1022, #1025). A no-answer forward CANCELs the ringing callee (#1013). Each extension has a no-answer timeout, default 20 s (#1010).
 - A 440 tone call ends after 600 s (#1038; bench on .244 against `3b74bc2a`). An 888 conference leg whose phone stopped sending RTP is ended (#1014).
 - PBX-built 480s carry a To tag (#1028; benched on hardware at `2993c0dc`).
-- A session in Cancel state whose callee never answers the forwarded CANCEL is ended after 32 s, and the caller gets its 487 (#1049; host-tested, bench owed).
+- A session in Cancel state whose callee never answers the forwarded CANCEL is ended after 32 s, and the caller gets its 487 (#1049; benched on .244: caller's 487 at about 34 s, 1.5 s CANCEL delay plus the 32 s bound). A callee's own 200 to the CANCEL does not stop the bound; hardware found that case in the release-candidate bench and it is fixed and tested.
 - Splice failures re-ACK a retransmitted 200 and BYE the refusing leg (#927, #928). Pickup absorbs the caller and picker ACKs on bridged sessions (#916). A leg the PBX dropped is never announced as an inbound call (#883). An oversize From or To is refused at ingress so a BYE can always be built (#931).
 
 ### Memory, stack and HTTP
@@ -59,11 +59,24 @@
 - Bench probe, fault-injection runner and the anchor scenarios (#868, #881, #925, #959, #980, #1041). The harness refuses a dial that could leave the board through the anchor (#1032). The probe is never in a release image (`tools/ci/check_no_bench_probe.py`).
 - Docs: ADR-002 for the programmable media anchor (#923), the E911 compliance audit (#926), design notes for federation, HTTPS dashboard, far-leg adapter and ring pool (#963 to #966), and a restyled site and README (#1000, #1004, #1008, #1017).
 
+### Release evidence
+
+- Tag `v1.6.0` is `219ef39f`. Its tree differs from the benched release candidate `d932b887` only in `CHANGELOG.md`, so the benched firmware is the released firmware.
+- Boards: LilyGO T-ETH-Elite (.244) and Waveshare ESP32-S3-ETH (.195). Both report exactly `v1.6.0` after the final flash.
+- .244 runs the published `SipServer-esp32s3-eth.bin`, sha256 `baffa99c003c51810ef77ff5caafcf67d94a262cb996d834c41fd90ac81a2b86`, matching the release `SHA256SUMS`.
+- .195 runs the Waveshare image built from the tag (`-D SIP_TRANSPORT=eth -D PD_ETH_BOARD=waveshare`), sha256 `8f2e9614be00732543c5fcc39c777076f876b77c8ec60bd71e29369fd1f2c6e9`. There is no Waveshare release asset.
+- Host suite on the release candidate: 2784 passed, 0 failed.
+- Bench, harness phones only, on both boards: an ordinary call, the 440 tone with `*11`, `*69`, and the OTA upload and coredump erase both answering 409 during a live call. On .244 also four silent-callee CANCEL cases (a callee that sends 180 only; 200 to the CANCEL and no 487; the same with the CANCEL retransmitted; a compliant callee), the caller's 487 arriving at 34.0 s to 34.3 s for the three silent cases.
+- Soak on .244: 4 h 1 min, 512 cycles (512 answered calls, 128 compliant CANCELs, 64 silent-callee CANCELs), no failures and no reboot. `sessionCount` was 0 at all 50 samples. Free internal heap stayed between 28367 B and 30975 B (low-water 25683 B). Lowest `stackHwm`: `sip_server_task` 4360 B, `udp_receiver_task` 7632 B, `rtp_media_tx` 1404 B, `flash_writer` 4176 B, `http_conn` 1296 B.
+- Each board still holds the one coredump it held before this release, unchanged. Nothing was erased. No 911 or 933 was dialed, and nothing left the LAN.
+- Not covered by the bench: #1047 (host tests only, by rule), a Waveshare silent-callee CANCEL, and a soak on .195.
+
 ### Known gaps
 
 - An inbound PSAP callback via the anchor can be dropped while the media bridge is busy (#967, Rule 5). Accepted for this release and fixed in v1.7.0. Do not rely on this unit as the only callback path.
 - The session-timer strip still breaks callers that send `Require: timer` on 777, 888, 997, voicemail, park, the trunk handset answer and the async anchor answer (#1042).
 - The 440 and call-pickup answers still strip `Session-Expires` for every caller, including a caller that sends `Require: timer`, which then hangs up; the fix is held for v1.7.0 (#739, #1034). A config export does not yet restore MAC bindings (#483, #1036; v1.9.0).
+- The PBX does not answer a caller's CANCEL with its own 200 when the callee stays silent; the caller's CANCEL times out while the INVITE still gets its 487 at about 34 s (RFC 3261 s9.2; #1057).
 - A far-side or loopback-only board has no 911 route: 911 and 933 get `503 Emergency Call Not Routable` and the Kari's Law notification (#1046).
 - A telephony slot saved by an older build with an emergency `routeDn` still loads at boot. This release refuses saving one and test-dialing one (#1047); it does not refuse loading one.
 - `http_conn` has 128 B of stack headroom on `GET /api/config/export` (#1044). A TASK_WDT was seen under an OTA upload with orphaned 888 legs (#1016). The 20-tombstone voicemail cap can light phantom messages (#1043). The heap audit lists 85 high-severity allocation sites on call paths (#1048).
