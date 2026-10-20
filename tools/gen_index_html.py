@@ -304,7 +304,7 @@ def min_html(data, what):
 # ------------------------------------------------------------------ SPA assembly
 SCRIPT_SRC_RE = re.compile(rb'<script\b[^>]*\bsrc\s*=\s*"([^"]*)"[^>]*>[ \t]*</script>[ \t]*\n?')
 EXTERNAL_RE = re.compile(rb'^(?:[a-zA-Z][a-zA-Z0-9+.-]*:|//)')
-EMPTY_SECTION_RE = re.compile(rb'^(?:\s|<!--.*?-->)*$', re.S)
+COMMENT_RE = re.compile(rb'<!--.*?-->', re.S)
 # link / script-with-src / section, matched in ONE pass over the original shell so text
 # inside an inlined fragment, script or stylesheet is never re-scanned.
 TAG_RE = re.compile(
@@ -424,7 +424,7 @@ def assemble_segments(web):
         if name not in frag_data:
             raise GenError("index.html has <section id=\"sec-%s\"> but manifest has no sections/NN-%s.html"
                            % (name, name))
-        if not EMPTY_SECTION_RE.match(m.group("sbody")):
+        if COMMENT_RE.sub(b"", m.group("sbody")).strip():
             raise GenError("index.html: <section id=\"sec-%s\"> must be empty (the fragment goes inside)" % name)
         if name in shell_names:
             raise GenError("index.html: duplicate <section id=\"sec-%s\">" % name)

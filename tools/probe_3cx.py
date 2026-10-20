@@ -162,6 +162,7 @@ def main():
     frames = []
     try:
         ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         s = ctx.wrap_socket(socket.create_connection((host, 443), timeout=10), server_hostname=host)
         key = base64.b64encode(os.urandom(16)).decode()
         hs = (f"GET /callcontrol/ws HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"

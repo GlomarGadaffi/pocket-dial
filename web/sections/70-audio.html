@@ -46,12 +46,12 @@
 
   <hr class="hr">
   <h3 class="subhead">Media transmit <span class="badge">experimental</span></h3>
-  <p class="note">Experimental (#985). Sets <code>TCP_NODELAY</code> on the anchor's audio POST socket for an A/B listening test. <code>0</code> leaves Nagle on (default); <code>1</code> turns it off. Off at every boot; applies when the next audio stream opens, not mid-call.</p>
+  <p class="note">Experimental (#985). Turns off Nagle (TCP no-delay) on the anchor's audio POST socket for an A/B listening test. <code>0</code> leaves Nagle on (default); <code>1</code> turns it off. Off at every boot; applies when the next audio stream opens, not mid-call.</p>
   <div class="field">
     <label for="mtx-nodelay">nodelay</label>
     <select id="mtx-nodelay" aria-disabled="true">
       <option value="0">0: Nagle on (default)</option>
-      <option value="1">1: TCP_NODELAY on</option>
+      <option value="1">1: no-delay on</option>
     </select>
   </div>
   <div class="row">
