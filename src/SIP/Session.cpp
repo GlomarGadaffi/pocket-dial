@@ -30,6 +30,7 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_pendingTargets.clear();
 	_inviteMessage.reset();
 	_ringTimerArmed = false;
+	_cancelAnswered = false;   // #1049: a recycled slot has no answered CANCEL
 	_noAnswerTarget.clear();
 	_huntActive = false;
 	_huntMembers.clear();
@@ -167,6 +168,7 @@ void Session::release()
 	_pendingTargets.clear();
 	_inviteMessage.reset();
 	_ringTimerArmed = false;
+	_cancelAnswered = false;   // #1049: a recycled slot has no answered CANCEL
 	_noAnswerTarget.clear();
 	_huntActive = false;
 	_huntMembers.clear();
