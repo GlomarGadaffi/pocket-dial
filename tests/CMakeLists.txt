@@ -500,6 +500,8 @@ add_executable(sip_parser_tests
     # Issue #746: a callee's 415/420/488/603 (and a ring-group member's refusal or
     # loser's 487) reached onFinalFailure() and went nowhere: no relay, no ACK.
     FinalFailureRelay_test.cpp
+    # Audit row 1: a CANCEL after a CFU/CFB/CFNA forward went to the original callee.
+    CancelAfterForward_test.cpp
     # Issue #802: the caller's ACK/BYE/CANCEL on a ring-group / zone / alias call
     # were dispatched on the To literal and 404'd; they reach the member now.
     GroupInDialog_test.cpp
