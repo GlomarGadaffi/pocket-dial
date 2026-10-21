@@ -476,3 +476,156 @@ TEST(ForceDisconnect, ExtensionOnNoCallSendsNothingAndLeavesOtherCallsAlone)
 		<< "a call 107 is not on must survive 107's kill";
 	EXPECT_TRUE(rig.handler.cdrSnapshotForTest().empty());
 }
+
+// Issue #1089: REGISTER Expires: 0 reached unregisterClient(), which released
+// the pool SipClient (blanking its number) and ended none of its sessions. The
+// sessions kept pointing at the blank client, sweepExpired() matches by number,
+// so they leaked their pool slot for good (4 of 8 slots held for 10 h on .195).
+namespace
+{
+	void sendDeregister(RequestsHandler& handler, const std::string& ext, const std::string& ip,
+	                    const std::string& callId)
+	{
+		std::string raw =
+			"REGISTER sip:server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKd" + callId + "\r\n"
+			"From: <sip:" + ext + "@server>;tag=dt" + callId + "\r\n"
+			"To: <sip:" + ext + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 2 REGISTER\r\n"
+			"Contact: <sip:" + ext + "@" + ip + ":5060>;expires=0\r\n"
+			"Content-Length: 0\r\n\r\n";
+		handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(ip)));
+	}
+
+	void sendCallerBye(RequestsHandler& handler, const std::string& callId)
+	{
+		std::string raw =
+			"BYE sip:106@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kCallerIp) + ":5060;branch=z9hG4bKbye" + callId + "\r\n"
+			"From: <sip:100@server>;tag=ctag" + callId + "\r\n"
+			"To: <sip:106@server>;tag=etag" + callId + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 3 BYE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Content-Length: 0\r\n\r\n";
+		handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(kCallerIp)));
+	}
+
+	// The callee's 200 OK to the relayed BYE: that, not the BYE itself, ends the session.
+	void sendCalleeByeOk(RequestsHandler& handler, const std::string& callId)
+	{
+		std::string raw =
+			"SIP/2.0 200 OK\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kCallerIp) + ":5060;branch=z9hG4bKbye" + callId + "\r\n"
+			"From: <sip:100@server>;tag=ctag" + callId + "\r\n"
+			"To: <sip:106@server>;tag=etag" + callId + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 3 BYE\r\n"
+			"Content-Length: 0\r\n\r\n";
+		handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(kCalleeIp)));
+	}
+
+	bool isBoundExt(RequestsHandler& handler, const std::string& ext)
+	{
+		handler.forceNextTickForTest();
+		handler.tick();
+		for (const auto& [number, address] : handler.getActiveClients())
+		{
+			(void)address;
+			if (number == ext) return true;
+		}
+		return false;
+	}
+
+	size_t liveSessions(RequestsHandler& handler)
+	{
+		handler.forceNextTickForTest();
+		handler.tick();
+		return handler.getSessionCount();
+	}
+
+	// Both legs of a connected call are hung up by a de-REGISTER from `who`.
+	void expectDeregisterEndsTheCall(const std::string& who, const std::string& whoIp,
+	                                 const std::string& peerIp, const std::string& callId)
+	{
+		Rig rig;
+		sendInvite(rig.handler, callId);
+		sendAnswer(rig.handler, callId);
+		ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "precondition: call up";
+		ASSERT_EQ(liveSessions(rig.handler), 1u) << "precondition: one session";
+		ASSERT_TRUE(rig.handler.cdrSnapshotForTest().empty()) << "precondition: no CDR yet";
+
+		rig.sent.clear();
+		sendDeregister(rig.handler, who, whoIp, "dereg-" + callId);
+
+		EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
+		EXPECT_EQ(liveSessions(rig.handler), 0u) << "the session slot leaked";
+		EXPECT_EQ(byesTo(rig.sent, addrFor(peerIp)).size(), 1u) << "the far party must be told";
+		const auto cdr = rig.handler.cdrSnapshotForTest();
+		ASSERT_EQ(cdr.size(), 1u) << "exactly one CDR";
+		EXPECT_EQ(cdr[0].caller, "100");
+		EXPECT_EQ(cdr[0].callee, "106");
+		EXPECT_FALSE(isBoundExt(rig.handler, who)) << "the client must still be released";
+	}
+}
+
+TEST(DeregisterMidCall, CallersDeregisterEndsTheCallByesThePeerAndWritesTheCdr)
+{
+	expectDeregisterEndsTheCall("100", kCallerIp, kCalleeIp, "dereg-1089-a");
+}
+
+TEST(DeregisterMidCall, CalleesDeregisterEndsTheCallByesThePeerAndWritesTheCdr)
+{
+	expectDeregisterEndsTheCall("106", kCalleeIp, kCallerIp, "dereg-1089-b");
+}
+
+TEST(DeregisterMidCall, ADeregisterDuringAnEmergencyCallDefersUntilTheCallEnds)
+{
+	// Rule 5, matching sweepExpired()'s #712: a de-REGISTER never ends a 911/933
+	// and never blanks the number the call's BYE and CDR still read.
+	Rig rig;
+	const std::string callId = "dereg-1089-911";
+	sendInvite(rig.handler, callId);
+	sendAnswer(rig.handler, callId);
+	auto s = rig.handler.getSession("Call-ID: " + callId);
+	ASSERT_TRUE(s.has_value());
+	s.value()->setEmergency(true);
+
+	rig.sent.clear();
+	sendDeregister(rig.handler, "100", kCallerIp, "dereg-1089-911-r");
+
+	EXPECT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "the 911 was torn down";
+	EXPECT_TRUE(byesTo(rig.sent, addrFor(kCalleeIp)).empty()) << "the PSAP leg was hung up";
+	EXPECT_TRUE(byesTo(rig.sent, addrFor(kCallerIp)).empty());
+	ASSERT_TRUE(s.value()->getSrc());
+	EXPECT_EQ(s.value()->getSrc()->getNumber(), "100") << "the caller was blanked under the live 911";
+	EXPECT_TRUE(rig.handler.cdrSnapshotForTest().empty());
+	size_t finals200 = 0;
+	for (const auto& [addr, msg] : rig.sent)
+		if (msg && sameAddr(addr, addrFor(kCallerIp)) && msg->toString().rfind("SIP/2.0 200", 0) == 0) ++finals200;
+	EXPECT_EQ(finals200, 1u) << "the REGISTER is still answered normally";
+
+	// The 911 ends; the next sweep prunes the deferred binding.
+	sendCallerBye(rig.handler, callId);
+	sendCalleeByeOk(rig.handler, callId);
+	ASSERT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "precondition: BYE ended it";
+	EXPECT_EQ(rig.handler.cdrSnapshotForTest().size(), 1u);
+	rig.handler.idleClientAndSweepForTest("100", std::chrono::seconds(0));
+	EXPECT_FALSE(isBoundExt(rig.handler, "100")) << "the deferred de-register must complete";
+	EXPECT_EQ(liveSessions(rig.handler), 0u);
+}
+
+TEST(DeregisterMidCall, ADeregisterWithNoCallsReleasesTheClientAsBefore)
+{
+	Rig rig;
+	ASSERT_TRUE(isBoundExt(rig.handler, "100"));
+	rig.sent.clear();
+	sendDeregister(rig.handler, "100", kCallerIp, "dereg-1089-idle");
+	EXPECT_FALSE(isBoundExt(rig.handler, "100"));
+	EXPECT_TRUE(isBoundExt(rig.handler, "106")) << "another extension is untouched";
+	EXPECT_TRUE(byesTo(rig.sent, addrFor(kCallerIp)).empty());
+	EXPECT_TRUE(byesTo(rig.sent, addrFor(kCalleeIp)).empty());
+	EXPECT_TRUE(rig.handler.cdrSnapshotForTest().empty());
+	EXPECT_EQ(liveSessions(rig.handler), 0u);
+}

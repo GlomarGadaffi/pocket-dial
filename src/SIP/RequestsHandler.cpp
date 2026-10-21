@@ -9415,6 +9415,22 @@ void RequestsHandler::unregisterClient(std::string_view number)
 	{
 		if (client->getNumber() == number)
 		{
+			// #1089: release() blanks the number the client's sessions match on, so
+			// end them FIRST (BYE, CDR, relays) as sweepExpired() does, or they leak
+			// their pool slot for good. #712/Rule 5: a live 911/933 or PSAP callback
+			// is never torn down by a de-register; lapse the lease instead and leave
+			// the binding intact. The next sweep after the call prunes it.
+			for (const auto& [cid, s] : _sessions)
+			{
+				if (s->isEmergency() &&
+				    ((s->getSrc() && s->getSrc()->getNumber() == number) ||
+				     (s->getDest() && s->getDest()->getNumber() == number)))
+				{
+					client->expireLease();
+					return;
+				}
+			}
+			endClientCalls(client->getNumber(), "unregistered");
 			client->release();
 			break;
 		}
@@ -9483,6 +9499,57 @@ int RequestsHandler::parseRequestedExpires(const std::shared_ptr<SipMessage>& da
 	return DEFAULT_EXPIRES;
 }
 
+void RequestsHandler::endClientCalls(std::string extension, const std::string& reason)
+{
+	// Issue #533 (#603 review): end this client's calls through endCall(),
+	// not a hand-rolled erase, so the peer leg is hung up (trunk BYE), relays
+	// and bridges are released and the CDR is written -- the same teardown
+	// every other path gets. Call-IDs are collected first: endCall() erases
+	// from _sessions.
+	struct Ending { std::string cid, src, dest; };
+	std::vector<Ending> ending;
+	for (const auto& [cid, s] : _sessions)
+	{
+		const bool isSrc = s->getSrc() && s->getSrc()->getNumber() == extension;
+		const bool isDest = s->getDest() && s->getDest()->getNumber() == extension;
+		if (!isSrc && !isDest) continue;
+		ending.push_back({cid, s->getSrc() ? s->getSrc()->getNumber() : std::string(),
+		                  s->getDest() ? s->getDest()->getNumber() : std::string()});
+#if POCKETDIAL_TRUNK_INBOUND
+		if (isTrunkInbound(*s)) continue;   // endTrunkInboundCall() below BYEs the handset
+#endif
+		// #1089: endCall() sends no BYE to a surviving phone, so hang it up here, on
+		// the dialog's own tags and our CSeq space (forceDisconnect()'s shape; same
+		// #72 empty-tag guard). A virtual-extension or trunk peer has no second phone.
+		const auto& peer = isSrc ? s->getDest() : s->getSrc();
+		const std::string& dFrom = s->getDialogFrom();
+		const std::string& dTo = s->getDialogTo();
+		const std::string peerNum = peer ? peer->getNumber() : std::string();
+		const bool peerVirtual = peerNum == "777" || peerNum == "440" || peerNum == ConferenceRoom::EXT ||
+		                        peerNum == kAnchorCallExt || s->isTrunk() || isMulticastPageCall(cid);
+		if (peer && !peerVirtual && !dFrom.empty() && !dTo.empty())
+		{
+			const uint32_t byeCSeq = s->nextServerCSeq();
+			auto b = isSrc ? buildServerBye(peer->getNumber(), peer->getAddress(), cid, dFrom, dTo, byeCSeq)
+			               : buildServerBye(peer->getNumber(), peer->getAddress(), cid, dTo, dFrom, byeCSeq);
+			if (b) _outbox.emplace_back(peer->getAddress(), std::move(b));
+			s->noteServerCSeq(byeCSeq);
+		}
+	}
+	for (const auto& e : ending)
+	{
+#if POCKETDIAL_TRUNK_INBOUND
+		// #398: a carrier's call to this handset: BYE it (best effort) and the carrier.
+		if (const auto s = getSession(e.cid); s.has_value() && isTrunkInbound(*s.value()))
+		{
+			endTrunkInboundCall(e.cid, s.value(), _outbox, reason);
+			continue;
+		}
+#endif
+		endCall(e.cid, e.src, e.dest, reason);
+	}
+}
+
 void RequestsHandler::sweepExpired()
 {
 	auto now = std::chrono::steady_clock::now();
@@ -9543,37 +9610,8 @@ void RequestsHandler::sweepExpired()
 				queueLog("Registration lease expired: " + client->getNumber());
 			}
 
-			// Issue #533 (#603 review): end this client's calls through endCall(),
-			// not a hand-rolled erase, so the far leg is hung up (trunk BYE), relays
-			// and bridges are released and the CDR is written -- the same teardown
-			// every other path gets. Call-IDs are collected first: endCall() erases
-			// from _sessions.
-			const std::string extension = client->getNumber();
-			std::vector<std::pair<std::string, std::string>> ending;   // {callID, other party}
-			for (const auto& [cid, s] : _sessions)
-			{
-				const bool isSrc = s->getSrc() && s->getSrc()->getNumber() == extension;
-				const bool isDest = s->getDest() && s->getDest()->getNumber() == extension;
-				if (isSrc || isDest)
-				{
-					const auto& other = isSrc ? s->getDest() : s->getSrc();
-					ending.emplace_back(cid, other ? other->getNumber() : std::string());
-				}
-			}
-			for (const auto& [cid, other] : ending)
-			{
-#if POCKETDIAL_TRUNK_INBOUND
-				// #398: a carrier's call to this handset: BYE it (best effort) and the carrier.
-				if (const auto s = getSession(cid); s.has_value() && isTrunkInbound(*s.value()))
-				{
-					endTrunkInboundCall(cid, s.value(), _outbox, leaseExpired ? "registration lease expired"
-					                                                          : "missed OPTIONS keepalive pings");
-					continue;
-				}
-#endif
-				endCall(cid, extension, other, leaseExpired ? "registration lease expired"
-				                                            : "missed OPTIONS keepalive pings");
-			}
+			endClientCalls(client->getNumber(), leaseExpired ? "registration lease expired"
+			                                                 : "missed OPTIONS keepalive pings");
 
 			client->release();
 		}

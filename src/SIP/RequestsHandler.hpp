@@ -2408,6 +2408,8 @@ private:
 	void onInboundAnchorOk(const std::shared_ptr<SipMessage>& ok, const std::shared_ptr<Session>& session);
 
 	void unregisterClient(std::string_view number);
+	// #1089: end every session `extension` is on through endCall(); caller holds _mutex.
+	void endClientCalls(std::string extension, const std::string& reason);
 
 	// Registration-lease handling (RFC 3261 §10.2.1)
 	int parseRequestedExpires(const std::shared_ptr<SipMessage>& data) const;
