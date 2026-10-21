@@ -97,6 +97,7 @@ void TelephonyAnchorClient::setRewarmIntervalSec(uint32_t)
 #endif
 
 static const char* TAG = "TelephonyAnchor";
+static void debugDumpParticipants(const char* where, const std::string& body, int status);   // DEBUG ONLY
 
 // RAII guard: cJSON_Delete on scope exit. Shared by the WS event parser and the
 // live-state reconcile/device GET helpers so every parse path frees on every return.
@@ -511,12 +512,13 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		// DEBUG ONLY (#1040 bench): never on a 911/933.
 		if (!pbx::classifyEmergencyDial(destination).isEmergency)
 		{
-			std::string dbgUrl;
+			std::string dbgUrl, dbgSrc;
 			{
 				std::lock_guard<std::mutex> lock(_mutex);
 				dbgUrl = _baseUrl + "/callcontrol/" + _sourceDn + "/participants";
+				dbgSrc = _sourceDn;
 			}
-			ESP_LOGI(TAG, "PDDBG makeCall dest=%s ownLeg=%s", destination.c_str(), ownLeg.c_str());
+			ESP_LOGI(TAG, "PDDBG makeCall dest=%s ownLeg=%s sourceDn=%s", destination.c_str(), ownLeg.c_str(), dbgSrc.c_str());
 			std::string dbgBody;
 			int dbgStatus = 0;
 			httpGetBody(dbgUrl, dbgBody, &dbgStatus, false);
@@ -1062,9 +1064,9 @@ static void debugDumpParticipants(const char* where, const std::string& body, in
 	cJSON_ArrayForEach(e, root)
 	{
 		cJSON* idv = cJSON_GetObjectItem(e, "id");
-		ESP_LOGI(TAG, "PDDBG %s[%d]: id=%d dn=%s party_dn=%s party_caller_id=%s party_caller_name=%s "
+		ESP_LOGI(TAG, "PDDBG %s[%d]: id=%d ids=%s dn=%s party_dn=%s party_caller_id=%s party_caller_name=%s "
 		              "party_did=%s party_dn_type=%s status=%s direct_control=%s callid=%s",
-		         where, n++, cJSON_IsNumber(idv) ? idv->valueint : -1, str(e, "dn"), str(e, "party_dn"),
+		         where, n++, cJSON_IsNumber(idv) ? idv->valueint : -1, str(e, "id"), str(e, "dn"), str(e, "party_dn"),
 		         str(e, "party_caller_id"), str(e, "party_caller_name"), str(e, "party_did"),
 		         str(e, "party_dn_type"), str(e, "status"), str(e, "direct_control"), str(e, "callid") );
 	}
