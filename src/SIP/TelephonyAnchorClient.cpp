@@ -508,6 +508,20 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 	if (success)
 	{
 		ownLeg = resolveOutboundLeg(respBody, destination, nullptr, &ownLegSource);
+		// DEBUG ONLY (#1040 bench): never on a 911/933.
+		if (!pbx::classifyEmergencyDial(destination).isEmergency)
+		{
+			std::string dbgUrl;
+			{
+				std::lock_guard<std::mutex> lock(_mutex);
+				dbgUrl = _baseUrl + "/callcontrol/" + _sourceDn + "/participants";
+			}
+			ESP_LOGI(TAG, "PDDBG makeCall dest=%s ownLeg=%s", destination.c_str(), ownLeg.c_str());
+			std::string dbgBody;
+			int dbgStatus = 0;
+			httpGetBody(dbgUrl, dbgBody, &dbgStatus, false);
+			debugDumpParticipants("after-makecall", dbgBody, dbgStatus);
+		}
 	}
 	else if (requestSent && !telephony::httpResponseParsed(status))
 	{
@@ -1023,6 +1037,39 @@ static void applyAudioNodelay(esp_http_client_handle_t client, int slotIdx)
 	{
 		ESP_LOGW(TAG, "audio POST TCP_NODELAY failed, slot %d, errno %d", slotIdx, fd >= 0 ? errno : EBADF);
 	}
+}
+
+// DEBUG ONLY (#1040 bench, never merged): log the party fields of each participant in a
+// /participants list body. Field values only; no token, no headers.
+static void debugDumpParticipants(const char* where, const std::string& body, int status)
+{
+	cJSON* root = cJSON_Parse(body.c_str());
+	if (!root || !cJSON_IsArray(root))
+	{
+		ESP_LOGW(TAG, "PDDBG %s: status %d, not an array (len=%u)", where, status, static_cast<unsigned>(body.size()));
+		if (root) cJSON_Delete(root);
+		return;
+	}
+	auto str = [](cJSON* e, const char* k) -> const char* {
+		cJSON* v = cJSON_GetObjectItem(e, k);
+		if (cJSON_IsString(v) && v->valuestring) return v->valuestring;
+		if (cJSON_IsNumber(v)) return "<num>";
+		if (cJSON_IsBool(v)) return cJSON_IsTrue(v) ? "<true>" : "<false>";
+		return v ? "<other>" : "<absent>";
+	};
+	int n = 0;
+	cJSON* e = nullptr;
+	cJSON_ArrayForEach(e, root)
+	{
+		cJSON* idv = cJSON_GetObjectItem(e, "id");
+		ESP_LOGI(TAG, "PDDBG %s[%d]: id=%d dn=%s party_dn=%s party_caller_id=%s party_caller_name=%s "
+		              "party_did=%s party_dn_type=%s status=%s direct_control=%s callid=%s",
+		         where, n++, cJSON_IsNumber(idv) ? idv->valueint : -1, str(e, "dn"), str(e, "party_dn"),
+		         str(e, "party_caller_id"), str(e, "party_caller_name"), str(e, "party_did"),
+		         str(e, "party_dn_type"), str(e, "status"), str(e, "direct_control"), str(e, "callid") );
+	}
+	ESP_LOGI(TAG, "PDDBG %s: %d participant(s), status %d", where, n, status);
+	cJSON_Delete(root);
 }
 
 // #862: only a token shaped like a JWT is installed (telephony::checkToken); an empty or garbled
@@ -3161,6 +3208,19 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 					[&](bool sosLane) { return getLegStatus(controlLeg, sosLane); }, sosPause);
 				const telephony::OutboundStep step = telephony::outboundStep(statusStr, emergency);
 				ESP_LOGI(TAG, "Upset %s -> control leg %s status '%s'", w.partId.c_str(), controlLeg.c_str(), statusStr.c_str());
+				// DEBUG ONLY (#1040 bench): never on a 911/933 slot.
+				if (!emergency)
+				{
+					std::string dbgUrl;
+					{
+						std::lock_guard<std::mutex> lock(_mutex);
+						dbgUrl = _baseUrl + "/callcontrol/" + _sourceDn + "/participants";
+					}
+					std::string dbgBody;
+					int dbgStatus = 0;
+					httpGetBody(dbgUrl, dbgBody, &dbgStatus, false);
+					debugDumpParticipants("upset", dbgBody, dbgStatus);
+				}
 
 				// Helper to read THIS slot's postLive (slot pointer stays valid — fixed array — but
 				// re-fetch the flag rather than caching across the blocking calls below).
