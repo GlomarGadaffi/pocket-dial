@@ -701,6 +701,8 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		else
 		{
 			ESP_LOGW(TAG, "makeCall: initiated %s but could not resolve own leg id — teardown will rely on reconcile", destination.c_str());
+			// #977: a live 911/933 with no slot looks like an orphan to a sweep armed before this POST: tell it.
+			if (sosLane) _unslottedEmergencySeq.store(postSeq, std::memory_order_release);
 		}
 	}
 	else
@@ -1873,7 +1875,8 @@ static std::string legIdOf(cJSON* elem)
 //   2) Legacy fallback (no result.id — bare /makecall, or a deregistered source DN): pick the
 //      CONTROLLABLE leg from the live participant list, i.e. one with direct_control == true
 //      (Telephony only acts on legs we directly control — see HTTP API §7.4). Among controllable
-//      legs, prefer the one whose party_dn matches _sourceDn (our own initiator leg).
+//      legs, prefer the one whose party_dn matches _sourceDn. (A bench capture shows an own outbound leg's party_dn
+//      is the DIALED number, not our DN, so this preference is a heuristic that may never match; see #1040.)
 //
 // We deliberately do NOT fall back to a destination digit-suffix match (audit #76): that keys
 // on the callee/FAR leg — exactly the leg class that 403'd in #40 — so a legacy-path guess could
@@ -1940,9 +1943,10 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 	if (!cJSON_IsArray(root)) return "";
 
 	std::string firstControllable;   // any direct_control:true leg (own-leg fallback)
-	std::string ownPartyDnLeg;       // the first of them whose party_dn is our source DN
+	std::string ownPartyDnLeg;       // the first of them whose party_dn is our source DN (see the capture note above)
 	std::string firstDn, firstCid;   // #977: the party fields of firstControllable and of ownPartyDnLeg
 	std::string ownDn, ownCid;
+	const bool wantParty = partyDnOut || partyCidOut;   // #977: only the sweep's read copies the party strings
 	auto partyOf = [](cJSON* o, const char* key) {
 		cJSON* v = cJSON_GetObjectItem(o, key);
 		return (cJSON_IsString(v) && v->valuestring) ? std::string(v->valuestring) : std::string();
@@ -1980,11 +1984,16 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 		if (firstControllable.empty())
 		{
 			firstControllable = id;
-			firstDn  = partyOf(elem, "party_dn");
-			firstCid = partyOf(elem, "party_caller_id");
+			if (wantParty)
+			{
+				firstDn  = partyOf(elem, "party_dn");
+				firstCid = partyOf(elem, "party_caller_id");
+			}
 		}
 
-		// Prefer the controllable leg whose party_dn IS our source DN — the initiator (own) leg.
+		// Prefer the controllable leg whose party_dn IS our source DN. Bench capture (#1040): an own outbound leg's
+		// party_dn and party_caller_id carry the DIALED number and its dn is ours, so this match is not what
+		// identifies the own leg; the first controllable leg is the fallback, unchanged.
 		if (ownPartyDnLeg.empty() && !srcDigits.empty())
 		{
 			cJSON* pdn = cJSON_GetObjectItem(elem, "party_dn");
@@ -1995,8 +2004,11 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 				if (pd == srcDigits)
 				{
 					ownPartyDnLeg = id;   // exact own-leg match
-					ownDn  = partyOf(elem, "party_dn");
-					ownCid = partyOf(elem, "party_caller_id");
+					if (wantParty)
+					{
+						ownDn  = partyOf(elem, "party_dn");
+						ownCid = partyOf(elem, "party_caller_id");
+					}
 				}
 			}
 		}
@@ -2297,26 +2309,23 @@ void TelephonyAnchorClient::maintRefreshTaskTrampoline(void* arg)
 
 // #977: the orphan sweep (decisions in SosStatusGet.hpp, host-tested by SosStatusGet_test.cpp). A 911/933's
 // makecall POST reached 3CX, no participant-list read of the #349 window showed the list, and the caller was
-// refused (503) as on main. 3CX may still hold a live call to the PSAP. makeCall() arms this with three atomic
-// stores and a wake: no lock, no I/O, no wait, so the caller's 503 is not delayed by it.
+// refused (503) as on main. 3CX may still hold a live call to the PSAP. makeCall() arms this with a few stores
+// under _mutex (no I/O, no wait on anything slower than a WS handler) and a wake, so the caller's 503 is not delayed.
 void TelephonyAnchorClient::armOrphanSweep(uint64_t postSeq, uint64_t armSeq, const std::string& destination)
 {
 	const int64_t nowUs = esp_timer_get_time();
-	// The digits of what this 911/933 dialed, into a fixed buffer: no allocation, and published by the release store below.
-	std::size_t n = 0;
-	for (const char c : destination)
 	{
-		if (c >= '0' && c <= '9' && n + 1 < sizeof(_sweepDest)) _sweepDest[n++] = c;
+		std::lock_guard<std::mutex> lock(_mutex);
+		_orphanArm.arm(nowUs, postSeq, armSeq, destination);
 	}
-	_sweepDest[n] = '\0';
-	_orphanPostSeq.store(postSeq, std::memory_order_relaxed);
-	_orphanArmSeq.store(armSeq, std::memory_order_relaxed);
 	_orphanHoldUntilUs.store(telephony::orphanHoldUntil(nowUs), std::memory_order_release);
-	_orphanArmedUs.store(nowUs, std::memory_order_release);
 	if (!wakeMaint(kMaintOrphanSweep))
 	{
 		// No tel_maint task: nothing will sweep, so take the hold back.
-		_orphanArmedUs.store(0, std::memory_order_release);
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			_orphanArm.disarm();
+		}
 		_orphanHoldUntilUs.store(0, std::memory_order_release);
 		_orphanWitness.noteNoWorker();
 	}
@@ -2348,11 +2357,15 @@ void TelephonyAnchorClient::orphanSweepTaskTrampoline(void* arg)
 void TelephonyAnchorClient::orphanSweepBody()
 {
 	// Take the arm. A wake whose arm an earlier pass already took finds 0 and returns.
-	const uint64_t postSeq = _orphanPostSeq.load(std::memory_order_relaxed);
-	const uint64_t armSeq = _orphanArmSeq.load(std::memory_order_relaxed);
-	const int64_t armedUs = _orphanArmedUs.exchange(0, std::memory_order_acq_rel);
-	if (armedUs == 0) return;
-	const std::string destDigits(_sweepDest);   // at most 23 digits: within the string's own buffer, no heap
+	telephony::OrphanArmSlot::Snapshot arm;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (!_orphanArm.take(arm)) return;
+	}
+	const uint64_t postSeq = arm.postSeq;
+	const uint64_t armSeq = arm.armSeq;
+	const int64_t armedUs = arm.armedUs;
+	const std::string_view destDigits(arm.dest);   // a view of the snapshot: at most 15 digits, no heap
 	const int64_t holdUntilUs = telephony::orphanHoldUntil(armedUs);
 
 	// Every exit ends this sweep's hold, unless a newer arm has replaced it.
@@ -2368,7 +2381,7 @@ void TelephonyAnchorClient::orphanSweepBody()
 	{
 		r = telephony::runOrphanSweep(
 			armedUs,
-			[this, postSeq, armSeq, &destDigits]() -> telephony::OrphanRead {
+			[this, postSeq, armSeq, destDigits]() -> telephony::OrphanRead {
 				// The pending guards and the stranger decision are telephony::readOrphanOnce (host-tested);
 				// this lends it the I/O and the client's state.
 				return telephony::readOrphanOnce(
@@ -2417,6 +2430,10 @@ void TelephonyAnchorClient::orphanSweepBody()
 			[this, postSeq, armSeq] {
 				std::lock_guard<std::mutex> lock(_mutex);
 				return _pendingSeen.anyIn(postSeq, armSeq);
+			},
+			// A 911/933 that succeeded with no own leg after this one's POST: its live leg may be any listed leg.
+			[this, postSeq] {
+				return telephony::unslottedEmergencyAfter(_unslottedEmergencySeq.load(std::memory_order_acquire), postSeq);
 			});
 	}
 	catch (const std::bad_alloc&)
@@ -3502,8 +3519,7 @@ int TelephonyAnchorClient::countOutboundLocked(std::string* inflight, size_t inf
 	// for an id upserted while a makeCall was pending: any other id (a PSAP callback) is announced at once (Rule 5).
 	pending = telephony::pendingWithOrphanHold(_outboundPending.load(std::memory_order_acquire),
 	                                           _orphanHoldUntilUs.load(std::memory_order_acquire), esp_timer_get_time(),
-	                                           !partId || _pendingSeen.seenIn(*partId, _orphanPostSeq.load(std::memory_order_relaxed),
-	                                                                  _orphanArmSeq.load(std::memory_order_relaxed)));
+	                                           !partId || _pendingSeen.seenIn(*partId, _orphanArm.postSeq(), _orphanArm.armSeq()));
 	return nin;
 }
 

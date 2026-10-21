@@ -64,16 +64,19 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertEqual(self.unread.count("resolveOutboundLeg("), 1, "the window's reads are the only reads")
         self.assertIn("/*skipOurs=*/true", self.unread)
 
-    def test_arming_takes_no_lock_does_no_io_and_waits_for_nothing(self):
-        self.assertIsNone(LOCK.search(self.arm), "armOrphanSweep() runs on the 911's worker")
+    def test_arming_takes_only_the_state_mutex_briefly_does_no_io_and_waits_for_nothing(self):
+        # The arm, its window and its number are one snapshot (OrphanArmSlot), written under _mutex: no I/O inside.
+        self.assertEqual(len(LOCK.findall(self.arm)), 2, "arm and disarm, each a scope of its own")
+        self.assertRegex(self.arm, r"\{\s*std::lock_guard<std::mutex> lock\(_mutex\);\s*"
+                                   r"_orphanArm\.arm\(nowUs, postSeq, armSeq, destination\);\s*\}")
         self.assertIsNone(IO.search(self.arm), "no I/O, no vTaskDelay")
+        arm = self.arm.index("_orphanArm.arm(")
         hold = self.arm.index("_orphanHoldUntilUs.store(telephony::orphanHoldUntil(nowUs)")
-        armed = self.arm.index("_orphanArmedUs.store(nowUs")
         wake = self.arm.index("wakeMaint(kMaintOrphanSweep)")
-        self.assertTrue(hold < armed < wake, "the hold is raised before anything can run, and the wake is last")
+        self.assertTrue(arm < hold < wake, "armed, then the hold is raised, and the wake is last")
         after = self.arm[wake:]
         self.assertIn("_orphanHoldUntilUs.store(0", after, "a wake with no task takes the hold back")
-        self.assertIn("_orphanArmedUs.store(0", after)
+        self.assertIn("_orphanArm.disarm();", after)
         self.assertIn("_orphanWitness.noteNoWorker()", after)
 
     # ── the hold ──────────────────────────────────────────────────────────────────
@@ -82,8 +85,7 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         count = body_of(self.cpp, "int TelephonyAnchorClient::countOutboundLocked(")
         self.assertRegex(count, r"pending = telephony::pendingWithOrphanHold\(_outboundPending\.load\([^)]*\),\s*"
                                 r"_orphanHoldUntilUs\.load\([^)]*\), esp_timer_get_time\(\),\s*"
-                                r"!partId \|\| _pendingSeen\.seenIn\(\*partId, _orphanPostSeq\.load\(std::memory_order_relaxed\),\s*"
-                                r"_orphanArmSeq\.load\(std::memory_order_relaxed\)\)\);")
+                                r"!partId \|\| _pendingSeen\.seenIn\(\*partId, _orphanArm\.postSeq\(\), _orphanArm\.armSeq\(\)\)\);")
         self.assertIn("struct PendingDec", self.make)
         self.assertRegex(self.make, r"~PendingDec\(\) \{ c\.fetch_sub\(1, std::memory_order_acq_rel\); \}",
                          "the makeCall RAII is as it was: the hold is a separate, time-bounded thing")
@@ -92,7 +94,7 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertIn("const int64_t holdUntilUs = telephony::orphanHoldUntil(armedUs);", self.sweep)
         end = self.sweep.index("struct HoldEnd")
         self.assertIn("compare_exchange_strong(until, 0", self.sweep[end:self.sweep.index("holdEnd{")])
-        self.assertLess(self.sweep.index("armedUs == 0) return;"), end, "no arm, no hold of its own to end")
+        self.assertLess(self.sweep.index("if (!_orphanArm.take(arm)) return;"), end, "no arm, no hold of its own to end")
         self.assertLess(end, self.sweep.index("telephony::runOrphanSweep("), "a destructor: every exit, a throw included")
 
     # ── the job ───────────────────────────────────────────────────────────────────
@@ -108,11 +110,12 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertIsNone(ALLOC.search(self.arm))
 
     def test_the_sweep_state_is_a_few_atomics_and_nothing_that_allocates(self):
-        decls = [l for l in self.hpp.split("\n") if "_orphan" in l and ";" in l and "(" not in l]
-        self.assertEqual(len(decls), 5, "armed time, POST seq, arm seq, hold, witness")
-        for line in decls[:4]:
-            self.assertIn("std::atomic<", line)
+        decls = [l for l in self.hpp.split("\n") if "_orphan" in l and ";" in l and "(" not in l and "//" not in l.split("_orphan")[0]]
+        self.assertEqual(len(decls), 3, "the arm snapshot, the hold, the witness")
+        self.assertIn("telephony::OrphanArmSlot _orphanArm;", "\n".join(decls))
+        self.assertIn("std::atomic<int64_t>  _orphanHoldUntilUs", "\n".join(decls))
         self.assertNotRegex("\n".join(decls), r"std::(string|vector|map|function)")
+        self.assertIn("std::atomic<uint64_t> _unslottedEmergencySeq{0};", self.hpp)
 
     def test_the_bound_runs_from_the_arm_and_the_sweep_sleeps_in_vtaskdelay(self):
         self.assertRegex(self.sweep, r"telephony::runOrphanSweep\(\s*armedUs,")
@@ -145,7 +148,7 @@ class AnchorOrphanSweepTest(unittest.TestCase):
 
     def test_no_lock_is_held_across_io_in_the_sweep(self):
         locks = [m.start() for m in LOCK.finditer(self.sweep)]
-        self.assertEqual(len(locks), 3, "the stranger check, the hold hook and the candidate check, each a scope of its own")
+        self.assertEqual(len(locks), 4, "the take, the stranger check, the hold hook and the candidate check, each a scope of its own")
         self.assertRegex(self.sweep, r"\{\s*std::lock_guard<std::mutex> lock\(_mutex\);\s*"
                                      r"_ownLegs\.noteNamed\(leg, esp_timer_get_time\(\), postSeq\);\s*\}",
                          "a scope of its own, one table call, no I/O inside")
@@ -194,7 +197,7 @@ class AnchorOrphanSweepTest(unittest.TestCase):
 
     def test_the_classifier_holds_only_an_id_seen_while_a_makecall_was_pending(self):
         count = body_of(self.cpp, "int TelephonyAnchorClient::countOutboundLocked(")
-        self.assertIn("_pendingSeen.seenIn(*partId, _orphanPostSeq", count)
+        self.assertIn("_pendingSeen.seenIn(*partId, _orphanArm.postSeq(), _orphanArm.armSeq())", count)
         self.assertIn("const std::string* partId", self.hpp)
         ws = self.cpp[self.cpp.index("std::string controlLegs[POCKETDIAL_MAX_ANCHOR_CALLS];"):]
         ws = ws[:ws.index("if (nLegs == 0) break;")]
@@ -210,8 +213,24 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertIn("rd.stranger = !rd.leg.empty() && !(seen(rd.leg) && partyIsDestination(destDigits, rd.partyDn, rd.partyCid));", helper)
 
     def test_a_sweep_with_no_leg_upserted_in_the_window_reads_nothing(self):
-        self.assertIn("_orphanArmSeq.load(std::memory_order_relaxed)", self.sweep)
+        self.assertIn("const uint64_t armSeq = arm.armSeq;", self.sweep)
         self.assertIn("if (r.reads == 0 && !hasCandidate())", self.sos)
+
+    # ── Rule 5 review of #1040, round 4 ───────────────────────────────────────────
+
+    def test_a_911_that_succeeded_with_no_own_leg_ends_the_sweep_before_a_drop(self):
+        make = self.make
+        branch = make[make.index("could not resolve own leg id"):]
+        branch = branch[:branch.index("else")]
+        self.assertIn("if (sosLane) _unslottedEmergencySeq.store(postSeq, std::memory_order_release);", branch)
+        self.assertIn("telephony::unslottedEmergencyAfter(_unslottedEmergencySeq.load(std::memory_order_acquire), postSeq)",
+                      self.sweep)
+
+    def test_the_party_strings_are_copied_only_when_the_caller_wants_them(self):
+        resolve = body_of(self.cpp, "std::string TelephonyAnchorClient::resolveOutboundLeg(")
+        self.assertIn("const bool wantParty = partyDnOut || partyCidOut;", resolve)
+        self.assertEqual(resolve.count("partyOf(elem,"), 4)
+        self.assertEqual(resolve.count("if (wantParty)"), 2, "both pick sites")
 
     # ── the list read ─────────────────────────────────────────────────────────────
 

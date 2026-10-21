@@ -483,7 +483,7 @@ private:
 	std::size_t _next = 0;
 };
 
-enum class OrphanSweepEnd : uint8_t { Dropped, DropFailed, GaveUp, Ambiguous, Stopped, TooLate, NoCandidate };
+enum class OrphanSweepEnd : uint8_t { Dropped, DropFailed, GaveUp, Ambiguous, Stopped, TooLate, NoCandidate, UnslottedLiveEmergency };
 
 // One sweep read: the leg resolveOutboundLeg() picked ("" when the read failed or listed none) and how many
 // candidates the list held.
@@ -507,7 +507,10 @@ inline std::string digitsOnly(std::string_view s)
 	return d;
 }
 
-// Is the pick's remote party the number this 911/933 dialed? A PSAP callback's party is the PSAP's number, not
+// Is the pick's remote party the number this 911/933 dialed? Bench capture of a real 3CX participant record for our
+// own outbound leg (PR #1040, 2026-10-21): dn = our DN, party_dn = *777 and party_caller_id = *777, both the DIALED
+// number, direct_control = false (a *777 park-type extension). So the dialed number is in party_dn and
+// party_caller_id, and either matches. A PSAP callback's party is the PSAP's number, not
 // 911/933. A record with no party field proves nothing, and neither does an empty destination.
 inline bool partyIsDestination(std::string_view destDigits, std::string_view partyDn, std::string_view partyCid)
 {
@@ -522,14 +525,17 @@ struct OrphanSweepResult
 	std::string    leg;   // the leg handed to dropLeg
 };
 
-// The sweep. hasCandidate() is false when no leg was upserted in the window (PendingSeenIds::anyIn): the sweep
+// The sweep. unslotted() is true once a 911/933 makeCall succeeded with no own leg after this sweep's POST
+// (unslottedEmergencyAfter): its live leg may be any listed leg, so the sweep ends before a drop. hasCandidate() is false when no leg was upserted in the window (PendingSeenIds::anyIn): the sweep
 // then has nothing it may drop, and it ends at once without a read. armedUs is the time makeCall() armed it (the bound runs from there, not from when tel_maint
 // got to it). readOnce() -> OrphanRead; nowUs() is a microsecond clock; keepGoing() is false once the
 // anchor is stopping; pause() sleeps one poll gap; holdLeg(leg) notes the leg as ours; dropLeg(leg) -> bool
 // drops it. The order is the contract: holdLeg, then dropLeg, once each, and only for a single candidate.
-template <class ReadFn, class NowFn, class KeepFn, class PauseFn, class HoldFn, class DropFn, class HasCandFn>
+template <class ReadFn, class NowFn, class KeepFn, class PauseFn, class HoldFn, class DropFn, class HasCandFn,
+          class UnslottedFn>
 OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& nowUs, KeepFn&& keepGoing,
-                                 PauseFn&& pause, HoldFn&& holdLeg, DropFn&& dropLeg, HasCandFn&& hasCandidate)
+                                 PauseFn&& pause, HoldFn&& holdLeg, DropFn&& dropLeg, HasCandFn&& hasCandidate,
+                                 UnslottedFn&& unslotted)
 {
 	OrphanSweepResult r;
 	for (;;)
@@ -537,6 +543,11 @@ OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& now
 		if (!keepGoing())
 		{
 			r.end = OrphanSweepEnd::Stopped;
+			break;
+		}
+		if (unslotted())
+		{
+			r.end = OrphanSweepEnd::UnslottedLiveEmergency;
 			break;
 		}
 		if (r.reads == 0 && !hasCandidate())
@@ -557,6 +568,11 @@ OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& now
 			const OrphanSweepStep step = orphanSweepStep(rd.leg.empty() || rd.stranger ? 0 : rd.candidates, nowUs() - armedUs);
 		if (step == OrphanSweepStep::Drop)
 		{
+			if (unslotted())   // one began during the read: its leg may be this pick
+			{
+				r.end = OrphanSweepEnd::UnslottedLiveEmergency;
+				break;
+			}
 			r.leg = rd.leg;
 			holdLeg(r.leg);   // ours before the drop goes out: its upserts are not inbound calls
 			r.end = dropLeg(r.leg) ? OrphanSweepEnd::Dropped : OrphanSweepEnd::DropFailed;
@@ -577,12 +593,77 @@ OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& now
 	return r;
 }
 
+template <class ReadFn, class NowFn, class KeepFn, class PauseFn, class HoldFn, class DropFn, class HasCandFn>
+OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& nowUs, KeepFn&& keepGoing,
+                                 PauseFn&& pause, HoldFn&& holdLeg, DropFn&& dropLeg, HasCandFn&& hasCandidate)
+{
+	return runOrphanSweep(armedUs, readOnce, nowUs, keepGoing, pause, holdLeg, dropLeg, hasCandidate,
+	                      [] { return false; });
+}
+
 template <class ReadFn, class NowFn, class KeepFn, class PauseFn, class HoldFn, class DropFn>
 OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& nowUs, KeepFn&& keepGoing,
                                  PauseFn&& pause, HoldFn&& holdLeg, DropFn&& dropLeg)
 {
 	return runOrphanSweep(armedUs, readOnce, nowUs, keepGoing, pause, holdLeg, dropLeg, [] { return true; });
 }
+
+// A 911/933 makeCall that returned success WITHOUT a resolved own leg (makeCall's "could not resolve own leg id"
+// branch) has a live call to the PSAP and no slot: its leg is listed, unslotted, and looks exactly like an orphan.
+// eventPostSeq is that makeCall's POST event number (0: none yet). Any such call whose POST was at or after the
+// sweep's own ends the sweep before a drop.
+inline bool unslottedEmergencyAfter(uint64_t eventPostSeq, uint64_t sweepPostSeq)
+{
+	return eventPostSeq != 0 && eventPostSeq >= sweepPostSeq;
+}
+
+// The armed sweep's state, written by makeCall() and taken by tel_maint. NOT synchronised: the client holds its
+// _mutex around arm() and take() (no I/O inside), so a take never pairs one arm's window with another's number.
+// The destination is kept as digits, at most kDestDigits (the longest string a std::string holds without a heap
+// allocation in libstdc++ is 15 characters).
+class OrphanArmSlot
+{
+public:
+	static constexpr std::size_t kDestDigits = 15;
+	struct Snapshot
+	{
+		int64_t  armedUs = 0;
+		uint64_t postSeq = 0;
+		uint64_t armSeq  = 0;
+		char     dest[kDestDigits + 1] = {};
+	};
+
+	void arm(int64_t armedUs, uint64_t postSeq, uint64_t armSeq, std::string_view destination)
+	{
+		_s.armedUs = armedUs;
+		_s.postSeq = postSeq;
+		_s.armSeq  = armSeq;
+		std::size_t n = 0;
+		for (const char c : destination)
+		{
+			if (c >= '0' && c <= '9' && n < kDestDigits) _s.dest[n++] = c;
+		}
+		_s.dest[n] = '\0';
+	}
+
+	// The whole arm at once, and it is spent: false when nothing is armed. The window stays readable (window()).
+	bool take(Snapshot& out)
+	{
+		if (_s.armedUs == 0) return false;
+		out         = _s;
+		_s.armedUs  = 0;
+		return true;
+	}
+
+	// A wake with no tel_maint task: nothing will sweep.
+	void disarm() { _s.armedUs = 0; }
+
+	uint64_t postSeq() const { return _s.postSeq; }
+	uint64_t armSeq() const { return _s.armSeq; }
+
+private:
+	Snapshot _s;
+};
 
 // One sweep read, with the decisions the ESP arm used to make inline. readList() does the I/O and returns the pick
 // and its candidate count (an empty leg when the read failed or listed none); it may throw std::bad_alloc, which
@@ -619,7 +700,7 @@ class OrphanSweepWitness
 {
 public:
 	static constexpr uint32_t kLinesPerEnd = 8;
-	static constexpr std::size_t kEnds     = 7;
+	static constexpr std::size_t kEnds     = 8;
 
 	// True when this one wrote a line.
 	bool noteEnd(OrphanSweepEnd end)
@@ -645,6 +726,9 @@ public:
 				break;
 			case OrphanSweepEnd::TooLate:
 				PD_WITNESS_W("anchor", "911 orphan sweep: tel_maint reached it after the bound, nothing read (#977)");
+				break;
+			case OrphanSweepEnd::UnslottedLiveEmergency:
+				PD_WITNESS_W("anchor", "911 orphan sweep: another 911 succeeded with no own leg after this one, its leg may be that live call, none dropped (#977)");
 				break;
 			case OrphanSweepEnd::NoCandidate:
 				PD_WITNESS_W("anchor", "911 orphan sweep: no leg was upserted in the window, nothing to find, no read (#977)");

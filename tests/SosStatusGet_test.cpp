@@ -1079,6 +1079,8 @@ struct SweepWorld
 	std::string              dest = "911";   // the number the armed 911 dialed
 	std::vector<OrphanRead>  lists;          // what the n-th list read returns (the last repeats)
 	std::vector<int>         pendingAtRead;  // _outboundPending at the n-th call to pendingCount (the last repeats)
+	uint64_t                 unslottedEventSeq = 0;      // POST seq of a 911 that succeeded with no own leg (0: none)
+	bool                     unslottedDuringRead = false; // it happens while the first list read is in flight
 	int                      readNo = 0, readNo2 = 0;
 	int64_t                  t = 0;
 	std::vector<std::string> events;
@@ -1096,6 +1098,7 @@ struct SweepWorld
 					[&] {
 						const std::size_t i = std::min(static_cast<std::size_t>(readNo), lists.size() - 1);
 						++readNo;
+						if (unslottedDuringRead) unslottedEventSeq = kPostSeq + 8;
 						return lists[i];
 					},
 					[&] { return pendingAtRead[std::min(static_cast<std::size_t>(attempt), pendingAtRead.size() - 1)]; },
@@ -1112,7 +1115,8 @@ struct SweepWorld
 				events.push_back("drop:" + leg);
 				return true;
 			},
-			[&] { return ring.anyIn(kPostSeq, kArmSeq); });
+			[&] { return ring.anyIn(kPostSeq, kArmSeq); },
+			[&] { return unslottedEmergencyAfter(unslottedEventSeq, kPostSeq); });
 	}
 
 	int count(const char* prefix) const
@@ -1233,6 +1237,67 @@ TEST(SosOrphanSweep, ALegWhoseRecordCarriesNoPartyIsNotProvablyTheOrphanAndIsNot
 	EXPECT_EQ(r.end, OrphanSweepEnd::GaveUp);
 }
 
+// Opus review of #1040, round 4, 1. A makeCall for a second 911 got 200 with no result.id and its list read failed,
+// so it returned success with no own leg: a live 911 with no slot. Its first upsert arrives while A's window is
+// open and A alone is pending, so it is noted with count 1, its party is 911, and it is the sole candidate.
+TEST(SosOrphanSweep, ALive911ThatSucceededWithNoOwnLegAfterThePostIsNeverDropped)
+{
+	SweepWorld w;
+	w.ring.note("601", SweepWorld::kPostSeq + 9, 1);
+	w.lists = { pick("601", "911") };
+	w.unslottedEventSeq = SweepWorld::kPostSeq + 5;   // the second 911's POST, after A's
+	const OrphanSweepResult r = w.run();
+	EXPECT_EQ(r.end, OrphanSweepEnd::UnslottedLiveEmergency);
+	EXPECT_EQ(w.count("drop:"), 0) << "that leg is a live 911";
+	EXPECT_EQ(w.count("hold:"), 0);
+	EXPECT_EQ(r.reads, 0) << "it ends before spending a read";
+
+	SweepWorld during;   // the second 911 returns while the sweep's read is in flight
+	during.ring.note("601", SweepWorld::kPostSeq + 9, 1);
+	during.lists = { pick("601", "911") };
+	during.unslottedDuringRead = true;
+	const OrphanSweepResult r2 = during.run();
+	EXPECT_EQ(r2.end, OrphanSweepEnd::UnslottedLiveEmergency);
+	EXPECT_EQ(r2.reads, 1);
+	EXPECT_EQ(during.count("drop:"), 0) << "checked again before the drop";
+
+	SweepWorld before;   // positive control: one that succeeded before A's POST says nothing about this leg
+	before.ring.note("517", SweepWorld::kPostSeq + 3, 1);
+	before.lists = { pick("517", "911") };
+	before.unslottedEventSeq = SweepWorld::kPostSeq - 1;
+	EXPECT_EQ(before.run().end, OrphanSweepEnd::Dropped);
+
+	EXPECT_FALSE(unslottedEmergencyAfter(0, 40)) << "none recorded";
+	EXPECT_TRUE(unslottedEmergencyAfter(40, 40)) << "at A's POST counts";
+	EXPECT_FALSE(unslottedEmergencyAfter(39, 40));
+}
+
+// 2. The arm's window, number and time are one snapshot: a take never pairs one arm's window with another's number.
+TEST(SosOrphanSweep, TheArmedWindowAndNumberAreTakenTogetherAndOnlyOnce)
+{
+	OrphanArmSlot slot;
+	OrphanArmSlot::Snapshot snap;
+	EXPECT_FALSE(slot.take(snap)) << "nothing armed";
+
+	slot.arm(1000, 40, 60, "911");
+	slot.arm(2000, 70, 90, "+1 (933)");   // a second 911 arms before tel_maint runs
+	ASSERT_TRUE(slot.take(snap));
+	EXPECT_EQ(snap.armedUs, 2000);
+	EXPECT_EQ(snap.postSeq, 70u);
+	EXPECT_EQ(snap.armSeq, 90u);
+	EXPECT_STREQ(snap.dest, "1933") << "digits only";
+	EXPECT_FALSE(slot.take(snap)) << "an arm is spent once";
+	EXPECT_EQ(slot.postSeq(), 70u) << "the window stays readable for the hold";
+	EXPECT_EQ(slot.armSeq(), 90u);
+
+	slot.arm(3000, 100, 120, "123456789012345678901234");
+	ASSERT_TRUE(slot.take(snap));
+	EXPECT_EQ(std::strlen(snap.dest), OrphanArmSlot::kDestDigits) << "within a std::string's own buffer: no heap";
+	slot.arm(4000, 130, 150, "911");
+	slot.disarm();
+	EXPECT_FALSE(slot.take(snap)) << "a wake with no worker takes the arm back";
+}
+
 TEST(SosOrphanSweep, WithNoLegUpsertedInTheWindowTheSweepEndsAtOnceWithoutReading)
 {
 	SweepWorld none;   // an empty ring: the WS delivered nothing (or another outbound call kept it from being noted)
@@ -1294,6 +1359,7 @@ TEST(SosOrphanSweepWitness, EachEndIsCountedAndItsLineIsCappedAndCarriesNoNumber
 	EXPECT_TRUE(w.noteEnd(OrphanSweepEnd::Stopped));
 	EXPECT_TRUE(w.noteEnd(OrphanSweepEnd::TooLate));
 	EXPECT_TRUE(w.noteEnd(OrphanSweepEnd::NoCandidate));
+	EXPECT_TRUE(w.noteEnd(OrphanSweepEnd::UnslottedLiveEmergency));
 	EXPECT_TRUE(w.noteNoWorker());
 
 	EXPECT_EQ(w.count(OrphanSweepEnd::GaveUp), 12u) << "the cap limits the log, not the count";
@@ -1312,10 +1378,11 @@ TEST(SosOrphanSweepWitness, EachEndIsCountedAndItsLineIsCappedAndCarriesNoNumber
 	EXPECT_EQ(pdwitness::count("911 orphan sweep: anchor stopping, ended (#977)"), 1u);
 	EXPECT_EQ(pdwitness::count("911 orphan sweep: tel_maint reached it after the bound, nothing read (#977)"), 1u);
 	EXPECT_EQ(pdwitness::count("911 orphan sweep: no leg was upserted in the window, nothing to find, no read (#977)"), 1u);
+	EXPECT_EQ(pdwitness::count("911 orphan sweep: another 911 succeeded with no own leg after this one, its leg may be that live call, none dropped (#977)"), 1u);
 	EXPECT_EQ(pdwitness::count("911 orphan sweep: no tel_maint task, not armed (#977)"), 1u);
 
 	const std::vector<std::string> lines = pdwitness::lines();
-	EXPECT_EQ(lines.size(), std::size_t{ OrphanSweepWitness::kLinesPerEnd } + 7u);
+	EXPECT_EQ(lines.size(), std::size_t{ OrphanSweepWitness::kLinesPerEnd } + 8u);
 	for (const std::string& line : lines)
 	{
 		// Only the issue tag, the emergency lane's name and the PBX's name have digits in them.

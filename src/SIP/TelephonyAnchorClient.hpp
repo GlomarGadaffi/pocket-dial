@@ -283,7 +283,7 @@ private:
 	WitnessTick witnessSightingLocked(const std::string& partId);
 	static void noteWitnessCap(const WitnessTick& tick);
 	// partId (#977, Rule 5): the id of the upsert being classified. The sweep's hold counts in pending only for an
-	// id _pendingSeen first noted within (_orphanPostSeq, _orphanArmSeq]; nullptr (a caller that announces nothing): the hold counts.
+	// id _pendingSeen first noted within the armed window (_orphanArm); nullptr (a caller that announces nothing): the hold counts.
 	int         countOutboundLocked(std::string* inflight, size_t inflightCap, int& active, int& pending,
 	                                const std::string* partId = nullptr) const;
 	// Issue #553: delete a slot's rx task only once it has parked (pd::reapDecision);
@@ -380,9 +380,12 @@ private:
 	// _orphanHoldUntilUs makes the WS classifier ignore an unmatched upsert as it does while a makeCall is
 	// pending, so the orphan's repeat upsert is not promoted to an inbound call before the drop.
 	static constexpr uint32_t kMaintOrphanSweep = 1u << 4;
-	std::atomic<int64_t>  _orphanArmedUs{0};       // 0: nothing armed; the sweep takes it with an exchange
-	std::atomic<uint64_t> _orphanPostSeq{0};       // _wsSeq at the POST that may have created the leg
-	std::atomic<uint64_t> _orphanArmSeq{0};        // _wsSeq when the sweep was armed: the window is (post, arm]
+	// The arm: its time, POST seq, arm seq and the number the 911/933 dialed, written and taken as one snapshot under
+	// _mutex (no I/O inside), so a take never pairs one arm's window with another's number. The window is (post, arm].
+	telephony::OrphanArmSlot _orphanArm;
+	// POST seq of the latest 911/933 makeCall that succeeded WITHOUT a resolved own leg: a live call with no slot,
+	// which looks like an orphan. A sweep whose POST is at or before it ends before a drop. 0: none.
+	std::atomic<uint64_t> _unslottedEmergencySeq{0};
 	std::atomic<int64_t>  _orphanHoldUntilUs{0};   // esp_timer time the hold lasts to; 0: no hold
 	telephony::OrphanSweepWitness _orphanWitness;
 	// The ids first upserted, within the sweep's window (its POST to its arm), while a makeCall was pending (guarded by
@@ -391,9 +394,6 @@ private:
 	telephony::PendingSeenIds<8, telephony::kParticipantIdBytes> _pendingSeen;
 	// The sweep's drop: a fresh-client POST, never performCtrl()'s _ctrlMutex, so answerCall() cannot queue behind it.
 	bool dropOrphanLeg(const std::string& leg);
-	// The digits of the number the armed 911/933 dialed (written by armOrphanSweep before _orphanArmedUs is
-	// released, read by the sweep after it takes the arm): only a leg whose party is this number is the orphan.
-	char _sweepDest[24] = {};
 	void armOrphanSweep(uint64_t postSeq, uint64_t armSeq, const std::string& destination);
 	void orphanSweepBody();
 	static void orphanSweepTaskTrampoline(void* arg);
