@@ -80,7 +80,8 @@ class AnchorOrphanSweepTest(unittest.TestCase):
     def test_the_hold_is_the_pending_count_the_classifier_reads_and_makecalls_own_count_is_untouched(self):
         count = body_of(self.cpp, "int TelephonyAnchorClient::countOutboundLocked(")
         self.assertRegex(count, r"pending = telephony::pendingWithOrphanHold\(_outboundPending\.load\([^)]*\),\s*"
-                                r"_orphanHoldUntilUs\.load\([^)]*\), esp_timer_get_time\(\)\);")
+                                r"_orphanHoldUntilUs\.load\([^)]*\), esp_timer_get_time\(\),\s*"
+                                r"!partId \|\| _pendingSeen\.seenAfter\(\*partId, _orphanPostSeq\.load\(std::memory_order_relaxed\)\)\);")
         self.assertIn("struct PendingDec", self.make)
         self.assertRegex(self.make, r"~PendingDec\(\) \{ c\.fetch_sub\(1, std::memory_order_acq_rel\); \}",
                          "the makeCall RAII is as it was: the hold is a separate, time-bounded thing")
@@ -119,8 +120,9 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertRegex(self.sos, r"kOrphanSweepWindowUs\s*=\s*kUnreadAdoptWindowUs;")
 
     def test_the_read_is_on_the_ordinary_lane_and_an_allocation_failure_is_a_failed_read(self):
-        self.assertIn("resolveOutboundLeg(std::string(), std::string(), &listStatus, &source, &counts, /*skipOurs=*/true)",
-                      self.sweep, "an empty destination is the ordinary status lane (#941)")
+        self.assertIn("resolveOutboundLeg(std::string(), std::string(), &listStatus, &source, &counts, /*skipOurs=*/true,"
+                      "\n\t\t\t\t\t\t\t\t/*fresh=*/true)",
+                      self.sweep, "an empty destination is the ordinary status lane (#941), and it never waits on the shared lock")
         for sos in ("sosLane", "_sosStatus", "_sosBody", "/*sosLane=*/true", "classifyEmergencyDial"):
             self.assertNotIn(sos, self.sweep, "never the 911 handle: its claim is a 911's own GET")
         self.assertGreaterEqual(self.sweep.count("catch (const std::bad_alloc&)"), 3, "read, drop and the driver")
@@ -144,16 +146,19 @@ class AnchorOrphanSweepTest(unittest.TestCase):
 
     def test_no_lock_is_held_across_io_in_the_sweep(self):
         locks = [m.start() for m in LOCK.finditer(self.sweep)]
-        self.assertEqual(len(locks), 1, "the one lock, in the hold hook")
+        self.assertEqual(len(locks), 2, "the stranger check and the hold hook, each a scope of its own")
         self.assertRegex(self.sweep, r"\{\s*std::lock_guard<std::mutex> lock\(_mutex\);\s*"
                                      r"_ownLegs\.noteNamed\(leg, esp_timer_get_time\(\), postSeq\);\s*\}",
                          "a scope of its own, one table call, no I/O inside")
+        self.assertRegex(self.sweep, r"\{\s*std::lock_guard<std::mutex> lock\(_mutex\);\s*"
+                                     r"rd\.stranger = !rd\.leg\.empty\(\) && !_pendingSeen\.seenAfter\(rd\.leg, postSeq\);\s*\}",
+                         "after the read, never across it")
 
     def test_the_leg_is_ours_before_its_drop_and_before_the_hold_ends(self):
         hook = self.sweep[self.sweep.index("[this, postSeq, holdUntilUs](const std::string& leg)"):]
         noted = hook.index("_ownLegs.noteNamed(")
         released = hook.index("_orphanHoldUntilUs.compare_exchange_strong(until, 0")
-        dropped = hook.index("dropCall(leg)")
+        dropped = hook.index("dropOrphanLeg(leg)")
         self.assertTrue(noted < released < dropped, "noteNamed, then the hold ends, then the drop")
 
     def test_the_end_is_counted_by_the_witness_and_the_harness_token_is_not_reused(self):
@@ -163,6 +168,42 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertRegex(self.sos, r"kLinesPerEnd\s*=\s*8;")
         for text in (self.sweep, self.arm):
             self.assertNotIn("ORPHANED", text, "tests/load/anchor_scenarios.py counts that token as the #349 refusal")
+
+    # ── Rule 5 review of #1040 ────────────────────────────────────────────────────
+
+    def test_the_sweep_drop_takes_no_ctrl_mutex_so_answercall_never_queues_behind_it(self):
+        # dropCall() ends in performCtrl(), which holds _ctrlMutex for the whole POST (up to 5 to 7 s), and
+        # answerCall() waits on it. The sweep's drop is a fresh-client POST, as makeCall()'s is.
+        self.assertNotIn("dropCall(", self.sweep)
+        self.assertNotIn("performCtrl", self.sweep)
+        drop = body_of(self.cpp, "bool TelephonyAnchorClient::dropOrphanLeg(")
+        self.assertIn("httpPostBody(", drop)
+        for shared in ("performCtrl", "_ctrlMutex", "_ctrlClient", "stopMediaStreams"):
+            self.assertNotIn(shared, drop)
+        self.assertIn("/drop", drop)
+
+    def test_the_sweep_read_has_a_handle_of_its_own_and_takes_no_status_lock(self):
+        get = body_of(self.cpp, "bool TelephonyAnchorClient::httpGetBody(")
+        self.assertIn("if (!sosLane && !fresh) statusLock.lock();", get)
+        self.assertIn("freshGuard{freshClient}", get)
+        self.assertIn("fresh ? freshClient : sosLane", get)
+        resolve = body_of(self.cpp, "std::string TelephonyAnchorClient::resolveOutboundLeg(")
+        self.assertIn("httpGetBody(url, body, &status, pbx::classifyEmergencyDial(destination).isEmergency, false, fresh)",
+                      resolve)
+
+    def test_the_classifier_holds_only_an_id_seen_while_a_makecall_was_pending(self):
+        count = body_of(self.cpp, "int TelephonyAnchorClient::countOutboundLocked(")
+        self.assertIn("_pendingSeen.seenAfter(*partId, _orphanPostSeq", count)
+        self.assertIn("const std::string* partId", self.hpp)
+        ws = self.cpp[self.cpp.index("std::string controlLegs[POCKETDIAL_MAX_ANCHOR_CALLS];"):]
+        ws = ws[:ws.index("if (nLegs == 0) break;")]
+        self.assertIn("countOutboundLocked(inflight, POCKETDIAL_MAX_ANCHOR_CALLS, witnessActive, witnessPending, &partId)", ws)
+        self.assertIn("if (_outboundPending.load(std::memory_order_acquire) > 0) _pendingSeen.note(partId, seq);", ws)
+
+    def test_the_sweep_read_marks_a_pick_the_makecall_never_saw_as_a_stranger(self):
+        read_at = self.sweep.index("resolveOutboundLeg(")
+        self.assertIn("rd.stranger =", self.sweep[read_at:])
+        self.assertIn("telephony::PendingSeenIds<", self.hpp)
 
     # ── the list read ─────────────────────────────────────────────────────────────
 

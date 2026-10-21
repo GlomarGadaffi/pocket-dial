@@ -27,8 +27,10 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <new>
 #include <string>
+#include <string_view>
 
 #include "TelephonyAnchorLogic.hpp"
 #include "Witness.hpp"
@@ -415,12 +417,61 @@ inline int64_t orphanHoldUntil(int64_t armedUs)
 }
 
 // holdUntilUs 0: no sweep is armed. The hold counts as one pending makeCall when none is, and never changes
-// a real count.
-inline int pendingWithOrphanHold(int outboundPending, int64_t holdUntilUs, int64_t nowUs)
+// a real count. Only for an id upserted while a makeCall was pending (idSeenInWindow, PendingSeenIds): any other
+// id, a PSAP callback among them, is not held, and the default errs toward announcing it (Rule 5).
+inline int pendingWithOrphanHold(int outboundPending, int64_t holdUntilUs, int64_t nowUs, bool idSeenInWindow = false)
 {
-	const bool held = holdUntilUs != 0 && nowUs < holdUntilUs;
+	const bool held = holdUntilUs != 0 && idSeenInWindow && nowUs < holdUntilUs;
 	return (held && outboundPending < 1) ? 1 : outboundPending;
 }
+
+// The participant ids 3CX upserted while a makeCall was pending (the classifier ignores those, #888), each with
+// the WS event number of its latest sighting. The orphan is one of them, upserted after the POST that made it
+// (seq above the sweep's postSeq). A PSAP callback is not: it is a participant this unit saw in no pending window
+// of this 911, so the sweep's hold does not cover it and the sweep never drops it. An id seen at or before the
+// POST (an earlier makeCall's window) does not count. Fixed size, oldest slot overwritten, an id over Len bytes
+// is not recorded; every miss errs toward announcing the leg and not dropping it. Under the client's _mutex.
+template <std::size_t N, std::size_t Len>
+class PendingSeenIds
+{
+public:
+	void note(std::string_view id, uint64_t seq)
+	{
+		if (id.empty() || id.size() > Len) return;
+		for (auto& e : _e)
+		{
+			if (id == e.id)
+			{
+				if (seq > e.seq) e.seq = seq;
+				return;
+			}
+		}
+		Entry& e = _e[_next++ % N];
+		std::memcpy(e.id, id.data(), id.size());
+		e.id[id.size()] = '\0';
+		e.seq           = seq;
+	}
+
+	// True when id was noted with an event number above afterSeq.
+	bool seenAfter(std::string_view id, uint64_t afterSeq) const
+	{
+		if (id.empty() || id.size() > Len) return false;
+		for (const auto& e : _e)
+		{
+			if (id == e.id) return e.seq > afterSeq;
+		}
+		return false;
+	}
+
+private:
+	struct Entry
+	{
+		char     id[Len + 1] = {};
+		uint64_t seq         = 0;
+	};
+	Entry       _e[N];
+	std::size_t _next = 0;
+};
 
 enum class OrphanSweepEnd : uint8_t { Dropped, DropFailed, GaveUp, Ambiguous, Stopped, TooLate };
 
@@ -430,6 +481,7 @@ struct OrphanRead
 {
 	std::string leg;
 	int         candidates = 0;
+	bool        stranger   = false;   // the pick was never upserted while our makeCall was pending
 };
 
 struct OrphanSweepResult
@@ -464,7 +516,8 @@ OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& now
 		}
 		const OrphanRead rd = readOnce();
 		++r.reads;
-		const OrphanSweepStep step = orphanSweepStep(rd.leg.empty() ? 0 : rd.candidates, nowUs() - armedUs);
+		// A pick the makeCall never saw upserted is not the orphan (it may be a PSAP callback): no candidate, never dropped.
+			const OrphanSweepStep step = orphanSweepStep(rd.leg.empty() || rd.stranger ? 0 : rd.candidates, nowUs() - armedUs);
 		if (step == OrphanSweepStep::Drop)
 		{
 			r.leg = rd.leg;

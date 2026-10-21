@@ -776,6 +776,28 @@ bool TelephonyAnchorClient::dropCall(const std::string& participantId)
 	return success;
 }
 
+// #977: the orphan sweep's drop. dropCall() ends in performCtrl(), which holds _ctrlMutex across the whole POST (two
+// attempts, about 5 to 7 s on a stall) and answerCall() waits on that mutex, so a PSAP callback would queue behind a
+// sweep's drop. This POSTs on a fresh client, as makeCall() does, and takes no mutex across the I/O. The leg has no
+// call slot (a slotted leg is not a candidate), so there are no media streams to stop.
+bool TelephonyAnchorClient::dropOrphanLeg(const std::string& leg)
+{
+	std::string baseUrl, sourceDn;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		if (!_connected.load(std::memory_order_acquire)) return false;
+		baseUrl = _baseUrl;
+		sourceDn = _sourceDn;
+		_droppedLegs.add(leg);
+	}
+	const std::string dropUrl = baseUrl + "/callcontrol/" + sourceDn + "/participants/" + leg + "/drop";
+	std::string resp;
+	int status = 0;
+	const bool ok = httpPostBody(dropUrl, "application/json", "{}", resp, &status);
+	if (!ok) ESP_LOGE(TAG, "orphan sweep: drop request failed for participant %s (status=%d) (#977)", leg.c_str(), status);
+	return ok;
+}
+
 bool TelephonyAnchorClient::answerCall(const std::string& participantId)
 {
 	std::string partId = participantId, baseUrl, sourceDn;
@@ -1470,7 +1492,8 @@ void sosPause() { vTaskDelay(1); }
 // S3's single crypto-bound core for CPU.
 // #941 (Rule 5): sosLane (an emergency makeCall's GET) drives _sosStatusClient instead and never
 // touches _statusMutex, so a 911/933 cannot wait behind another task's status GET.
-bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut, bool sosLane, bool warm)
+bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut, bool sosLane, bool warm,
+                                        bool fresh)
 try
 {
 	if (statusOut) *statusOut = -1;
@@ -1485,9 +1508,17 @@ try
 	// #941: the shared lock is held across this GET's open and read (2 s timeouts), so a 911's
 	// makeCall (resolveDevice, resolveOutboundLeg) used to wait on it behind any other task's status
 	// GET. The 911 lane takes its own handle under a lock-free claim instead.
-	esp_http_client_handle_t& client = sosLane ? _sosStatusClient : _statusClient;
+	// #977 (Rule 5 review of #1040): the orphan sweep's read (fresh) has a handle of its own, freed on every exit,
+	// and takes no _statusMutex: an inbound leg's getParticipantCaller() waits on it before the handsets ring.
+	esp_http_client_handle_t freshClient = nullptr;
+	struct FreshGuard
+	{
+		esp_http_client_handle_t& h;
+		~FreshGuard() { if (h) esp_http_client_cleanup(h); }
+	} freshGuard{freshClient};
+	esp_http_client_handle_t& client = fresh ? freshClient : sosLane ? _sosStatusClient : _statusClient;
 	std::unique_lock<std::mutex> statusLock(_statusMutex, std::defer_lock);
-	if (!sosLane) statusLock.lock();
+	if (!sosLane && !fresh) statusLock.lock();
 	// #948 (Rule 5): the 911 lane never waits for its claim. Held by another GET or by teardown:
 	// no status read, an error, and makeCall() takes the conservative route (it never assumes its
 	// own leg answered). On the #349 unread-response path every read failing is the usual 503.
@@ -1848,7 +1879,7 @@ static std::string legIdOf(cJSON* elem)
 // let the reconcile/watchdog teardown handle it, rather than drop a guessed id.
 std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecallRespBody, const std::string& destination,
                                                        int* listStatusOut, telephony::OwnLegSource* sourceOut,
-                                                       telephony::ListLegCounts* countsOut, bool skipOurs)
+                                                       telephony::ListLegCounts* countsOut, bool skipOurs, bool fresh)
 {
 	// 0 = the live list was never consulted (result.id answered it, below).
 	if (listStatusOut) *listStatusOut = 0;
@@ -1892,7 +1923,7 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 	std::string body;
 	int status = 0;
 	// #941: a 911/933 reads the list on the sos lane's own handle (destination is used for nothing else).
-	const bool got = httpGetBody(url, body, &status, pbx::classifyEmergencyDial(destination).isEmergency);
+	const bool got = httpGetBody(url, body, &status, pbx::classifyEmergencyDial(destination).isEmergency, false, fresh);
 	// Report the list's own status before ANY of the early returns below, so a caller
 	// can tell "3CX never answered" (status <= 0, transient) from "3CX answered and
 	// there is no leg" (status > 0, definitive). Everything past this point already
@@ -2275,11 +2306,13 @@ void TelephonyAnchorClient::orphanSweepTaskTrampoline(void* arg)
 //   reads (no spin), and the hold lapses with it. A read in flight still runs to its HTTP timeouts and the
 //   drop to performCtrl()'s own (two attempts), so the whole sweep can run to about 5 to 7 s (#379's figure
 //   for a stalled drop), not 4.
-//   Locks. The sweep takes none of its own across I/O, but the two calls it makes do, as every status read and
-//   every drop does today: resolveOutboundLeg()'s ordinary status GET holds _statusMutex for its read (the
-//   reconcile watchdog's does too) and dropCall()'s performCtrl() holds _ctrlMutex for the drop POST. Those
-//   are the #949 holds a PSAP callback's caller-name GET or answerCall() can queue behind. No 911/933 status
-//   read takes _statusMutex (#941).
+//   Locks (Rule 5 review of #1040). The drop is a fresh-client POST (dropOrphanLeg): it never takes _ctrlMutex,
+//   so answerCall() cannot queue behind it. The read is a fresh-client GET (fresh): it never takes _statusMutex,
+//   which an inbound leg's getParticipantCaller() waits on before the handsets ring. No 911/933 status read
+//   takes _statusMutex (#941). Cost: a cold TLS handshake per sweep read, at most ten, on tel_maint.
+//   Callbacks. Only a leg upserted while a makeCall was pending (_pendingSeen) is held by the hold or dropped by
+//   the sweep. A PSAP callback is a participant this unit never saw in that window: it is announced at once and
+//   never a drop candidate.
 //   Heap. This allocates after init, unlike the 911 lane's own GET: the status GET's vector, cJSON and the
 //   strings, as the reconcile watchdog's do. It is off the 911 lane, and a std::bad_alloc is a failed read.
 //   Delay. It delays no call and no drop: only tel_maint's other jobs, which run after it.
@@ -2316,8 +2349,15 @@ void TelephonyAnchorClient::orphanSweepBody()
 				telephony::ListLegCounts counts;
 				try
 				{
-					rd.leg = resolveOutboundLeg(std::string(), std::string(), &listStatus, &source, &counts, /*skipOurs=*/true);
+					rd.leg = resolveOutboundLeg(std::string(), std::string(), &listStatus, &source, &counts, /*skipOurs=*/true,
+								/*fresh=*/true);
 					rd.candidates = counts.candidates;
+					// A pick this unit never saw upserted while its makeCall was pending is not the orphan: it
+					// may be a PSAP callback, and it is never dropped (Rule 5).
+					{
+						std::lock_guard<std::mutex> lock(_mutex);
+						rd.stranger = !rd.leg.empty() && !_pendingSeen.seenAfter(rd.leg, postSeq);
+					}
 				}
 				catch (const std::bad_alloc&)
 				{
@@ -2346,7 +2386,7 @@ void TelephonyAnchorClient::orphanSweepBody()
 			[this](const std::string& leg) {
 				try
 				{
-					return dropCall(leg);
+					return dropOrphanLeg(leg);
 				}
 				catch (const std::bad_alloc&)
 				{
@@ -3415,7 +3455,8 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 	}
 }
 
-int TelephonyAnchorClient::countOutboundLocked(std::string* inflight, size_t inflightCap, int& active, int& pending) const
+int TelephonyAnchorClient::countOutboundLocked(std::string* inflight, size_t inflightCap, int& active, int& pending,
+                                               const std::string* partId) const
 {
 	int nin = 0;
 	active = 0;
@@ -3432,9 +3473,11 @@ int TelephonyAnchorClient::countOutboundLocked(std::string* inflight, size_t inf
 		++nin;
 	}
 	// #977: a 911/933's orphan sweep (armOrphanSweep) counts as a pending makeCall until it ends or its bound
-	// passes, so the orphan's repeat upsert after the 503 is ignored here, not promoted to an inbound call.
+	// passes, so the orphan's repeat upsert after the 503 is ignored here, not promoted to an inbound call. Only
+	// for an id upserted while a makeCall was pending: any other id (a PSAP callback) is announced at once (Rule 5).
 	pending = telephony::pendingWithOrphanHold(_outboundPending.load(std::memory_order_acquire),
-	                                           _orphanHoldUntilUs.load(std::memory_order_acquire), esp_timer_get_time());
+	                                           _orphanHoldUntilUs.load(std::memory_order_acquire), esp_timer_get_time(),
+	                                           !partId || _pendingSeen.seenAfter(*partId, _orphanPostSeq.load(std::memory_order_relaxed)));
 	return nin;
 }
 
@@ -3610,7 +3653,7 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 										else
 										{
 											std::string inflight[POCKETDIAL_MAX_ANCHOR_CALLS];
-											const int nin = countOutboundLocked(inflight, POCKETDIAL_MAX_ANCHOR_CALLS, witnessActive, witnessPending);
+											const int nin = countOutboundLocked(inflight, POCKETDIAL_MAX_ANCHOR_CALLS, witnessActive, witnessPending, &partId);
 											const int pending = witnessPending;
 											witnessNin = nin;
 											if (nin > 0)
@@ -3626,6 +3669,7 @@ void TelephonyAnchorClient::handleWsEvent(int32_t eventId, void* eventData)
 												else
 												{
 													ignoredPending = pending;
+												if (_outboundPending.load(std::memory_order_acquire) > 0) _pendingSeen.note(partId, seq);
 													ignoredAgeMs = (esp_timer_get_time() - _outboundPendingSinceUs.load(std::memory_order_relaxed)) / 1000;
 												}
 											}

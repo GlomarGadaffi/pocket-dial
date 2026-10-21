@@ -282,7 +282,10 @@ private:
 	struct WitnessTick { WitnessStatus status = WitnessStatus::Skipped; uint16_t seen = 0; };
 	WitnessTick witnessSightingLocked(const std::string& partId);
 	static void noteWitnessCap(const WitnessTick& tick);
-	int         countOutboundLocked(std::string* inflight, size_t inflightCap, int& active, int& pending) const;
+	// partId (#977, Rule 5): the id of the upsert being classified. The sweep's hold counts in pending only for an
+	// id _pendingSeen noted after the sweep's POST; nullptr (a caller that announces nothing): the hold counts.
+	int         countOutboundLocked(std::string* inflight, size_t inflightCap, int& active, int& pending,
+	                                const std::string* partId = nullptr) const;
 	// Issue #553: delete a slot's rx task only once it has parked (pd::reapDecision);
 	// clears rxTaskHandle on Reap. Caller holds _mutex.
 	pd::ReapDecision reapParkedRxLocked(CallSlot& slot);
@@ -381,6 +384,12 @@ private:
 	std::atomic<uint64_t> _orphanPostSeq{0};       // _wsSeq at the POST that may have created the leg
 	std::atomic<int64_t>  _orphanHoldUntilUs{0};   // esp_timer time the hold lasts to; 0: no hold
 	telephony::OrphanSweepWitness _orphanWitness;
+	// The ids upserted, after the sweep's POST, while a makeCall was pending (guarded by _mutex): the orphan is one, a
+	// PSAP callback is not.
+	// The hold covers only these, and the sweep drops only one of these (Rule 5 review of #1040).
+	telephony::PendingSeenIds<8, telephony::kParticipantIdBytes> _pendingSeen;
+	// The sweep's drop: a fresh-client POST, never performCtrl()'s _ctrlMutex, so answerCall() cannot queue behind it.
+	bool dropOrphanLeg(const std::string& leg);
 	void armOrphanSweep(uint64_t postSeq);
 	void orphanSweepBody();
 	static void orphanSweepTaskTrampoline(void* arg);
@@ -509,8 +518,10 @@ private:
 	// sosLane (#941): an emergency makeCall()'s GET; uses _sosStatusClient, never _statusMutex.
 	// warm (#948): start()'s warm GET on the sos handle. Not a 911: if it loses the claim it records no
 	// fallback witness line.
+	// fresh (#977): the orphan sweep's read. A handle of its own, no _statusMutex, so it holds nothing an inbound
+	// leg's caller-name GET waits for.
 	bool httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut = nullptr, bool sosLane = false,
-	                 bool warm = false);
+	                 bool warm = false, bool fresh = false);
 	// First participant id currently on our DN (single-leg assumption), or "" if none / on error.
 	std::string reconcileParticipantId();
 	// POST + capture the response body (for makecall result.id). Fresh client (not the persistent
@@ -533,7 +544,8 @@ private:
 	                               int* listStatusOut = nullptr,
 	                               telephony::OwnLegSource* sourceOut = nullptr,   // #379
 	                               telephony::ListLegCounts* countsOut = nullptr,   // #349: what the list held
-	                               bool skipOurs = false);   // #349: skip a leg an earlier call left listed
+	                               bool skipOurs = false,    // #349: skip a leg an earlier call left listed
+	                               bool fresh = false);      // #977: the sweep's read, see httpGetBody
 	// Status of a specific leg read from the LIST (GET /participants -> find id). Replaces
 	// getParticipantStatus(id), which 403s for a leg this DN cannot directly control (issue #40).
 	// sosLane (#949): the tel_wsw worker's read for a 911/933 slot; uses _sosStatusClient, never _statusMutex.

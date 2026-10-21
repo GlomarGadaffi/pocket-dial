@@ -193,7 +193,7 @@ class EspWitnessWiringTest(unittest.TestCase):
         self.assertIn("_witnessCapNoted = true;", self.src, "the cap line is handed out once per boot")
 
     def test_888_inflight_array_size_is_passed_to_the_counter(self):
-        self.assertIn("countOutboundLocked(inflight, POCKETDIAL_MAX_ANCHOR_CALLS, witnessActive, witnessPending)", self.src)
+        self.assertIn("countOutboundLocked(inflight, POCKETDIAL_MAX_ANCHOR_CALLS, witnessActive, witnessPending, &partId)", self.src)
         self.assertIn("never past the caller's array", self.src)
 
     def test_888_witness_format_literals_are_in_the_source(self):

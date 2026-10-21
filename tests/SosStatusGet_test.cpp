@@ -982,13 +982,70 @@ TEST(SosOrphanSweep, TheHoldCoversTheGapBetweenThe503AndTheDropAndNoLonger)
 	const int64_t armed = 1'000'000'000;
 	const int64_t until = orphanHoldUntil(armed);
 	EXPECT_EQ(until, armed + kOrphanSweepWindowUs) << "from the arm, so a queued sweep cannot extend it";
-	EXPECT_GE(pendingWithOrphanHold(0, until, armed), 1) << "the orphan's repeat upsert right after the 503";
-	EXPECT_GE(pendingWithOrphanHold(0, until, until - 1), 1);
-	EXPECT_EQ(pendingWithOrphanHold(0, until, until), 0) << "the hold lapses at the bound, however the job fares";
-	EXPECT_EQ(pendingWithOrphanHold(0, until, until + 5'000'000), 0);
-	EXPECT_EQ(pendingWithOrphanHold(0, 0, armed), 0) << "no sweep armed (or the hold taken back): no hold";
-	EXPECT_EQ(pendingWithOrphanHold(2, until, armed), 2) << "a real pending makeCall count is never changed";
-	EXPECT_EQ(pendingWithOrphanHold(2, 0, armed), 2);
+	EXPECT_GE(pendingWithOrphanHold(0, until, armed, true), 1) << "the orphan's repeat upsert right after the 503";
+	EXPECT_GE(pendingWithOrphanHold(0, until, until - 1, true), 1);
+	EXPECT_EQ(pendingWithOrphanHold(0, until, until, true), 0) << "the hold lapses at the bound, however the job fares";
+	EXPECT_EQ(pendingWithOrphanHold(0, until, until + 5'000'000, true), 0);
+	EXPECT_EQ(pendingWithOrphanHold(0, 0, armed, true), 0) << "no sweep armed (or the hold taken back): no hold";
+	EXPECT_EQ(pendingWithOrphanHold(2, until, armed, true), 2) << "a real pending makeCall count is never changed";
+	EXPECT_EQ(pendingWithOrphanHold(2, 0, armed, true), 2);
+}
+
+// Rule 5 review of #1040, point 1: the sole candidate is dropped only if it is a leg 3CX upserted while OUR
+// makeCall was pending (the orphan is one: it exists from the POST). A PSAP callback is a participant this
+// unit never saw in that window, and it is never dropped, however alone it is in the list.
+TEST(SosOrphanSweep, ASoleCandidateNeverSeenDuringTheMakeCallIsAPsapCallbackAndIsNeverDropped)
+{
+	SweepRun s;
+	s.script = { { "518", 1, /*stranger=*/true } };
+	const OrphanSweepResult r = s.run();
+	EXPECT_NE(r.end, OrphanSweepEnd::Dropped);
+	EXPECT_EQ(s.count("hold:"), 0) << "not noted as ours: its upserts are announced as the callback they are";
+	EXPECT_EQ(s.count("drop:"), 0) << "a callback hung up is worse than an orphan left up";
+	EXPECT_EQ(r.end, OrphanSweepEnd::GaveUp);
+	EXPECT_EQ(r.reads, 10) << "it keeps looking for the orphan within the bound, and drops nothing else";
+
+	SweepRun orphan;   // positive control: the same lone leg, seen during the makeCall, is the orphan
+	orphan.script = { { "517", 1, /*stranger=*/false } };
+	EXPECT_EQ(orphan.run().end, OrphanSweepEnd::Dropped);
+	EXPECT_EQ(orphan.count("drop:"), 1);
+}
+
+// Point 2: the hold swallows only an upsert whose id was already upserted while a makeCall was pending.
+TEST(SosOrphanSweep, TheHoldNeverSwallowsAnUpsertForAnIdTheMakeCallNeverSaw)
+{
+	const int64_t until = orphanHoldUntil(1'000'000'000);
+	const int64_t now   = 1'000'000'000;
+	EXPECT_EQ(pendingWithOrphanHold(0, until, now, /*idSeenInWindow=*/false), 0)
+		<< "a PSAP callback right after the 503 is promoted at once, not held for up to 4 s";
+	EXPECT_GE(pendingWithOrphanHold(0, until, now, /*idSeenInWindow=*/true), 1) << "the orphan's repeat upsert is still held";
+	EXPECT_EQ(pendingWithOrphanHold(2, until, now, false), 2) << "a real pending count is never changed";
+}
+
+TEST(SosOrphanSweep, TheIdsSeenWhileAMakeCallWasPendingAreAFixedTableScopedToThisPost)
+{
+	constexpr uint64_t kPostSeq = 40;   // the WS event number when the makecall POST went out
+	PendingSeenIds<4, 8> ids;
+	EXPECT_FALSE(ids.seenAfter("517", kPostSeq));
+	ids.note("517", kPostSeq + 3);
+	EXPECT_TRUE(ids.seenAfter("517", kPostSeq)) << "upserted after the POST while pending: the orphan";
+	EXPECT_FALSE(ids.seenAfter("518", kPostSeq)) << "another participant: a callback";
+	EXPECT_FALSE(ids.seenAfter("", kPostSeq)) << "no id is never seen";
+
+	// A PSAP callback that arrived during an EARLIER makeCall's pending window was ignored then (#888) and
+	// stays listed unslotted. It is not this POST's orphan, and it must never become the sweep's drop.
+	ids.note("519", kPostSeq - 7);
+	EXPECT_FALSE(ids.seenAfter("519", kPostSeq)) << "seen before this POST: a stranger, not held, not dropped";
+	ids.note("519", kPostSeq + 9);
+	EXPECT_TRUE(ids.seenAfter("519", kPostSeq)) << "a later sighting inside this window moves it up";
+	ids.note("519", kPostSeq - 7);
+	EXPECT_TRUE(ids.seenAfter("519", kPostSeq)) << "an older number never lowers it";
+
+	ids.note("a-very-long-id", kPostSeq + 1);   // does not fit: not recorded
+	EXPECT_FALSE(ids.seenAfter("a-very-long-id", kPostSeq));
+	for (const char* id : { "1", "2", "3", "4" }) ids.note(id, kPostSeq + 10);   // four slots: 517 is the oldest
+	EXPECT_FALSE(ids.seenAfter("517", kPostSeq)) << "evicted: announced and not dropped, the safe direction";
+	EXPECT_TRUE(ids.seenAfter("4", kPostSeq));
 }
 
 TEST(SosOrphanSweepWitness, EachEndIsCountedAndItsLineIsCappedAndCarriesNoNumber)
