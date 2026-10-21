@@ -802,7 +802,9 @@ bool TelephonyAnchorClient::dropOrphanLeg(const std::string& leg)
 	const std::string dropUrl = baseUrl + "/callcontrol/" + sourceDn + "/participants/" + leg + "/drop";
 	std::string resp;
 	int status = 0;
-	const bool ok = httpPostBody(dropUrl, "application/json", "{}", resp, &status);
+	// One overall deadline for the drop: a restart wanted meanwhile waits at most about this (kOrphanOpBudgetUs).
+	const int64_t deadlineUs = esp_timer_get_time() + telephony::kOrphanOpBudgetUs;
+	const bool ok = httpPostBody(dropUrl, "application/json", "{}", resp, &status, nullptr, deadlineUs);
 	if (!ok) ESP_LOGE(TAG, "orphan sweep: drop request failed for participant %s (status=%d) (#977)", leg.c_str(), status);
 	return ok;
 }
@@ -1039,7 +1041,7 @@ void TelephonyAnchorClient::freeSlotLocked(CallSlot& slot)
 static bool armTokenOpTimeout(esp_http_client_handle_t client, int64_t deadlineUs)
 {
 	if (deadlineUs == 0) return true;
-	constexpr int kOpCapMs = 2000;
+	constexpr int kOpCapMs = 2000;   // the orphan sweep's ops are shorter: their deadline (kOrphanOpBudgetUs) is under it
 	const int ms = telephony::opTimeoutMs(esp_timer_get_time(), deadlineUs, kOpCapMs);
 	if (ms == 0) return false;
 	esp_http_client_set_timeout_ms(client, ms);
@@ -1502,7 +1504,7 @@ void sosPause() { vTaskDelay(1); }
 // #941 (Rule 5): sosLane (an emergency makeCall's GET) drives _sosStatusClient instead and never
 // touches _statusMutex, so a 911/933 cannot wait behind another task's status GET.
 bool TelephonyAnchorClient::httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut, bool sosLane, bool warm,
-                                        bool fresh)
+                                        bool fresh, int64_t deadlineUs)
 try
 {
 	if (statusOut) *statusOut = -1;
@@ -1571,11 +1573,17 @@ try
 			}
 		}
 
-		esp_err_t err = esp_http_client_open(client, 0);
+		// #977: deadlineUs != 0 is the orphan sweep's read: each step is armed from what is left of it.
+		esp_err_t err = ESP_ERR_TIMEOUT;
+		if (armTokenOpTimeout(client, deadlineUs)) err = esp_http_client_open(client, 0);
 		if (err == ESP_OK)
 		{
-			esp_http_client_fetch_headers(client);
-			int status = esp_http_client_get_status_code(client);
+			int status = -1;
+			if (armTokenOpTimeout(client, deadlineUs))
+			{
+				esp_http_client_fetch_headers(client);
+				status = esp_http_client_get_status_code(client);
+			}
 
 			if (sosLane)
 			{
@@ -1612,8 +1620,15 @@ try
 			std::vector<char> buffer;
 			char tempBuf[512];
 			int readBytes = 0;
-			while ((readBytes = esp_http_client_read(client, tempBuf, sizeof(tempBuf))) > 0)
+			for (;;)
 			{
+				if (!armTokenOpTimeout(client, deadlineUs))
+				{
+					readBytes = -1;   // out of time: an error, never a shorter body taken for the whole one
+					break;
+				}
+				readBytes = esp_http_client_read(client, tempBuf, sizeof(tempBuf));
+				if (readBytes <= 0) break;
 				buffer.insert(buffer.end(), tempBuf, tempBuf + readBytes);
 			}
 			esp_http_client_close(client);   // keep handle+session warm; NOT cleanup
@@ -1662,7 +1677,7 @@ catch (const std::bad_alloc&)
 // makecall, whose result.id we need to read. Uses a fresh client (the _ctrlClient handle that
 // performCtrl drives via esp_http_client_perform does not surface the body). close()+cleanup() on
 // every path; *statusOut carries the HTTP status (or -1).
-bool TelephonyAnchorClient::httpPostBody(const std::string& url, const char* contentType, const std::string& body, std::string& respBody, int* statusOut, bool* requestSentOut)
+bool TelephonyAnchorClient::httpPostBody(const std::string& url, const char* contentType, const std::string& body, std::string& respBody, int* statusOut, bool* requestSentOut, int64_t deadlineUs)
 {
 	if (statusOut) *statusOut = -1;
 	if (requestSentOut) *requestSentOut = false;
@@ -1686,25 +1701,40 @@ bool TelephonyAnchorClient::httpPostBody(const std::string& url, const char* con
 	}
 
 	bool ok = false;
-	esp_err_t err = esp_http_client_open(client, static_cast<int>(body.length()));
+	// #977: deadlineUs != 0 is the orphan sweep's drop: each step below is armed from what is left of it.
+	esp_err_t err = ESP_ERR_TIMEOUT;
+	if (armTokenOpTimeout(client, deadlineUs)) err = esp_http_client_open(client, static_cast<int>(body.length()));
 	if (err == ESP_OK)
 	{
-		int wlen = (body.empty()) ? 0 : esp_http_client_write(client, body.c_str(), body.length());
+		int wlen = -1;
+		if (body.empty()) wlen = 0;
+		else if (armTokenOpTimeout(client, deadlineUs)) wlen = esp_http_client_write(client, body.c_str(), body.length());
 		if (wlen >= 0)
 		{
 			// #349: the full request is now on the wire. Everything that fails from
 			// here on is a RESPONSE-side failure, and the server may already have
 			// acted on what it received.
 			if (requestSentOut) *requestSentOut = true;
-			esp_http_client_fetch_headers(client);
-			int status = esp_http_client_get_status_code(client);
+			int status = -1;
+			if (armTokenOpTimeout(client, deadlineUs))
+			{
+				esp_http_client_fetch_headers(client);
+				status = esp_http_client_get_status_code(client);
+			}
 			if (statusOut) *statusOut = status;
 
 			std::vector<char> buffer;
 			char tempBuf[512];
 			int readBytes = 0;
-			while ((readBytes = esp_http_client_read(client, tempBuf, sizeof(tempBuf))) > 0)
+			for (;;)
 			{
+				if (!armTokenOpTimeout(client, deadlineUs))
+				{
+					readBytes = -1;   // out of time: an error, never a shorter body taken for the whole one
+					break;
+				}
+				readBytes = esp_http_client_read(client, tempBuf, sizeof(tempBuf));
+				if (readBytes <= 0) break;
 				buffer.insert(buffer.end(), tempBuf, tempBuf + readBytes);
 			}
 			if (readBytes < 0)
@@ -1890,7 +1920,8 @@ static std::string legIdOf(cJSON* elem)
 std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecallRespBody, const std::string& destination,
                                                        int* listStatusOut, telephony::OwnLegSource* sourceOut,
                                                        telephony::ListLegCounts* countsOut, bool skipOurs, bool fresh,
-                                                       std::string* partyDnOut, std::string* partyCidOut)
+                                                       std::string* partyDnOut, std::string* partyCidOut,
+                                                       int64_t deadlineUs)
 {
 	// 0 = the live list was never consulted (result.id answered it, below).
 	if (listStatusOut) *listStatusOut = 0;
@@ -1934,7 +1965,7 @@ std::string TelephonyAnchorClient::resolveOutboundLeg(const std::string& makecal
 	std::string body;
 	int status = 0;
 	// #941: a 911/933 reads the list on the sos lane's own handle (destination is used for nothing else).
-	const bool got = httpGetBody(url, body, &status, pbx::classifyEmergencyDial(destination).isEmergency, false, fresh);
+	const bool got = httpGetBody(url, body, &status, pbx::classifyEmergencyDial(destination).isEmergency, false, fresh, deadlineUs);
 	// Report the list's own status before ANY of the early returns below, so a caller
 	// can tell "3CX never answered" (status <= 0, transient) from "3CX answered and
 	// there is no leg" (status > 0, definitive). Everything past this point already
@@ -2281,7 +2312,8 @@ void TelephonyAnchorClient::maintTaskTrampoline(void* arg)
 		uint32_t jobs = 0;
 		xTaskNotifyWait(0, UINT32_MAX, &jobs, portMAX_DELAY);
 		// #977: a restart first. makeCall refuses 911s while the anchor is down, so the sweep (which also yields to
-		// _restartRequested) never waits in front of one; a sweep that follows a long restart is TooLate, harmlessly.
+		// _restartRequested) does not start in front of one; a sweep that follows a long restart is TooLate, harmlessly.
+		// A sweep operation already in flight delays a restart by at most about kOrphanOpBudgetUs.
 		if (jobs & kMaintRestart)   restartTaskTrampoline(arg);
 		if (jobs & kMaintOrphanSweep) orphanSweepTaskTrampoline(arg);
 		if (jobs & kMaintRewarm)    rewarmTaskTrampoline(arg);
@@ -2394,11 +2426,13 @@ void TelephonyAnchorClient::orphanSweepBody()
 				return telephony::readOrphanOnce(
 					[this]() -> telephony::OrphanRead {
 						telephony::OrphanRead rd;
+						// One overall deadline for this read: a restart wanted meanwhile waits at most about this.
+						const int64_t deadlineUs = esp_timer_get_time() + telephony::kOrphanOpBudgetUs;
 						int listStatus = 0;
 						telephony::OwnLegSource source = telephony::OwnLegSource::FirstControllable;
 						telephony::ListLegCounts counts;
 						rd.leg = resolveOutboundLeg(std::string(), std::string(), &listStatus, &source, &counts, /*skipOurs=*/true,
-									/*fresh=*/true, &rd.partyDn, &rd.partyCid);
+									/*fresh=*/true, &rd.partyDn, &rd.partyCid, deadlineUs);
 						rd.candidates = counts.candidates;
 						return rd;
 					},
@@ -2411,7 +2445,8 @@ void TelephonyAnchorClient::orphanSweepBody()
 					destDigits);
 			},
 			[] { return esp_timer_get_time(); },
-			// Never delays a restart: a WS drop with a stale token wants one, and makeCall refuses 911s until it is done.
+			// Yields between operations to a restart (a WS drop with a stale token wants one, and makeCall refuses 911s
+			// until it is done); an operation in flight is bounded by kOrphanOpBudgetUs (the deadline below).
 			[this] {
 				return telephony::sweepMayContinue(_running.load(std::memory_order_acquire),
 				                                   _restartRequested.load(std::memory_order_acquire));

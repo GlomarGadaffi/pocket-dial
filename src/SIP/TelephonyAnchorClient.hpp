@@ -526,7 +526,8 @@ private:
 	// fresh (#977): the orphan sweep's read. A handle of its own, no _statusMutex, so it holds nothing an inbound
 	// leg's caller-name GET waits for.
 	bool httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut = nullptr, bool sosLane = false,
-	                 bool warm = false, bool fresh = false);
+	                 bool warm = false, bool fresh = false,
+	                 int64_t deadlineUs = 0);   // #977: != 0, each step runs under this deadline (the sweep's read)
 	// First participant id currently on our DN (single-leg assumption), or "" if none / on error.
 	std::string reconcileParticipantId();
 	// POST + capture the response body (for makecall result.id). Fresh client (not the persistent
@@ -536,7 +537,8 @@ private:
 	// return with *requestSentOut == true is UNKNOWN state, not a declined call --
 	// 3CX may well have set the call up. Callers that can reconcile must not treat
 	// the two the same.
-	bool httpPostBody(const std::string& url, const char* contentType, const std::string& body, std::string& respBody, int* statusOut = nullptr, bool* requestSentOut = nullptr);
+	bool httpPostBody(const std::string& url, const char* contentType, const std::string& body, std::string& respBody, int* statusOut = nullptr, bool* requestSentOut = nullptr,
+	                  int64_t deadlineUs = 0);   // #977: != 0, each step runs under this deadline (the sweep's drop)
 	// The leg WE control for an outbound call: makecall result.id, else a destination digit-suffix
 	// match in the live participant list — the id Telephony authorizes us to stream/drop (issue #40).
 	// #349 follow-up: listStatusOut reports the HTTP status of the live-participant-list
@@ -552,7 +554,8 @@ private:
 	                               bool skipOurs = false,    // #349: skip a leg an earlier call left listed
 	                               bool fresh = false,       // #977: the sweep's read, see httpGetBody
 	                               std::string* partyDnOut = nullptr,    // #977: the pick's party_dn and
-	                               std::string* partyCidOut = nullptr);  // party_caller_id, as the record carried them
+	                               std::string* partyCidOut = nullptr,
+	                               int64_t deadlineUs = 0);   // #977: the sweep's read, see httpGetBody  // party_caller_id, as the record carried them
 	// Status of a specific leg read from the LIST (GET /participants -> find id). Replaces
 	// getParticipantStatus(id), which 403s for a leg this DN cannot directly control (issue #40).
 	// sosLane (#949): the tel_wsw worker's read for a 911/933 slot; uses _sosStatusClient, never _statusMutex.

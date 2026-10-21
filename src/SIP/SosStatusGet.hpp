@@ -568,7 +568,7 @@ OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& now
 			const OrphanSweepStep step = orphanSweepStep(rd.leg.empty() || rd.stranger ? 0 : rd.candidates, nowUs() - armedUs);
 		if (step == OrphanSweepStep::Drop)
 		{
-			if (!keepGoing())   // stopping, or a restart wanted, during the read: no drop that would delay it
+			if (!keepGoing())   // stopping, or a restart wanted, during the read: no drop is started
 			{
 				r.end = OrphanSweepEnd::Stopped;
 				break;
@@ -637,8 +637,18 @@ private:
 	std::atomic<bool> _set{false};
 };
 
-// Does the sweep go on? A restart wanted (a WS drop with a stale token, #336) must not wait behind a sweep whose
-// reads time out: makeCall refuses 911s while the anchor is down, so the sweep yields at once.
+// One sweep I/O operation (its list GET, its drop POST) runs under this overall deadline: each esp_http_client
+// step (open, write, headers, each read) is armed from what is left of it (opTimeoutMs, capped at kOrphanOpCapMs),
+// and a step that finds it spent is not started. keepGoing is only checked between operations, so this is what bounds
+// the time a restart wanted mid-operation (a WS drop with a stale token, #336; makeCall refuses 911s until it is done)
+// waits on the sweep: about kOrphanOpBudgetUs, plus at most one step's overshoot inside a TLS handshake, not the
+// 2 s per step of the client's usual timeout. 1.5 s leaves a cold software ECDHE (about 0.5 to 1 s) room to finish.
+inline constexpr int64_t kOrphanOpBudgetUs = 1'500'000;
+inline constexpr int     kOrphanOpCapMs    = 1500;
+static_assert(kOrphanOpBudgetUs < 2'000'000, "shorter than the client's usual three 2 s steps");
+
+// Does the sweep go on? A restart wanted (a WS drop with a stale token, #336) ends the sweep between operations: it
+// reads nothing more and starts no drop. An operation already in flight is bounded by kOrphanOpBudgetUs.
 inline bool sweepMayContinue(bool running, bool restartRequested)
 {
 	return running && !restartRequested;

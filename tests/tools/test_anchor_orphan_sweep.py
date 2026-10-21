@@ -130,7 +130,7 @@ class AnchorOrphanSweepTest(unittest.TestCase):
 
     def test_the_read_is_on_the_ordinary_lane_and_an_allocation_failure_is_a_failed_read(self):
         self.assertIn("resolveOutboundLeg(std::string(), std::string(), &listStatus, &source, &counts, /*skipOurs=*/true,"
-                      "\n\t\t\t\t\t\t\t\t\t/*fresh=*/true, &rd.partyDn, &rd.partyCid)",
+                      "\n\t\t\t\t\t\t\t\t\t/*fresh=*/true, &rd.partyDn, &rd.partyCid, deadlineUs)",
                       self.sweep, "an empty destination is the ordinary status lane (#941), and it never waits on the shared lock")
         for sos in ("sosLane", "_sosStatus", "_sosBody", "/*sosLane=*/true", "classifyEmergencyDial"):
             self.assertNotIn(sos, self.sweep, "never the 911 handle: its claim is a 911's own GET")
@@ -196,7 +196,7 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertIn("freshGuard{freshClient}", get)
         self.assertIn("fresh ? freshClient : sosLane", get)
         resolve = body_of(self.cpp, "std::string TelephonyAnchorClient::resolveOutboundLeg(")
-        self.assertIn("httpGetBody(url, body, &status, pbx::classifyEmergencyDial(destination).isEmergency, false, fresh)",
+        self.assertIn("httpGetBody(url, body, &status, pbx::classifyEmergencyDial(destination).isEmergency, false, fresh, deadlineUs)",
                       resolve)
 
     def test_the_classifier_holds_only_an_id_seen_while_a_makecall_was_pending(self):
@@ -236,6 +236,31 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertIn("const bool wantParty = partyDnOut || partyCidOut;", resolve)
         self.assertEqual(resolve.count("partyOf(elem,"), 4)
         self.assertEqual(resolve.count("if (wantParty)"), 2, "both pick sites")
+
+    # ── Rule 5 review of #1040, round 7 ───────────────────────────────────────────
+
+    def test_the_sweeps_io_runs_under_a_short_overall_deadline_so_a_restart_never_waits_on_it(self):
+        # keepGoing is checked only between operations, so the GET and the POST themselves are bounded: each
+        # esp_http_client operation is armed from what is left of the op budget (telephony::opTimeoutMs, host-tested).
+        self.assertRegex(self.sos, r"kOrphanOpBudgetUs\s*=\s*1'500'000;")
+        self.assertIn("const int64_t deadlineUs = esp_timer_get_time() + telephony::kOrphanOpBudgetUs;", self.sweep)
+        self.assertIn("/*fresh=*/true, &rd.partyDn, &rd.partyCid, deadlineUs)", self.sweep)
+        drop = body_of(self.cpp, "bool TelephonyAnchorClient::dropOrphanLeg(")
+        self.assertIn("const int64_t deadlineUs = esp_timer_get_time() + telephony::kOrphanOpBudgetUs;", drop)
+        self.assertIn("httpPostBody(dropUrl, \"application/json\", \"{}\", resp, &status, nullptr, deadlineUs)", drop)
+        post = body_of(self.cpp, "bool TelephonyAnchorClient::httpPostBody(")
+        self.assertGreaterEqual(post.count("armTokenOpTimeout(client, deadlineUs)"), 4, "open, write, headers, each read")
+        get = body_of(self.cpp, "bool TelephonyAnchorClient::httpGetBody(")
+        self.assertGreaterEqual(get.count("armTokenOpTimeout(client, deadlineUs)"), 3, "open, headers, each drain read")
+        self.assertIn("deadlineUs", self.hpp)
+
+    def test_no_comment_says_the_sweep_never_delays_a_restart(self):
+        for text in (self.cpp, self.hpp, self.sos):
+            self.assertNotIn("ever delays a restart", text)
+            self.assertNotIn("never waits in front of one", text)
+            self.assertNotIn("must not wait behind a sweep", text)
+            self.assertNotIn("no drop that would delay it", text)
+        self.assertIn("kOrphanOpBudgetUs", self.sos)
 
     # ── the list read ─────────────────────────────────────────────────────────────
 

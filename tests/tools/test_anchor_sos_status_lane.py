@@ -56,7 +56,7 @@ class AnchorSosStatusLaneTest(unittest.TestCase):
                          "both the lazy resolve and the stale-device re-resolve")
         self.assertNotIn("resolveDevice()", self.make)
         self.assertIn("httpGetBody(url, body, &status, sosLane)", self.resolve_dev)
-        self.assertIn("httpGetBody(url, body, &status, pbx::classifyEmergencyDial(destination).isEmergency, false, fresh)",
+        self.assertIn("httpGetBody(url, body, &status, pbx::classifyEmergencyDial(destination).isEmergency, false, fresh, deadlineUs)",
                       self.resolve_leg, "the fallback list read is the 911's other status GET")
 
     def test_the_sos_handle_is_built_at_init_and_freed_at_teardown(self):

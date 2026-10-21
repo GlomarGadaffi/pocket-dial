@@ -1361,6 +1361,19 @@ TEST(SosOrphanSweep, TheArmedWindowAndNumberAreTakenTogetherAndOnlyOnce)
 	EXPECT_FALSE(slot.take(snap)) << "a wake with no worker takes the arm back";
 }
 
+// Round 7. keepGoing is checked only between operations, so the sweep's own GET and POST run under an overall deadline
+// (armTokenOpTimeout -> opTimeoutMs): a restart wanted mid-operation waits about kOrphanOpBudgetUs, not three 2 s steps.
+TEST(SosOrphanSweep, EachSweepOperationRunsUnderOneShortOverallDeadline)
+{
+	const int64_t t0 = 5'000'000;
+	const int64_t deadline = t0 + kOrphanOpBudgetUs;
+	EXPECT_EQ(opTimeoutMs(t0, deadline, 2000), kOrphanOpCapMs) << "the first step gets the whole budget, under the client's 2 s";
+	EXPECT_LT(kOrphanOpBudgetUs, int64_t{ 3 } * 2'000'000) << "well under open + headers + read at 2 s each";
+	EXPECT_EQ(opTimeoutMs(t0 + 1'000'000, deadline, 2000), 500) << "a later step gets only what is left";
+	EXPECT_EQ(opTimeoutMs(deadline, deadline, 2000), 0) << "a spent budget starts nothing";
+	EXPECT_EQ(opTimeoutMs(deadline + 10, deadline, 2000), 0);
+}
+
 TEST(SosOrphanSweep, WithNoLegUpsertedInTheWindowTheSweepEndsAtOnceWithoutReading)
 {
 	SweepWorld none;   // an empty ring: the WS delivered nothing (or another outbound call kept it from being noted)
