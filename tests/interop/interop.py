@@ -31,7 +31,8 @@ here sends video: its CLI compiles the dynamic call-id picker inside
 id and the attended-transfer scenario can never issue its REFER.
 
 baresip is optional: if it is not installed the mixed-stack scenarios report
-SKIP rather than FAIL, and the exit code ignores them.
+SKIP rather than FAIL, and the exit code ignores them. A baresip installed
+without root: put it on PATH and set BARESIP_MODULES to its modules directory.
 """
 import argparse
 import json
@@ -366,10 +367,12 @@ class BaresipUA:
 
         The config must name it: without `module_path` Debian's baresip looks in
         ./, loads nothing, never opens ctrl_tcp, and mixed_stack SKIPs exactly as
-        if baresip were absent.
+        if baresip were absent. BARESIP_MODULES=<dir> is searched first, for a
+        user-side install (e.g. ~/baresip-root/usr/lib/baresip/modules).
         """
         import glob
-        for d in ["/usr/lib/baresip/modules", "/usr/local/lib/baresip/modules"] + \
+        for d in [os.environ.get("BARESIP_MODULES", ""), "/usr/lib/baresip/modules",
+                  "/usr/local/lib/baresip/modules"] + \
                  glob.glob("/usr/lib/*/baresip/modules"):
             if os.path.isfile(os.path.join(d, "ctrl_tcp.so")):
                 return d
