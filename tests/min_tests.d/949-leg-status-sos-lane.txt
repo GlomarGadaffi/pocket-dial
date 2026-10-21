@@ -1,0 +1,2 @@
+# OutboundLegStatus_test.cpp: 6. tests/tools/test_anchor_leg_status_sos_lane.py (unittest, 4 tests) pins the ESP-only wiring: 0 to the gtest floor.
+6
