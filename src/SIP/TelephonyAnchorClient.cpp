@@ -2337,7 +2337,7 @@ void TelephonyAnchorClient::orphanSweepBody()
 	{
 		r = telephony::runOrphanSweep(
 			armedUs,
-			[this]() -> telephony::OrphanRead {
+			[this, postSeq]() -> telephony::OrphanRead {
 				telephony::OrphanRead rd;
 				// A makeCall in flight (a redialed 911 among them) has a leg 3CX lists before it keys it, and a
 				// lone candidate is dropped: no decision while one is pending, before the read or after it, or
