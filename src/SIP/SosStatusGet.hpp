@@ -525,8 +525,8 @@ struct OrphanSweepResult
 	std::string    leg;   // the leg handed to dropLeg
 };
 
-// The sweep. unslotted() is true once a 911/933 makeCall succeeded with no own leg after this sweep's POST
-// (unslottedEmergencyAfter): its live leg may be any listed leg, so the sweep ends before a drop. hasCandidate() is false when no leg was upserted in the window (PendingSeenIds::anyIn): the sweep
+// The sweep. unslotted() is true once any 911/933 makeCall succeeded with no own leg
+// (unslottedEmergencyRecorded): its live leg may be any listed leg, so the sweep ends before a drop. hasCandidate() is false when no leg was upserted in the window (PendingSeenIds::anyIn): the sweep
 // then has nothing it may drop, and it ends at once without a read. armedUs is the time makeCall() armed it (the bound runs from there, not from when tel_maint
 // got to it). readOnce() -> OrphanRead; nowUs() is a microsecond clock; keepGoing() is false once the
 // anchor is stopping; pause() sleeps one poll gap; holdLeg(leg) notes the leg as ours; dropLeg(leg) -> bool
@@ -610,11 +610,14 @@ OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& now
 
 // A 911/933 makeCall that returned success WITHOUT a resolved own leg (makeCall's "could not resolve own leg id"
 // branch) has a live call to the PSAP and no slot: its leg is listed, unslotted, and looks exactly like an orphan.
-// eventPostSeq is that makeCall's POST event number (0: none yet). Any such call whose POST was at or after the
-// sweep's own ends the sweep before a drop.
-inline bool unslottedEmergencyAfter(uint64_t eventPostSeq, uint64_t sweepPostSeq)
+// eventPostSeq is that makeCall's POST event number (0: none yet). ANY such call, whether its POST came before or
+// after the sweep's, ends the sweep before a drop: a call with no slot and no media is redialed, and its leg's
+// repeat upsert is first seen inside the redial's window, with one makeCall pending, looking just like the orphan.
+// The record is sticky until reboot (this unit cannot prove the leg is gone), so the sweep is disabled after this
+// rare event; that never drops a live call.
+inline bool unslottedEmergencyRecorded(uint64_t eventPostSeq)
 {
-	return eventPostSeq != 0 && eventPostSeq >= sweepPostSeq;
+	return eventPostSeq != 0;
 }
 
 // The armed sweep's state, written by makeCall() and taken by tel_maint. NOT synchronised: the client holds its
@@ -646,7 +649,7 @@ public:
 		_s.dest[n] = '\0';
 	}
 
-	// The whole arm at once, and it is spent: false when nothing is armed. The window stays readable (window()).
+	// The whole arm at once, and it is spent: false when nothing is armed. postSeq() and armSeq() stay readable.
 	bool take(Snapshot& out)
 	{
 		if (_s.armedUs == 0) return false;

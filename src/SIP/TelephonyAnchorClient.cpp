@@ -701,8 +701,13 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		else
 		{
 			ESP_LOGW(TAG, "makeCall: initiated %s but could not resolve own leg id — teardown will rely on reconcile", destination.c_str());
-			// #977: a live 911/933 with no slot looks like an orphan to a sweep armed before this POST: tell it.
-			if (sosLane) _unslottedEmergencySeq.store(postSeq, std::memory_order_release);
+			// #977: a live 911/933 with no slot looks like an orphan to ANY sweep, armed before or after this POST (its
+			// repeat upsert is first seen inside a redial's window). Record it, sticky until reboot: the sweep is
+			// disabled after this rare event, which never drops a live call. Logged once.
+			if (sosLane && _unslottedEmergencySeq.exchange(postSeq, std::memory_order_acq_rel) == 0)
+			{
+				ESP_LOGW(TAG, "makeCall: a 911/933 succeeded with no own leg: the orphan sweep is disabled until reboot (#977)");
+			}
 		}
 	}
 	else
@@ -2431,9 +2436,9 @@ void TelephonyAnchorClient::orphanSweepBody()
 				std::lock_guard<std::mutex> lock(_mutex);
 				return _pendingSeen.anyIn(postSeq, armSeq);
 			},
-			// A 911/933 that succeeded with no own leg after this one's POST: its live leg may be any listed leg.
-			[this, postSeq] {
-				return telephony::unslottedEmergencyAfter(_unslottedEmergencySeq.load(std::memory_order_acquire), postSeq);
+			// A 911/933 that succeeded with no own leg, ever: its live leg may be any listed leg.
+			[this] {
+				return telephony::unslottedEmergencyRecorded(_unslottedEmergencySeq.load(std::memory_order_acquire));
 			});
 	}
 	catch (const std::bad_alloc&)

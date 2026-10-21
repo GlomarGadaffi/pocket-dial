@@ -1116,7 +1116,7 @@ struct SweepWorld
 				return true;
 			},
 			[&] { return ring.anyIn(kPostSeq, kArmSeq); },
-			[&] { return unslottedEmergencyAfter(unslottedEventSeq, kPostSeq); });
+			[&] { return unslottedEmergencyRecorded(unslottedEventSeq); });
 	}
 
 	int count(const char* prefix) const
@@ -1261,15 +1261,25 @@ TEST(SosOrphanSweep, ALive911ThatSucceededWithNoOwnLegAfterThePostIsNeverDropped
 	EXPECT_EQ(r2.reads, 1);
 	EXPECT_EQ(during.count("drop:"), 0) << "checked again before the drop";
 
-	SweepWorld before;   // positive control: one that succeeded before A's POST says nothing about this leg
+	// B got 200 with no id and a failed list read BEFORE A: it has no slot and no media, so the caller redialed (A).
+	// B's ~750 ms repeat upsert is first seen inside A's window, with one makeCall pending and party 911: it looks
+	// exactly like A's orphan, and it is a live PSAP call.
+	SweepWorld before;
 	before.ring.note("517", SweepWorld::kPostSeq + 3, 1);
 	before.lists = { pick("517", "911") };
 	before.unslottedEventSeq = SweepWorld::kPostSeq - 1;
-	EXPECT_EQ(before.run().end, OrphanSweepEnd::Dropped);
+	const OrphanSweepResult r3 = before.run();
+	EXPECT_EQ(r3.end, OrphanSweepEnd::UnslottedLiveEmergency);
+	EXPECT_EQ(before.count("drop:"), 0) << "an earlier unslotted live 911 is never dropped either";
 
-	EXPECT_FALSE(unslottedEmergencyAfter(0, 40)) << "none recorded";
-	EXPECT_TRUE(unslottedEmergencyAfter(40, 40)) << "at A's POST counts";
-	EXPECT_FALSE(unslottedEmergencyAfter(39, 40));
+	SweepWorld none;   // positive control: with none recorded the same orphan is dropped
+	none.ring.note("517", SweepWorld::kPostSeq + 3, 1);
+	none.lists = { pick("517", "911") };
+	EXPECT_EQ(none.run().end, OrphanSweepEnd::Dropped);
+
+	EXPECT_FALSE(unslottedEmergencyRecorded(0)) << "none recorded";
+	EXPECT_TRUE(unslottedEmergencyRecorded(1)) << "any recorded, before or after A's POST";
+	EXPECT_TRUE(unslottedEmergencyRecorded(39));
 }
 
 // 2. The arm's window, number and time are one snapshot: a take never pairs one arm's window with another's number.

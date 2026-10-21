@@ -383,8 +383,8 @@ private:
 	// The arm: its time, POST seq, arm seq and the number the 911/933 dialed, written and taken as one snapshot under
 	// _mutex (no I/O inside), so a take never pairs one arm's window with another's number. The window is (post, arm].
 	telephony::OrphanArmSlot _orphanArm;
-	// POST seq of the latest 911/933 makeCall that succeeded WITHOUT a resolved own leg: a live call with no slot,
-	// which looks like an orphan. A sweep whose POST is at or before it ends before a drop. 0: none.
+	// POST seq of a 911/933 makeCall that succeeded WITHOUT a resolved own leg: a live call with no slot, which looks
+	// like an orphan to any sweep. Once set, every sweep ends before a drop; sticky until reboot. 0: none.
 	std::atomic<uint64_t> _unslottedEmergencySeq{0};
 	std::atomic<int64_t>  _orphanHoldUntilUs{0};   // esp_timer time the hold lasts to; 0: no hold
 	telephony::OrphanSweepWitness _orphanWitness;

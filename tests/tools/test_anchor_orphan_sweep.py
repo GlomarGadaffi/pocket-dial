@@ -222,9 +222,11 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         make = self.make
         branch = make[make.index("could not resolve own leg id"):]
         branch = branch[:branch.index("else")]
-        self.assertIn("if (sosLane) _unslottedEmergencySeq.store(postSeq, std::memory_order_release);", branch)
-        self.assertIn("telephony::unslottedEmergencyAfter(_unslottedEmergencySeq.load(std::memory_order_acquire), postSeq)",
+        self.assertIn("if (sosLane && _unslottedEmergencySeq.exchange(postSeq, std::memory_order_acq_rel) == 0)", branch)
+        self.assertIn("the orphan sweep is disabled until reboot", branch, "logged once")
+        self.assertIn("telephony::unslottedEmergencyRecorded(_unslottedEmergencySeq.load(std::memory_order_acquire))",
                       self.sweep)
+        self.assertNotIn("_unslottedEmergencySeq.store(0", self.cpp, "sticky: nothing clears it")
 
     def test_the_party_strings_are_copied_only_when_the_caller_wants_them(self):
         resolve = body_of(self.cpp, "std::string TelephonyAnchorClient::resolveOutboundLeg(")
