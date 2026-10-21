@@ -4202,6 +4202,16 @@ void HttpServer::sendApiTelephonyConfigSet(int sock, size_t slotIdx, const std::
 	TelephonyApiConfig::Slot s;
 	s.type     = TelephonyProviderType::Telephony;
 	s.enabled  = (enabledParam == "1" || enabledParam == "true" || enabledParam == "on");
+	// #1086: a save that carries no provider field and does not enable is not a request to
+	// configure the real provider, so it keeps the stored type (a Loopback slot is exempt from
+	// the #1073 acceptance gate; flipping it to TELEPHONY-API would silently drop that exemption).
+	if (!s.enabled && baseUrl.empty() && clientId.empty() && secret.empty() && routeDn.empty())
+	{
+		if (RequestsHandler* h = _handler.load(std::memory_order_acquire))
+		{
+			s.type = h->getTelephonyConfigSlot(slotIdx).type;
+		}
+	}
 	s.baseUrl  = baseUrl;
 	s.clientId = clientId;
 	s.secret   = secret;

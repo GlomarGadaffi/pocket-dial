@@ -290,6 +290,27 @@ TEST_F(TelephonyConfigHttpTest, EnabledSlotRequiresHttpsElse400)
 	EXPECT_NE(bodyOf(good).find("\"enabled\":true"), std::string::npos);
 }
 
+// #1086: a save that carries no provider field must not change the stored type. A slot's
+// type decides whether the #1073 acceptance gate applies (Loopback is exempt).
+TEST_F(TelephonyConfigHttpTest, DisablingAnEmptyLoopbackSlotKeepsItLoopback)
+{
+	AdminSession a = loginOn(_port);
+	ASSERT_EQ(_handler->getTelephonyConfigSlot(2).type, TelephonyProviderType::Loopback);
+
+	std::string put = httpRaw(_port, "PUT", "/api/telephony-config/2", "enabled=0",
+		"pd_session=" + a.cookie, a.csrf);
+	ASSERT_EQ(statusOf(put), 200);
+	EXPECT_NE(bodyOf(put).find("\"type\":\"LOOPBACK\""), std::string::npos) << bodyOf(put);
+	EXPECT_EQ(_handler->getTelephonyConfigSlot(2).type, TelephonyProviderType::Loopback);
+
+	// Same slot, now given credentials: that is a request to configure the real provider.
+	std::string cfg = httpRaw(_port, "PUT", "/api/telephony-config/2",
+		"enabled=0&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=100",
+		"pd_session=" + a.cookie, a.csrf);
+	ASSERT_EQ(statusOf(cfg), 200);
+	EXPECT_EQ(_handler->getTelephonyConfigSlot(2).type, TelephonyProviderType::Telephony);
+}
+
 // ── #1073: enabling or activating a slot needs an explicit acceptance ──────────
 
 namespace
