@@ -1052,6 +1052,35 @@ TEST(EmergencyCallback, AnInternalCallbackWithinThirtyMinutesIsAnEmergencyCall)
 	EXPECT_TRUE(s.value()->isEmergency());
 }
 
+TEST(EmergencyCallback, ByeOnAnAnsweredCallbackIsRelayedAndNeverAnswered481)
+{
+	// Rule 5, audit row 20: the callback has a session, so its BYE is not the no-session 481 case.
+	Bench b;
+	b.handler->handle(makeRegister("102", kOtherIp));
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+	b.handler->handle(makeCall("102", kOtherIp, "101", "er-bye-cb"));
+	const std::string body =
+		"v=0\r\no=- 0 0 IN IP4 " + std::string(kHandsetIp) + "\r\ns=-\r\n"
+		"c=IN IP4 " + std::string(kHandsetIp) + "\r\nt=0 0\r\n"
+		"m=audio 40002 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	b.handler->handle(RequestsHandler::getMessageFromPool(
+		"SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP " + std::string(kOtherIp) + ":5060;branch=z9hG4bKer-bye-cb\r\n"
+		"From: <sip:102@server>;tag=fer-bye-cb\r\nTo: <sip:101@server>;tag=ter-bye-cb\r\n"
+		"Call-ID: er-bye-cb\r\nCSeq: 1 INVITE\r\nContact: <sip:101@" + std::string(kHandsetIp) + ":5060>\r\n"
+		"Content-Type: application/sdp\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body,
+		addrFor(kHandsetIp)));
+	const auto s = b.handler->getSession("Call-ID: er-bye-cb");
+	ASSERT_TRUE(s.has_value() && s.value()->isEmergency()) << b.dump();
+	b.sent.clear();
+	b.handler->handle(RequestsHandler::getMessageFromPool(
+		"BYE sip:101@server SIP/2.0\r\nVia: SIP/2.0/UDP " + std::string(kOtherIp) + ":5060;branch=z9hG4bKer-bye-cb2\r\n"
+		"From: <sip:102@server>;tag=fer-bye-cb\r\nTo: <sip:101@server>;tag=ter-bye-cb\r\n"
+		"Call-ID: er-bye-cb\r\nCSeq: 2 BYE\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n", addrFor(kOtherIp)));
+	EXPECT_EQ(b.count("SIP/2.0 200", kOtherIp), 1u) << b.dump();
+	EXPECT_EQ(b.count("BYE", kHandsetIp), 1u) << b.dump();
+	EXPECT_EQ(b.count("481"), 0u) << b.dump();
+}
+
 TEST(EmergencyCallback, ACallbackWithAnOversizeFromIsNotRefusedForItsLength)
 {
 	// #870 must not refuse an emergency callback for its header length (Rule 5).
