@@ -9526,7 +9526,7 @@ void RequestsHandler::endClientCalls(std::string extension, const std::string& r
 		const std::string& dTo = s->getDialogTo();
 		const std::string peerNum = peer ? peer->getNumber() : std::string();
 		const bool peerVirtual = peerNum == "777" || peerNum == "440" || peerNum == ConferenceRoom::EXT ||
-		                        peerNum == kAnchorCallExt || s->isTrunk() || isMulticastPageCall(cid);
+		                        peerNum == kAnchorCallExt || s->isTrunk() || s->isAnchor() || s->isAnchorInbound() || isMulticastPageCall(cid);
 		if (peer && !peerVirtual && !dFrom.empty() && !dTo.empty())
 		{
 			const uint32_t byeCSeq = s->nextServerCSeq();
@@ -9601,13 +9601,13 @@ void RequestsHandler::sweepExpired()
 			}
 			if (emergencyLive) continue;
 
-			if (keepAliveTimedOut)
+			if (leaseExpired)
 			{
-				queueLog("Pruning client due to missed OPTIONS keepalive pings: " + client->getNumber());
+				queueLog("Registration lease expired: " + client->getNumber());
 			}
 			else
 			{
-				queueLog("Registration lease expired: " + client->getNumber());
+				queueLog("Pruning client due to missed OPTIONS keepalive pings: " + client->getNumber());
 			}
 
 			endClientCalls(client->getNumber(), leaseExpired ? "registration lease expired"
@@ -11945,11 +11945,22 @@ std::shared_ptr<SipClient> RequestsHandler::allocateClient(std::string number, s
 	auto now = std::chrono::steady_clock::now();
 	for (auto& client : _clientPool)
 	{
-		if (client->isExpired(now))
+		if (!client->isExpired(now)) continue;
+		// #1089: a lapsed client still on a session (a 911 deferred by sweepExpired,
+		// #712) keeps its slot: resetting it would hand the live call to this number.
+		bool inCall = false;
+		for (const auto& [cid, sess] : _sessions)
 		{
-			client->reset(std::move(number), address, expiresSeconds);
-			return client;
+			if ((sess->getSrc() && sess->getSrc()->getNumber() == client->getNumber()) ||
+			    (sess->getDest() && sess->getDest()->getNumber() == client->getNumber()))
+			{
+				inCall = true;
+				break;
+			}
 		}
+		if (inCall) continue;
+		client->reset(std::move(number), address, expiresSeconds);
+		return client;
 	}
 
 	// Out of space!

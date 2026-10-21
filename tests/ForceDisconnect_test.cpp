@@ -629,3 +629,83 @@ TEST(DeregisterMidCall, ADeregisterWithNoCallsReleasesTheClientAsBefore)
 	EXPECT_TRUE(rig.handler.cdrSnapshotForTest().empty());
 	EXPECT_EQ(liveSessions(rig.handler), 0u);
 }
+
+// #1089 follow-ups: a freed pool slot is reused by a later REGISTER, the sweep path
+// shares the de-register path's BYE and CDR, and a lapsed client on a live call
+// keeps its slot.
+namespace
+{
+	size_t byeCount(const Sent& sent, const std::string& ip)
+	{
+		return byesTo(sent, addrFor(ip)).size();
+	}
+
+	void expectLeaseExpiryEndsTheCall(const std::string& who, const char* peerIp, const char* whoIp,
+	                                  const std::string& callId)
+	{
+		Rig rig;
+		sendInvite(rig.handler, callId);
+		sendAnswer(rig.handler, callId);
+		ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value());
+		rig.sent.clear();
+
+		rig.handler.expireLeaseAndSweepForTest(who);
+
+		EXPECT_EQ(byeCount(rig.sent, peerIp), 1u) << "exactly one BYE to the surviving phone";
+		EXPECT_EQ(byeCount(rig.sent, whoIp), 0u) << "none to the phone whose lease lapsed";
+		EXPECT_EQ(liveSessions(rig.handler), 0u);
+		const auto cdr = rig.handler.cdrSnapshotForTest();
+		ASSERT_EQ(cdr.size(), 1u);
+		EXPECT_EQ(cdr[0].caller, "100");
+		EXPECT_EQ(cdr[0].callee, "106");
+	}
+}
+
+TEST(DeregisterMidCall, ANewPhoneTakingAFreedSlotInheritsNoCall)
+{
+	Rig rig;
+	const std::string callId = "dereg-1089-slot";
+	sendInvite(rig.handler, callId);
+	sendAnswer(rig.handler, callId);
+	ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value());
+	sendDeregister(rig.handler, "100", kCallerIp, "dereg-1089-slot-a");
+	sendDeregister(rig.handler, "106", kCalleeIp, "dereg-1089-slot-b");
+	rig.handler.handle(makeRegister("107", kOtherIp, "reg-107"));   // takes 100's freed slot
+	ASSERT_TRUE(isBoundExt(rig.handler, "107")) << "precondition: 107 is registered";
+	rig.sent.clear();
+
+	EXPECT_EQ(liveSessions(rig.handler), 0u) << "a phantom session outlived its clients";
+	rig.handler.expireLeaseAndSweepForTest("107");
+	EXPECT_EQ(byeCount(rig.sent, kOtherIp), 0u) << "107 was BYEd for a dialog it never had";
+	EXPECT_EQ(rig.handler.cdrSnapshotForTest().size(), 1u) << "one CDR, for the real call only";
+}
+
+TEST(DeregisterMidCall, ALeaseExpiringOnTheCallerByesThePeerOnceAndKeepsTheCdrOrder)
+{
+	expectLeaseExpiryEndsTheCall("100", kCalleeIp, kCallerIp, "lease-1089-a");
+}
+
+TEST(DeregisterMidCall, ALeaseExpiringOnTheCalleeByesThePeerOnceAndKeepsTheCdrOrder)
+{
+	expectLeaseExpiryEndsTheCall("106", kCallerIp, kCalleeIp, "lease-1089-b");
+}
+
+TEST(DeregisterMidCall, ALapsedClientOnALiveEmergencyCallKeepsItsSlotWhenThePoolIsFull)
+{
+	Rig rig;
+	const std::string callId = "dereg-1089-evict";
+	sendInvite(rig.handler, callId);
+	sendAnswer(rig.handler, callId);
+	auto s = rig.handler.getSession("Call-ID: " + callId);
+	ASSERT_TRUE(s.has_value());
+	s.value()->setEmergency(true);
+	for (int i = 2; i < POCKETDIAL_MAX_CLIENTS; ++i)
+		rig.handler.handle(makeRegister("2" + std::to_string(100 + i), kOtherIp, "fill" + std::to_string(i)));
+	rig.handler.expireLeaseUnsweptForTest("100");   // lapsed, not yet swept
+	rig.handler.handle(makeRegister("300", kOtherIp, "reg-300"));   // pool full: would evict 100
+
+	ASSERT_TRUE(s.value()->getSrc());
+	EXPECT_EQ(s.value()->getSrc()->getNumber(), "100") << "the live 911 was handed to another number";
+	EXPECT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value());
+	EXPECT_FALSE(isBoundExt(rig.handler, "300")) << "no free slot: refused, as for any full pool";
+}

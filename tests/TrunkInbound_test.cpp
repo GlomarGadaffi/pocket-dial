@@ -978,6 +978,27 @@ TEST(TrunkInbound, AnExpiredLeaseByesTheHandsetAndTheCarrier)
 	expectAllReleased(b, a.forkId);
 }
 
+// #1089: the shared teardown helper must not double-BYE a trunk-inbound call.
+TEST(TrunkInbound, AnExpiredLeaseSendsExactlyOneByeToEachSide)
+{
+	Bench b;
+	const Answered a = answer(b, "in-lease-once");
+	(void)a;
+	b.sent.clear();
+
+	b.handler.expireLeaseAndSweepForTest(kExt);
+
+	auto byes = [&](const std::string& ip) {
+		const uint32_t want = inet_addr(ip.c_str());
+		size_t n = 0;
+		for (const auto& [addr, msg] : b.sent)
+			if (msg && addr.sin_addr.s_addr == want && msg->toString().rfind("BYE ", 0) == 0) ++n;
+		return n;
+	};
+	EXPECT_EQ(byes(kPhoneIp), 1u);
+	EXPECT_EQ(byes(kSbcIp), 1u);
+}
+
 TEST(TrunkInbound, AnRtpAddressThatIsNotAUnicastDottedQuadIsNeverARelayPeer)
 {
 	// C review: inet_addr("999.0.113.5") is 255.255.255.255, which setRawPeer()
