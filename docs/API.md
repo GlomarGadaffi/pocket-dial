@@ -363,7 +363,7 @@ Three things worth knowing before you paste:
   and reuse `$SESSION` rather than logging in per request.
 
 ### `GET /`
-Serves the retro CGA CRT web interface. `GET /index.html` is the same route and the
+Serves the web dashboard (the ISA-101 operator console). `GET /index.html` is the same route and the
 same response (in `handleClient()`).
 
 Ungated (the page itself is public), because it is inert without a session: it renders

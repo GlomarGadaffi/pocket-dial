@@ -197,7 +197,7 @@ the single most common failure when running a pre-existing script against curren
 ## 3. Endpoint Specifications & JSON Schemas
 
 ### 3.1 GET `/` or `/index.html`
-Serves the CGA CRT web dashboard. Ungated. Once logged in, the page also carries the
+Serves the web dashboard. Ungated. Once logged in, the page also carries the
 session's CSRF token, which is how the dashboard's own `fetch()` calls satisfy layer 3.
 * Request: `GET /`
 * Response: `200 OK`

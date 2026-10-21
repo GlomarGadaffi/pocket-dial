@@ -65,7 +65,7 @@ It is off by default on purpose: switching it on forces every phone already
 associated with the access point to be re-paired, so it is never done to a live fleet
 by a firmware update. Enable it deliberately, in one of two ways:
 
-* From the dashboard: *Admin / Security & Firmware* → *Wi-Fi Access Point Security*.
+* From the dashboard: *Security* → *Wi-Fi access point security*.
   Tick the box and save. The change takes effect the next time the access point starts.
 * At flash time: the [browser flasher](https://glomargadaffi.github.io/pocket-dial/flasher/)
   can write the setting and the passphrase directly to the board. This is the easiest
@@ -126,7 +126,7 @@ or, where mDNS resolves:
 http://pocketdial.local
 ```
 
-You should see the retro CGA dashboard. It renders live data from
+You should see the operator console (Overview first). It renders live data from
 [`GET /api/status`](API.md#get-apistatus): the server IP/port, uptime, processed/dropped
 packet counters, the list of registered extensions, and any active call sessions.
 
@@ -164,7 +164,7 @@ While `admin`/`admin` is still in place, a request with a valid session gets `40
 
 ### Log in and complete setup from the dashboard
 
-Use the admin/security control on the dashboard. It opens on a login form;
+Use the login form on the dashboard. It opens on a login form;
 logging in with the default `admin`/`admin` credential immediately routes to
 a forced setup form (new username, new password, and an optional DTMF admin
 PIN) that nothing else on the dashboard is usable until you submit.

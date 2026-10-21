@@ -10,7 +10,7 @@ The firmware architecture is divided into three core logical layers:
 
 1. Network Hardware & Driver Layer: controls physical media (Wi-Fi radio, W5500 SPI Ethernet MAC/PHY, LAN8720 RMII PHY) and registers low-level event handlers.
 2. Signaling & State Engine Layer (`RequestsHandler`): A lightweight SIP registrar and session controller managing client registration leases, active SIP sessions, and intercom broadcasting/paging features. It implements a deliberately partial subset of RFC 3261: no §16 proxy behaviour (§1.1), but all four §17 transaction machines; §1.2 states which messages they cover, which they deliberately leave out, and where timing and coverage fall short (1 Hz sweep, pool exhaustion).
-3. User Interface & Query Layer: consists of a custom select-based, thread-dispatching `HttpServer` serving a CGA-style web dashboard, an mDNS service responder, and a high-frequency LVGL-based GUI display task.
+3. User Interface & Query Layer: consists of a custom select-based, thread-dispatching `HttpServer` serving the web dashboard, an mDNS service responder, and a high-frequency LVGL-based GUI display task.
 
 The diagram below shows the **display (JC3248W535) build**, where LVGL runs on Core 1 and
 the SIP, UDP and status tasks run on Core 0. On the headless builds (`eth`, `lan8720` and

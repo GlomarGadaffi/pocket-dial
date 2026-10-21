@@ -63,7 +63,7 @@
 <title>pocket-dial: a SIP PBX on an ESP32-S3</title>
 <meta name="description" content="A self-contained SIP PBX that runs on a single ESP32-S3. No router, no server, no cloud. The same C++17 engine builds as a desktop binary.">
 <style>
-/* Layout and type borrowed from the Switchboard dashboard; the palette stays plain. */
+/* Layout and type borrowed from the pocket-dial dashboard; the palette stays plain. */
 :root{--bg:#fefefe;--face:#f4f4f4;--face-raised:#f0f0f0;--ink:#454545;--ink-dim:#777;--brass:#07a;--brass-hi:#07a;--brass-lo:#999;--line:#ddd;--alert:#c0392b;--ringing:#941352;
  --mono:ui-monospace,"SF Mono","Cascadia Code","Consolas","Liberation Mono",monospace;--sans:"Open Sans",Arial,sans-serif}
 /* Invert: the plain dark scheme. */
@@ -156,8 +156,8 @@ cmake --build build --config Release
 <p>Not all of this has been exercised on real hardware yet. The <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/FEATURE_ROADMAP.md">feature roadmap</a> is honest about which features have, and which have only passed the host tests.</p>
 
 <figure>
-<img src="screenshot.png" alt="The pocket-dial Switchboard web dashboard: jack board, ring groups and forwarding, and the call log" width="1512" height="1341" loading="lazy" decoding="async">
-<figcaption>The Switchboard dashboard, here on a desktop build with no phones registered yet.</figcaption>
+<img src="screenshot.png" alt="The pocket-dial operator console, Overview section: annunciator, signal path, readouts, and the jack board with four registered extensions" width="1440" height="704" loading="lazy" decoding="async">
+<figcaption>The operator console&rsquo;s Overview, here on a desktop build with four demo phones registered.</figcaption>
 </figure>
 
 <h2 id="hardware">Hardware</h2>

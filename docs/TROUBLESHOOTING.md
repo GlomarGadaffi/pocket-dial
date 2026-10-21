@@ -56,7 +56,7 @@ default and nothing is baked into the image ([SETUP_GUIDE.md](SETUP_GUIDE.md#tur
 |-------|------------------|
 | `display` | On the LVGL screen during captive-portal onboarding |
 | `wifi` (headless) | Serial boot log: `INFRA: SoftAP passphrase (WPA2): …` (`idf.py monitor`) |
-| Any | `GET /api/ap-security` / the dashboard's *Wi-Fi Access Point Security* panel, once logged in as admin |
+| Any | `GET /api/ap-security` / the dashboard's *Security* → *Wi-Fi access point security* section, once logged in as admin |
 | Any | The browser flasher, if it was set at flash time |
 
 **Warning:** On a headless `wifi` board with AP security on, with no admin password you remember and nobody on the AP, the only ways back are a **serial console** (the passphrase is logged at every boot) or a **re-flash**. Read the passphrase before you need it.

@@ -13,13 +13,13 @@ Every board runs `learn` or `secure`. A **fresh install boots in `learn`**. An *
 ## 1. Registrar modes
 
 The registrar mode is a runtime setting (NVS-backed, chosen at onboarding and changeable
-from the dashboard's *Extension Registration & Onboarding* panel, or `POST /api/registrar`).
+from the dashboard's *Devices* → *Registration* control, or `POST /api/registrar`).
 It controls how a REGISTER is treated.
 
 There are two routes to it, and which one you want depends on whether the board is already
 on a network you can reach:
 
-- **The dashboard** (*Extension Registration & Onboarding* panel, or `POST /api/registrar` directly) works for any board you can reach over HTTP. **The dashboard is always reachable on its port.** The HTTP listener opens at boot and stays open. There is no dark-by-default admin plane, no `*4887` star-code, no bounded admin-open window and no `POST /api/admin/keepalive`. If the dashboard refuses your connection, that is a genuine fault (wrong address, wrong network, or a board that never finished booting), not a gate you need to open. You do need to **log in**, and on an unclaimed board you must replace the default credential first (see §3, Step 0).
+- **The dashboard** (*Devices* → *Registration*, or `POST /api/registrar` directly) works for any board you can reach over HTTP. **The dashboard is always reachable on its port.** The HTTP listener opens at boot and stays open. There is no dark-by-default admin plane, no `*4887` star-code, no bounded admin-open window and no `POST /api/admin/keepalive`. If the dashboard refuses your connection, that is a genuine fault (wrong address, wrong network, or a board that never finished booting), not a gate you need to open. You do need to **log in**, and on an unclaimed board you must replace the default credential first (see §3, Step 0).
 - The browser flasher's flash-time configuration panel: the only way to pick a mode
   *before first boot*, which matters on a headless board you are about to deploy somewhere
   you would rather not visit twice.
