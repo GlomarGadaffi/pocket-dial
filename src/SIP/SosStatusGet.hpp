@@ -426,10 +426,11 @@ inline int pendingWithOrphanHold(int outboundPending, int64_t holdUntilUs, int64
 }
 
 // The participant ids 3CX upserted while a makeCall was pending (the classifier ignores those, #888), each with
-// the WS event number of its latest sighting. The orphan is one of them, upserted after the POST that made it
-// (seq above the sweep's postSeq). A PSAP callback is not: it is a participant this unit saw in no pending window
-// of this 911, so the sweep's hold does not cover it and the sweep never drops it. An id seen at or before the
-// POST (an earlier makeCall's window) does not count. Fixed size, oldest slot overwritten, an id over Len bytes
+// the WS event number of its FIRST sighting. The orphan is one of them, first upserted after the POST that made it
+// and no later than the arm (seq in (postSeq, armSeq]). A PSAP callback is not: it is a participant this unit saw
+// in no pending window of this 911, so the sweep's hold does not cover it and the sweep never drops it. An id
+// first seen at or before the POST (an earlier makeCall's window) or after the arm (a redial's window, whose
+// callback or live leg is not the orphan) does not count, however often it is seen again. Fixed size, oldest slot overwritten, an id over Len bytes
 // is not recorded; every miss errs toward announcing the leg and not dropping it. Under the client's _mutex.
 template <std::size_t N, std::size_t Len>
 class PendingSeenIds
@@ -440,11 +441,8 @@ public:
 		if (id.empty() || id.size() > Len) return;
 		for (auto& e : _e)
 		{
-			if (id == e.id)
-			{
-				if (seq > e.seq) e.seq = seq;
-				return;
-			}
+			if (id == e.id) return;   // the first sighting stands
+
 		}
 		Entry& e = _e[_next++ % N];
 		std::memcpy(e.id, id.data(), id.size());
@@ -452,13 +450,23 @@ public:
 		e.seq           = seq;
 	}
 
-	// True when id was noted with an event number above afterSeq.
-	bool seenAfter(std::string_view id, uint64_t afterSeq) const
+	// True when id's first sighting has an event number in (afterSeq, uptoSeq].
+	bool seenIn(std::string_view id, uint64_t afterSeq, uint64_t uptoSeq) const
 	{
 		if (id.empty() || id.size() > Len) return false;
 		for (const auto& e : _e)
 		{
-			if (id == e.id) return e.seq > afterSeq;
+			if (id == e.id) return e.seq > afterSeq && e.seq <= uptoSeq;
+		}
+		return false;
+	}
+
+	// True when any id's first sighting is in (afterSeq, uptoSeq].
+	bool anyIn(uint64_t afterSeq, uint64_t uptoSeq) const
+	{
+		for (const auto& e : _e)
+		{
+			if (e.id[0] != '\0' && e.seq > afterSeq && e.seq <= uptoSeq) return true;
 		}
 		return false;
 	}
@@ -473,7 +481,7 @@ private:
 	std::size_t _next = 0;
 };
 
-enum class OrphanSweepEnd : uint8_t { Dropped, DropFailed, GaveUp, Ambiguous, Stopped, TooLate };
+enum class OrphanSweepEnd : uint8_t { Dropped, DropFailed, GaveUp, Ambiguous, Stopped, TooLate, NoCandidate };
 
 // One sweep read: the leg resolveOutboundLeg() picked ("" when the read failed or listed none) and how many
 // candidates the list held.
@@ -491,13 +499,14 @@ struct OrphanSweepResult
 	std::string    leg;   // the leg handed to dropLeg
 };
 
-// The sweep. armedUs is the time makeCall() armed it (the bound runs from there, not from when tel_maint
+// The sweep. hasCandidate() is false when no leg was upserted in the window (PendingSeenIds::anyIn): the sweep
+// then has nothing it may drop, and it ends at once without a read. armedUs is the time makeCall() armed it (the bound runs from there, not from when tel_maint
 // got to it). readOnce() -> OrphanRead; nowUs() is a microsecond clock; keepGoing() is false once the
 // anchor is stopping; pause() sleeps one poll gap; holdLeg(leg) notes the leg as ours; dropLeg(leg) -> bool
 // drops it. The order is the contract: holdLeg, then dropLeg, once each, and only for a single candidate.
-template <class ReadFn, class NowFn, class KeepFn, class PauseFn, class HoldFn, class DropFn>
+template <class ReadFn, class NowFn, class KeepFn, class PauseFn, class HoldFn, class DropFn, class HasCandFn>
 OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& nowUs, KeepFn&& keepGoing,
-                                 PauseFn&& pause, HoldFn&& holdLeg, DropFn&& dropLeg)
+                                 PauseFn&& pause, HoldFn&& holdLeg, DropFn&& dropLeg, HasCandFn&& hasCandidate)
 {
 	OrphanSweepResult r;
 	for (;;)
@@ -505,6 +514,11 @@ OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& now
 		if (!keepGoing())
 		{
 			r.end = OrphanSweepEnd::Stopped;
+			break;
+		}
+		if (r.reads == 0 && !hasCandidate())
+		{
+			r.end = OrphanSweepEnd::NoCandidate;
 			break;
 		}
 		// tel_maint was busy past the bound (a restart job ahead of this one): the hold has lapsed, so a
@@ -540,13 +554,47 @@ OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& now
 	return r;
 }
 
+template <class ReadFn, class NowFn, class KeepFn, class PauseFn, class HoldFn, class DropFn>
+OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& nowUs, KeepFn&& keepGoing,
+                                 PauseFn&& pause, HoldFn&& holdLeg, DropFn&& dropLeg)
+{
+	return runOrphanSweep(armedUs, readOnce, nowUs, keepGoing, pause, holdLeg, dropLeg, [] { return true; });
+}
+
+// One sweep read, with the decisions the ESP arm used to make inline. readList() does the I/O and returns the pick
+// and its candidate count (an empty leg when the read failed or listed none); it may throw std::bad_alloc, which
+// is a failed read. pendingCount() is the client's pending makeCall count, pendingSinceUs() when the oldest began.
+// seen(leg) is PendingSeenIds::seenIn over (postSeq, armSeq].
+//   - A makeCall in flight (a redialed 911 among them) has a leg 3CX lists before it keys it, and a lone
+//     candidate is dropped: no decision while one is pending, before the read or after it, or if one began and
+//     ended during it. The read is an empty one, so the sweep reads again.
+//   - A pick not seen in the window is a stranger (it may be a PSAP callback) and is never dropped.
+template <class ReadFn, class PendingFn, class SinceFn, class SeenFn>
+OrphanRead readOrphanOnce(ReadFn&& readList, PendingFn&& pendingCount, SinceFn&& pendingSinceUs, SeenFn&& seen)
+{
+	const int64_t sinceUs = pendingSinceUs();
+	if (pendingCount() > 0) return {};
+	OrphanRead rd;
+	try
+	{
+		rd = readList();
+	}
+	catch (const std::bad_alloc&)
+	{
+		return {};   // a failed read, not a terminate: the ordinary lane rethrows
+	}
+	if (pendingCount() > 0 || pendingSinceUs() != sinceUs) return {};
+	rd.stranger = !rd.leg.empty() && !seen(rd.leg);
+	return rd;
+}
+
 // Counts how each sweep ended; writes the first kLinesPerEnd lines of each kind, so a stuck unit cannot flood
 // the log. No number or credential in a line.
 class OrphanSweepWitness
 {
 public:
 	static constexpr uint32_t kLinesPerEnd = 8;
-	static constexpr std::size_t kEnds     = 6;
+	static constexpr std::size_t kEnds     = 7;
 
 	// True when this one wrote a line.
 	bool noteEnd(OrphanSweepEnd end)
@@ -572,6 +620,9 @@ public:
 				break;
 			case OrphanSweepEnd::TooLate:
 				PD_WITNESS_W("anchor", "911 orphan sweep: tel_maint reached it after the bound, nothing read (#977)");
+				break;
+			case OrphanSweepEnd::NoCandidate:
+				PD_WITNESS_W("anchor", "911 orphan sweep: no leg was upserted in the window, nothing to find, no read (#977)");
 				break;
 		}
 		return true;

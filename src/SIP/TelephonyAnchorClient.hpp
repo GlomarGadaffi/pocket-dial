@@ -283,7 +283,7 @@ private:
 	WitnessTick witnessSightingLocked(const std::string& partId);
 	static void noteWitnessCap(const WitnessTick& tick);
 	// partId (#977, Rule 5): the id of the upsert being classified. The sweep's hold counts in pending only for an
-	// id _pendingSeen noted after the sweep's POST; nullptr (a caller that announces nothing): the hold counts.
+	// id _pendingSeen first noted within (_orphanPostSeq, _orphanArmSeq]; nullptr (a caller that announces nothing): the hold counts.
 	int         countOutboundLocked(std::string* inflight, size_t inflightCap, int& active, int& pending,
 	                                const std::string* partId = nullptr) const;
 	// Issue #553: delete a slot's rx task only once it has parked (pd::reapDecision);
@@ -382,15 +382,16 @@ private:
 	static constexpr uint32_t kMaintOrphanSweep = 1u << 4;
 	std::atomic<int64_t>  _orphanArmedUs{0};       // 0: nothing armed; the sweep takes it with an exchange
 	std::atomic<uint64_t> _orphanPostSeq{0};       // _wsSeq at the POST that may have created the leg
+	std::atomic<uint64_t> _orphanArmSeq{0};        // _wsSeq when the sweep was armed: the window is (post, arm]
 	std::atomic<int64_t>  _orphanHoldUntilUs{0};   // esp_timer time the hold lasts to; 0: no hold
 	telephony::OrphanSweepWitness _orphanWitness;
-	// The ids upserted, after the sweep's POST, while a makeCall was pending (guarded by _mutex): the orphan is one, a
-	// PSAP callback is not.
+	// The ids first upserted, within the sweep's window (its POST to its arm), while a makeCall was pending (guarded by
+	// _mutex): the orphan is one, a PSAP callback is not.
 	// The hold covers only these, and the sweep drops only one of these (Rule 5 review of #1040).
 	telephony::PendingSeenIds<8, telephony::kParticipantIdBytes> _pendingSeen;
 	// The sweep's drop: a fresh-client POST, never performCtrl()'s _ctrlMutex, so answerCall() cannot queue behind it.
 	bool dropOrphanLeg(const std::string& leg);
-	void armOrphanSweep(uint64_t postSeq);
+	void armOrphanSweep(uint64_t postSeq, uint64_t armSeq);
 	void orphanSweepBody();
 	static void orphanSweepTaskTrampoline(void* arg);
 	std::atomic<TaskHandle_t> _maintHandle{nullptr};

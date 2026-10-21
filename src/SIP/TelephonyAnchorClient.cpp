@@ -575,6 +575,8 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		}
 		else
 		{
+			// #977: the WS event number the window of ids the sweep may drop ends at.
+			const uint64_t armSeq = readPostSeq();
 			// Loud on purpose: 3CX may be holding a call we can no longer see or
 			// control, and the next repeat upset for it can still surface as a
 			// phantom inbound. The allocation failures behind this are #328's.
@@ -587,7 +589,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 			// see. Arm the sweep that drops it; the return below is unchanged. Lock-free and I/O-free.
 			if (telephony::orphanSweepWanted(sosLane, outcome, reads, listsRead))
 			{
-				armOrphanSweep(postSeq);
+				armOrphanSweep(postSeq, armSeq);
 			}
 		}
 	}
@@ -2278,10 +2280,11 @@ void TelephonyAnchorClient::maintRefreshTaskTrampoline(void* arg)
 // makecall POST reached 3CX, no participant-list read of the #349 window showed the list, and the caller was
 // refused (503) as on main. 3CX may still hold a live call to the PSAP. makeCall() arms this with three atomic
 // stores and a wake: no lock, no I/O, no wait, so the caller's 503 is not delayed by it.
-void TelephonyAnchorClient::armOrphanSweep(uint64_t postSeq)
+void TelephonyAnchorClient::armOrphanSweep(uint64_t postSeq, uint64_t armSeq)
 {
 	const int64_t nowUs = esp_timer_get_time();
 	_orphanPostSeq.store(postSeq, std::memory_order_relaxed);
+	_orphanArmSeq.store(armSeq, std::memory_order_relaxed);
 	_orphanHoldUntilUs.store(telephony::orphanHoldUntil(nowUs), std::memory_order_release);
 	_orphanArmedUs.store(nowUs, std::memory_order_release);
 	if (!wakeMaint(kMaintOrphanSweep))
@@ -2320,6 +2323,7 @@ void TelephonyAnchorClient::orphanSweepBody()
 {
 	// Take the arm. A wake whose arm an earlier pass already took finds 0 and returns.
 	const uint64_t postSeq = _orphanPostSeq.load(std::memory_order_relaxed);
+	const uint64_t armSeq = _orphanArmSeq.load(std::memory_order_relaxed);
 	const int64_t armedUs = _orphanArmedUs.exchange(0, std::memory_order_acq_rel);
 	if (armedUs == 0) return;
 	const int64_t holdUntilUs = telephony::orphanHoldUntil(armedUs);
@@ -2337,38 +2341,26 @@ void TelephonyAnchorClient::orphanSweepBody()
 	{
 		r = telephony::runOrphanSweep(
 			armedUs,
-			[this, postSeq]() -> telephony::OrphanRead {
-				telephony::OrphanRead rd;
-				// A makeCall in flight (a redialed 911 among them) has a leg 3CX lists before it keys it, and a
-				// lone candidate is dropped: no decision while one is pending, before the read or after it, or
-				// if one began and ended during it. An empty read is a read again.
-				const int64_t pendingSinceUs = _outboundPendingSinceUs.load(std::memory_order_acquire);
-				if (_outboundPending.load(std::memory_order_acquire) > 0) return rd;
-				int listStatus = 0;
-				telephony::OwnLegSource source = telephony::OwnLegSource::FirstControllable;
-				telephony::ListLegCounts counts;
-				try
-				{
-					rd.leg = resolveOutboundLeg(std::string(), std::string(), &listStatus, &source, &counts, /*skipOurs=*/true,
-								/*fresh=*/true);
-					rd.candidates = counts.candidates;
-					// A pick this unit never saw upserted while its makeCall was pending is not the orphan: it
-					// may be a PSAP callback, and it is never dropped (Rule 5).
-					{
+			[this, postSeq, armSeq]() -> telephony::OrphanRead {
+				// The pending guards and the stranger decision are telephony::readOrphanOnce (host-tested);
+				// this lends it the I/O and the client's state.
+				return telephony::readOrphanOnce(
+					[this]() -> telephony::OrphanRead {
+						telephony::OrphanRead rd;
+						int listStatus = 0;
+						telephony::OwnLegSource source = telephony::OwnLegSource::FirstControllable;
+						telephony::ListLegCounts counts;
+						rd.leg = resolveOutboundLeg(std::string(), std::string(), &listStatus, &source, &counts, /*skipOurs=*/true,
+									/*fresh=*/true);
+						rd.candidates = counts.candidates;
+						return rd;
+					},
+					[this] { return _outboundPending.load(std::memory_order_acquire); },
+					[this] { return _outboundPendingSinceUs.load(std::memory_order_acquire); },
+					[this, postSeq, armSeq](const std::string& leg) {
 						std::lock_guard<std::mutex> lock(_mutex);
-						rd.stranger = !rd.leg.empty() && !_pendingSeen.seenAfter(rd.leg, postSeq);
-					}
-				}
-				catch (const std::bad_alloc&)
-				{
-					rd = telephony::OrphanRead{};   // a failed read, not a terminate: the ordinary lane rethrows
-				}
-				if (_outboundPending.load(std::memory_order_acquire) > 0 ||
-				    _outboundPendingSinceUs.load(std::memory_order_acquire) != pendingSinceUs)
-				{
-					rd = telephony::OrphanRead{};
-				}
-				return rd;
+						return _pendingSeen.seenIn(leg, postSeq, armSeq);
+					});
 			},
 			[] { return esp_timer_get_time(); },
 			[this] { return _running.load(std::memory_order_acquire); },
@@ -2392,6 +2384,11 @@ void TelephonyAnchorClient::orphanSweepBody()
 				{
 					return false;
 				}
+			},
+			// Nothing upserted in the window: nothing the sweep may drop, so no read and no handshake for nothing.
+			[this, postSeq, armSeq] {
+				std::lock_guard<std::mutex> lock(_mutex);
+				return _pendingSeen.anyIn(postSeq, armSeq);
 			});
 	}
 	catch (const std::bad_alloc&)
@@ -2411,8 +2408,8 @@ void TelephonyAnchorClient::orphanSweepBody()
 	}
 	else
 	{
-		ESP_LOGW(TAG, "orphan sweep: ended after %d read(s), nothing dropped (gave up, stopping or too late): "
-			"a call may still be on 3CX (#977)", r.reads);
+		ESP_LOGW(TAG, "orphan sweep: ended after %d read(s), nothing dropped (gave up, stopping, too late or no leg "
+			"upserted in the window): a call may still be on 3CX (#977)", r.reads);
 	}
 }
 
@@ -3477,7 +3474,8 @@ int TelephonyAnchorClient::countOutboundLocked(std::string* inflight, size_t inf
 	// for an id upserted while a makeCall was pending: any other id (a PSAP callback) is announced at once (Rule 5).
 	pending = telephony::pendingWithOrphanHold(_outboundPending.load(std::memory_order_acquire),
 	                                           _orphanHoldUntilUs.load(std::memory_order_acquire), esp_timer_get_time(),
-	                                           !partId || _pendingSeen.seenAfter(*partId, _orphanPostSeq.load(std::memory_order_relaxed)));
+	                                           !partId || _pendingSeen.seenIn(*partId, _orphanPostSeq.load(std::memory_order_relaxed),
+	                                                                  _orphanArmSeq.load(std::memory_order_relaxed)));
 	return nin;
 }
 
