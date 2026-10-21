@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
 #include <utility>
 #include <vector>
@@ -113,6 +114,22 @@ namespace
 			"Contact: <sip:" + toExt + "@" + calleeIp + ":5060>\r\n"
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(calleeIp));
+	}
+
+	// The callee's mandatory 200 to the PBX's CANCEL (RFC 3261 s9.2): CSeq names CANCEL, no SDP.
+	std::shared_ptr<SipMessage> makeCancelOk(const std::string& fromExt, const std::string& toExt,
+		const std::string& callerIp, const std::string& calleeIp, const std::string& callId,
+		const std::string& branch)
+	{
+		std::string raw =
+			"SIP/2.0 200 OK\r\n"
+			"Via: SIP/2.0/UDP " + callerIp + ":5060;branch=" + branch + "\r\n"
+			"From: <sip:" + fromExt + "@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:" + toExt + "@server>;tag=bt" + callId + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 CANCEL\r\n"
+			"Content-Length: 0\r\n\r\n";
 		return RequestsHandler::getMessageFromPool(raw, addrFor(calleeIp));
 	}
 
@@ -546,4 +563,354 @@ TEST(FinalFailureRelay, RingAllFailsTheCallerWhenEveryMemberAnswersBusyOrUnavail
 		EXPECT_FALSE(handler.getSession("Call-ID: ab-1").has_value())
 			<< "and the session slot must be freed";
 	}
+}
+
+// #1049: a caller's CANCEL leaves the session in state Cancel until the callee's 487
+// arrives. A silent callee never sends one, so nothing ended the call. The bounded wait
+// (RFC 3261 s17.1.1.2, 64*T1 = 32 s) is armed on the CANCEL itself. There is no
+// injectable clock: the window is checked with the before/after bracket NoAnswerTimeout
+// uses, and the sweep is forced by arming the deadline in the past.
+namespace
+{
+	using TestClock = std::chrono::steady_clock;
+
+	int countSentTo(const SentList& sent, const sockaddr_in& addr, const std::string& needle)
+	{
+		int n = 0;
+		for (const auto& entry : sent)
+		{
+			const sockaddr_in& to = entry.first;
+			if (to.sin_addr.s_addr != addr.sin_addr.s_addr || to.sin_port != addr.sin_port) continue;
+			if (!entry.second) continue;
+			if (entry.second->toString().find(needle) != std::string::npos) ++n;
+		}
+		return n;
+	}
+}
+
+// RED on main: the INVITE-time ring timer (20 s) stays armed through the CANCEL, so the
+// first assertion fails; and nothing ends a Cancel session, so the last two fail too.
+TEST(FinalFailureRelay, ASilentCalleesCancelIsEndedAt32sWithTheCallersOwn487)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.50.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.50.20");
+	handler.handle(makeRegister("401", "192.168.50.20", "reg-401"));
+	handler.handle(makeRegister("402", "192.168.50.21", "reg-402"));
+	handler.handle(makeInvite("401", "402", "192.168.50.20", "cb-1", "z9hG4bKcb1"));
+
+	const auto before = TestClock::now();
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-1", "z9hG4bKcb1"));
+	const auto after = TestClock::now();
+	const std::string key = "Call-ID: cb-1";
+	auto session = handler.getSession(key);
+	ASSERT_TRUE(session.has_value());
+	EXPECT_FALSE(session.value()->isRingExpired(before + std::chrono::seconds(31)))
+		<< "the cancelled call must not be ended before 32 s";
+	EXPECT_TRUE(session.value()->isRingExpired(after + std::chrono::seconds(32)))
+		<< "the cancelled call must be ended by 32 s";
+
+	handler.forceNextTickForTest();
+	handler.tick();
+	EXPECT_TRUE(handler.getSession(key).has_value())
+		<< "the session waits for the callee's 487 at ~0 s";
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 487"), 0)
+		<< "nothing is sent to the caller before the 32 s are up";
+
+	session.value()->armRingTimer(TestClock::now() - std::chrono::seconds(1));   // the 32 s have passed
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+	EXPECT_FALSE(handler.getSession(key).has_value())
+		<< "the session must be gone after 32 s with no 487 from the callee";
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 487"), 1)
+		<< "the PBX answers the caller's INVITE with its own 487, exactly once";
+}
+
+// A retransmitted CANCEL (same branch, same Call-ID, 500 ms later while the callee stays silent)
+// must leave the 32 s window armed from the first CANCEL: it neither clears it nor pushes it out.
+// RED against the first fix commit: the second CANCEL finds state Cancel and clears the timer.
+TEST(FinalFailureRelay, ARetransmittedCancelKeepsTheBoundedWaitArmedFromTheFirstCancel)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.50.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.50.20");
+	handler.handle(makeRegister("401", "192.168.50.20", "reg-401"));
+	handler.handle(makeRegister("402", "192.168.50.21", "reg-402"));
+	handler.handle(makeInvite("401", "402", "192.168.50.20", "cb-4", "z9hG4bKcb4"));
+
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-4", "z9hG4bKcb4"));
+	const auto afterFirst = TestClock::now();
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-4", "z9hG4bKcb4"));   // retransmit
+
+	const std::string key = "Call-ID: cb-4";
+	auto session = handler.getSession(key);
+	ASSERT_TRUE(session.has_value());
+	EXPECT_EQ(session.value()->getState(), Session::State::Cancel);
+	EXPECT_TRUE(session.value()->isRingExpired(afterFirst + std::chrono::seconds(32)))
+		<< "a retransmitted CANCEL must not disarm the 32 s bound";
+
+	session.value()->armRingTimer(TestClock::now() - std::chrono::seconds(1));
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+	EXPECT_FALSE(handler.getSession(key).has_value())
+		<< "the call is still ended once the 32 s are up";
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 487"), 1)
+		<< "exactly one 487 reaches the caller";
+}
+
+// RED on main for the plain call (its ring deadline is never honoured in state Cancel).
+// The emergency twin, armed past its deadline in the same tick, must stay untouched.
+TEST(FinalFailureRelay, AnEmergencyCancelIsNotEndedByTheBoundedWait)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.50.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in emergencyCallerAddr = addrFor("192.168.50.22");
+	handler.handle(makeRegister("401", "192.168.50.20", "reg-401"));
+	handler.handle(makeRegister("402", "192.168.50.21", "reg-402"));
+	handler.handle(makeRegister("403", "192.168.50.22", "reg-403"));
+	handler.handle(makeRegister("404", "192.168.50.23", "reg-404"));
+	handler.handle(makeInvite("401", "402", "192.168.50.20", "cb-2", "z9hG4bKcb2"));
+	handler.handle(makeInvite("403", "404", "192.168.50.22", "cb-3", "z9hG4bKcb3"));
+
+	auto emergency = handler.getSession("Call-ID: cb-3");
+	ASSERT_TRUE(emergency.has_value());
+	emergency.value()->setEmergency(true);
+
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-2", "z9hG4bKcb2"));
+	handler.handle(makeCancel("403", "404", "192.168.50.22", "cb-3", "z9hG4bKcb3"));
+
+	auto plain = handler.getSession("Call-ID: cb-2");
+	ASSERT_TRUE(plain.has_value());
+	const auto past = TestClock::now() - std::chrono::seconds(1);
+	plain.value()->armRingTimer(past);
+	emergency.value()->armRingTimer(past);
+
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+	EXPECT_FALSE(handler.getSession("Call-ID: cb-2").has_value())
+		<< "the plain cancelled call is ended once its 32 s are up";
+	ASSERT_TRUE(handler.getSession("Call-ID: cb-3").has_value())
+		<< "an emergency Cancel session is never ended by the bounded wait";
+	EXPECT_EQ(emergency.value()->getState(), Session::State::Cancel);
+	EXPECT_EQ(countSentTo(sent, emergencyCallerAddr, "SIP/2.0 487"), 0)
+		<< "no 487 goes to the emergency caller";
+}
+
+// Found on hardware (.244, RC 3237af5f): a callee that answers the CANCEL with its mandatory
+// 200 but never sends the 487 must still be bounded. That 200 has CSeq "n CANCEL"; it is not a
+// 2xx that answers the call, so it must neither disarm the 32 s window nor mark the cancel answered.
+// RED against 3237af5f: onOk's Cancel branch clears the timer for any 200.
+TEST(FinalFailureRelay, ACalleesOwn200ToTheCancelDoesNotDisarmTheBoundedWait)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.50.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.50.20");
+	handler.handle(makeRegister("401", "192.168.50.20", "reg-401"));
+	handler.handle(makeRegister("402", "192.168.50.21", "reg-402"));
+	handler.handle(makeInvite("401", "402", "192.168.50.20", "cb-6", "z9hG4bKcb6"));
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-6", "z9hG4bKcb6"));
+	const auto afterCancel = TestClock::now();
+
+	handler.handle(makeCancelOk("401", "402", "192.168.50.20", "192.168.50.21", "cb-6", "z9hG4bKcb6"));
+
+	const std::string key = "Call-ID: cb-6";
+	auto session = handler.getSession(key);
+	ASSERT_TRUE(session.has_value());
+	EXPECT_TRUE(session.value()->isRingExpired(afterCancel + std::chrono::seconds(32)))
+		<< "the callee's 200 to the CANCEL must not disarm the 32 s bound";
+	EXPECT_FALSE(session.value()->cancelAnswered())
+		<< "a 200 to the CANCEL does not mean the caller was answered";
+
+	session.value()->armRingTimer(TestClock::now() - std::chrono::seconds(1));
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+	EXPECT_FALSE(handler.getSession(key).has_value())
+		<< "the silent callee's call is still ended once the 32 s are up";
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 487"), 1)
+		<< "exactly one 487 reaches the caller";
+}
+
+// Guard, green after the fix: once the bounded wait has ended the call, the callee's late 487
+// and a stray CANCEL find no session and send nothing more (teardown runs exactly once).
+TEST(FinalFailureRelay, ALate487OrCancelAfterTheBoundedReapSendsNothingMore)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.50.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.50.20");
+	const sockaddr_in calleeAddr = addrFor("192.168.50.21");
+	handler.handle(makeRegister("401", "192.168.50.20", "reg-401"));
+	handler.handle(makeRegister("402", "192.168.50.21", "reg-402"));
+	handler.handle(makeInvite("401", "402", "192.168.50.20", "cb-5", "z9hG4bKcb5"));
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-5", "z9hG4bKcb5"));
+
+	auto session = handler.getSession("Call-ID: cb-5");
+	ASSERT_TRUE(session.has_value());
+	session.value()->armRingTimer(TestClock::now() - std::chrono::seconds(1));
+	handler.forceNextTickForTest();
+	handler.tick();
+	ASSERT_FALSE(handler.getSession("Call-ID: cb-5").has_value()) << "reaped at 32 s";
+
+	sent.clear();
+	handler.handle(makeFinal(487, "401", "402", "192.168.50.20", "192.168.50.21",
+		"cb-5", "z9hG4bKcb5"));
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-5", "z9hG4bKcb5"));
+	handler.forceNextTickForTest();
+	handler.tick();
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 487"), 0)
+		<< "no second 487 reaches the caller after the reap";
+	EXPECT_EQ(countSentTo(sent, callerAddr, "BYE "), 0);
+	EXPECT_EQ(countSentTo(sent, calleeAddr, "BYE "), 0)
+		<< "no BYE or drop follows a reaped call";
+	EXPECT_FALSE(handler.getSession("Call-ID: cb-5").has_value());
+}
+
+// Guard, green on main and after the fix: the callee's 487 ends the call through the
+// relay, and the bounded wait afterwards sends nothing more and leaves nothing behind.
+TEST(FinalFailureRelay, TheCalleesRequestTerminatedEndsACancelledCallWithNoSecond487)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.50.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.50.20");
+	handler.handle(makeRegister("401", "192.168.50.20", "reg-401"));
+	handler.handle(makeRegister("402", "192.168.50.21", "reg-402"));
+	handler.handle(makeInvite("401", "402", "192.168.50.20", "cb-4", "z9hG4bKcb4"));
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-4", "z9hG4bKcb4"));
+
+	sent.clear();
+	handler.handle(makeFinal(487, "401", "402", "192.168.50.20", "192.168.50.21",
+		"cb-4", "z9hG4bKcb4"));
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 487"), 1)
+		<< "the callee's 487 is relayed to the caller once";
+
+	auto session = handler.getSession("Call-ID: cb-4");
+	ASSERT_TRUE(session.has_value()) << "the relayed 487 waits for the caller's ACK";
+	session.value()->armRingTimer(TestClock::now() - std::chrono::seconds(1));
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 487"), 0)
+		<< "no second 487 after the callee's own was relayed";
+
+	sent.clear();
+	handler.handle(makeAck("401", "402", "192.168.50.20", "cb-4", "z9hG4bKcb4"));
+	EXPECT_FALSE(handler.getSession("Call-ID: cb-4").has_value())
+		<< "the caller's ACK ends the call and leaves nothing behind";
+	handler.forceNextTickForTest();
+	handler.tick();
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 487"), 0);
+}
+
+// RED on main, by the same deadline check: the 200 that crosses the CANCEL is relayed,
+// the session stays in Cancel, and no ring deadline may fire after it (a 487 would follow a 200).
+TEST(FinalFailureRelay, A2xxThatCrossesTheCancelDisarmsTheBoundedWait)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.50.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.50.20");
+	handler.handle(makeRegister("401", "192.168.50.20", "reg-401"));
+	handler.handle(makeRegister("402", "192.168.50.21", "reg-402"));
+	handler.handle(makeInvite("401", "402", "192.168.50.20", "cb-5", "z9hG4bKcb5"));
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-5", "z9hG4bKcb5"));
+
+	sent.clear();
+	handler.handle(makeOk("401", "402", "192.168.50.20", "192.168.50.21", "cb-5", "z9hG4bKcb5"));
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 200"), 1)
+		<< "the 200 that crossed the CANCEL is relayed to the caller";
+
+	auto session = handler.getSession("Call-ID: cb-5");
+	ASSERT_TRUE(session.has_value());
+	EXPECT_FALSE(session.value()->isRingExpired(TestClock::now() + std::chrono::hours(1)))
+		<< "no ring deadline may fire after the 200: a 487 must never follow it";
+
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 487"), 0)
+		<< "the caller must not be sent a 487 after its 200";
+}
+
+// #1057 (RFC 3261 s9.2): the PBX is the UAS of the caller's CANCEL and answers it with its own 200 at
+// once, whether or not the callee ever answers. Before the fix the CANCEL was only relayed, so a
+// callee that sent 180 and then nothing left the caller's CANCEL transaction to time out.
+// RED on main: no "SIP/2.0 200" with CSeq CANCEL reaches the caller after the CANCEL.
+TEST(FinalFailureRelay, TheCallersCancelGetsTheProxysOwn200EvenWhenTheCalleeStaysSilent)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.50.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.50.20");
+	const sockaddr_in calleeAddr = addrFor("192.168.50.21");
+	handler.handle(makeRegister("401", "192.168.50.20", "reg-401"));
+	handler.handle(makeRegister("402", "192.168.50.21", "reg-402"));
+	handler.handle(makeInvite("401", "402", "192.168.50.20", "cb-7", "z9hG4bKcb7"));
+
+	sent.clear();
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-7", "z9hG4bKcb7"));
+	const std::string own200 = findSentTo(sent, callerAddr, "SIP/2.0 200");
+	EXPECT_FALSE(own200.empty()) << "the PBX answers the caller's CANCEL with a 200 in the same tick";
+	EXPECT_NE(own200.find("CSeq: 1 CANCEL"), std::string::npos) << "that 200 names the CANCEL transaction";
+	EXPECT_NE(own200.find(";tag="), std::string::npos) << "a 2xx carries a To tag (RFC 3261 s8.2.6.2)";
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 200"), 1) << "exactly one 200";
+	EXPECT_EQ(countSentTo(sent, calleeAddr, "CANCEL "), 1) << "the CANCEL is still relayed to the callee";
+
+	// The callee's own 200 to the relayed CANCEL is absorbed: relayed, the caller would get two.
+	sent.clear();
+	handler.handle(makeCancelOk("401", "402", "192.168.50.20", "192.168.50.21", "cb-7", "z9hG4bKcb7"));
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 200"), 0)
+		<< "the callee's 200 to the CANCEL is not relayed after the PBX answered it";
+	auto session = handler.getSession("Call-ID: cb-7");
+	ASSERT_TRUE(session.has_value());
+	EXPECT_TRUE(session.value()->isRingExpired(TestClock::now() + std::chrono::seconds(33)))
+		<< "the #1049 bound is still armed";
+}
+
+// Rule 5: an emergency caller's CANCEL gets the same 200, and the bound stays off it.
+TEST(FinalFailureRelay, AnEmergencyCallersCancelGetsTheSame200)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.50.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.50.22");
+	handler.handle(makeRegister("403", "192.168.50.22", "reg-403"));
+	handler.handle(makeRegister("404", "192.168.50.23", "reg-404"));
+	handler.handle(makeInvite("403", "404", "192.168.50.22", "cb-8", "z9hG4bKcb8"));
+	auto session = handler.getSession("Call-ID: cb-8");
+	ASSERT_TRUE(session.has_value());
+	session.value()->setEmergency(true);
+
+	sent.clear();
+	handler.handle(makeCancel("403", "404", "192.168.50.22", "cb-8", "z9hG4bKcb8"));
+	const std::string own200 = findSentTo(sent, callerAddr, "SIP/2.0 200");
+	EXPECT_FALSE(own200.empty()) << "an emergency caller's CANCEL is answered with a 200";
+	EXPECT_NE(own200.find("CSeq: 1 CANCEL"), std::string::npos);
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 200"), 1);
 }

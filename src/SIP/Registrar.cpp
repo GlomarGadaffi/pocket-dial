@@ -725,6 +725,79 @@ size_t Registrar::forgetLearned()
 	return n;
 }
 
+Registrar::ReplaceResult Registrar::replaceDevices(const std::vector<Binding>& rows,
+	FunctionRef<bool(const std::string&)> extensionOk,
+	FunctionRef<bool(const std::string&)> hasSecret, std::vector<BindingFault>& faults)
+{
+	// Phase 1: look at every row, change nothing. The table is persisted as
+	// "mac \t ext \t ..." lines, so the MAC must be what ARP resolution yields (toHex12)
+	// and the extension must hold neither delimiter.
+	const auto lowerHex = [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); };
+	const auto faulted = [&faults](std::size_t row) {
+		return std::any_of(faults.begin(), faults.end(),
+			[row](const BindingFault& f) { return f.row == row; });
+	};
+	for (std::size_t i = 0; i < rows.size(); ++i)
+	{
+		if (faulted(i)) continue;   // the caller could not even read this one
+		const Binding& b = rows[i];
+		const char* why = nullptr;
+		if (b.mac.size() != 12 || !std::all_of(b.mac.begin(), b.mac.end(), lowerHex))
+		{
+			why = "mac";
+		}
+		else if (b.extension.empty() || b.extension.find_first_of("\t\n") != std::string::npos ||
+			!extensionOk(b.extension))
+		{
+			why = "extension";
+		}
+		else if (std::any_of(rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(i),
+			[&b](const Binding& earlier) { return earlier.mac == b.mac; }))
+		{
+			why = "duplicate";
+		}
+		else if (b.state == DeviceState::Secured && !hasSecret(b.extension))
+		{
+			// A Secured row with no stored secret would digest-challenge a phone that can
+			// never answer: the lockout secure() refuses.
+			why = "secret";
+		}
+		else if (i >= static_cast<std::size_t>(POCKETDIAL_MAX_CLIENTS))
+		{
+			why = "capacity";
+		}
+		if (why != nullptr) faults.push_back({i, why});
+	}
+	if (!faults.empty()) return ReplaceResult::Refused;
+
+	// Phase 2: build the new table beside the old one, swap, persist once. A table the
+	// writer refuses (a factory reset is running, the staging slot is too small) swaps
+	// straight back, so "restored" is never claimed for a table that is not staged.
+	std::unordered_map<std::string, DeviceRecord> next;
+	next.reserve(rows.size());
+	for (const Binding& b : rows)
+	{
+		DeviceRecord rec;
+		rec.extension = b.extension;
+		rec.state = b.state;
+		rec.locked = b.locked;
+		rec.shared = b.shared;
+		rec.seq = _nextSeq++;
+		const auto old = _devices.find(b.mac);
+		if (old != _devices.end()) rec.online = old->second.online;
+		next.emplace(b.mac, std::move(rec));
+	}
+	_devices.swap(next);   // `next` now holds the old table
+	if (!persistDevices())
+	{
+		_devices.swap(next);
+		return ReplaceResult::NotStaged;
+	}
+	noteChange(Change::Structural);
+	_env.log("Devices: " + std::to_string(rows.size()) + " bindings restored from a config import");
+	return ReplaceResult::Replaced;
+}
+
 std::vector<Registrar::AdoptedDevice> Registrar::adoptedDevices() const
 {
 	std::vector<AdoptedDevice> out;
@@ -739,6 +812,7 @@ std::vector<Registrar::AdoptedDevice> Registrar::adoptedDevices() const
 		d.locked = rec.locked;
 		d.shared = rec.shared;
 		d.assigned = rec.assigned;
+		d.seq = rec.seq;
 		out.push_back(std::move(d));
 	}
 	return out;

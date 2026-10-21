@@ -1,0 +1,2 @@
+# EmergencyRoute_test.cpp EmergencyCallback: 5 (#967: an inbound PSAP callback pre-empts one non-emergency call; "drop 2" ringing and up; the live 911, an earlier callback and the one-call-cannot-make-room case stay dropped). The two section G tests that recorded the drop were renamed in place (0 net); 967-psap-callback-bridges-full.txt still counts them.
+5

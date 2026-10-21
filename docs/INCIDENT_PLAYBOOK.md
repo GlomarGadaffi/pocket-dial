@@ -194,7 +194,7 @@ ESP_ERROR_CHECK(ret);
 `RequestsHandler` keeps a concurrent, snapshot-based view for the dashboard. A deadlock occurs if recursive operations or lock-order inversion lock `RequestsHandler::_mutex` permanently, starving SIP execution.
 
 ### Detection & Symptoms
-1. Partial Responsiveness: The HTTP dashboard is fully active on Core 0 (`http://192.168.4.1:80` returns the CGA CRT interface instantly), but the metrics showing active sessions, registered extensions, and processed packet counts remain frozen.
+1. Partial Responsiveness: The HTTP dashboard is fully active on Core 0 (`http://192.168.4.1:80` returns the operator console instantly), but the metrics showing active sessions, registered extensions, and processed packet counts remain frozen.
 2. SIP Protocol Silent Drop: Active SIP phone endpoints show `No Registration` or timeout with status `408 Request Timeout` on port `5060` (UDP).
 3. Task Monitor Frozen: Serial console logs do not show `UdpServer` or `RequestsHandler::tick` processing notices.
 
@@ -425,7 +425,7 @@ flowchart TD
 Production builds confirm the new image after 5 s of healthy operation. The bench-only rollback probe (`POCKETDIAL_OTA_ROLLBACK_PROBE`, `main/esp_main_eth.cpp`) waits 60 s and restarts without confirming, so the bootloader's rollback can be exercised.
 
 ### Detection & Symptoms
-1. **Silent rollback:** After an OTA firmware update, the device boots but still shows the old version string on the CGA HTTP dashboard.
+1. **Silent rollback:** After an OTA firmware update, the device boots but still shows the old version string on the HTTP dashboard.
 2. Boot Logs Rollback Signature: The serial console displays the following bootloader notifications:
    ```text
    I (520) esp_image: Verifying image signature...
@@ -538,7 +538,7 @@ glyphs (no `0`/`O`, `1`/`I`/`L`, `U`) so it survives being read off an LCD and r
 | :--- | :--- |
 | `display` | On the LVGL onboarding screen, beside the SSID |
 | `wifi` (headless) | Serial boot log: `INFRA: SoftAP passphrase (WPA2): …`, deliberate; a serial cable is already inside the physical trust boundary |
-| Any | `GET /api/ap-security` → `{"secure":true,"psk":"…"}`, or the dashboard's *Wi-Fi Access Point Security* panel, once logged in **and past forced setup** |
+| Any | `GET /api/ap-security` → `{"secure":true,"psk":"…"}`, or the dashboard's *Security* → *Wi-Fi access point security* section, once logged in **and past forced setup** |
 | Any | The browser flasher, if it was written at flash time |
 
 Change it with `POST /api/ap-security` (`secure`, `psk`, `regenerate`; needs `X-CSRF`). **The

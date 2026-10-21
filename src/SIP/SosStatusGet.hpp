@@ -541,6 +541,44 @@ private:
 	std::atomic<uint32_t> _noWorker{0};
 };
 
+
+// ── The worker's outbound leg status read (#949 item 1) ──────────────────────
+// The tel_wsw worker decides Connected -> Answered from a participant-list read. For a slot that is
+// a 911/933 (CallSlot::emergency non-zero) that read takes the sos lane, so it never waits on
+// _statusMutex behind another caller's GET. That lane's claim never waits either, so an empty read
+// can mean "claim held" or "GET failed", not "the leg is not Connected". Owner ruling (#949,
+// 2026-10-20): on an emergency slot an empty or failed read is UNKNOWN. It is not answered and it
+// is not the dialing branch; the worker keeps asking.
+
+// Reads per pass on the sos lane, one tick apart. The worker is not makeCall(), so a short re-ask is
+// allowed here; past it the pass ends Unknown and the worker re-asks after kEmergencyReaskMs.
+inline constexpr int kEmergencyStatusReads = 3;
+inline constexpr int kEmergencyReaskMs = 100;
+
+// read(bool sosLane) returns the leg's status, "" on any failure; pause() sleeps one tick.
+template <class ReadFn, class PauseFn>
+std::string readOutboundLegStatus(bool emergency, ReadFn&& read, PauseFn&& pause)
+{
+	if (!emergency) return read(false);   // unchanged: one read on the shared lane
+	std::string st;
+	for (int i = 0; i < kEmergencyStatusReads; ++i)
+	{
+		st = read(true);
+		if (!st.empty()) break;
+		if (i + 1 < kEmergencyStatusReads) pause();
+	}
+	return st;
+}
+
+enum class OutboundStep : uint8_t { Answered, Dialing, Unknown };
+
+inline OutboundStep outboundStep(const std::string& status, bool emergency)
+{
+	if (status == "Connected") return OutboundStep::Answered;
+	if (status.empty() && emergency) return OutboundStep::Unknown;
+	return OutboundStep::Dialing;
+}
+
 }  // namespace telephony
 
 #endif // SOS_STATUS_GET_HPP

@@ -73,6 +73,7 @@ scenario's "path exercised" counter: a run whose fault shows `fired: 0` is `INVA
 | `post_stream_fail` | none | the next `writeAudio()` on any live POST stream | `shutdown()` of that stream's socket: that write and every later one fails until the bridge gives up | #279 |
 | `token_age` | none | the anchor's next tick, if it holds a token | the token's obtained-at stamp moves back one lifetime, so `tokenExpiringSoon()` is true | #336 |
 | `ws_upsert` | 1-3, the case | the anchor's next tick at which the case can happen ([below](#ws_upsert-888)) | one synthetic WS upsert goes through `handleWsEvent()`, the function a 3CX frame takes, to reach one #888 witness branch on purpose | #888 |
+| `get_sock_shutdown` | none | the outbound call's GET stream (the leg `makeCall()` claimed), the first time `open()` succeeds and its socket is published ([below](#get_sock_shutdown-370-350)) | `shutdown(SHUT_RDWR)` of that socket before the response headers are read, so the read finds no response: a real `GET stream transport failure`, then the rx loop rebuilds its handle and pays a fresh handshake | #370, #350 |
 
 Notes:
 
@@ -82,8 +83,8 @@ Notes:
 - Do not hold ballast while `makecall_read_fail` is armed: if the reconcile list GET
   then fails too, the call is the #349 ORPHAN variant (a live billable leg on 3CX),
   which the approval excludes.
-- `get_status` and `get_max_attempts` apply only to an outbound leg that `makeCall()`
-  claimed. An inbound call, including a PSAP callback, is never the forced one.
+- `get_status`, `get_max_attempts` and `get_sock_shutdown` apply only to an outbound leg that
+  `makeCall()` claimed. An inbound call, including a PSAP callback, is never the forced one.
 - After a `get_status` 200 is closed, the next attempt reconnects and pays a TLS
   handshake. Size `get_max_attempts` for a short call: about 20-40 attempts.
 - **`ws_drop` is not implemented.** `esp_websocket_client` (1.8.0) has no documented
@@ -92,8 +93,12 @@ Notes:
   end the client, cannot run from its event handler, and expose no socket. Variant A
   of `x336_ws_reauth` needs another way to cut the WS (for example, at the network).
 
-App-level faults are **not** evidence for #350. That bug lives in mbedTLS's failed-read
-state, and only ballast or a real network fault reaches it.
+An application-level fault is weaker evidence for #350 than a real network fault. That bug lives in
+mbedTLS's failed-read state after an allocation failure (`esp-aes: Failed to allocate memory`, read error
+`-0x0084`), which a ballast or a real network fault can reach; a `shutdown()` fails the read a different way. So
+every fault above except `get_sock_shutdown` is **not** evidence for #350. desmo ruled on 2026-10-19 that
+`get_sock_shutdown` may count as the arm for #370 and #350, with this caveat: #350 should be closed only with a
+valid arm that also shows the rebuild surviving pressure.
 
 ### `ws_upsert` (#888)
 
@@ -144,6 +149,74 @@ it (`part=pdb-u2-3`). The witness line is the first sighting of that id, so it i
   the witness line of each case by the exact text above and the case's part id; a case with 0 lines is
   `INVALID`, never `PASS`. Far end only: no owner extension, no test UA, no service number.
 
+### `get_sock_shutdown` (#370, #350)
+
+This is part of #370 and #350. It shuts down the socket the rx task has just published for its GET stream, so the
+read of the response headers right after it finds no response. That is the failure behind both issues, made on
+demand: the loop logs `GET stream transport failure`, rebuilds its handle (`recreateGetClient()`), and the next
+open pays a fresh TLS handshake. Nothing else the probe has does that: `get_status` leaves a transport failure
+real, and the ballast reaches one only by chance.
+
+`POST fault=get_sock_shutdown` arms it (no value). Arm it **before the INVITE**: `makeCall()` claims the outbound
+leg it is about to dial for the GET faults, if `get_sock_shutdown`, `get_status` or `get_max_attempts` is armed at
+that moment, and the leg's rx loop takes the claim once. So the fault is never aimed at an inbound call, a PSAP
+callback or a 911/933.
+
+- **Where.** `runRxLoop()`, in the retry loop, right after `open()` succeeded and the socket was published to
+  `slot->getFd` under `getMutex`, and before `esp_http_client_fetch_headers()`. It acts on the first attempt that
+  has a published socket; an attempt whose `open()` failed has none, and the fault waits, still armed. The rx task
+  shuts down its own socket, the way `post_stream_fail` shuts down the POST stream's socket from the thread that
+  writes to it. It does so under `getMutex`, the lock `stopMediaStreams()` holds for its own `shutdown()`:
+  `closePostClient()` can close this handle from another task, and a shutdown outside the lock could hit a
+  descriptor that was closed and reused. That is the same call under the same lock as `stopMediaStreams()` makes.
+- **Why there and not later.** Once a 200 has opened the stream, a failed read ends the audio loop with a `break`
+  and never reaches the rebuild. The rebuild is in the open and header-read retry loop only. The intended window is
+  an unanswered ring, where every real answer is a 404 on a kept connection and the first open is the first
+  handshake. `get_status=404` and `get_max_attempts=8` keep that loop and the ring short, as in
+  `x370_pressure_rebuild`.
+- **`fired` means a shutdown was issued.** `fire()` runs only once `getSockShutdownDue()` says there is a claimed
+  leg and a published socket, so a fault that finds no socket stays armed and `fired` stays 0 (`INVALID`). It says
+  nothing about the rebuild: that is read from the log, as for `x370_pressure_rebuild` above.
+- **Rule 5.** As every fault: no claim for an emergency destination, no arming (`409`) while an emergency is live,
+  and a site reached during one fires nothing and disarms every fault.
+
+The log of a good run, in this order (tags `BenchProbe`, then `TelephonyAnchor`):
+
+| Line | Meaning |
+|---|---|
+| `BENCHFAULT get_sock_shutdown armed (value 0)` | the arm, from the HTTP route |
+| `BENCHFAULT get_sock_shutdown fired` | `fire()`; counted in `faults.get_sock_shutdown.fired` |
+| `BENCHFAULT get_sock_shutdown applied: shutdown(SHUT_RDWR) on the published GET socket, rc=0` | the call was made; `rc` is what it returned: `0` is a shutdown, `-1` means none happened |
+| `GET stream transport failure (no HTTP response, status=-1), attempt k/N` | the header read found nothing (`status=0` is the same failure) |
+| `GET stream not ready (HTTP 404), attempt k+1/N` | the rebuilt handle's fresh handshake was answered (a 404 because `get_status=404` is armed) |
+
+The last two are the `x370_pressure_rebuild` witness: a failure at attempt k and an attempt line at k+1 of the same
+N. Verdicts, with that scenario's other conditions (no panic line, no coredump, uptime and reset reason unchanged,
+one anchored leg, no second rx task, no `ORPHANED` line, one drop, a CANCEL answered 200):
+
+- **#370.** `PASS` when `fired` is 1, the `applied` line shows with `rc=0`, the witness shows and none of the `FAIL`
+  conditions holds. `FAIL` on a panic, a coredump or a reboot, a second rx task on the leg, an `ORPHANED` line, or a
+  CANCEL not answered 200. `INVALID` when `fired` is 0 (armed after the INVITE, or no open ever succeeded), when the
+  `applied` line shows `rc=-1` (no shutdown happened, so a transport failure after it has another cause), when the
+  failure has no next attempt (the CANCEL came first, or a syslog line was lost), or when the only line is `could not
+  rebuild client` (no handshake was made). A `PASS` shows that the rebuilt handle's first handshake survived at that run's
+  free heap, on the path #370 recorded: a successful open, no response parsed, a fresh handshake. #370 stays open
+  until a valid run exists. The 2026-10-03 closure rule also wants a named scenario whose script computes the
+  verdict: `x370_get_sock_shutdown` ([TEST_HARNESS.md](TEST_HARNESS.md)) arms this fault beside `get_status=404` and
+  `get_max_attempts=8` before the INVITE, holds no ballast, and computes the rules above. It counts the witness only
+  from the `applied` line on, so a transport failure before the shutdown is not credited to it, and it calls more than
+  one `applied` line `INVALID`.
+- **#350.** Weaker, as above. A run without ballast shows the rebuild path ran and survived at the board's normal
+  free heap. It does not show that it survives pressure, and a shutdown does not make mbedTLS fail the way an
+  allocation failure did. `x370_get_sock_shutdown` is that no-ballast run. To close #350 the run is repeated with a
+  ballast held from before the INVITE (arm the fault first, then `POST ballast=<bytes>&deadman=<s>`) at a target high
+  enough that the first open still works: at the 8192 floor the 2026-10-10 run answered 503 before any GET handshake,
+  so the fault could not fire (`fired` 0, `INVALID`). The scenario's run holds a ballast, after its three arms, when
+  its config has `ballast_bytes` and `ballast_deadman_s` (checked like `x370_pressure_rebuild`'s), but no scenario is
+  registered with one: the target is not known. Take it from the no-ballast run's `freeHeapInternal` reading, then
+  register a variant. The ballast also puts `makeCall()`'s POST under pressure, so the #349 ORPHAN variant is
+  possible: each such run needs desmo's OK, and the board's HTTP may not answer until the ballast is released.
+
 ## Ballast
 
 `ballast=<bytes>` takes `heap_caps_malloc(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)`
@@ -173,11 +246,14 @@ returns.
 The line numbers in this section are from commit `87d2874` (`src/SIP/TelephonyAnchorClient.cpp`). `grep -n` on a
 quoted log line finds its current location.
 
-- **No fault forces the rebuild.** `get_status` rewrites only a parsed HTTP answer, and a parsed answer keeps the
+- **`get_status` does not force the rebuild.** It rewrites only a parsed HTTP answer, and a parsed answer keeps the
   handle (`:4197-4245`); `overrideGetStatus()` (`src/SIP/BenchProbeLogic.hpp`) leaves a transport failure (status
   <= 0) real. The rebuild runs only after a real `GET stream transport failure` (`:4253`) or `GET stream open failed`
-  (`:4264`) line, and only the ballast can cause one, by chance. In a call that is not answered every GET answer is a
-  404 on a kept connection, so the one handshake under pressure is the first open (`startRxIfNeeded()` in
+  (`:4264`) line. The ballast is the only thing this scenario arms that can cause one, and only by chance
+  (`get_sock_shutdown`, [above](#get_sock_shutdown-370-350), causes one on purpose, and `x370_get_sock_shutdown`
+  arms it). In a
+  call that is not answered every GET answer is a 404 on a kept connection, so the one handshake under pressure is
+  the first open (`startRxIfNeeded()` in
   `makeCall()`, `:603` and its retry at `:614`, before `Successfully initiated call` at `:685`). That is why the
   ballast is held **before the INVITE**. `get_status=404` and the small `get_max_attempts` only keep the loop in
   its "not ready" retries for a short call; a 403 would trip the #902 fail-fast and end it with a 503.
@@ -273,7 +349,9 @@ The host tests pin the decisions (`tests/BenchProbeLogic_test.cpp`).
  "freeInternal":65410}
 ```
 
-The counters live in RAM and reset at boot.
+The counters live in RAM and reset at boot. The body goes through one static 1024-byte buffer
+(`HttpServer.cpp`, `sendApiBenchFault`): 756 bytes with the seven faults idle, 995 by the widest-counter estimate
+that `BenchProbeLogic_test.cpp` pins. An eighth fault needs the buffer raised.
 
 ## Not verified
 
@@ -292,6 +370,17 @@ failure lines the knobs ask for. Not known until a board runs it: whether a ball
 fail at all (the mbedTLS buffers may be in PSRAM), whether `makeCall()`'s POST survives it, whether the board's
 HTTP answers the release, and whether 35 s is a long enough backstop. The rebuild witness is derived from the
 log, not read from a line of its own.
+
+`x370_get_sock_shutdown` (#370, #350) has host tests only: its judge on sample logs
+(`tests/tools/test_anchor_x370_get_sock_shutdown.py`) and a fake board (`X370SockShutdownTest`) whose GET loop logs
+the lines this section says the probe image logs. It has never run on a board.
+
+`get_sock_shutdown` (#370, #350) was written without a build: its pure decisions have host tests
+(`BenchProbeLogic_test.cpp`) and its source wiring is pinned (`tests/tools/test_bench_get_sock_shutdown.py`), but the
+ESP glue (the block in `runRxLoop()` and the two edits in `BenchProbe.cpp`) has not been compiled, linked or run.
+Not known until a board runs it: whether the header read fails at once after the local `shutdown()` or only after
+the client's 2 s timeout (so the transport failure line may follow `fired` by about 2 s), whether it reads `status=-1`
+or `0` (both count), and what 3CX or the call does about the half-closed connection.
 
 ## HTTP DRAM accounting (`POCKETDIAL_HTTP_DRAM_ACCOUNT`)
 

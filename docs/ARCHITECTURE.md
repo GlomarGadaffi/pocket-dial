@@ -10,7 +10,7 @@ The firmware architecture is divided into three core logical layers:
 
 1. Network Hardware & Driver Layer: controls physical media (Wi-Fi radio, W5500 SPI Ethernet MAC/PHY, LAN8720 RMII PHY) and registers low-level event handlers.
 2. Signaling & State Engine Layer (`RequestsHandler`): A lightweight SIP registrar and session controller managing client registration leases, active SIP sessions, and intercom broadcasting/paging features. It implements a deliberately partial subset of RFC 3261: no §16 proxy behaviour (§1.1), but all four §17 transaction machines; §1.2 states which messages they cover, which they deliberately leave out, and where timing and coverage fall short (1 Hz sweep, pool exhaustion).
-3. User Interface & Query Layer: consists of a custom select-based, thread-dispatching `HttpServer` serving a CGA-style web dashboard, an mDNS service responder, and a high-frequency LVGL-based GUI display task.
+3. User Interface & Query Layer: consists of a custom select-based, thread-dispatching `HttpServer` serving the web dashboard, an mDNS service responder, and a high-frequency LVGL-based GUI display task.
 
 The diagram below shows the **display (JC3248W535) build**, where LVGL runs on Core 1 and
 the SIP, UDP and status tasks run on Core 0. On the headless builds (`eth`, `lan8720` and
@@ -132,6 +132,8 @@ intentional scope boundary (a relayed response, an `OPTIONS` ping,
 `REGISTER`, `ACK`) or a specific, logged degrade path (pool exhaustion, an
 oversized message, an unACKed 2xx) — not a missing layer.
 
+**A callee that never answers the forwarded `CANCEL`.** A session in the Cancel state whose callee sends no final answer to the relayed `CANCEL` is ended after 32 s (the Timer F figure), and the caller then gets its `487`. The bound is armed once, by the caller's first `CANCEL`; neither a retransmitted `CANCEL` nor the callee's own `200` to the `CANCEL` (`CSeq` `n CANCEL`) disarms it. A ringing 911/933 is excluded. On a board the caller's `487` arrived about 34 s after the `CANCEL` (1.5 s CANCEL delay plus the 32 s bound) (#1049, v1.6.0).
+
 ## 2. Core Task Topology & Affinity Splits
 
 To limit render frame drops and network packet loss, **pocket-dial** pins its real-time SIP, UDP-receive and media tasks away from the LVGL render loop where it can. The split is not strict: `tel_media_rx` shares Core 1 with LVGL, and the HTTP threads and several workers are unpinned (see the note after the task tables).
@@ -157,7 +159,7 @@ Tasks the table above does not cover (name, stack, priority, core), from the `xT
 | `conf_mix_tick` | 3072 / 6 / Core 0 | The single `888` mix clock (`ConferenceRoom.cpp:308-310`) |
 | `moh_tx` | 6144 / 5 / Core 0 | Music-on-hold pacer (`HoldMusic.cpp:517-518`) |
 | `tel_media_rx` | 6144 / 6 / **Core 1** | Anchor-provider media receive (`TelephonyAnchorClient.cpp:3760-3762`) |
-| `flash_writer`, `cdr_archive`, `vm_archive` | 6144 / 1 / Core 0 | NVS writer, SD CDR archive, voicemail archive writers. `flash_writer` (#991, `FlashWriter.cpp`, plain internal stack) is the one task that writes NVS for the CDR ring and for the device table, the forwards and the DID table (#986), so none of those writes holds `_mutex` across a flash write. That covers a call teardown, a REGISTER adoption, a `*72` or `*73` change, a DID mapping change and a config import's DID replace. Each source keeps its own depth-1 queue; one pass takes at most one unit from each. `cdr_archive` stays separate: its SD card writes can take seconds. |
+| `flash_writer`, `cdr_archive`, `vm_archive` | 6144 / 1 / Core 0 | NVS writer, SD CDR archive, voicemail archive writers. `flash_writer` (#991, `FlashWriter.cpp`, plain internal stack) is the one task that writes NVS for the CDR ring and for the device table, the forwards and the DID table (#986), so none of those writes holds `_mutex` across a flash write. That covers a call teardown, a REGISTER adoption, a `*72` or `*73` change, a DID mapping change and a config import's DID replace. Each source keeps its own depth-1 queue; one pass takes at most one unit from each. `cdr_archive` stays separate: its SD card writes can take seconds. `vm_archive` also counts each voicemail mailbox's stored messages once at boot (#756), through its own job slot and with no new task, so the MWI lamps relight after a reboot. |
 | `log_drain` | 3072 / 1 / Core 0 | Log queue drain + syslog tee, headless builds only |
 | `dns_task` / `decay_task` | 4096 / 5 / Core 0; 3072 / 3 / Core 0 | Captive-portal DNS; captive-portal decay (display build) |
 | `http_conn` (pthread) | 4096 / – / unpinned | One per HTTP connection, at most 3 at once (§4) |
@@ -327,3 +329,25 @@ To protect the registrar from UDP flood denial-of-service (DoS) attacks, the `Re
 * Bounded table: at most **256** buckets; a new source IP arriving when the table is full is dropped outright (`RequestsHandler.cpp:11445-11448`).
 * Eviction cycle: To prevent memory leak accumulation from transient spoofed IPs, buckets idle for 60 s are evicted from `tick()` (`RequestsHandler.cpp:11134-11145`).
 * **Warning:** subnet (CIDR) filtering is not implemented, so do not plan a deployment around it. The macro `-DPOCKETDIAL_ALLOW_CIDR` does not exist anywhere in the tree. The matching runtime state exists but is inert: `_allowNet` and `_allowMask` (`src/SIP/RequestsHandler.hpp:3101-3102`) are initialised to `0` and no code path assigns them. There is no setter, no constructor argument, no HTTP route and no NVS key. `RequestsHandler::ipAllowed()` (`RequestsHandler.cpp:11430-11434`) therefore takes its `if (_allowMask == 0) return true;` early exit on every packet, so every source IP is allowed. The token bucket above is real and does run. The subnet filter is scaffolding that was never wired up, so segment isolation has to come from the network: a VLAN, a firewall, or simply not routing the board's link.
+
+## 6. Origins
+
+pocket-dial began as a fork of [BarGabriel/SipServer](https://github.com/BarGabriel/SipServer), an MIT-licensed SIP server. That credit is kept in [NOTICE](../NOTICE) and the original licence text in [LICENSE-MIT](../LICENSE-MIT) (Copyright (c) 2022 BarGabriel). Everything added or changed since the fork is Apache 2.0 ([LICENSE](../LICENSE)); [CHANGELOG.md](../CHANGELOG.md) records the relicensing of the project from MIT to Apache 2.0.
+
+What the upstream project was: at its default branch (`master`, last pushed 2024-05-31) it holds 25 files and 33 commits, all under `src/SIP`, `src/Helpers`, `main.cpp`, `CMakeLists.txt` and the usual README, LICENSE and `.gitignore`. The upstream names that matter here are `SipServer`, `RequestsHandler`, `Session`, `SipClient`, `SipMessage`, `SipMessageFactory`, `SipSdpMessage`, `UdpServer` and `IDGen`.
+
+What survives: 24 of those 25 upstream paths still exist in this tree; only `src/SIP/SipMessageHeaders.h` is gone. Comparing git blob hashes, exactly one of the 24 is byte-identical to upstream, the vendored `src/Helpers/cxxopts.hpp`. The other 23 have been rewritten. For scale, upstream `src/SIP/RequestsHandler.cpp` is 8,953 bytes and the current file is 663,338 bytes. The file names carry over; the contents mostly do not, so read this section as lineage, not as a claim about how many lines are upstream's.
+
+What was added since: the current tree has 215 C/C++ source and header files under `src/` and `main/`. Named subsystems with no counterpart in the upstream file list include the registrar (`Registrar`), the SIP transaction layer (`TransactionLayer`), call forking (`CallForker`), parking (`ParkOrbit`), conferencing (`ConferenceRoom`, `MixBus`), voicemail (`VoicemailLeg`, `VoicemailMenu`), SIP trunks (`SipTrunk`, `TrunkResolver`), the telephony anchor clients (`AnchorClient`, `TelephonyAnchorClient`, `ApidazeAnchorClient`), plug-and-play provisioning (`PnpResponder`), OTA update (`OtaUpdater`), admin authentication (`AdminAuth`), and the ESP32 firmware entry points under `main/` (`esp_main*.cpp`). Upstream has no `main/` directory, no `web/` directory and no `tests/` directory.
+
+How the history is recorded: this repository was created on 2026-04-12 and is not a GitHub-marked fork (the API reports `fork: false`). Upstream's 33 commits are not in this repository's history. Its oldest commit reachable in a shallow clone is `c96dc048` (2026-08-28), a merge whose tree already holds 202 files, so the days of work before it are one undifferentiated commit as far as `git log` here can tell. The first tag is `v1.0.0` (`53ea00c6`, 2026-05-29). As of 2026-10-20 GitHub reports 781 commits on `main` and 506 merged pull requests, 245 of those commits dated on or before 2026-08-28. Counts move; the commands below reproduce them.
+
+Reproduce:
+
+```
+git log --diff-filter=A --format='%h %ad %s' --date=short -- LICENSE-MIT NOTICE
+gh api 'repos/BarGabriel/SipServer/git/trees/HEAD?recursive=1' --jq '.tree[]|select(.type=="blob")|"\(.sha) \(.path)"'
+git hash-object <path>          # compare against the upstream blob sha
+gh api 'repos/GlomarGadaffi/pocket-dial/commits?per_page=1' -i       # Link rel="last" = commit count
+gh api 'search/issues?q=repo:GlomarGadaffi/pocket-dial+is:pr+is:merged&per_page=1' --jq .total_count
+```

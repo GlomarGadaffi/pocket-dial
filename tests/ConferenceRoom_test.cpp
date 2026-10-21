@@ -1038,3 +1038,213 @@ TEST(ConferenceReap, AParkedCallIsSendonlyHoldMusicAndIsLeftToTheParkTimeout)
 
 	EXPECT_TRUE(b.alive("park-1003")) << "a watch here would take the call off the orbit at 60 s, ahead of the park timeout";
 }
+
+// ── Issue #1003: a 440 tone call is bounded at 10 minutes (desmo's ruling, 2026-10-19) ──
+//
+// 440 is answered a=sendonly, so a healthy phone sends the board nothing and rx silence cannot tell a
+// dead phone from a listener (the ConferenceReap tests above pin that it is never reaped for it). A phone
+// that vanished without a BYE therefore kept the tone streaming at 50 packets/s to a dead port and held
+// the board's one RtpSender slot, so every other 440 caller got 486 until the registration lease ran out.
+// The ruling is a hard maximum duration of 600 s, which ends even a healthy long listener's call.
+//
+// The clock is the #604 watch's: it starts at the first tick that sees the leg Connected, and
+// ageRtpWatchForTest() moves it, as in ConferenceReap. Real milliseconds pass between the arming tick and
+// the aged one, so the boundary test keeps 5 s clear of 600 rather than sit on it.
+namespace
+{
+	// True when what the board just sent includes a 486 Busy Here (the 440 stream slot is held).
+	bool sentBusy(const ReapBench& b)
+	{
+		for (const auto& [addr, msg] : b.sent)
+		{
+			(void)addr;
+			if (msg && msg->toString().rfind("SIP/2.0 486", 0) == 0) return true;
+		}
+		return false;
+	}
+}
+
+TEST(ToneCallCap, A440CallPastTenMinutesIsEndedAndTheStreamSlotGoesToTheNextCaller)
+{
+	ReapBench b;
+	ASSERT_FALSE(b.dial("501", "192.168.7.51", "tone-cap", "440").empty()) << "precondition: 501 has the tone";
+	b.handler.tick();   // arms the clock
+
+	// The orphan's cost, pinned first: while the call holds the one stream slot, a second caller is refused.
+	EXPECT_TRUE(b.dial("502", "192.168.7.52", "tone-busy", "440").empty());
+	EXPECT_TRUE(sentBusy(b)) << "a second 440 caller gets 486 while the first holds the stream";
+
+	b.tickAfter("tone-cap", std::chrono::seconds(601));
+
+	EXPECT_FALSE(b.alive("tone-cap")) << "601 s into a tone call: the 600 s cap ends it, phone gone or not";
+	EXPECT_EQ(b.handler.getSessionCount(), 0u);
+
+	const std::string again = b.dial("502", "192.168.7.52", "tone-again", "440");
+	EXPECT_FALSE(again.empty()) << "the stream slot is free again: the next 440 caller is answered 200";
+	EXPECT_TRUE(b.alive("tone-again"));
+}
+
+TEST(ToneCallCap, TheEndedToneCallIsToldByAByeFromOurSideOfTheDialogAndRecordedAs440)
+{
+	ReapBench b;
+	const std::string answer = b.dial("501", "192.168.7.51", "tone-bye", "440");
+	ASSERT_FALSE(answer.empty()) << "precondition: 501 has the tone";
+	b.handler.tick();
+
+	b.tickAfter("tone-bye", std::chrono::seconds(601));
+
+	// A listener whose call the cap ends must be told, once, or its phone sits on a dead call.
+	const auto byes = b.byesTo("192.168.7.51");
+	ASSERT_EQ(byes.size(), 1u) << "exactly one BYE to the phone that was on the tone";
+	EXPECT_EQ(byes[0].rfind("BYE sip:501@192.168.7.51:5060 SIP/2.0", 0), 0u) << byes[0];
+	EXPECT_NE(byes[0].find("Call-ID: tone-bye"), std::string::npos);
+	EXPECT_EQ(headerValue(byes[0], "From"), headerValue(answer, "To"))
+		<< "the BYE is from the PBX end of the dialog: the 200 OK's To, with our tag";
+	EXPECT_EQ(headerValue(byes[0], "To"), "<sip:501@server>;tag=fttone-bye")
+		<< "and to the phone's own From, with its tag";
+
+	// The CDR names the number dialed, as a BYE-ended 440 call's does.
+	bool recorded = false;
+	for (const auto& rec : b.handler.cdrSnapshotForTest())
+	{
+		if (rec.caller == "501" && rec.callee == "440") recorded = true;
+	}
+	EXPECT_TRUE(recorded) << "CDR 501 -> 440";
+}
+
+TEST(ToneCallCap, A440CallJustUnderTenMinutesStaysAndTheStreamStaysHeld)
+{
+	ReapBench b;
+	ASSERT_FALSE(b.dial("501", "192.168.7.51", "tone-under", "440").empty());
+	b.handler.tick();
+
+	b.tickAfter("tone-under", std::chrono::seconds(595));
+
+	ASSERT_TRUE(b.alive("tone-under")) << "595 s is inside the 600 s cap";
+	EXPECT_TRUE(b.byesTo("192.168.7.51").empty());
+	EXPECT_TRUE(b.dial("502", "192.168.7.52", "tone-busy-2", "440").empty());
+	EXPECT_TRUE(sentBusy(b)) << "still one stream: the second caller is still refused";
+
+	// Control: 6 s later the same call is over, so the checks above ran a live cap.
+	b.tickAfter("tone-under", std::chrono::seconds(6));
+	EXPECT_FALSE(b.alive("tone-under"));
+}
+
+TEST(ToneCallCap, TheCapIsThe440sAloneAnEchoTestAndATalkingConferenceLegPastTenMinutesStay)
+{
+	ReapBench b;
+	ASSERT_FALSE(b.dial("501", "192.168.7.51", "mix-tone", "440").empty());
+	ASSERT_FALSE(b.dial("502", "192.168.7.52", "mix-echo", "777").empty());
+	ASSERT_FALSE(b.dial("503", "192.168.7.53", "mix-conf").empty());   // 888
+	b.handler.tick();
+
+	// The conference leg keeps talking, so its own 60 s rule keeps restarting; the echo test has no
+	// board-side watch at all. Only the tone call is over 600 s old in a way the cap counts.
+	b.rtpFrom("mix-conf");
+	for (const char* id : {"mix-tone", "mix-echo", "mix-conf"})
+	{
+		b.session(id)->ageRtpWatchForTest(std::chrono::seconds(601));
+	}
+	b.tickNow();
+
+	EXPECT_FALSE(b.alive("mix-tone")) << "the tone call is over the cap";
+	EXPECT_TRUE(b.alive("mix-echo")) << "777 has no stream and no cap";
+	EXPECT_TRUE(b.alive("mix-conf")) << "a conference leg that is still talking is not a tone call";
+	EXPECT_EQ(b.handler.getConferenceLegs(), 1);
+	EXPECT_TRUE(b.byesTo("192.168.7.52").empty());
+	EXPECT_TRUE(b.byesTo("192.168.7.53").empty());
+}
+
+TEST(ToneCallCap, ASessionFlaggedEmergencyIsNeverCappedAtTenMinutes)
+{
+	// Rule 5: the emergency exemption stays in the shared path. A 911/933 never reaches 440, but a session
+	// flagged so is never cut by a limit meant for the tone.
+	ReapBench b;
+	ASSERT_FALSE(b.dial("501", "192.168.7.51", "tone-911", "440").empty());
+	b.handler.tick();
+	auto s = b.session("tone-911");
+	ASSERT_NE(s, nullptr);
+	s->setEmergency(true);
+
+	b.tickAfter("tone-911", std::chrono::seconds(601));
+
+	EXPECT_TRUE(b.alive("tone-911")) << "601 s on an emergency-flagged session";
+	EXPECT_TRUE(b.byesTo("192.168.7.51").empty());
+
+	// Control: the same clock, flag cleared, ends it.
+	s->setEmergency(false);
+	b.tickNow();
+	EXPECT_FALSE(b.alive("tone-911"));
+}
+
+TEST(ToneCallCap, AHeldToneCallIsExemptAndTheClockRestartsWhenItResumes)
+{
+	// A real 440 leg never reaches Held (its hold re-INVITE is declined, 488); this forces the state to pin
+	// the shared sweep's exemption, as the 888 test does.
+	ReapBench b;
+	ASSERT_FALSE(b.dial("501", "192.168.7.51", "tone-held", "440").empty());
+	b.handler.tick();
+	auto s = b.session("tone-held");
+	ASSERT_NE(s, nullptr);
+
+	s->setState(Session::State::Held);
+	b.tickAfter("tone-held", std::chrono::seconds(601));
+	ASSERT_TRUE(b.alive("tone-held")) << "a held call is outside the cap";
+
+	s->setState(Session::State::Connected);
+	b.tickNow();
+	ASSERT_TRUE(b.alive("tone-held")) << "resume restarts the clock; it must not fire at once";
+
+	// Control: 601 s after resume it is over.
+	b.tickAfter("tone-held", std::chrono::seconds(601));
+	EXPECT_FALSE(b.alive("tone-held"));
+}
+
+// *11 and *69 pressed over SIP INFO repoint a live call's dest at a virtual 777 peer (DtmfFeatureCodes.cpp),
+// and the tone stream goes on holding the one RtpSender slot. The dest number is therefore not a tone call's
+// identity; the call has to be marked as one when it is answered.
+namespace
+{
+	// One DTMF digit as a SIP INFO from the phone on this dialog. `n` numbers the INFO: its CSeq counts up
+	// from the INVITE's and its branch is its own, so no two digits look like a retransmission.
+	std::shared_ptr<SipMessage> makeInfoDigit(const std::string& ext, const std::string& ip,
+		const std::string& callId, char digit, int n)
+	{
+		const std::string body = std::string("Signal=") + digit + "\r\nDuration=100\r\n";
+		std::string raw =
+			"INFO sip:server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKd" + callId + std::to_string(n) + "\r\n"
+			"From: <sip:" + ext + "@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: " + std::to_string(1 + n) + " INFO\r\n"
+			"Content-Type: application/dtmf-relay\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(ip));
+	}
+}
+
+TEST(ToneCallCap, A440CallThatPressedStar11IsStillEndedAtTenMinutes)
+{
+	ReapBench b;
+	ASSERT_FALSE(b.dial("501", "192.168.7.51", "tone-s11", "440").empty());
+	b.handler.tick();
+
+	int n = 1;
+	for (const char digit : std::string("*11")) b.handler.handle(makeInfoDigit("501", "192.168.7.51", "tone-s11", digit, n++));
+
+	auto s = b.session("tone-s11");
+	ASSERT_NE(s, nullptr);
+	ASSERT_TRUE(s->getDest());
+	ASSERT_EQ(s->getDest()->getNumber(), "777") << "precondition: *11 moved the call's destination to the virtual echo peer";
+	b.sent.clear();
+	ASSERT_TRUE(b.dial("502", "192.168.7.52", "tone-s11-busy", "440").empty());
+	ASSERT_TRUE(sentBusy(b)) << "precondition: the tone stream still holds the one slot";
+
+	b.tickAfter("tone-s11", std::chrono::seconds(601));
+
+	EXPECT_FALSE(b.alive("tone-s11")) << "601 s into a tone call that pressed *11: the cap still ends it";
+	EXPECT_EQ(b.byesTo("192.168.7.51").size(), 1u) << "and tells the phone";
+	EXPECT_FALSE(b.dial("502", "192.168.7.52", "tone-s11-again", "440").empty())
+		<< "the stream slot is free again";
+}

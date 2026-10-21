@@ -1,0 +1,63 @@
+    <h2>Live console</h2>
+    <p class="hint">Read-only. The device has no push channel, so this view polls: status (calls, roster, parked) every 2 s, the call log every 5 s, and the SIP trace every 1.5 s while it is on.</p>
+
+    <div id="con-link" class="row"></div>
+
+    <dl class="kv" aria-label="Live counts">
+      <div class="kvrow"><dt>Phones registered</dt><dd><span class="well" id="con-phones">—</span><span class="unit">phones</span></dd></div>
+      <div class="kvrow"><dt>Calls up</dt><dd><span class="well" id="con-calls-n">—</span><span class="unit">calls</span></dd></div>
+      <div class="kvrow"><dt>Parked</dt><dd><span class="well" id="con-parked-n">—</span><span class="unit">parked</span></dd></div>
+      <div class="kvrow"><dt>Oldest call</dt><dd><span class="well" id="con-oldest">—</span><span class="unit">h:m:s</span></dd></div>
+    </dl>
+
+    <h3>Calls</h3>
+    <div class="scroll">
+      <table class="data">
+        <caption class="sr">Calls up now</caption>
+        <thead><tr>
+          <th>Caller</th>
+          <th>Callee</th>
+          <th>State</th>
+          <th>Duration</th>
+        </tr></thead>
+        <tbody id="con-calls-body"></tbody>
+      </table>
+    </div>
+    <div class="gempty" id="con-calls-empty" hidden><p id="con-calls-empty-txt">No calls up right now.</p></div>
+
+    <h3>Parked calls</h3>
+    <ul class="plain" id="con-parked" aria-label="Parked calls"></ul>
+    <p class="hint" id="con-parked-note"></p>
+
+    <h3>Registered phones</h3>
+    <p class="msg" id="con-roster-msg"></p>
+    <ul class="plain" id="con-roster" aria-label="Registered phones"></ul>
+
+    <h3>Recent calls</h3>
+    <p class="msg" id="con-cdr-msg"></p>
+    <div class="scroll">
+      <table class="data">
+        <caption class="sr">Recent calls, newest first</caption>
+        <thead><tr>
+          <th>Caller</th>
+          <th>Callee</th>
+          <th>Result</th>
+          <th>Length</th>
+          <th>When</th>
+        </tr></thead>
+        <tbody id="con-cdr-body"></tbody>
+      </table>
+    </div>
+    <div class="gempty" id="con-cdr-empty" hidden><p>No calls recorded yet.</p></div>
+    <p class="hint">Newest first, 20 at most. The device can stop recording calls without showing an error, so an old or short list does not prove that no calls were made.</p>
+
+    <h3>SIP trace</h3>
+    <div class="row">
+      <button class="btn" id="con-trace-btn" data-needs="login" onclick="conTraceToggle()">Start trace</button>
+      <a class="lnk" id="con-pcap" href="/api/pcap" download="pocket-dial.pcap" data-needs="login">Download capture (.pcap)</a>
+    </div>
+    <div id="con-trace-state" class="row"></div>
+    <p class="hint">Lines come from the device's SIP trace ring.</p>
+    <div class="term" id="con-trace" role="log" aria-label="SIP trace lines">
+      <p class="hint" id="con-trace-empty">Trace is off.</p>
+    </div>

@@ -1,0 +1,80 @@
+  <header class="sec-head">
+    <h2>Routing</h2>
+    <p class="note">Dial plan rules that send outside and internal numbers, and SBC mode. E911 notification is in <a href="#security">Security</a>.</p>
+  </header>
+
+  <div class="msg" id="rt-gate-msg"></div>
+
+  <h3 class="subhead">Dial plan <span class="badge mono"><span class="well" id="rt-count">0</span><span class="unit">rules</span></span></h3>
+  <p class="note">Ordered rules, first match wins. <code>X</code> matches one digit; a trailing <code>*</code> matches the rest. Rules are checked after the reserved feature extensions. Emergency calls (911, 933) are classified before the dial plan.</p>
+  <div class="tbl-wrap">
+    <table class="data">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Pattern</th>
+          <th>Action</th>
+          <th>Target / prepend</th>
+          <th>Strip</th>
+          <th><span class="sr">Row actions</span></th>
+        </tr>
+      </thead>
+      <tbody id="rt-rules-body"></tbody>
+    </table>
+  </div>
+
+  <h3 class="subhead" id="rt-form-title">Add a rule</h3>
+  <p class="note" id="rt-form-note">New rules go to the end of the list.</p>
+  <div class="field">
+    <label for="rt-pattern">Pattern</label>
+    <input type="text" id="rt-pattern" autocomplete="off" placeholder="digits, X, or a trailing *">
+  </div>
+  <div class="field">
+    <label for="rt-action">Action</label>
+    <select id="rt-action">
+      <option value="trunk">Trunk (outside line)</option>
+      <option value="group">Ring group</option>
+      <option value="page">Page zone</option>
+      <option value="park">Park orbit</option>
+    </select>
+  </div>
+  <div class="field">
+    <label for="rt-target" id="rt-target-label">Prepend after stripping (blank = prepend nothing)</label>
+    <input type="text" id="rt-target" autocomplete="off">
+  </div>
+  <div class="field" id="rt-strip-field">
+    <label for="rt-strip">Strip leading digits</label>
+    <input type="text" id="rt-strip" inputmode="numeric" autocomplete="off" value="0">
+  </div>
+  <div class="row">
+    <button class="btn primary" id="rt-save" aria-disabled="true">Save rule</button>
+    <button class="btn" id="rt-cancel" hidden>Cancel edit</button>
+  </div>
+  <div class="msg" id="rt-dp-msg"></div>
+
+  <p class="note"><strong>Prepend nothing:</strong> on a trunk rule, leave the prepend field blank. The dialed digits go out with only the strip applied. It is still saved as a rule, never a delete.</p>
+
+  <hr class="hr">
+  <h3 class="subhead">Reserved extensions</h3>
+  <p class="note">
+    Fixed in firmware and checked before any dial-plan rule: park orbits 700&ndash;709 and paging
+    zones 980&ndash;989, plus the fixed feature codes. A rule cannot use them as its pattern.
+  </p>
+
+  <hr class="hr">
+  <h3 class="subhead">SBC mode</h3>
+  <p class="note">Border-element mode: calls the dial plan does not claim, including extension-to-extension, go out the selected trunk exactly as dialed. Emergency calls (911, 933) are classified first. A changed route takes effect on next reboot.</p>
+  <div class="field">
+    <label><input type="checkbox" id="rt-sbc-enabled" aria-disabled="true"> Enable SBC mode</label>
+  </div>
+  <div class="field">
+    <label for="rt-sbc-route">Route (telephony slot)</label>
+    <select id="rt-sbc-route" aria-disabled="true"></select>
+  </div>
+  <div class="row">
+    <button class="btn primary" id="rt-sbc-save" aria-disabled="true">Save SBC mode</button>
+  </div>
+  <dl class="kv">
+    <div class="kv-row"><dt>Stored</dt><dd id="rt-sbc-current">—</dd></div>
+  </dl>
+  <div class="msg" id="rt-sbc-msg"></div>

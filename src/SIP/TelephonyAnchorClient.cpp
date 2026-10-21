@@ -1749,7 +1749,7 @@ std::string TelephonyAnchorClient::reconcileParticipantId()
 // Status of one specific leg, read from the participant LIST (GET /callcontrol/{dn}/participants
 // then find id). This is the controllable-scope read Telephony honours, unlike GET .../participants/{id}
 // which 403s for a leg this DN does not directly control (issue #40). "" if the leg isn't listed.
-std::string TelephonyAnchorClient::getLegStatus(const std::string& legId)
+std::string TelephonyAnchorClient::getLegStatus(const std::string& legId, bool sosLane)
 {
 	if (legId.empty()) return "";
 	std::string url;
@@ -1759,7 +1759,7 @@ std::string TelephonyAnchorClient::getLegStatus(const std::string& legId)
 	}
 	std::string body;
 	int status = 0;
-	if (!httpGetBody(url, body, &status) || status != 200)
+	if (!httpGetBody(url, body, &status, sosLane) || status != 200)
 	{
 		ESP_LOGW(TAG, "getLegStatus: GET /participants failed (status=%d)", status);
 		return "";
@@ -3289,18 +3289,24 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 			// BEFORE connect and using it as the sole skip would swallow the Connected->Answered
 			// transition.
 			bool fullyUp = false;
+			bool emergency = false;   // #949: this slot is a 911/933 (makeCall stored its number)
 			{
 				std::lock_guard<std::mutex> lock(_mutex);
 				CallSlot* s = slotForLocked(controlLeg);
 				fullyUp = s && s->postLive.load(std::memory_order_acquire) &&
 				          s->outboundAnswered.load(std::memory_order_acquire);
+				emergency = s && s->emergency.load(std::memory_order_acquire) != 0;
 			}
 
 			if (!fullyUp)
 			{
 				// Authoritative status from the LIST (GET /participants -> find leg), never
 				// getParticipantStatus(id) which 403s for a non-controlled leg (issue #40).
-				std::string statusStr = getLegStatus(controlLeg);
+				// #949 (Rule 5): a 911/933 slot reads on the sos lane (never _statusMutex), a few
+				// short re-asks if its claim is held; "" there is UNKNOWN, see outboundStep().
+				std::string statusStr = telephony::readOutboundLegStatus(emergency,
+					[&](bool sosLane) { return getLegStatus(controlLeg, sosLane); }, sosPause);
+				const telephony::OutboundStep step = telephony::outboundStep(statusStr, emergency);
 				ESP_LOGI(TAG, "Upset %s -> control leg %s status '%s'", w.partId.c_str(), controlLeg.c_str(), statusStr.c_str());
 
 				// Helper to read THIS slot's postLive (slot pointer stays valid — fixed array — but
@@ -3311,7 +3317,7 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 					return s && s->postLive.load(std::memory_order_acquire);
 				};
 
-				if (statusStr == "Connected")
+				if (step == telephony::OutboundStep::Answered)
 				{
 					// The PSTN leg answered. Media is usually already up from the dialing pre-warm;
 					// open it now as a fallback if a pre-answer stream open was rejected. Then fire
@@ -3348,6 +3354,23 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 					{
 						ESP_LOGE(TAG, "Failed to start media streams for participant %s", controlLeg.c_str());
 						stopMediaStreams(controlLeg);
+					}
+				}
+				else if (step == telephony::OutboundStep::Unknown)
+				{
+					// #949: no answer to "is the 911 leg Connected?" (claim held or GET failed). Not
+					// answered, and not dialing either: no ringing mark, no pre-warm. Ask again soon,
+					// through the single-flight loop, until the slot is answered or freed.
+					ESP_LOGW(TAG, "Upset %s -> emergency leg %s status unknown, re-asking in %d ms (#949)",
+					         w.partId.c_str(), controlLeg.c_str(), telephony::kEmergencyReaskMs);
+					if (_running.load(std::memory_order_acquire))
+					{
+						{
+							std::lock_guard<std::mutex> lock(_mutex);
+							CallSlot* us = slotForLocked(controlLeg);
+							if (us) us->upsetPending.store(true, std::memory_order_release);
+						}
+						vTaskDelay(pdMS_TO_TICKS(telephony::kEmergencyReaskMs));
 					}
 				}
 				else
@@ -4316,6 +4339,33 @@ void TelephonyAnchorClient::runRxLoop(CallSlot* slot)
 					slot->getFd = esp_http_client_get_socket(_getClient);
 				}
 				if (!keepRunning()) break;
+#if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
+				// #370/#350 get_sock_shutdown (docs/BENCH_PROBE.md): shut down the socket just published,
+				// before the header read below, so that read finds no response. That is the transport
+				// failure that sends this loop to rebuild its handle and pay a fresh handshake. Only on the
+				// leg makeCall() claimed. fire() runs once a socket is there to shut down, so "fired" means
+				// a shutdown was issued. getMutex is held across that one call, as
+				// stopMediaStreams does: closePostClient can close this handle from another task, and a
+				// shutdown outside the lock could hit a descriptor that was closed and reused.
+				if (benchGet.sockShutdownLeg && pd::benchprobe::armedHint(pd::benchprobe::Fault::GetSockShutdown))
+				{
+					bool benchShut = false;
+					int benchRc = -1;
+					{
+						std::lock_guard<std::mutex> lock(_getMutex);
+						if (pd::benchprobe::getSockShutdownDue(benchGet.sockShutdownLeg, slot->getFd) &&
+						    pd::benchprobe::fire(pd::benchprobe::Fault::GetSockShutdown))
+						{
+							benchRc = shutdown(slot->getFd, SHUT_RDWR);
+							benchShut = true;
+						}
+					}
+					if (benchShut)
+					{
+						ESP_LOGW(TAG, "BENCHFAULT get_sock_shutdown applied: shutdown(SHUT_RDWR) on the published GET socket, rc=%d", benchRc);
+					}
+				}
+#endif
 			}
 			if (err == ESP_OK)
 			{

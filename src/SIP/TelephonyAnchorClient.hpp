@@ -536,7 +536,8 @@ private:
 	                               bool skipOurs = false);   // #349: skip a leg an earlier call left listed
 	// Status of a specific leg read from the LIST (GET /participants -> find id). Replaces
 	// getParticipantStatus(id), which 403s for a leg this DN cannot directly control (issue #40).
-	std::string getLegStatus(const std::string& legId);
+	// sosLane (#949): the tel_wsw worker's read for a 911/933 slot; uses _sosStatusClient, never _statusMutex.
+	std::string getLegStatus(const std::string& legId, bool sosLane = false);
 	// Best-effort caller display (party_caller_id, else party_caller_name) for an inbound leg
 	// from the live participant list — the WS event's attached_data is often null on a route
 	// point. "" if unavailable. Blocking GET; call off the WS event task.

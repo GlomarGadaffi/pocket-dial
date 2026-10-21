@@ -4,6 +4,9 @@
 
 #include <gtest/gtest.h>
 
+#include <set>
+#include <string>
+
 #include "BlfSubscriptions.hpp"
 #include "FakePbxEnv.hpp"
 #include "SipHeaderUtil.hpp"
@@ -401,4 +404,120 @@ TEST(BlfSubscriptions, MwiInDialogRefreshAndUnsubscribeSurviveAnIpChange)
 	blf.mwiDeposit("201");
 	blf.refresh();
 	EXPECT_TRUE(env.sent.empty()) << env.sentRaw(0);
+}
+
+// ── MWI boot seed (#756): request -> next -> apply ───────────────────────────
+// The engine asks for each voicemail mailbox's stored-message count once at boot
+// (the SD task answers it), and the answer is counted as NEW (owner ruling
+// 2026-10-19: nothing on the card records what was heard).
+namespace
+{
+	// Phone 201 subscribed to its own mailbox; the initial 0/0 NOTIFY is dropped.
+	void subscribeMwi201(FakePbxEnv& env, BlfSubscriptions& blf)
+	{
+		const sockaddr_in phone = FakePbxEnv::addr("192.168.1.60", 5060);
+		env.registered["201"] = std::make_shared<SipClient>("201", phone);
+		blf.onSubscribe(mwiSubscribe("201", "seed-cid", "Event: message-summary", "w1", "", 3600,
+			phone));
+		env.sent.clear();
+	}
+}
+
+TEST(BlfSubscriptions, MwiSeedCountsStoredMessagesAsNewAndNotifies)
+{
+	FakePbxEnv env;
+	BlfSubscriptions blf(env);
+	subscribeMwi201(env, blf);
+
+	EXPECT_TRUE(blf.mwiSeedNext().empty()) << "nothing was asked for yet";
+	blf.mwiSeedRequest("201");
+	EXPECT_EQ(std::string(blf.mwiSeedNext()), "201");
+	blf.mwiSeedApply("201", 3);
+	EXPECT_TRUE(blf.mwiSeedNext().empty()) << "answered, so no longer wanted";
+
+	blf.refresh();
+	ASSERT_EQ(env.sent.size(), 1u) << "the seed must NOTIFY the subscribed phone";
+	const std::string notify = env.sentRaw(0);
+	EXPECT_NE(notify.find("Messages-Waiting: yes\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 3/0 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+// The owner dialed 796 before the board's count came back: that listing is the
+// truth, and a late seed must not turn the lamp back on over it.
+TEST(BlfSubscriptions, MwiSeedIsIgnoredOnceTheOwnerHasListened)
+{
+	FakePbxEnv env;
+	BlfSubscriptions blf(env);
+	subscribeMwi201(env, blf);
+
+	blf.mwiSeedRequest("201");
+	EXPECT_EQ(std::string(blf.mwiSeedNext()), "201");
+	blf.mwiListened("201", 2);
+	EXPECT_TRUE(blf.mwiSeedNext().empty()) << "the listing answers the seed's question";
+	blf.mwiSeedApply("201", 5);
+
+	blf.refresh();
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string notify = env.sentRaw(0);
+	EXPECT_NE(notify.find("Messages-Waiting: no\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 0/2 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+// Messages deposited while the count was still on its way may or may not be among
+// the stored messages yet (the card write may or may not have beaten the count), so
+// the seed must neither add to the live count nor lower it: two deposits and a
+// stored count of one stay 2. An add would give 3, an assign would give 1.
+TEST(BlfSubscriptions, MwiSeedAfterADepositDoesNotDoubleCount)
+{
+	FakePbxEnv env;
+	BlfSubscriptions blf(env);
+	subscribeMwi201(env, blf);
+
+	blf.mwiSeedRequest("201");
+	EXPECT_EQ(std::string(blf.mwiSeedNext()), "201");
+	blf.mwiDeposit("201");
+	blf.mwiDeposit("201");
+	blf.mwiSeedApply("201", 1);
+	EXPECT_TRUE(blf.mwiSeedNext().empty()) << "a count that is not higher is still an answer";
+
+	blf.refresh();
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string notify = env.sentRaw(0);
+	EXPECT_NE(notify.find("Messages-Waiting: yes\r\n"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("Voice-Message: 2/0 (0/0)\r\n"), std::string::npos) << notify;
+}
+
+// An empty answer holds nothing: seeding every mailbox of a card with no
+// messages must leave the whole table free for real counts.
+TEST(BlfSubscriptions, MwiSeedOfEmptyMailboxesDoesNotUseUpTheTable)
+{
+	FakePbxEnv env;
+	BlfSubscriptions blf(env);
+	subscribeMwi201(env, blf);
+
+	const size_t boxes = static_cast<size_t>(POCKETDIAL_MWI_MAILBOXES);
+	for (size_t i = 0; i < boxes; ++i)
+		blf.mwiSeedRequest("e" + std::to_string(i));
+
+	// Drain the way the engine does: ask who is waiting, answer 0, repeat. Every
+	// request must have been KEPT, so exactly one distinct mailbox comes out per
+	// box. If a waiting box could be reclaimed as spare, later requests would
+	// overwrite earlier ones and far fewer would come out. The bound only stops
+	// a mailbox that never clears from looping the test forever.
+	std::set<std::string> drained;
+	for (size_t pass = 0; pass < 2 * boxes; ++pass)
+	{
+		const std::string waiting(blf.mwiSeedNext());
+		if (waiting.empty()) break;
+		drained.insert(waiting);
+		blf.mwiSeedApply(waiting, 0);
+	}
+	EXPECT_EQ(drained.size(), boxes) << "every requested mailbox must have kept its box";
+	EXPECT_TRUE(blf.mwiSeedNext().empty()) << "each answer must clear its request";
+
+	blf.mwiDeposit("201");
+	blf.refresh();
+	ASSERT_EQ(env.sent.size(), 1u) << "a deposit must still find a free box";
+	const std::string notify = env.sentRaw(0);
+	EXPECT_NE(notify.find("Voice-Message: 1/0 (0/0)\r\n"), std::string::npos) << notify;
 }

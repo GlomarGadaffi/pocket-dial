@@ -1,0 +1,165 @@
+<h2>Maintenance</h2>
+<p class="hint">Firmware, settings backup, reset, network, notifications, logging, crash data and captures. Changes need an admin login. Actions marked <span class="tag">owner</span> also need an owner login.</p>
+
+<h3>Firmware</h3>
+<dl class="kv">
+  <div class="kvrow"><dt>Running partition</dt><dd class="mono" id="mnt-ota-running">—</dd></div>
+  <div class="kvrow"><dt>Boot / next</dt><dd class="mono" id="mnt-ota-parts">—</dd></div>
+  <div class="kvrow"><dt>Update</dt><dd id="mnt-ota-inprogress">—</dd></div>
+  <div class="kvrow"><dt>Firmware update support</dt><dd id="mnt-ota-supported">—</dd></div>
+  <div class="kvrow"><dt>Verification</dt><dd id="mnt-ota-pending">—</dd></div>
+</dl>
+<div class="msg" id="mnt-ota-state"></div>
+<div class="field">
+  <label for="mnt-ota-file">Firmware image (.bin) <span class="tag">owner</span></label>
+  <input type="file" id="mnt-ota-file" accept=".bin,application/octet-stream" data-needs="owner">
+</div>
+<div class="row">
+  <button class="btn btn-primary" id="mnt-ota-upload-btn" data-needs="owner">Upload image</button>
+  <button class="btn" id="mnt-ota-reboot-btn" data-needs="login" aria-label="[ ARM ] Reboot device">[ ARM ] Reboot</button>
+</div>
+<div class="row" id="mnt-ota-prog-row" hidden>
+  <progress id="mnt-ota-prog" max="100" value="0" aria-label="Upload progress"></progress>
+  <span class="well" id="mnt-ota-pct">0</span><span class="unit">%</span>
+</div>
+<div class="msg" id="mnt-ota-msg"></div>
+
+<h3>Backup and restore</h3>
+<p class="hint">Export downloads the device settings as JSON. Without a password the file has no encrypted secrets block. A password adds that block and needs an owner login. The password must be at least 12 characters.</p>
+<div class="field">
+  <label for="mnt-exp-pw">Export password, optional <span class="tag">owner</span></label>
+  <input type="password" id="mnt-exp-pw" autocomplete="new-password" data-needs="owner">
+</div>
+<div class="row"><button class="btn" id="mnt-exp-btn" data-needs="login">Export settings</button></div>
+<div class="msg" id="mnt-exp-msg"></div>
+<div class="field">
+  <label for="mnt-imp-file">Import file (.json)</label>
+  <input type="file" id="mnt-imp-file" accept=".json,application/json" data-needs="login">
+</div>
+<div class="field">
+  <label for="mnt-imp-pw">Import password, only for a file exported with one <span class="tag">owner</span></label>
+  <input type="password" id="mnt-imp-pw" autocomplete="off" data-needs="owner">
+</div>
+<p class="hint">Import replaces the settings the file contains. It does not merge them. Whatever the device cannot take back is listed as skipped.</p>
+<div class="row"><button class="btn" id="mnt-imp-btn" data-needs="login">[ ARM ] Import settings</button></div>
+<div class="msg" id="mnt-imp-msg"></div>
+
+<h3>Factory reset</h3>
+<div class="dz">
+  <p>Returns the device to its install-time seed settings and reboots it. Erases stored logins, credentials, call history and saved Wi-Fi. Owner login required.</p>
+  <div class="field">
+    <label for="mnt-reset-confirm">Type ERASE to confirm <span class="tag">owner</span></label>
+    <input type="text" id="mnt-reset-confirm" autocomplete="off" data-needs="owner">
+  </div>
+  <div class="row"><button class="btn" id="mnt-reset-btn" data-needs="owner" aria-describedby="mnt-reset-why">[ ARM ] Factory reset</button><span class="hint" id="mnt-reset-why"></span></div>
+  <div class="msg" id="mnt-reset-msg"></div>
+</div>
+
+<div id="wifi-slot"></div>
+
+<h3>Notifications</h3>
+<p class="hint">SMTP settings for alert email. Save stays off until the current settings load. A blank password, service key or CA certificate keeps the stored one.</p>
+<div class="msg" id="mnt-mail-load-msg"></div>
+<div class="form two">
+  <div class="field">
+    <label for="mnt-mail-host">SMTP host</label>
+    <input type="text" id="mnt-mail-host" autocomplete="off" data-needs="login">
+  </div>
+  <div class="field">
+    <label for="mnt-mail-port">Port</label>
+    <input type="text" id="mnt-mail-port" inputmode="numeric" autocomplete="off" data-needs="login">
+  </div>
+  <div class="field">
+    <label for="mnt-mail-mode">Transport</label>
+    <select id="mnt-mail-mode" data-needs="login">
+      <option value="starttls">STARTTLS (587)</option>
+      <option value="tls">Implicit TLS (465)</option>
+      <option value="plain">Plain (25), LAN relay only</option>
+    </select>
+  </div>
+  <div class="field">
+    <label for="mnt-mail-auth">Authentication</label>
+    <select id="mnt-mail-auth" data-needs="login">
+      <option value="none">None</option>
+      <option value="plain">AUTH PLAIN</option>
+      <option value="login">AUTH LOGIN</option>
+      <option value="xoauth2-sa">XOAUTH2 (Workspace service account)</option>
+    </select>
+  </div>
+  <div class="field">
+    <label for="mnt-mail-user">User</label>
+    <input type="text" id="mnt-mail-user" autocomplete="off" data-needs="login">
+  </div>
+  <div class="field">
+    <label for="mnt-mail-pass">Password</label>
+    <input type="password" id="mnt-mail-pass" autocomplete="new-password" data-needs="login">
+    <span class="hint" id="mnt-mail-pass-state">—</span>
+  </div>
+  <div class="field">
+    <label for="mnt-mail-from">From</label>
+    <input type="text" id="mnt-mail-from" autocomplete="off" data-needs="login">
+  </div>
+  <div class="field">
+    <label for="mnt-mail-to">To</label>
+    <input type="text" id="mnt-mail-to" autocomplete="off" data-needs="login">
+  </div>
+  <div class="field">
+    <label for="mnt-mail-gsa">Service account email</label>
+    <input type="text" id="mnt-mail-gsa" autocomplete="off" data-needs="login">
+  </div>
+  <div class="field">
+    <label for="mnt-mail-gsakey">Service account key</label>
+    <textarea id="mnt-mail-gsakey" rows="3" data-needs="login"></textarea>
+    <span class="hint" id="mnt-mail-gsakey-state">—</span>
+  </div>
+  <div class="field">
+    <label for="mnt-mail-capem">CA certificate (PEM)</label>
+    <textarea id="mnt-mail-capem" rows="3" data-needs="login"></textarea>
+    <span class="hint" id="mnt-mail-capem-state">—</span>
+  </div>
+  <label class="opt"><input type="checkbox" id="mnt-mail-insecure" data-needs="login"> Skip TLS certificate checks (insecure)</label>
+</div>
+<div class="row"><button class="btn btn-primary" id="mnt-mail-save" data-needs="login" aria-disabled="true">Save email settings</button></div>
+<div class="msg" id="mnt-mail-msg"></div>
+<div class="field">
+  <label for="mnt-mail-testto">Test recipient, optional</label>
+  <input type="text" id="mnt-mail-testto" autocomplete="off" data-needs="login">
+</div>
+<p class="hint">The test uses the saved settings, so save first. A blank recipient uses the saved To address.</p>
+<div class="row"><button class="btn" id="mnt-mail-test-btn" data-needs="login">Send test email</button></div>
+<div class="msg" id="mnt-mail-test-msg"></div>
+
+<h3>Logging</h3>
+<p class="hint">Remote syslog sends log lines to one collector, by IPv4 address. An empty host turns remote logging off.</p>
+<dl class="kv">
+  <div class="kvrow"><dt>Remote logging</dt><dd id="mnt-sys-state">—</dd></div>
+</dl>
+<div class="form two">
+  <div class="field">
+    <label for="mnt-sys-host">Collector IPv4 address</label>
+    <input type="text" id="mnt-sys-host" inputmode="decimal" autocomplete="off" data-needs="login">
+  </div>
+  <div class="field">
+    <label for="mnt-sys-port">Port</label>
+    <input type="text" id="mnt-sys-port" inputmode="numeric" autocomplete="off" data-needs="login">
+  </div>
+</div>
+<div class="row"><button class="btn" id="mnt-sys-save" data-needs="login">Save syslog target</button></div>
+<div class="msg" id="mnt-sys-msg"></div>
+
+<h3>Crash dump</h3>
+<dl class="kv" id="mnt-core-kv"></dl>
+<div class="row">
+  <button class="btn" id="mnt-core-refresh" data-needs="login">Refresh</button>
+  <button class="btn" id="mnt-core-dl" data-needs="owner">Download dump <span class="tag">owner</span></button>
+  <button class="btn" id="mnt-core-erase" data-needs="login">[ ARM ] Erase dump</button>
+</div>
+<div class="msg" id="mnt-core-msg"></div>
+
+<h3>Capture</h3>
+<p class="hint">The pcap holds raw SIP bytes, so it needs a login.</p>
+<div class="row"><button class="btn" id="mnt-pcap-btn" data-needs="login">Download pcap</button></div>
+<div class="msg" id="mnt-pcap-msg"></div>
+
+<h3>Metrics</h3>
+<p class="hint">Prometheus text, readable without a login: <a href="/metrics">/metrics</a>. This page does not read it.</p>

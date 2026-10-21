@@ -98,6 +98,13 @@ public:
 	bool isVoicemail() const { return _isVoicemail; }
 	void setVoicemail(bool val) { _isVoicemail = val; }
 
+	// True for a call answered as the 440 tone (#1003, onMediaInvite()), for its whole life. Set at
+	// setup because the dest number cannot say it later: *11 and *69 over SIP INFO repoint a live
+	// call's dest at a virtual 777 peer while the tone stream goes on holding the one RtpSender slot.
+	// sweepToneCall()'s 600 s cap keys on this, never on the dest.
+	bool isToneCall() const { return _isToneCall; }
+	void setToneCall(bool val) { _isToneCall = val; }
+
 	// Which _vmLegs[]/_vmRtpReceivers[]/_vmRtpSenders[] slot this session
 	// claimed (-1 if none) -- onBye()/onCancel() need this to release the
 	// slot back to the pool; VoicemailLeg itself carries no callId until
@@ -311,6 +318,10 @@ public:
 	// caller's INVITE, so onReqTerminated() ACKs it instead of relaying it.
 	const std::string& getCancelledLegExt() const { return _cancelledLegExt; }
 	void setCancelledLegExt(const std::string& ext) { _cancelledLegExt = ext; }
+	// #1049: the callee's answer to our CANCEL (its 487, or a 2xx that crossed it) has been
+	// relayed. The bounded wait armed in onCancel() must never answer the caller a second time.
+	bool cancelAnswered() const { return _cancelAnswered; }
+	void setCancelAnswered() { _cancelAnswered = true; }
 
 	// ── Sequential hunt-group progression (Class A sweep) ─────────────
 	// _huntMembers is the ordered list; _huntIndex is the member currently ringing.
@@ -476,6 +487,7 @@ private:
 	bool _isBroadcast = false;
 	bool _isAnchor = false;
 	bool _isVoicemail = false;
+	bool _isToneCall = false;   // #1003
 	int  _voicemailLegSlot = -1;
 	bool _isTrunk = false;
 	int  _trunkRelaySlot = -1;
@@ -509,6 +521,7 @@ private:
 	// No-answer / hunt timer + forwarding/hunt bookkeeping (Class A sweep).
 	std::chrono::steady_clock::time_point _ringDeadline;
 	bool _ringTimerArmed = false;
+	bool _cancelAnswered = false;   // #1049: the callee answered our CANCEL and that answer was relayed
 	std::string _noAnswerTarget;
 	std::string _cancelledLegExt;
 

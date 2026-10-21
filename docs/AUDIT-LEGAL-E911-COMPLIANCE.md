@@ -81,7 +81,7 @@ On a traditional SIP trunk, the local PBX would have to attach location itself, 
 ### 2.5 Outage and failover
 
 - **Provider readiness check (`telephonyProviderPlacesRealCalls()`):** Evaluated in `src/SIP/TelephonyProvider.hpp`. Simulated providers (such as `LoopbackAnchorClient`) explicitly report `false` and are barred from receiving 911 routing.
-- **Network outage signalling:** If the cloud media anchor is disconnected or the WAN is down, the PBX immediately returns SIP `503 Service Unavailable` with clear cause headers, so compliant handsets can trigger local cellular fallback or prompt the caller to use an alternate device.
+- **Network outage signalling:** If the cloud media anchor is disconnected or the WAN is down, the PBX immediately returns SIP `503 Emergency Call Not Routable` with a Warning header and raises the on-site notification. The PBX has no fallback route for 911 or 933 (see `DEMARCATION.md`); any cellular fallback is the handset's own.
 
 ## 3. Compliance summary and operator checklist
 

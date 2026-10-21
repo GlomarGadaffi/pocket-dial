@@ -277,7 +277,7 @@ Endpoints marked "None" are read-only and reachable without a session: `/`, `/in
 | [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
 | [`/api/registrar/forget-learned`](#post-apiregistrarforget-learned) | `POST` | High | Gated (+ `X-CSRF`) | Forgets every `learned` device at once; `secured` ones stay (#515). |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
-| [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated, owner (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
+| [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated, owner (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). Refused with `409` while any call is up or ringing (#986). |
 | [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image, or plainly restarts with `confirm=1` if none is staged (#645). Simulated (`200`, no-op) on desktop. While a 911/933 call is live a plain restart answers `409` `{"error":"emergency call in progress"}` and a staged-image reboot waits for the call to end (#652). |
 | [`/api/media-tx`](#post-apimedia-tx) | `POST` | High | Gated, owner (+ `X-CSRF`) | **Experimental (#985).** `nodelay=0\|1`: the A/B switch for `TCP_NODELAY` on the anchor's audio POST socket. RAM only, off at every boot; read back as `mediaTx.nodelay` in `/api/status`. |
 | [`/setup/email`](#get-setupemail) | `GET` | Low | None | Standalone SMTP-configuration page (own document, not part of the `/` SPA). Shell only, no data. |
@@ -292,11 +292,11 @@ Endpoints marked "None" are read-only and reachable without a session: `/`, `/in
 | `/api/voicemail` | `POST` | High | Gated (+ `X-CSRF`) | Enables or disables voicemail for one extension (`extension`, `on`). Reserved and park-orbit numbers are refused. |
 | `/api/coredump/info` | `GET` | Medium | Gated | Stored panic coredump metadata: `supported`, `present`, `size`, and the fault details when a dump is stored. |
 | `/api/coredump` | `GET` | High | Gated, owner | Downloads the stored raw panic coredump. |
-| `/api/coredump/erase` | `POST` | High | Gated (+ `X-CSRF`) | Erases the stored coredump. Answers `{"erased":true}` or `{"erased":false}`. |
+| `/api/coredump/erase` | `POST` | High | Gated (+ `X-CSRF`) | Erases the stored coredump. Answers `{"erased":true}` or `{"erased":false}`. Refused with `409` `{"error":"busy","message":"call in progress; coredump erase refused until no call is up or ringing"}` while any call is up or ringing, 911/933 and PSAP callbacks included (#1045). Same check as [`/api/ota/upload`](#post-apiotaupload) (#986): the erase is a 128 KiB flash erase that stalls every flash-resident task. Retry on an idle line. The check runs first, so a board without a coredump partition also answers `409` while a call is live. A call that starts after the check is not covered. |
 | `/api/e911-config` | `GET` | Medium | Gated | E911 notify list, callback and location, with `maxNotifyExts`. |
 | `/api/e911-config` | `PUT` | High | Gated (+ `X-CSRF`) | Sets `notifyExts`, `callback` and `location`. All optional; an empty `notifyExts` turns SIP notification off. |
 | `/api/sbc-mode` | `GET` | Medium | Gated | SBC mode and the telephony slot it routes through. |
-| `/api/sbc-mode` | `PUT` | High | Gated (+ `X-CSRF`) | Sets `enabled` and `route` (a telephony slot index). Enabling with a bad route is a `400`. Enabling changes the active slot like `.../activate`, which is accepted and staged for the NVS writer, not yet on flash; it is also a `400` while a factory reset is running or when the NVS writer is not running, and SBC mode then stays off (#997). |
+| `/api/sbc-mode` | `PUT` | High | Gated (+ `X-CSRF`) | Sets `enabled` and `route` (a telephony slot index). Enabling with a bad route is a `400`. (#1073) Selecting a slot that is not already the active one is an activation: it needs `acceptLimitations=<current acceptanceVersion>` unless the slot holds an acceptance, else `409` and SBC mode stays as it was; re-selecting the active slot, and turning SBC mode off, need none. Enabling changes the active slot like `.../activate`, which is accepted and staged for the NVS writer, not yet on flash; it is also a `400` while a factory reset is running or when the NVS writer is not running, and SBC mode then stays off (#997). |
 | [`/api/multicast-paging`](#get-apimulticast-paging) | `GET` | Medium | Gated | Multicast paging configuration (`enabled`, `group`, `port`). |
 | [`/api/multicast-paging`](#put-apimulticast-paging) | `PUT` | High | Gated (+ `X-CSRF`) | Sets the multicast paging configuration. Every parameter is optional. |
 | [`/api/config/export`](#get-apiconfigexport) | `GET` | Medium | Gated | Plaintext configuration backup. |
@@ -363,7 +363,7 @@ Three things worth knowing before you paste:
   and reuse `$SESSION` rather than logging in per request.
 
 ### `GET /`
-Serves the retro CGA CRT web interface. `GET /index.html` is the same route and the
+Serves the web dashboard (the ISA-101 operator console). `GET /index.html` is the same route and the
 same response (in `handleClient()`).
 
 Ungated (the page itself is public), because it is inert without a session: it renders
@@ -647,9 +647,12 @@ A single-file JSON backup/restore for the whole device, split into an
 (AES-256-GCM, PBKDF2-SHA256-derived key, 200000 iterations). See
 `src/Helpers/HttpServer.cpp`'s `sendApiConfigExport()`/`sendApiConfigImport()` for the
 authoritative field-by-field accounting of what is plaintext, what is gated, and the
-two data gaps neither direction can close (per-extension digest secrets and
-MAC bindings export but cannot import; a trunk slot's client secret is never exported
-at all).
+one thing neither direction carries on purpose: a telephony client secret is never
+exported (a second board given the first one's secret would connect as the same device
+and fight it for the control WebSocket), so the import names it under `skipped` and it
+is entered again on the board. The per-extension digest secrets and the MAC bindings
+(each with its lock) travel only in the password-encrypted block, and an Owner-level
+import restores them.
 
 ### `GET /api/config/export`
 
@@ -670,8 +673,12 @@ curl -s "http://$DEV/api/config/export" -b "pd_session=$SESSION" > backup.json
 
 Same plaintext body as the `GET`, plus (only when `password` is non-empty) an
 encrypted `secretsEnc` block carrying the Wi-Fi upstream password, the SoftAP WPA2
-passphrase, and each telephony-trunk slot's `baseUrl`/`clientId`/`routeDn` (never the
-slot's secret; see the data gaps above). **Owner-gated, but only when a
+passphrase, each telephony-trunk slot's `baseUrl`/`clientId`/`routeDn` (never the
+slot's secret; see above), each secured extension's digest secret, the trunk and SMTP
+passwords, and the MAC bindings: one `["<mac>","<extension>",<state 0|1>,<flags>]` row
+each, in adoption order (the order decides which phone holds an extension's first
+claim), with `flags` bit 0 = locked and bit 1 = shared; about 27 bytes a row, 28 with
+its comma, before the encryption doubles it into hex. **Owner-gated, but only when a
 non-empty `password` is sent**; an empty/absent `password` behaves exactly like the
 `GET` (sysop-level, plaintext only), so a single dashboard form can drive both.
 
@@ -699,8 +706,23 @@ curl -s -X POST "http://$DEV/api/config/export" \
 
 Restores config from a blob produced by either export route above.
 Replace-not-merge: for every table this can restore (ring groups, call-forward,
-DND, page zones, dial plan, DID mappings), an entry present on the device but absent
-from the blob is **removed**, not left behind. Sysop-level, with its own `confirm=REPLACE` interlock. It is owner-only when `password` is non-empty (see [Two-Role Privilege Model](#two-role-privilege-model-issue-173)).
+DND, page zones, dial plan, DID mappings, and the MAC bindings), an entry present on the
+device but absent from the blob is **removed**, not left behind. The MAC bindings are
+restored only from the password-encrypted block, and **all or nothing**: every row is
+checked first (MAC form, extension, duplicate MAC, a Secured row's digest secret, the
+table's capacity), and if any is refused, or the device table cannot be staged for flash,
+the table is left exactly as it was and one `skipped` entry names the rows (`row 3
+extension`) by number and reason class, never by value. A file whose list is empty
+clears the table; a file with no list (an encrypted export from before bindings
+travelled in it) leaves it alone and says so. The block's digest-secret list and its
+bindings list stand or fall together: the secrets are written only if the bindings list
+was not refused, so a refused list changes neither the table nor the stored secrets
+(`extensionSecrets (not applied ...)`) and `secure` is not applied. The rest of the
+block (the Wi-Fi password, the AP passphrase, the telephony slot fields, the trunk and
+SMTP secrets) and the readable part are applied either way and are not rolled back. A
+failed flash write after the table is staged is not rolled back either. Locked and Secured rows come back exactly as the source board had them,
+so a phone with a different MAC (a replacement) is refused its extension until that row
+is forgotten; the import says so under `skipped`. Sysop-level, with its own `confirm=REPLACE` interlock. It is owner-only when `password` is non-empty (see [Two-Role Privilege Model](#two-role-privilege-model-issue-173)).
 
 * Requires Same-Origin Check + CSRF Token: Yes
 * Requires `pd_session` cookie: Yes (sysop)
@@ -711,17 +733,22 @@ from the blob is **removed**, not left behind. Sysop-level, with its own `confir
   * `confirm` (Required): must be the literal string `REPLACE`.
 * Response Content-Type: `application/json`
 * Response Status Codes:
-  * `200 OK`: `{"status":"ok","applied":[...],"skipped":[...]}`. For `forwards`, `didMappings` and `telephonyConfig`, `applied` means accepted and staged for the NVS writer, not yet on flash (see the notes under [`POST /api/forward`](#post-apiforward), [`PUT /api/did-mapping`](#put-apidid-mapping) and [`PUT /api/telephony-config/<slot>`](#put-apitelephony-configslot) for the power-fail window); the burst of per-entry writes an import makes coalesces into one flash write, the last table, for as long as the writer has not yet taken the previous one (it runs at priority 1 and may wake between entries under light load, in which case an intermediate table is written first; the last table is always written last). An import never carries or changes a telephony client secret, so it writes none. The other settings an import applies (ring groups, voicemail, page zones, dial plan, registrar mode, E911, admin extension) are still written to flash before their setter returns. The response is not a bare `204`. This feature cannot restore everything a plaintext-capable export can carry, and a bare `204` would tell the operator "fully restored" when it was not.
+  * `200 OK`: `{"status":"ok","applied":[...],"skipped":[...]}`. For `forwards`, `didMappings` and `telephonyConfig`, `applied` means accepted and staged for the NVS writer, not yet on flash (see the notes under [`POST /api/forward`](#post-apiforward), [`PUT /api/did-mapping`](#put-apidid-mapping) and [`PUT /api/telephony-config/<slot>`](#put-apitelephony-configslot) for the power-fail window); the burst of per-entry writes an import makes coalesces into one flash write, the last table, for as long as the writer has not yet taken the previous one (it runs at priority 1 and may wake between entries under light load, in which case an intermediate table is written first; the last table is always written last). An import never carries or changes a telephony client secret, so it writes none. (#1073) Nor does it carry an acceptance of the limitations, so it cannot enable a slot that is not already enabled and accepted on this board: such a slot is imported **disabled** and listed under `skipped` (`telephonyConfig slot N (imported disabled: Acceptance required: ...)`); a slot already enabled without an acceptance is left exactly as it is (`left unchanged`). The MAC bindings (`extensions`) are staged the same way: `applied` means the device table is accepted and staged, and a table the writer refuses is reported under `skipped`, not claimed. The other settings an import applies (ring groups, voicemail, page zones, dial plan, registrar mode, E911, admin extension) are still written to flash before their setter returns. The response is not a bare `204`. This feature does not restore everything an export can carry (MAC bindings and digest secrets only from a password-encrypted file, a telephony client secret and provider type never), and a bare `204` would tell the operator "fully restored" when it was not.
   * `400 Bad Request`: `{"error":"import requires confirm=REPLACE"}` / `"missing blob parameter"` / `"malformed export blob"` / `"export blob is missing a plaintext object"` / `"unsupported exportVer"` / `"malformed secretsEnc block"`.
   * `422 Unprocessable Entity`: `{"error":"bad password or corrupted secrets block"}`. A wrong password and a tampered/corrupted `secretsEnc` block are **deliberately indistinguishable** (the GCM tag check fails identically either way). A `400`/`422` leaves the device completely untouched; the whole blob is validated (and decrypted, if a password was given) before the first setter runs.
   * `401`/`403`: gates 1-3 as in §0.1.
 
 Switching the registrar to `secure` mode via an imported blob is refused (reported
-`skipped`, not an error) when the device has no secured extensions after the
-import (the same guard [`POST /api/registrar`](#post-apiregistrar) already applies to
-a live switch), since restoring `secure` onto a board whose per-extension digest
-secrets could not be restored (see the data gaps above) would digest-challenge every
-`REGISTER` with no working handset left to notice.
+`skipped`, not an error) when no secured extension on the device has a stored digest
+secret after the import (the live switch, [`POST /api/registrar`](#post-apiregistrar),
+counts secured extensions only), since restoring `secure` onto a board whose secured
+extensions could not be restored (a plaintext-only import carries neither their MAC
+bindings nor their digest secrets) would digest-challenge every `REGISTER` with no
+working handset left to notice. A Secured row left without a secret is named under
+`skipped`. The mode is decided last, after the bindings and digest secrets, so an
+Owner-level import of an encrypted file brings the Secured rows back first and `secure`
+applies. It is not applied at all when the file's bindings list was refused: the board's
+table is then not the one the file's `secure` was made for.
 
 ```bash
 curl -s -X POST "http://$DEV/api/config/import" \
@@ -836,6 +863,7 @@ Covered by `test_api.sh` TC-HP-02 (reachable ungated, schema present).
 | `memory.dynamicTaskCreates` | Integer | (#479) Tasks created with a heap stack and TCB since boot: every `pd::createTaskPreferPsram()` task plus the media call path's `moh_tx`. RTP media tasks and `conf_mix_tick` run on boot-preallocated stacks and are not counted. Read it before and after a call; the difference is the call path's dynamic task creation (0 for an ordinary extension-to-extension call). Also counts the anchor client's persistent `tel_maint` task (#658), created once by its first `start()`; restart, TLS re-warm, reconcile and the background token refresh (#862) run on it and create nothing. |
 | `version` | String | (#411) The firmware build stamp (the `git describe` of the commit it was built from). No build host, path or timestamp. |
 | `wifiCapable` | Boolean | (#167) Whether this build has a radio at all. `false` on the Ethernet builds, so an empty Wi-Fi scan is not mistaken for "no networks found". |
+| `anchorAcceptanceMissing` | Array of 4 booleans | (#1073) Per telephony slot: enabled without an acceptance of the current warning text (see [`GET /api/telephony-config`](#get-apitelephony-config)). Such a slot keeps working. Only for a logged-in caller; absent otherwise and while no SIP engine is attached. |
 | `emergencyRoute` | String | (#521) The emergency route the telephony layer provides: `"anchor"` when the boot-selected telephony provider places real 911/933 calls, or `"none"` when only the loopback test provider is present. With `"none"` the board **refuses** emergency calls with `503 Emergency Call Not Routable`; the loopback simulator never answers one. The dashboard shows a warning banner while this is `"none"`. Ungated like the rest of the block. **Absent** while no SIP engine is attached yet (the first seconds after boot), which a client should treat as unknown, not as `"none"`. |
 | `uptime` | Integer | Time in seconds since the HTTP server initialized. |
 | `cdrPersistFailures` | Integer | (#470) CDR ring writes to flash that failed. Non-zero means call history is not surviving reboots. |
@@ -1937,9 +1965,15 @@ and at most one is active at a time.
       "baseUrl": "https://pbx.example.com",
       "clientId": "pocketdial",
       "routeDn": "8000",
-      "secretSet": true
+      "secretSet": true,
+      "accepted": true,
+      "acceptanceMissing": false,
+      "acceptedVersion": 1,
+      "acceptedBy": "owner",
+      "acceptedAt": 1760000000
     }
-  ]
+  ],
+  "acceptanceVersion": 1
 }
 ```
 
@@ -1954,6 +1988,13 @@ and at most one is active at a time.
 | `clientId` | String | OAuth2 client identifier. |
 | `routeDn` | String | The provider-side DN this box owns. Outbound calls originate from it; inbound calls to it are what [`/api/did-mapping`](#get-apidid-mapping) routes. |
 | `secretSet` | Boolean | Whether a secret is stored. **The secret itself is never returned by any endpoint**, by design (`telephonySlotJson()`). |
+| `accepted` | Boolean | (#1073) The slot holds an acceptance of the **current** warning text. |
+| `acceptanceMissing` | Boolean | (#1073) The slot is enabled and `accepted` is `false`: it was enabled before acceptances existed, or the warning text changed since. It keeps working; the dashboard shows a banner. A `LOOPBACK` slot is never flagged. |
+| `acceptedVersion` | Integer | (#1073) The warning-text version that was accepted, `0` for none. |
+| `acceptedBy` | String | (#1073) The role of the admin session that accepted: `owner`, `sysop`, or `""`. The session carries no user name, so no name is recorded. |
+| `acceptedAt` | Integer | (#1073) Seconds since 1970 when it was accepted (`timesync::epochSeconds()`), `0` if the board's clock had not synced yet (the boards have no RTC) or there is no acceptance. |
+
+The top level also carries `acceptanceVersion`, the current warning-text version (`TelephonyApiConfig::kAcceptanceVersion`); a client sends it back as `acceptLimitations`. [`GET /api/status`](#get-apistatus) carries `anchorAcceptanceMissing`, four booleans, for a logged-in caller.
 
 These slots do not describe a SIP trunk. The client speaks HTTP/OAuth2 plus a call-control WebSocket, with media as chunked-HTTPS PCM16, and the shipping real client targets the **3CX Call Control API**. The firmware never sends a `REGISTER` of its own, so the box does not register to an ITSP and speaks no SIP to a carrier. Reaching a trunk also requires a dial-plan rule with `action=trunk` ([`POST /api/dialplan`](#post-apidialplan)); there is no `9`-prefix default.
 
@@ -1977,6 +2018,7 @@ Writes one slot. `<slot>` is the decimal index from the `GET`. Form-encoded.
 | `clientId` | ≤ 64 chars | OAuth2 client id. |
 | `secret` | ≤ 64 chars | OAuth2 client secret. **An empty value means "keep the stored secret"**, so a slot can be edited without re-typing it. |
 | `routeDn` | ≤ 64 chars | The DN this box owns on the provider. |
+| `acceptLimitations` | the current `acceptanceVersion` | (#1073) The administrator's explicit acceptance of the limitations (the dashboard's "Accept and enable" dialog). **Required to enable a slot** unless that slot is already enabled and holds an acceptance of the current text. Stored with the slot: the version, the accepting session's role and the time. Disabling needs none and clears the stored acceptance, so each enable asks again. |
 
 `type` is deliberately **not** a parameter: this endpoint only ever configures a real
 (`TELEPHONY-API`) provider. `LOOPBACK` is the internal default and is never set through
@@ -1996,7 +2038,8 @@ lives in exactly one place in the codebase, deliberately.
 
 * Response Status Codes:
   * `200 OK`: Slot written. Body is `{"status":"ok","slot":{…}}` with the same slot shape as the `GET`.
-  * `400 Bad Request`: the body carries the literal reason from `TelephonyApiConfig::setSlot`, one of `{"error":"Bad slot index"}`, `{"error":"Unknown provider type"}`, `{"error":"Base URL too long"}` (over 128), `{"error":"Field too long"}` (`clientId`/`secret`/`routeDn` over 64), `{"error":"Enabled slot needs an https:// base URL"}`, `{"error":"Enabled slot needs a route DN"}`, `{"error":"Enabled slot needs a client ID"}`, `{"error":"Enabled slot needs a client secret"}`, `{"error":"Telephony config not persisted: ..."}` (a factory reset is running, the NVS writer is not running because its staging memory could not be reserved at boot, or a stored value is longer than the writer's 129-byte cell, which only a hand-edited store can produce), or an NVS failure (`{"error":"NVS open failed"}` / `{"error":"NVS write failed"}` on device, `{"error":"config file open failed"}` on host). In every `400` from persisting the change is live in RAM all the same. A refused stage (the first three) wrote nothing to flash; but when the stage was accepted and the secret write then failed (`NVS write failed`), the staged half still reaches flash next to the old secret, and the new secret stays owed to the next write.
+  * `409 Conflict`: (#1073) enabling without an acceptance: `{"error":"Acceptance required: ... send acceptLimitations=1","acceptanceRequired":true,"acceptanceVersion":1}`. Checked after the field validation below, before anything is written; nothing is changed. An `acceptLimitations` of any other version counts as none.
+  * `400 Bad Request`: the body carries the literal reason from `TelephonyApiConfig::setSlot`, one of `{"error":"Bad slot index"}`, `{"error":"Unknown provider type"}`, `{"error":"Base URL too long"}` (over 128), `{"error":"Field too long"}` (`clientId`/`secret`/`routeDn` over 64), `{"error":"Enabled slot needs an https:// base URL"}`, `{"error":"Enabled slot needs a route DN"}`, `{"error":"Enabled slot needs a client ID"}`, `{"error":"Enabled slot needs a client secret"}`, `{"error":"Route DN may not be an emergency number"}` (refused whether or not the slot is enabled), `{"error":"Telephony config not persisted: ..."}` (a factory reset is running, the NVS writer is not running because its staging memory could not be reserved at boot, or a stored value is longer than the writer's 129-byte cell, which only a hand-edited store can produce), or an NVS failure (`{"error":"NVS open failed"}` / `{"error":"NVS write failed"}` on device, `{"error":"config file open failed"}` on host). In every `400` from persisting the change is live in RAM all the same. A refused stage (the first three) wrote nothing to flash; but when the stage was accepted and the secret write then failed (`NVS write failed`), the staged half still reaches flash next to the old secret, and the new secret stays owed to the next write.
   * `401`/`403`: gates 1-4 as in §0.1.
 
 `200` also means accepted and staged, not yet persisted (#997). Everything except the secret is copied to the NVS writer task, which writes the four slots to flash after the request has been answered: shortly (21 NVS sets and a commit; longer if the write triggers a flash page garbage collection or the writer is starved by media load). The new slot is live in RAM at once. A power cut, panic or restart (OTA, reboot) inside that window brings the board back with the **previous** persisted table; nothing is flushed before a planned restart. **The client secret is not staged.** It is never copied into the writer's staging slot, queue or scratch (none of them is zeroised); when `secret` changed it is written to flash by the request itself, one `nvs_set_str` and a commit, after the rest has been staged, so a secret edit costs the caller one flash write and every other edit costs none. A stage that is refused (a factory reset is running, the writer is not running) writes nothing at all, secret included, so flash keeps the previous consistent configuration and the secret stays owed to the next accepted write. Because the two halves are separate writes, a power cut between them can leave the new secret next to the old URL, client id and route DN (or the reverse); nothing validates that pairing at boot, and the symptom is a failed OAuth token fetch (`Failed to retrieve OAuth token` in the log): the anchor, which is the path outbound calls and 911 take, cannot authenticate until the slot is saved again. The on-flash form (the `tapicfg` namespace, `s<N>type`/`en`/`url`/`id`/`sec`/`dn` and `active`) is unchanged.
@@ -2028,9 +2071,10 @@ Makes that slot the one the outbound anchor path uses.
 
 A reboot is required before the new slot is actually live. Provider selection is boot-time-only: the running `_anchorClient` was chosen at startup and activation only changes the persisted choice. Until the board restarts, the previously-active slot is still the one placing calls, and [`POST /api/telephony-config/<slot>/test`](#post-apitelephony-configslottest) will refuse the newly-activated slot with *"this slot is not the active one — activate it and reboot first"* (`RequestsHandler::testDialSlot()`).
 
-* Request Parameters: none. The body is ignored; the slot is the path segment.
+* Request Parameters: `acceptLimitations` (optional, #1073), the current `acceptanceVersion`. **Required** unless the slot already holds an acceptance of the current text; it is stored with the slot. Index `4` (deactivate) needs none.
 * Response Status Codes:
   * `200 OK`: `{"status":"ok","activeIndex":0}`
+  * `409 Conflict`: (#1073) the slot has no stored acceptance and the request carries none: `{"error":"Acceptance required: ...","acceptanceRequired":true,"acceptanceVersion":1}`. Nothing is changed.
   * `400 Bad Request`: `{"error":"Bad slot index"}`, or an NVS/persist failure string from `TelephonyApiConfig::setActiveSlot`.
   * `401`/`403`: gates 1-4 as in §0.1.
 
@@ -2076,6 +2120,7 @@ wrong connection or silently no-op.
 | `{"ok":false,"error":"this slot is not the active one — activate it and reboot first"}` | The requested slot is not `activeSlot()`. Provider selection is boot-time-only. |
 | `{"ok":false,"error":"no anchor client connected"}` | No `_anchorClient`, or it reports not connected. Nothing was dialled. |
 | `{"ok":false,"error":"anchor declined makeCall"}` | The provider refused the origination. Nothing is left up. |
+| `{"ok":false,"error":"route DN is an emergency number, so no test call was placed"}` | The slot's `routeDn` is an emergency number (`911`, `933`, `9911`, `9933`, `112`, `113`). Refused before `makeCall()`, so nothing was dialled. A store written before the #1047 fix can still hold such a value; this check is what stops it being self-dialled. |
 | `{"ok":false,"error":"no handler attached"}` | The SIP engine has not bound to the dashboard yet; see [`GET /api/registrar`](#get-apiregistrar)'s `attached`. |
 
 ```bash
@@ -2377,6 +2422,7 @@ Streams a firmware image body directly into the inactive OTA slot. **Not routed 
   * `400 Bad Request`: Body was incomplete or a flash write failed mid-stream.
   * `403 Forbidden`: `{"error":"owner privilege required"}`. A sysop session, with an owner already provisioned.
   * `401 Unauthorized` / `403 Forbidden`: as above.
+  * `409 Conflict` (#986): `{"error":"busy","message":"call in progress; firmware upload refused until no call is up or ringing"}`. Any call counts: ringing, answered, held or parked, an anchor or trunk leg, a conference, page, echo or voicemail leg, a 911/933, a PSAP callback. Nothing is written to flash, and the upload is not deferred or buffered: retry on an idle line (`sessionCount` on [`/api/status`](#get-apistatus) is `0`). Why: a flash erase or write stalls every task that runs from flash, and holds of the SIP engine lock of 93, 190 and 296 ms were measured across three OTA flashes. The check is made once, after the auth gate and before the body is read. The body is not drained, so a client that is still sending may see the connection reset instead of the `409`. A call that starts after the check, while the image is streaming, is not covered.
   * `411 Length Required`: `Content-Length` missing or `0`.
   * `422 Unprocessable Entity`: The image was fully received but failed validation (e.g. bad magic byte / signature).
   * `500 Internal Server Error`: OTA slot could not be opened, or activation failed after a valid image was written.

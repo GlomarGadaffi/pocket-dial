@@ -93,7 +93,9 @@ No build measurement of the RAM or flash savings is recorded in this repository.
 ### 5. Emergency (E911) policy
 
 - All programmable media anchor providers must register emergency caller service profiles.
-- If an anchor provider does not support Kari's Law / RAY BAUM'S Act compliant emergency routing, the PBX enforces local dispatch notification and fallback routing per Rule 5.
+- If an anchor provider does not support Kari's Law / RAY BAUM'S Act compliant emergency routing, the call is answered `503 Emergency Call Not Routable` and the Kari's Law on-site notification is raised. There is no fallback route and no SIP-trunk path for 911 or 933 (see `docs/DEMARCATION.md`).
+- **Far-side boards (owner decision, 2026-10-20, #1046).** A far-side board is dedicated to one provider, chosen at boot, which takes the place of the 3CX anchor. The owner decided that such a board has no 911 route: 911 and 933 are answered `503 Emergency Call Not Routable`, and the Kari's Law on-site notification is triggered. No board has a fallback route; a far-side board behaves as every board without a real-call 911 route does (see the code rule below and `docs/DEMARCATION.md`).
+- **Code rule.** A board whose boot-selected provider is not on the `telephonyProviderPlacesRealCalls` allowlist reports `emergencyRoute()` as `None`, and 911 and 933 are answered `503 Emergency Call Not Routable` on that board. Today the allowlist admits only the 3CX provider (`TelephonyProviderType::Telephony`). The owner's decision above is that a far-side board is such a board.
 
 ## Consequences
 

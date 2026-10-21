@@ -165,7 +165,7 @@ That is **Learn** mode, trust on first use. Switch the registrar to **Secure** a
 
 ## Releases
 
-**v1.5.1** (2026-10-03) is current. The flasher offers it and every earlier tag; images and checksums are on the [releases page](https://github.com/GlomarGadaffi/pocket-dial/releases). `main` moves ahead of the newest tag between releases; the [changelog](CHANGELOG.md) says what changed and what is still a known gap.
+**v1.6.0** (2026-10-20) is current: 114 pull requests since v1.5.1, built to be left running, on two boards. The flasher offers it and every earlier tag; images and checksums are on the [releases page](https://github.com/GlomarGadaffi/pocket-dial/releases). `main` moves ahead of the newest tag between releases; the [changelog](CHANGELOG.md) says what changed and what is still a known gap.
 
 ## Repository layout
 
@@ -183,6 +183,7 @@ docs/       guides, design notes, and the GitHub Pages site (index.html, flasher
 - [Setup guide](docs/SETUP_GUIDE.md) · [Flashing](docs/FLASHING.md) · [Hardware](docs/HARDWARE.md) · [Phone compatibility](docs/PHONE_COMPATIBILITY.md)
 - [Architecture](docs/ARCHITECTURE.md) · [HTTP API](docs/API.md) · [Provisioning](docs/PROVISIONING.md) · [OTA](docs/OTA.md)
 - [Threat model](docs/THREAT_MODEL.md) · [Feature roadmap](docs/FEATURE_ROADMAP.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Emergency calling and deployment: who is responsible for what](docs/DEMARCATION.md)
 
 ## Contributing
 
