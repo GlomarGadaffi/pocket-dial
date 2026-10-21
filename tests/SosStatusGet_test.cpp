@@ -1079,7 +1079,8 @@ struct SweepWorld
 	std::string              dest = "911";   // the number the armed 911 dialed
 	std::vector<OrphanRead>  lists;          // what the n-th list read returns (the last repeats)
 	std::vector<int>         pendingAtRead;  // _outboundPending at the n-th call to pendingCount (the last repeats)
-	uint64_t                 unslottedEventSeq = 0;      // POST seq of a 911 that succeeded with no own leg (0: none)
+	UnslottedRecord          unslotted;                  // a 911 that succeeded with no own leg
+	bool                     restartRequested = false;   // a restart is wanted (a WS drop with a stale token)
 	bool                     unslottedDuringRead = false; // it happens while the first list read is in flight
 	int                      readNo = 0, readNo2 = 0;
 	int64_t                  t = 0;
@@ -1098,14 +1099,14 @@ struct SweepWorld
 					[&] {
 						const std::size_t i = std::min(static_cast<std::size_t>(readNo), lists.size() - 1);
 						++readNo;
-						if (unslottedDuringRead) unslottedEventSeq = kPostSeq + 8;
+						if (unslottedDuringRead) unslotted.note();
 						return lists[i];
 					},
 					[&] { return pendingAtRead[std::min(static_cast<std::size_t>(attempt), pendingAtRead.size() - 1)]; },
 					[] { return int64_t{ 0 }; },
 					[&](const std::string& leg) { return ring.seenIn(leg, kPostSeq, kArmSeq); }, dest);
 			},
-			[&] { return t; }, [] { return true; },
+			[&] { return t; }, [&] { return sweepMayContinue(true, restartRequested); },
 			[&] {
 				events.push_back("pause");
 				t += int64_t{ kOrphanSweepPollMs } * 1000;
@@ -1116,7 +1117,7 @@ struct SweepWorld
 				return true;
 			},
 			[&] { return ring.anyIn(kPostSeq, kArmSeq); },
-			[&] { return unslottedEmergencyRecorded(unslottedEventSeq); });
+			[&] { return unslotted.recorded(); });
 	}
 
 	int count(const char* prefix) const
@@ -1245,7 +1246,7 @@ TEST(SosOrphanSweep, ALive911ThatSucceededWithNoOwnLegAfterThePostIsNeverDropped
 	SweepWorld w;
 	w.ring.note("601", SweepWorld::kPostSeq + 9, 1);
 	w.lists = { pick("601", "911") };
-	w.unslottedEventSeq = SweepWorld::kPostSeq + 5;   // the second 911's POST, after A's
+	w.unslotted.note();   // the second 911's POST, after A's
 	const OrphanSweepResult r = w.run();
 	EXPECT_EQ(r.end, OrphanSweepEnd::UnslottedLiveEmergency);
 	EXPECT_EQ(w.count("drop:"), 0) << "that leg is a live 911";
@@ -1267,7 +1268,7 @@ TEST(SosOrphanSweep, ALive911ThatSucceededWithNoOwnLegAfterThePostIsNeverDropped
 	SweepWorld before;
 	before.ring.note("517", SweepWorld::kPostSeq + 3, 1);
 	before.lists = { pick("517", "911") };
-	before.unslottedEventSeq = SweepWorld::kPostSeq - 1;
+	before.unslotted.note();
 	const OrphanSweepResult r3 = before.run();
 	EXPECT_EQ(r3.end, OrphanSweepEnd::UnslottedLiveEmergency);
 	EXPECT_EQ(before.count("drop:"), 0) << "an earlier unslotted live 911 is never dropped either";
@@ -1277,9 +1278,61 @@ TEST(SosOrphanSweep, ALive911ThatSucceededWithNoOwnLegAfterThePostIsNeverDropped
 	none.lists = { pick("517", "911") };
 	EXPECT_EQ(none.run().end, OrphanSweepEnd::Dropped);
 
-	EXPECT_FALSE(unslottedEmergencyRecorded(0)) << "none recorded";
-	EXPECT_TRUE(unslottedEmergencyRecorded(1)) << "any recorded, before or after A's POST";
-	EXPECT_TRUE(unslottedEmergencyRecorded(39));
+	UnslottedRecord rec;
+	EXPECT_FALSE(rec.recorded()) << "none recorded";
+	EXPECT_TRUE(rec.note());
+	EXPECT_TRUE(rec.recorded()) << "any recorded, before or after A's POST";
+}
+
+// Opus review of #1040, round 6, 1. _wsSeq starts at 0 and only participant events advance it, so a 911 that is the
+// first call after boot and hits the no-own-leg branch has a POST seq of 0. That is a record, not "none".
+TEST(SosOrphanSweep, AnUnslotted911WhosePostSeqIsZeroStillEndsEverySweep)
+{
+	UnslottedRecord rec;
+	EXPECT_TRUE(rec.note()) << "the first one: the caller logs that the sweep is disabled";
+	EXPECT_TRUE(rec.recorded());
+	EXPECT_FALSE(rec.note()) << "logged once";
+
+	SweepWorld w;
+	w.unslotted.note();
+	w.ring.note("517", SweepWorld::kPostSeq + 3, 1);
+	w.lists = { pick("517", "911") };
+	const OrphanSweepResult r = w.run();
+	EXPECT_EQ(r.end, OrphanSweepEnd::UnslottedLiveEmergency);
+	EXPECT_EQ(w.count("drop:"), 0) << "B's live PSAP call is not dropped";
+}
+
+// 2. tel_maint runs the sweep, and a restart queues behind it; makeCall refuses 911s while the anchor is down. A
+// sweep never delays a restart: it yields at once when one is wanted, before a read and before a drop.
+TEST(SosOrphanSweep, ARestartWantedWhileASweepIsArmedIsNotDelayedByIt)
+{
+	EXPECT_TRUE(sweepMayContinue(true, false));
+	EXPECT_FALSE(sweepMayContinue(true, true)) << "a restart is wanted";
+	EXPECT_FALSE(sweepMayContinue(false, false)) << "the anchor is stopping";
+
+	SweepWorld w;
+	w.ring.note("517", SweepWorld::kPostSeq + 3, 1);
+	w.lists = { pick("517", "911") };
+	w.restartRequested = true;
+	const OrphanSweepResult r = w.run();
+	EXPECT_EQ(r.end, OrphanSweepEnd::Stopped);
+	EXPECT_EQ(r.reads, 0);
+	EXPECT_TRUE(w.events.empty()) << "no read, no pause, no drop in front of the restart";
+
+	SweepWorld during;   // the restart is wanted while the read is in flight: the drop POST would delay it
+	during.ring.note("517", SweepWorld::kPostSeq + 3, 1);
+	during.lists = { pick("517", "911") };
+	OrphanSweepResult r2 = runOrphanSweep(
+		0,
+		[&] { during.restartRequested = true; return pick("517", "911"); },
+		[&] { return during.t; }, [&] { return sweepMayContinue(true, during.restartRequested); },
+		[&] { during.events.push_back("pause"); },
+		[&](const std::string& leg) { during.events.push_back("hold:" + leg); },
+		[&](const std::string& leg) { during.events.push_back("drop:" + leg); return true; });
+	EXPECT_EQ(r2.end, OrphanSweepEnd::Stopped);
+	EXPECT_EQ(r2.reads, 1);
+	EXPECT_EQ(during.count("drop:"), 0);
+	EXPECT_EQ(during.count("hold:"), 0);
 }
 
 // 2. The arm's window, number and time are one snapshot: a take never pairs one arm's window with another's number.

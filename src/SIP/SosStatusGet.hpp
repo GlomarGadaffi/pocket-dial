@@ -526,7 +526,7 @@ struct OrphanSweepResult
 };
 
 // The sweep. unslotted() is true once any 911/933 makeCall succeeded with no own leg
-// (unslottedEmergencyRecorded): its live leg may be any listed leg, so the sweep ends before a drop. hasCandidate() is false when no leg was upserted in the window (PendingSeenIds::anyIn): the sweep
+// (UnslottedRecord): its live leg may be any listed leg, so the sweep ends before a drop. hasCandidate() is false when no leg was upserted in the window (PendingSeenIds::anyIn): the sweep
 // then has nothing it may drop, and it ends at once without a read. armedUs is the time makeCall() armed it (the bound runs from there, not from when tel_maint
 // got to it). readOnce() -> OrphanRead; nowUs() is a microsecond clock; keepGoing() is false once the
 // anchor is stopping; pause() sleeps one poll gap; holdLeg(leg) notes the leg as ours; dropLeg(leg) -> bool
@@ -568,6 +568,11 @@ OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& now
 			const OrphanSweepStep step = orphanSweepStep(rd.leg.empty() || rd.stranger ? 0 : rd.candidates, nowUs() - armedUs);
 		if (step == OrphanSweepStep::Drop)
 		{
+			if (!keepGoing())   // stopping, or a restart wanted, during the read: no drop that would delay it
+			{
+				r.end = OrphanSweepEnd::Stopped;
+				break;
+			}
 			if (unslotted())   // one began during the read: its leg may be this pick
 			{
 				r.end = OrphanSweepEnd::UnslottedLiveEmergency;
@@ -610,14 +615,33 @@ OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& now
 
 // A 911/933 makeCall that returned success WITHOUT a resolved own leg (makeCall's "could not resolve own leg id"
 // branch) has a live call to the PSAP and no slot: its leg is listed, unslotted, and looks exactly like an orphan.
-// eventPostSeq is that makeCall's POST event number (0: none yet). ANY such call, whether its POST came before or
+// ANY such call, whether its POST came before or
 // after the sweep's, ends the sweep before a drop: a call with no slot and no media is redialed, and its leg's
 // repeat upsert is first seen inside the redial's window, with one makeCall pending, looking just like the orphan.
 // The record is sticky until reboot (this unit cannot prove the leg is gone), so the sweep is disabled after this
 // rare event; that never drops a live call.
-inline bool unslottedEmergencyRecorded(uint64_t eventPostSeq)
+// The record of it, in one place the client and the host tests share. A flag, not a seq: _wsSeq starts at 0 and
+// only participant events advance it, so a 911 that is the first call after boot has a POST seq of 0, and a seq
+// of 0 must not read as "none".
+class UnslottedRecord
 {
-	return eventPostSeq != 0;
+public:
+	// True the first time only (the caller logs once).
+	bool note()
+	{
+		return !_set.exchange(true, std::memory_order_acq_rel);
+	}
+	bool recorded() const { return _set.load(std::memory_order_acquire); }
+
+private:
+	std::atomic<bool> _set{false};
+};
+
+// Does the sweep go on? A restart wanted (a WS drop with a stale token, #336) must not wait behind a sweep whose
+// reads time out: makeCall refuses 911s while the anchor is down, so the sweep yields at once.
+inline bool sweepMayContinue(bool running, bool restartRequested)
+{
+	return running && !restartRequested;
 }
 
 // The armed sweep's state, written by makeCall() and taken by tel_maint. NOT synchronised: the client holds its

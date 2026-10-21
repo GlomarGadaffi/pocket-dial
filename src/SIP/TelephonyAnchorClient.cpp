@@ -704,7 +704,7 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 			// #977: a live 911/933 with no slot looks like an orphan to ANY sweep, armed before or after this POST (its
 			// repeat upsert is first seen inside a redial's window). Record it, sticky until reboot: the sweep is
 			// disabled after this rare event, which never drops a live call. Logged once.
-			if (sosLane && _unslottedEmergencySeq.exchange(postSeq, std::memory_order_acq_rel) == 0)
+			if (sosLane && _unslottedEmergency.note())
 			{
 				ESP_LOGW(TAG, "makeCall: a 911/933 succeeded with no own leg: the orphan sweep is disabled until reboot (#977)");
 			}
@@ -2280,8 +2280,10 @@ void TelephonyAnchorClient::maintTaskTrampoline(void* arg)
 	{
 		uint32_t jobs = 0;
 		xTaskNotifyWait(0, UINT32_MAX, &jobs, portMAX_DELAY);
-		if (jobs & kMaintOrphanSweep) orphanSweepTaskTrampoline(arg);   // #977: first, it runs against a deadline
+		// #977: a restart first. makeCall refuses 911s while the anchor is down, so the sweep (which also yields to
+		// _restartRequested) never waits in front of one; a sweep that follows a long restart is TooLate, harmlessly.
 		if (jobs & kMaintRestart)   restartTaskTrampoline(arg);
+		if (jobs & kMaintOrphanSweep) orphanSweepTaskTrampoline(arg);
 		if (jobs & kMaintRewarm)    rewarmTaskTrampoline(arg);
 		if (jobs & kMaintReconcile) reconcileTaskTrampoline(arg);
 		if (jobs & kMaintTokenRefresh) maintRefreshTaskTrampoline(arg);
@@ -2409,7 +2411,11 @@ void TelephonyAnchorClient::orphanSweepBody()
 					destDigits);
 			},
 			[] { return esp_timer_get_time(); },
-			[this] { return _running.load(std::memory_order_acquire); },
+			// Never delays a restart: a WS drop with a stale token wants one, and makeCall refuses 911s until it is done.
+			[this] {
+				return telephony::sweepMayContinue(_running.load(std::memory_order_acquire),
+				                                   _restartRequested.load(std::memory_order_acquire));
+			},
 			[] { vTaskDelay(pdMS_TO_TICKS(telephony::kOrphanSweepPollMs)); },
 			[this, postSeq, holdUntilUs](const std::string& leg) {
 				// Ours before the drop goes out and before the hold ends: 3CX repeats the orphan's upsert while
@@ -2438,7 +2444,7 @@ void TelephonyAnchorClient::orphanSweepBody()
 			},
 			// A 911/933 that succeeded with no own leg, ever: its live leg may be any listed leg.
 			[this] {
-				return telephony::unslottedEmergencyRecorded(_unslottedEmergencySeq.load(std::memory_order_acquire));
+				return _unslottedEmergency.recorded();
 			});
 	}
 	catch (const std::bad_alloc&)

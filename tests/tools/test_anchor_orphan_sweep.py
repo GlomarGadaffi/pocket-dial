@@ -103,8 +103,12 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertIn("kMaintOrphanSweep = 1u << 4", self.hpp)
         loop = body_of(self.cpp, "void TelephonyAnchorClient::maintTaskTrampoline(")
         self.assertRegex(loop, r"jobs & kMaintOrphanSweep\)\s*orphanSweepTaskTrampoline\(arg\)")
-        self.assertLess(loop.index("kMaintOrphanSweep"), loop.index("kMaintRestart"),
-                        "it runs against a deadline, ahead of the long jobs")
+        self.assertLess(loop.index("jobs & kMaintRestart"), loop.index("jobs & kMaintOrphanSweep"),
+                        "a restart never waits behind a sweep (makeCall refuses 911s while the anchor is down)")
+        self.assertLess(loop.index("jobs & kMaintOrphanSweep"), loop.index("jobs & kMaintRewarm"))
+        self.assertRegex(self.sweep, r"telephony::sweepMayContinue\(_running\.load\(std::memory_order_acquire\),\s*"
+                                     r"_restartRequested\.load\(std::memory_order_acquire\)\)",
+                         "the sweep yields at once when a restart is wanted")
         self.assertNotIn("vTaskDelete", self.sweep, "it runs on tel_maint and must return")
         self.assertIsNone(ALLOC.search(self.sweep), "no task, thread or new/malloc of its own")
         self.assertIsNone(ALLOC.search(self.arm))
@@ -115,7 +119,7 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertIn("telephony::OrphanArmSlot _orphanArm;", "\n".join(decls))
         self.assertIn("std::atomic<int64_t>  _orphanHoldUntilUs", "\n".join(decls))
         self.assertNotRegex("\n".join(decls), r"std::(string|vector|map|function)")
-        self.assertIn("std::atomic<uint64_t> _unslottedEmergencySeq{0};", self.hpp)
+        self.assertIn("telephony::UnslottedRecord _unslottedEmergency;", self.hpp)
 
     def test_the_bound_runs_from_the_arm_and_the_sweep_sleeps_in_vtaskdelay(self):
         self.assertRegex(self.sweep, r"telephony::runOrphanSweep\(\s*armedUs,")
@@ -222,11 +226,10 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         make = self.make
         branch = make[make.index("could not resolve own leg id"):]
         branch = branch[:branch.index("else")]
-        self.assertIn("if (sosLane && _unslottedEmergencySeq.exchange(postSeq, std::memory_order_acq_rel) == 0)", branch)
+        self.assertIn("if (sosLane && _unslottedEmergency.note())", branch)
         self.assertIn("the orphan sweep is disabled until reboot", branch, "logged once")
-        self.assertIn("telephony::unslottedEmergencyRecorded(_unslottedEmergencySeq.load(std::memory_order_acquire))",
-                      self.sweep)
-        self.assertNotIn("_unslottedEmergencySeq.store(0", self.cpp, "sticky: nothing clears it")
+        self.assertIn("return _unslottedEmergency.recorded();", self.sweep)
+        self.assertNotIn("_unslottedEmergency = ", self.cpp, "sticky: nothing clears it")
 
     def test_the_party_strings_are_copied_only_when_the_caller_wants_them(self):
         resolve = body_of(self.cpp, "std::string TelephonyAnchorClient::resolveOutboundLeg(")
