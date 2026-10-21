@@ -27,8 +27,9 @@ class AnchorSosStatusLaneTest(unittest.TestCase):
         # Positive control: every other caller still goes through the shared, mutex-guarded handle.
         self.assertIn("_statusMutex", self.get_body)
         self.assertIn("_statusClient", self.get_body)
-        for sig in ("std::string TelephonyAnchorClient::getLegStatus(",
-                    "std::string TelephonyAnchorClient::reconcileParticipantId(",
+        # getLegStatus took no lane before #949; it forwards one now (default: shared), see
+        # test_anchor_leg_status_sos_lane.py. The other two still pass none.
+        for sig in ("std::string TelephonyAnchorClient::reconcileParticipantId(",
                     "std::string TelephonyAnchorClient::getParticipantCaller("):
             self.assertIn("httpGetBody(url, body, &status)", body_of(self.src, sig), sig)
 
