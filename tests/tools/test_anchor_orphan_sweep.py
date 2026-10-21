@@ -48,7 +48,7 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertNotIn("armOrphanSweep", self.unread[:refusal_at], "not on the adopt branch")
         tail = self.unread[refusal_at:]
         self.assertIn("telephony::orphanSweepWanted(sosLane, outcome, reads, listsRead)", tail)
-        self.assertIn("armOrphanSweep(postSeq, armSeq);", tail, "postSeq of the latest POST, and the event number at the arm")
+        self.assertIn("armOrphanSweep(postSeq, armSeq, destination);", tail, "postSeq of the latest POST, and the event number at the arm")
         self.assertIn("const uint64_t armSeq = readPostSeq();", self.unread[:refusal_at], "read before the refusal is logged")
         self.assertNotIn("success = true", tail, "the refusal still sets nothing: the caller gets its 503")
         self.assertNotIn("Proceed", self.make)
@@ -123,7 +123,7 @@ class AnchorOrphanSweepTest(unittest.TestCase):
 
     def test_the_read_is_on_the_ordinary_lane_and_an_allocation_failure_is_a_failed_read(self):
         self.assertIn("resolveOutboundLeg(std::string(), std::string(), &listStatus, &source, &counts, /*skipOurs=*/true,"
-                      "\n\t\t\t\t\t\t\t\t\t/*fresh=*/true)",
+                      "\n\t\t\t\t\t\t\t\t\t/*fresh=*/true, &rd.partyDn, &rd.partyCid)",
                       self.sweep, "an empty destination is the ordinary status lane (#941), and it never waits on the shared lock")
         for sos in ("sosLane", "_sosStatus", "_sosBody", "/*sosLane=*/true", "classifyEmergencyDial"):
             self.assertNotIn(sos, self.sweep, "never the 911 handle: its claim is a 911's own GET")
@@ -199,7 +199,7 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         ws = self.cpp[self.cpp.index("std::string controlLegs[POCKETDIAL_MAX_ANCHOR_CALLS];"):]
         ws = ws[:ws.index("if (nLegs == 0) break;")]
         self.assertIn("countOutboundLocked(inflight, POCKETDIAL_MAX_ANCHOR_CALLS, witnessActive, witnessPending, &partId)", ws)
-        self.assertIn("if (_outboundPending.load(std::memory_order_acquire) > 0) _pendingSeen.note(partId, seq);", ws)
+        self.assertIn("if (_outboundPending.load(std::memory_order_acquire) > 0) _pendingSeen.note(partId, seq, _outboundPending.load(std::memory_order_acquire));", ws)
 
     def test_the_sweep_read_marks_a_pick_the_window_never_saw_as_a_stranger(self):
         # point 1 and the Opus blocker: seen means first noted in (postSeq, armSeq], decided by the host-tested helper.
@@ -207,7 +207,7 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertIn("_pendingSeen.seenIn(leg, postSeq, armSeq)", self.sweep[read_at:])
         self.assertIn("telephony::PendingSeenIds<", self.hpp)
         helper = body_of(self.sos, "OrphanRead readOrphanOnce(")
-        self.assertIn("rd.stranger = !rd.leg.empty() && !seen(rd.leg);", helper)
+        self.assertIn("rd.stranger = !rd.leg.empty() && !(seen(rd.leg) && partyIsDestination(destDigits, rd.partyDn, rd.partyCid));", helper)
 
     def test_a_sweep_with_no_leg_upserted_in_the_window_reads_nothing(self):
         self.assertIn("_orphanArmSeq.load(std::memory_order_relaxed)", self.sweep)

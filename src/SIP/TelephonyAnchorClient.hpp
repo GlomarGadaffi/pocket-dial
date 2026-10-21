@@ -391,7 +391,10 @@ private:
 	telephony::PendingSeenIds<8, telephony::kParticipantIdBytes> _pendingSeen;
 	// The sweep's drop: a fresh-client POST, never performCtrl()'s _ctrlMutex, so answerCall() cannot queue behind it.
 	bool dropOrphanLeg(const std::string& leg);
-	void armOrphanSweep(uint64_t postSeq, uint64_t armSeq);
+	// The digits of the number the armed 911/933 dialed (written by armOrphanSweep before _orphanArmedUs is
+	// released, read by the sweep after it takes the arm): only a leg whose party is this number is the orphan.
+	char _sweepDest[24] = {};
+	void armOrphanSweep(uint64_t postSeq, uint64_t armSeq, const std::string& destination);
 	void orphanSweepBody();
 	static void orphanSweepTaskTrampoline(void* arg);
 	std::atomic<TaskHandle_t> _maintHandle{nullptr};
@@ -546,7 +549,9 @@ private:
 	                               telephony::OwnLegSource* sourceOut = nullptr,   // #379
 	                               telephony::ListLegCounts* countsOut = nullptr,   // #349: what the list held
 	                               bool skipOurs = false,    // #349: skip a leg an earlier call left listed
-	                               bool fresh = false);      // #977: the sweep's read, see httpGetBody
+	                               bool fresh = false,       // #977: the sweep's read, see httpGetBody
+	                               std::string* partyDnOut = nullptr,    // #977: the pick's party_dn and
+	                               std::string* partyCidOut = nullptr);  // party_caller_id, as the record carried them
 	// Status of a specific leg read from the LIST (GET /participants -> find id). Replaces
 	// getParticipantStatus(id), which 403s for a leg this DN cannot directly control (issue #40).
 	// sosLane (#949): the tel_wsw worker's read for a 911/933 slot; uses _sosStatusClient, never _statusMutex.

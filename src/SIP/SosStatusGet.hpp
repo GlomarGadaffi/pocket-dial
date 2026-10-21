@@ -426,7 +426,8 @@ inline int pendingWithOrphanHold(int outboundPending, int64_t holdUntilUs, int64
 }
 
 // The participant ids 3CX upserted while a makeCall was pending (the classifier ignores those, #888), each with
-// the WS event number of its FIRST sighting. The orphan is one of them, first upserted after the POST that made it
+// the WS event number of its FIRST sighting and whether more than one makeCall was pending then (two 911s dialed
+// together: whose leg it is cannot be told, so it is never counted as seen). The orphan is one of them, first upserted after the POST that made it
 // and no later than the arm (seq in (postSeq, armSeq]). A PSAP callback is not: it is a participant this unit saw
 // in no pending window of this 911, so the sweep's hold does not cover it and the sweep never drops it. An id
 // first seen at or before the POST (an earlier makeCall's window) or after the arm (a redial's window, whose
@@ -436,18 +437,18 @@ template <std::size_t N, std::size_t Len>
 class PendingSeenIds
 {
 public:
-	void note(std::string_view id, uint64_t seq)
+	void note(std::string_view id, uint64_t seq, int pendingMakeCalls)
 	{
 		if (id.empty() || id.size() > Len) return;
 		for (auto& e : _e)
 		{
 			if (id == e.id) return;   // the first sighting stands
-
 		}
 		Entry& e = _e[_next++ % N];
 		std::memcpy(e.id, id.data(), id.size());
 		e.id[id.size()] = '\0';
 		e.seq           = seq;
+		e.multi         = pendingMakeCalls > 1;
 	}
 
 	// True when id's first sighting has an event number in (afterSeq, uptoSeq].
@@ -456,7 +457,7 @@ public:
 		if (id.empty() || id.size() > Len) return false;
 		for (const auto& e : _e)
 		{
-			if (id == e.id) return e.seq > afterSeq && e.seq <= uptoSeq;
+			if (id == e.id) return !e.multi && e.seq > afterSeq && e.seq <= uptoSeq;
 		}
 		return false;
 	}
@@ -466,7 +467,7 @@ public:
 	{
 		for (const auto& e : _e)
 		{
-			if (e.id[0] != '\0' && e.seq > afterSeq && e.seq <= uptoSeq) return true;
+			if (e.id[0] != '\0' && !e.multi && e.seq > afterSeq && e.seq <= uptoSeq) return true;
 		}
 		return false;
 	}
@@ -476,6 +477,7 @@ private:
 	{
 		char     id[Len + 1] = {};
 		uint64_t seq         = 0;
+		bool     multi       = false;   // more than one makeCall was pending at the first sighting
 	};
 	Entry       _e[N];
 	std::size_t _next = 0;
@@ -489,8 +491,29 @@ struct OrphanRead
 {
 	std::string leg;
 	int         candidates = 0;
-	bool        stranger   = false;   // the pick was never upserted while our makeCall was pending
+	bool        stranger   = false;   // the pick is not provably the orphan: see readOrphanOnce
+	std::string partyDn;              // the pick's party_dn and party_caller_id, as the record carried them
+	std::string partyCid;
 };
+
+// The digits of s, for comparing a participant's party with the number a 911/933 dialed.
+inline std::string digitsOnly(std::string_view s)
+{
+	std::string d;
+	for (const char c : s)
+	{
+		if (c >= '0' && c <= '9') d.push_back(c);
+	}
+	return d;
+}
+
+// Is the pick's remote party the number this 911/933 dialed? A PSAP callback's party is the PSAP's number, not
+// 911/933. A record with no party field proves nothing, and neither does an empty destination.
+inline bool partyIsDestination(std::string_view destDigits, std::string_view partyDn, std::string_view partyCid)
+{
+	if (destDigits.empty()) return false;
+	return digitsOnly(partyDn) == destDigits || digitsOnly(partyCid) == destDigits;
+}
 
 struct OrphanSweepResult
 {
@@ -568,9 +591,11 @@ OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& now
 //   - A makeCall in flight (a redialed 911 among them) has a leg 3CX lists before it keys it, and a lone
 //     candidate is dropped: no decision while one is pending, before the read or after it, or if one began and
 //     ended during it. The read is an empty one, so the sweep reads again.
-//   - A pick not seen in the window is a stranger (it may be a PSAP callback) and is never dropped.
+//   - A pick not seen in the window, or whose remote party is not the number this 911/933 dialed, is a stranger (it
+//     may be a PSAP callback or another call's leg) and is never dropped.
 template <class ReadFn, class PendingFn, class SinceFn, class SeenFn>
-OrphanRead readOrphanOnce(ReadFn&& readList, PendingFn&& pendingCount, SinceFn&& pendingSinceUs, SeenFn&& seen)
+OrphanRead readOrphanOnce(ReadFn&& readList, PendingFn&& pendingCount, SinceFn&& pendingSinceUs, SeenFn&& seen,
+                          std::string_view destDigits)
 {
 	const int64_t sinceUs = pendingSinceUs();
 	if (pendingCount() > 0) return {};
@@ -584,7 +609,7 @@ OrphanRead readOrphanOnce(ReadFn&& readList, PendingFn&& pendingCount, SinceFn&&
 		return {};   // a failed read, not a terminate: the ordinary lane rethrows
 	}
 	if (pendingCount() > 0 || pendingSinceUs() != sinceUs) return {};
-	rd.stranger = !rd.leg.empty() && !seen(rd.leg);
+	rd.stranger = !rd.leg.empty() && !(seen(rd.leg) && partyIsDestination(destDigits, rd.partyDn, rd.partyCid));
 	return rd;
 }
 

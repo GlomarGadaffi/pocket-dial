@@ -1029,7 +1029,7 @@ TEST(SosOrphanSweep, TheIdsSeenWhileAMakeCallWasPendingAreAFixedTableScopedToThe
 	PendingSeenIds<4, 8> ids;
 	EXPECT_FALSE(ids.seenIn("517", kPostSeq, kArmSeq));
 	EXPECT_FALSE(ids.anyIn(kPostSeq, kArmSeq));
-	ids.note("517", kPostSeq + 3);
+	ids.note("517", kPostSeq + 3, 1);
 	EXPECT_TRUE(ids.seenIn("517", kPostSeq, kArmSeq)) << "upserted after the POST while pending: the orphan";
 	EXPECT_TRUE(ids.anyIn(kPostSeq, kArmSeq));
 	EXPECT_FALSE(ids.seenIn("518", kPostSeq, kArmSeq)) << "another participant: a callback";
@@ -1037,25 +1037,36 @@ TEST(SosOrphanSweep, TheIdsSeenWhileAMakeCallWasPendingAreAFixedTableScopedToThe
 
 	// A PSAP callback that arrived during an EARLIER makeCall's pending window was ignored then (#888) and
 	// stays listed unslotted. It is not this POST's orphan, and it must never become the sweep's drop.
-	ids.note("519", kPostSeq - 7);
+	ids.note("519", kPostSeq - 7, 1);
 	EXPECT_FALSE(ids.seenIn("519", kPostSeq, kArmSeq)) << "seen before this POST: a stranger, not held, not dropped";
 	// And one that arrived during a LATER makeCall's window (a redial after the arm) is past the window.
-	ids.note("520", kArmSeq + 5);
+	ids.note("520", kArmSeq + 5, 1);
 	EXPECT_FALSE(ids.seenIn("520", kPostSeq, kArmSeq)) << "seen after the arm: a stranger";
 	// The first sighting stands: a later one (the orphan's repeat upsert during a redial) neither moves it out of
 	// the window nor, for an id first seen outside it, into it.
-	ids.note("517", kArmSeq + 20);
+	ids.note("517", kArmSeq + 20, 1);
 	EXPECT_TRUE(ids.seenIn("517", kPostSeq, kArmSeq)) << "the orphan's repeat upsert during a redial keeps it seen";
-	ids.note("519", kPostSeq + 9);
+	ids.note("519", kPostSeq + 9, 1);
 	EXPECT_FALSE(ids.seenIn("519", kPostSeq, kArmSeq)) << "a later sighting does not move a stranger into the window";
-	ids.note("517", kPostSeq - 30);
+	ids.note("517", kPostSeq - 30, 1);
 	EXPECT_TRUE(ids.seenIn("517", kPostSeq, kArmSeq)) << "an older number does not move it out either";
 
-	ids.note("a-very-long-id", kPostSeq + 1);   // does not fit: not recorded
+	ids.note("a-very-long-id", kPostSeq + 1, 1);   // does not fit: not recorded
 	EXPECT_FALSE(ids.seenIn("a-very-long-id", kPostSeq, kArmSeq));
-	for (const char* id : { "1", "2", "3", "4" }) ids.note(id, kPostSeq + 10);   // four slots: 517 is the oldest
+	for (const char* id : { "1", "2", "3", "4" }) ids.note(id, kPostSeq + 10, 1);   // four slots: 517 is the oldest
 	EXPECT_FALSE(ids.seenIn("517", kPostSeq, kArmSeq)) << "evicted: announced and not dropped, the safe direction";
 	EXPECT_TRUE(ids.seenIn("4", kPostSeq, kArmSeq));
+}
+
+// A list read's pick whose record carries the given party_dn (the destination of the armed 911 unless said otherwise).
+static OrphanRead pick(const char* leg, const char* partyDn = "911", const char* partyCid = "")
+{
+	OrphanRead rd;
+	rd.leg      = leg;
+	rd.candidates = 1;
+	rd.partyDn  = partyDn;
+	rd.partyCid = partyCid;
+	return rd;
 }
 
 // What the ESP arm does, with the I/O lent in: the read goes through readOrphanOnce (the pending guards and the
@@ -1065,6 +1076,7 @@ struct SweepWorld
 	static constexpr uint64_t kPostSeq = 40;
 	static constexpr uint64_t kArmSeq  = 60;
 	PendingSeenIds<8, 32>    ring;
+	std::string              dest = "911";   // the number the armed 911 dialed
 	std::vector<OrphanRead>  lists;          // what the n-th list read returns (the last repeats)
 	std::vector<int>         pendingAtRead;  // _outboundPending at the n-th call to pendingCount (the last repeats)
 	int                      readNo = 0, readNo2 = 0;
@@ -1088,7 +1100,7 @@ struct SweepWorld
 					},
 					[&] { return pendingAtRead[std::min(static_cast<std::size_t>(attempt), pendingAtRead.size() - 1)]; },
 					[] { return int64_t{ 0 }; },
-					[&](const std::string& leg) { return ring.seenIn(leg, kPostSeq, kArmSeq); });
+					[&](const std::string& leg) { return ring.seenIn(leg, kPostSeq, kArmSeq); }, dest);
 			},
 			[&] { return t; }, [] { return true; },
 			[&] {
@@ -1116,9 +1128,9 @@ struct SweepWorld
 TEST(SosOrphanSweep, APsapCallbackThatArrivesDuringARedialIsNeverDropped)
 {
 	SweepWorld w;
-	w.ring.note("517", SweepWorld::kPostSeq + 3);   // A's orphan, upserted while A was pending
-	w.ring.note("518", SweepWorld::kArmSeq + 12);   // the callback, during B's pending window
-	w.lists = { { "518", 1 } };                     // the orphan is already gone from the list; only the callback is up
+	w.ring.note("517", SweepWorld::kPostSeq + 3, 1);   // A's orphan, upserted while A was pending
+	w.ring.note("518", SweepWorld::kArmSeq + 12, 1);   // the callback, during B's pending window
+	w.lists = { pick("518") };                     // the orphan is already gone from the list; only the callback is up
 	const OrphanSweepResult r = w.run();
 	EXPECT_NE(r.end, OrphanSweepEnd::Dropped);
 	EXPECT_EQ(w.count("hold:"), 0);
@@ -1126,9 +1138,9 @@ TEST(SosOrphanSweep, APsapCallbackThatArrivesDuringARedialIsNeverDropped)
 	EXPECT_EQ(r.end, OrphanSweepEnd::GaveUp);
 
 	SweepWorld orphan;   // positive control: the orphan, seen in the window, is dropped even after a redial repeats it
-	orphan.ring.note("517", SweepWorld::kPostSeq + 3);
-	orphan.ring.note("517", SweepWorld::kArmSeq + 12);   // its repeat upsert while B is pending
-	orphan.lists = { { "517", 1 } };
+	orphan.ring.note("517", SweepWorld::kPostSeq + 3, 1);
+	orphan.ring.note("517", SweepWorld::kArmSeq + 12, 1);   // its repeat upsert while B is pending
+	orphan.lists = { pick("517") };
 	EXPECT_EQ(orphan.run().end, OrphanSweepEnd::Dropped);
 	EXPECT_EQ(orphan.count("drop:517"), 1);
 }
@@ -1138,10 +1150,10 @@ TEST(SosOrphanSweep, APsapCallbackThatArrivesDuringARedialIsNeverDropped)
 TEST(SosOrphanSweep, ALiveLegOfTheRedialWhoseOwnLegWasNotResolvedIsNeverDropped)
 {
 	SweepWorld w;
-	w.ring.note("517", SweepWorld::kPostSeq + 3);   // A's orphan
-	w.ring.note("601", SweepWorld::kArmSeq + 8);    // B's leg, upserted while B was pending
+	w.ring.note("517", SweepWorld::kPostSeq + 3, 1);   // A's orphan
+	w.ring.note("601", SweepWorld::kArmSeq + 8, 1);    // B's leg, upserted while B was pending
 	w.pendingAtRead = { 1, 0 };                     // the first read is while B is pending, then B is done
-	w.lists = { { "601", 1 } };
+	w.lists = { pick("601") };
 	const OrphanSweepResult r = w.run();
 	EXPECT_EQ(w.count("drop:"), 0) << "B's live call is not the orphan";
 	EXPECT_EQ(w.count("hold:"), 0);
@@ -1150,53 +1162,124 @@ TEST(SosOrphanSweep, ALiveLegOfTheRedialWhoseOwnLegWasNotResolvedIsNeverDropped)
 }
 
 // Blocker 3: when no leg was upserted in the window nothing can be a candidate, so there is nothing to read for.
+// Opus review of #1040, round 3, A. A callback for an EARLIER dropped 911 lands inside A's window: #888 ignores it
+// and it is noted as seen. A's orphan is missing from the list (the POST was rejected, or the orphan already
+// ended), so the callback is the sole candidate. Its remote party is the PSAP's number, not what A dialed.
+TEST(SosOrphanSweep, ACallbackForAnEarlierDropped911InsideTheWindowIsNeverDroppedEvenSeenAndAlone)
+{
+	SweepWorld w;
+	w.ring.note("518", SweepWorld::kPostSeq + 4, 1);   // the callback, ignored while A alone was pending
+	w.lists = { pick("518", "5551234", "5551234") };
+	const OrphanSweepResult r = w.run();
+	EXPECT_NE(r.end, OrphanSweepEnd::Dropped);
+	EXPECT_EQ(w.count("hold:"), 0);
+	EXPECT_EQ(w.count("drop:"), 0) << "a PSAP callback is not the orphan: its party is the PSAP, not 911";
+	EXPECT_EQ(r.end, OrphanSweepEnd::GaveUp);
+}
+
+// B. Two handsets dial 911 together. B's leg is noted with two makeCalls pending, and B succeeded without
+// resolving its own leg, so that leg is unslotted, listed, and its party is 911 too.
+TEST(SosOrphanSweep, ALegSeenWhileTwoMakeCallsWerePendingIsNeverDropped)
+{
+	SweepWorld w;
+	w.ring.note("601", SweepWorld::kPostSeq + 2, 2);   // B's leg, upserted with A and B both pending
+	w.lists = { pick("601", "911") };
+	const OrphanSweepResult r = w.run();
+	EXPECT_NE(r.end, OrphanSweepEnd::Dropped);
+	EXPECT_EQ(w.count("drop:"), 0) << "whose leg it is cannot be told: B's live 911 is not dropped";
+	EXPECT_EQ(r.end, OrphanSweepEnd::NoCandidate) << "and with nothing provable in the window there is nothing to read for";
+	EXPECT_EQ(w.count("read"), 0);
+
+	PendingSeenIds<4, 8> ids;
+	ids.note("601", 50, 2);
+	EXPECT_FALSE(ids.seenIn("601", 40, 60));
+	EXPECT_FALSE(ids.anyIn(40, 60));
+	ids.note("601", 52, 1);   // a later sighting with one pending does not make it provable
+	EXPECT_FALSE(ids.seenIn("601", 40, 60));
+	ids.note("517", 51, 1);
+	EXPECT_TRUE(ids.seenIn("517", 40, 60)) << "positive control: one makeCall pending, in the window";
+	EXPECT_TRUE(ids.anyIn(40, 60));
+}
+
+TEST(SosOrphanSweep, AnOrphanWhoseRemotePartyIsWhatTheArmed911DialedIsStillDropped)
+{
+	for (const char* party : { "911", "+911" }) {
+		SweepWorld w;
+		w.ring.note("517", SweepWorld::kPostSeq + 3, 1);
+		w.lists = { pick("517", party) };
+		EXPECT_EQ(w.run().end, OrphanSweepEnd::Dropped) << party;
+		EXPECT_EQ(w.count("drop:517"), 1) << party;
+	}
+	SweepWorld cid;   // the number can be in party_caller_id instead of party_dn
+	cid.ring.note("517", SweepWorld::kPostSeq + 3, 1);
+	cid.lists = { pick("517", "", "933") };
+	cid.dest = "933";
+	EXPECT_EQ(cid.run().end, OrphanSweepEnd::Dropped);
+	EXPECT_TRUE(partyIsDestination("911", "911", ""));
+	EXPECT_TRUE(partyIsDestination("911", "x", "911"));
+	EXPECT_FALSE(partyIsDestination("911", "9111", "")) << "equal, not a prefix";
+	EXPECT_FALSE(partyIsDestination("", "911", "911")) << "no destination proves nothing";
+}
+
+TEST(SosOrphanSweep, ALegWhoseRecordCarriesNoPartyIsNotProvablyTheOrphanAndIsNotDropped)
+{
+	SweepWorld w;
+	w.ring.note("517", SweepWorld::kPostSeq + 3, 1);
+	w.lists = { pick("517", "", "") };
+	const OrphanSweepResult r = w.run();
+	EXPECT_NE(r.end, OrphanSweepEnd::Dropped);
+	EXPECT_EQ(w.count("drop:"), 0);
+	EXPECT_EQ(w.count("hold:"), 0);
+	EXPECT_EQ(r.end, OrphanSweepEnd::GaveUp);
+}
+
 TEST(SosOrphanSweep, WithNoLegUpsertedInTheWindowTheSweepEndsAtOnceWithoutReading)
 {
 	SweepWorld none;   // an empty ring: the WS delivered nothing (or another outbound call kept it from being noted)
-	none.lists = { { "517", 1 } };
+	none.lists = { pick("517") };
 	const OrphanSweepResult r = none.run();
 	EXPECT_EQ(r.end, OrphanSweepEnd::NoCandidate);
 	EXPECT_EQ(r.reads, 0);
 	EXPECT_TRUE(none.events.empty()) << "no read, no pause, no TLS handshake for nothing";
 
 	SweepWorld outside;   // ids only outside (postSeq, armSeq] do not make a candidate either
-	outside.ring.note("519", SweepWorld::kPostSeq - 1);
-	outside.ring.note("520", SweepWorld::kArmSeq + 1);
+	outside.ring.note("519", SweepWorld::kPostSeq - 1, 1);
+	outside.ring.note("520", SweepWorld::kArmSeq + 1, 1);
 	EXPECT_EQ(outside.run().end, OrphanSweepEnd::NoCandidate);
 	EXPECT_TRUE(outside.events.empty());
 
 	SweepWorld some;   // positive control: one id in the window and the sweep reads
-	some.ring.note("517", SweepWorld::kArmSeq);
-	some.lists = { { "517", 1 } };
+	some.ring.note("517", SweepWorld::kArmSeq, 1);
+	some.lists = { pick("517") };
 	EXPECT_EQ(some.run().end, OrphanSweepEnd::Dropped);
 }
 
 TEST(SosOrphanSweep, ASweepReadDecidesNothingWhileAMakeCallIsInFlightOrFailsToAllocate)
 {
 	auto seen = [](const std::string&) { return true; };
-	const OrphanRead pick{ "517", 1 };
+	const OrphanRead pk = pick("517");
 
 	int reads = 0;
-	OrphanRead rd = readOrphanOnce([&] { ++reads; return pick; }, [] { return 1; }, [] { return int64_t{ 5 }; }, seen);
+	OrphanRead rd = readOrphanOnce([&] { ++reads; return pk; }, [] { return 1; }, [] { return int64_t{ 5 }; }, seen, "911");
 	EXPECT_TRUE(rd.leg.empty());
 	EXPECT_EQ(reads, 0) << "a makeCall pending before the read: no read at all";
 
 	int asks = 0;   // a makeCall begins during the read
-	rd = readOrphanOnce([&] { return pick; }, [&] { return ++asks == 1 ? 0 : 1; }, [] { return int64_t{ 5 }; }, seen);
+	rd = readOrphanOnce([&] { return pk; }, [&] { return ++asks == 1 ? 0 : 1; }, [] { return int64_t{ 5 }; }, seen, "911");
 	EXPECT_TRUE(rd.leg.empty()) << "pending after the read";
 
 	int64_t since = 5;   // a makeCall began and ended during the read
-	rd = readOrphanOnce([&] { since = 9; return pick; }, [] { return 0; }, [&] { return since; }, seen);
+	rd = readOrphanOnce([&] { since = 9; return pk; }, [] { return 0; }, [&] { return since; }, seen, "911");
 	EXPECT_TRUE(rd.leg.empty()) << "the oldest pending began afresh";
 
-	rd = readOrphanOnce([]() -> OrphanRead { throw std::bad_alloc(); }, [] { return 0; }, [] { return int64_t{ 5 }; }, seen);
+	rd = readOrphanOnce([]() -> OrphanRead { throw std::bad_alloc(); }, [] { return 0; }, [] { return int64_t{ 5 }; }, seen, "911");
 	EXPECT_TRUE(rd.leg.empty()) << "an allocation failure is a failed read, not a terminate";
 
-	rd = readOrphanOnce([&] { return pick; }, [] { return 0; }, [] { return int64_t{ 5 }; }, seen);   // positive control
+	rd = readOrphanOnce([&] { return pk; }, [] { return 0; }, [] { return int64_t{ 5 }; }, seen, "911");   // positive control
 	EXPECT_EQ(rd.leg, "517");
 	EXPECT_EQ(rd.candidates, 1);
 	EXPECT_FALSE(rd.stranger);
-	rd = readOrphanOnce([&] { return pick; }, [] { return 0; }, [] { return int64_t{ 5 }; }, [](const std::string&) { return false; });
+	rd = readOrphanOnce([&] { return pk; }, [] { return 0; }, [] { return int64_t{ 5 }; }, [](const std::string&) { return false; }, "911");
 	EXPECT_TRUE(rd.stranger) << "a pick the window never saw";
 }
 
