@@ -2771,6 +2771,7 @@ else tnSelectSlot(tnSelected);
 function tnChipEl(s){
 if(!(s.baseUrl||s.clientId||s.secretSet||s.routeDn||s.enabled))return tnStatusEl("standby","·","Not configured");
 if(!s.implemented)return tnStatusEl("warning","▲","Configured, not yet connected");
+if(s.active&&!s.enabled)return tnStatusEl("warning","▲","Selected, disabled");
 return s.active?tnStatusEl("ok","·","Active"):tnStatusEl("standby","·","Configured");
 }
 function tnBtn(cls,label,aria,enabled,fn){
@@ -2787,7 +2788,7 @@ var lbl="None (loopback default)";
 var miss=[];
 body.textContent="";
 tnSlots.forEach((s,i)=>{
-if(s.active)lbl="Slot "+(i+1)+(s.implemented?"":" (not yet connected)");
+if(s.active)lbl="Slot "+(i+1)+(!s.enabled?" (disabled, loopback runs)":s.implemented?"":" (not yet connected)");
 if(s.acceptanceMissing)miss.push(i+1);
 var acts=tnEl("div",0,"row-btns");
 acts.append(tnBtn("btn","Edit","Edit slot "+(i+1),canWrite(),()=>tnEditSlot(i)));
@@ -2894,14 +2895,14 @@ var i=tnSelected;
 ui.arm($("tn-tapi-clear"),"Clear slot",()=>tnThen(del("/api/telephony-config/"+i,""),tnSlotMsg,"Slot "+(i+1)+" cleared.",()=>tnFetchSlots(false)));
 }
 function tnFetchTrunk(){
-return tnGet("/api/trunk","tn-trunk-msg",tnRenderTrunk);
-}
-function tnKvRow(dl,label,valueEl){
-var row=tnEl("div",0,"kvrow");
 )html23";
 
 static const char PD_HTML_24[] =
-R"html24(row.append(tnEl("dt",label),tnEl("dd",valueEl));
+R"html24(return tnGet("/api/trunk","tn-trunk-msg",tnRenderTrunk);
+}
+function tnKvRow(dl,label,valueEl){
+var row=tnEl("div",0,"kvrow");
+row.append(tnEl("dt",label),tnEl("dd",valueEl));
 dl.append(row);
 }
 function tnRenderTrunk(t){
