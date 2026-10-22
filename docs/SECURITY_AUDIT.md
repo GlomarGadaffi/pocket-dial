@@ -38,7 +38,7 @@ The pocket-dial PBX exposes multiple UDP and TCP listening services and interact
 flowchart TD
     AV["Attack vectors"] --> DNS["Port 53/UDP: DnsServer<br/>(DNS redirection)"]
     AV --> SIP["Port 5060/UDP: UdpServer (SIP)<br/>(signaling parser)"]
-    AV --> HTTP["Port 80/TCP: HttpServer<br/>(CGA admin dashboard)"]
+    AV --> HTTP["Port 80/TCP: HttpServer<br/>(admin dashboard)"]
     DNS --> CP["Captive portal<br/>(host redirection)"]
     SIP --> RH["RequestsHandler<br/>(pre-allocated)"]
     HTTP --> HC["Detached HTTP client threads"]

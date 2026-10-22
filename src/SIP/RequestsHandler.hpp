@@ -478,6 +478,17 @@ public:
 		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		return emergencyCallLive();
 	}
+	// #986: true while the engine holds any dialog in _sessions: a call ringing, answered or held,
+	// a parked call, an anchor or trunk leg, a conference, page, echo, media or voicemail leg, a
+	// 911/933 or a PSAP callback. POST /api/ota/upload refuses on it, because a firmware flash
+	// stalls every task that runs from flash. Reads _sessions itself, not the dashboard snapshot
+	// (getSessionCount() lags tick() by up to a second). Takes _mutex, like hasLiveEmergencyCall(),
+	// so it must NOT be called with _mutex already held.
+	bool hasLiveCall()
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		return !_sessions.empty();
+	}
 	// PbxEnv hook for the DTMF restart doors (#652). Caller holds _mutex.
 	bool emergencyCallLive() override
 	{
@@ -754,8 +765,15 @@ public:
 	// writes everything here and now (the reset has begun; a stage would be refused).
 	std::vector<TelephonyApiConfig::SlotView> getTelephonyConfigSlots();
 	TelephonyApiConfig::SlotView getTelephonyConfigSlot(size_t idx);
-	std::string setTelephonyConfigSlot(size_t idx, const TelephonyApiConfig::Slot& s, bool keepSecret);
-	std::string setTelephonyConfigActiveSlot(size_t idx);
+	// #1073: enabling a slot, and activating one, take the caller's acceptance of the
+	// limitations (TelephonyApiConfig.hpp); without one that the slot already holds,
+	// they answer "Acceptance required: ...". The SBC route does not go through here.
+	std::string setTelephonyConfigSlot(size_t idx, const TelephonyApiConfig::Slot& s, bool keepSecret,
+		const TelephonyApiConfig::Acceptance* accept = nullptr);
+	std::string setTelephonyConfigActiveSlot(size_t idx, const TelephonyApiConfig::Acceptance* accept = nullptr);
+	// Bit i set: slot i is enabled without an acceptance of the current warning text.
+	// Lock-free, for /api/status (polled every second).
+	uint8_t telephonyAcceptanceMissingMask() const { return _tapiConfig.acceptanceMissingMask(); }
 	std::string clearTelephonyConfigSlot(size_t idx);
 	std::string clearAllTelephonyConfig();
 
@@ -773,7 +791,10 @@ public:
 	// #997: the activation is staged for the NVS writer like POST .../activate, so
 	// it is refused (and SBC mode stays off) while a factory reset runs or when the
 	// writer is not running; the active slot has changed in RAM all the same.
-	std::string setSbcMode(bool enabled, size_t route);
+	// #1073: selecting a slot that is not already the active one is an activation, so it
+	// takes the same acceptance as POST .../activate ("Acceptance required: ...", SBC mode
+	// left as it was); re-selecting the slot that is active already changes nothing.
+	std::string setSbcMode(bool enabled, size_t route, const TelephonyApiConfig::Acceptance* accept = nullptr);
 
 	// ── RFC 3262 100rel on a forwarded call (Issue #172, step 3) ──────────────
 	// Off in a shipped image; in memory only (see PbxFeatureConfig::setForward100rel()).
@@ -978,6 +999,14 @@ public:
 		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		anchorDroppedLocked(participantId);
 	}
+	// Test-only (#1095): run an outbound anchor call's Make job on the calling
+	// thread, as a tel_ctl worker does, so a test orders the anchor's events
+	// around it with no worker in between.
+	void runAnchorMakeJobForTest(const std::string& callId, const std::string& dest,
+		const std::string& callerNumber)
+	{
+		runTelCtl(TelCtlJob{ TelCtlJob::Make, dest, callId, callerNumber, {} });
+	}
 
 	// Test-only: drive an inbound anchored call (PSTN -> handset) the way a real
 	// anchor's CallEvent::Incoming does, and return the new session's Call-ID
@@ -1095,6 +1124,17 @@ public:
 	bool forgetDevice(const std::string& macOrExt);
 	// #515: forget every Learned device at once; Secured ones stay. Thread-safe + persisted.
 	size_t forgetLearnedDevices();
+	// #483: replace the whole device table with a restored config export's rows, all or
+	// nothing (Registrar::replaceDevices; only the Owner-gated import calls this), in ONE
+	// _mutex hold with one persist and one snapshot rebuild. Each extension must pass what
+	// onRegister() demands before it adopts one: the AOR charset and length, the engine's
+	// service names, the reserved / emergency / PSTN-shaped identities. `hasSecret` says
+	// whether an extension has a stored digest secret AS THE CALLER WILL LEAVE THE STORE,
+	// so a Secured row is judged with the secrets that come with it. `faults` may already
+	// hold rows the caller could not read; with any fault left on return (Refused) the table
+	// is untouched, and so it is for NotStaged. Thread-safe + persisted.
+	Registrar::ReplaceResult replaceBindings(const std::vector<Registrar::Binding>& rows,
+		FunctionRef<bool(const std::string&)> hasSecret, std::vector<Registrar::BindingFault>& faults);
 
 private:
 	void initHandlers();
@@ -1604,6 +1644,10 @@ private:
 	// one-way RTP tone stream to the caller's RTP address. ONE concurrent stream: a
 	// 2nd dial while busy is rejected 486 Busy Here. Caller holds _mutex.
 	void onMediaInvite(std::shared_ptr<SipMessage> data, const std::shared_ptr<SipClient>& caller);
+	// #1003: BYE the phone and end the 440 tone call once it has run k440MaxCallDuration
+	// (600 s, desmo's ruling), so an orphaned call frees the one RtpSender slot. Caller
+	// holds _mutex.
+	void sweepToneCall(std::chrono::steady_clock::time_point now);
 
 	// ── Local N-way conference: virtual extension 888 (server-mixed RTP) ─────────
 	// onInvite() routes a dial of 888 here (Issue #75). The server answers 200 OK
@@ -1787,6 +1831,17 @@ public:
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	// Test-only: the sink wipeAllVoicemail() uses on host. Not owned.
 	void setVoicemailSinkForTest(vmarchive::Sink* sink) { _vmSinkForTest = sink; }
+#if POCKETDIAL_MWI
+	// Test-only (#756): the boot seed's arming step, run after a test has enabled
+	// voicemail on some extensions. The constructor runs the same step on the
+	// device, but only there: the persisted voicemail list it reads is empty on
+	// host at construction time. `cardMounted` is what pd_sd_mounted() answers.
+	void armMwiSeedForTest(bool cardMounted = true)
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		armMwiSeedLocked(cardMounted);
+	}
+#endif
 #endif
 	// Runs every slot's pending retrieval SD job (list/read/delete), a
 	// no-op for any slot not Pending. The ESP+PD_ETH_HAS_SD writer task
@@ -1797,12 +1852,16 @@ public:
 	// writer task needed -- same public-for-the-lambda reasoning as
 	// drainVoicemailFlush() above (a plain xTaskCreatePinnedToCore callback
 	// is not a member function and cannot reach a private method).
+	// Also runs the boot-time MWI count job (#756), if one is waiting.
 	void runVoicemailSdJobs(vmarchive::Source& source)
 	{
 		for (size_t i = 0; i < POCKETDIAL_MAX_VOICEMAIL_LEGS; ++i)
 		{
 			runVoicemailSdJob(static_cast<int>(i), source);
 		}
+#if POCKETDIAL_MWI
+		runMwiSeedJob(source);   // #756: the boot-time MWI count, if one is waiting
+#endif
 	}
 	// Test-only seam, same reasoning as RtpReceiver::dispatchDtmf() being
 	// public "so host tests can reach it": RtpReceiver::start() is a no-op
@@ -2139,7 +2198,9 @@ private:
 
 	// True iff every POCKETDIAL_MAX_ANCHOR_CALLS bridge slot is active — the
 	// capacity gate for both a fresh 555 dial (onAnchorInvite) and a fresh
-	// inbound anchor call (routeInboundAnchorCall). Caller holds _mutex.
+	// inbound anchor call (routeInboundAnchorCall). A PSAP callback is the one
+	// inbound that may still pre-empt a call to get past it (#967). Caller holds
+	// _mutex.
 	bool allBridgesBusy() const;
 
 	// How many anchored calls may run at once: min(what the plugged-in provider
@@ -2155,6 +2216,22 @@ private:
 	// #624: when the anchor is full, end one non-emergency anchored call so a
 	// 911/933 can take its room. Caller holds _mutex.
 	void preemptAnchorCallForEmergency();
+
+	// #967: an inbound PSAP callback that routeInboundAnchorCall() would refuse
+	// (every bridge busy, or another anchor inbound ringing or up) ends ONE
+	// non-emergency anchored call that clears every reason that applies, or ends
+	// none. True iff nothing is in the way now; false means drop the callback as
+	// before (only emergency calls in the way, or no single call makes room).
+	// Runs on the anchor's event task, so its sends go to _asyncOutbox. Caller
+	// holds _mutex.
+	bool preemptAnchorCallForPsapCallback();
+
+	// The teardown both pre-emptions share: tell the victim's phone (503, CANCEL
+	// or BYE) on `outbox`, then endCall() with `reason`. `outbox` is _outbox on
+	// the SIP thread and _asyncOutbox off it. `victim` refers into _sessions and
+	// is dead after the call. Caller holds _mutex.
+	void endAnchorCallForPreempt(const std::shared_ptr<Session>& victim,
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outbox, std::string_view reason);
 
 	// True iff the currently-selected anchor provider is Loopback — the boundary
 	// between the two calling conventions this port has to support:
@@ -2339,6 +2416,11 @@ private:
 	void onInboundAnchorOk(const std::shared_ptr<SipMessage>& ok, const std::shared_ptr<Session>& session);
 
 	void unregisterClient(std::string_view number);
+	// #1089: end every session `extension` is on through endCall(); caller holds _mutex.
+	void endClientCalls(const std::string& extension, const std::string& reason);
+	// #1089: is `ext` a party to `s`, including the callee of a plain call still ringing?
+	static std::string_view ringingCalleeOf(const Session& s);
+	static bool sessionOnExtension(const Session& s, std::string_view ext);
 
 	// Registration-lease handling (RFC 3261 §10.2.1)
 	int parseRequestedExpires(const std::shared_ptr<SipMessage>& data) const;
@@ -2688,6 +2770,38 @@ private:
 	};
 	VmSdJob _vmSdJob[POCKETDIAL_MAX_VOICEMAIL_LEGS];
 	std::atomic<VmSdJobState> _vmSdJobState[POCKETDIAL_MAX_VOICEMAIL_LEGS]{};
+
+#if POCKETDIAL_MWI
+	// ── Boot-time MWI seed (#756) ───────────────────────────────────────────
+	// The MWI counts are RAM-only, so after a reboot every message-waiting lamp
+	// would read "no" until the owner dialed 796. At boot each voicemail-enabled
+	// mailbox is therefore asked how many messages the card holds, and
+	// BlfSubscriptions counts them as NEW (owner ruling 2026-10-19: nothing on the
+	// card records what was heard, and none is added).
+	//
+	// ONE job slot, handed over exactly like a VmSdJob but deliberately NOT one: a
+	// VmSdJob belongs to a call's leg and carries its Call-ID. The SIP thread picks
+	// the next mailbox still waiting (BlfSubscriptions::mwiSeedNext), fills
+	// _mwiSeedExt and release-stores Pending; the vm_archive task runs a COUNT-ONLY
+	// listMessages() (no MessageInfo buffer, no message bodies), writes
+	// _mwiSeedCount and release-stores Done; the next sweepVoicemailLegs() applies
+	// the count under _mutex and issues the following mailbox. About one mailbox per
+	// 1 Hz tick, boot only. No task, no queue, no flash writer, and no heap beyond the
+	// constructor's one-shot snapshot vector and one log line per seeded mailbox:
+	// 40 bytes of members here (32-bit target) plus 2 per MWI box (64 in all).
+	std::atomic<VmSdJobState> _mwiSeedState{VmSdJobState::Idle};
+	char   _mwiSeedExt[33] = {};   // BlfSubscriptions::MwiBox::ext's size
+	size_t _mwiSeedCount = 0;
+	// Ask for the count of every voicemail-enabled mailbox -- or, with no card
+	// mounted, say so once and ask for nothing. Constructor (single-threaded) or
+	// caller holds _mutex.
+	void armMwiSeedLocked(bool cardMounted);
+	// SIP thread, from sweepVoicemailLegs(), _mutex held: apply a finished count,
+	// then hand the next waiting mailbox to the vm_archive task.
+	void pumpMwiSeed();
+	// vm_archive task: run the Pending count, if any. SD I/O, never under _mutex.
+	void runMwiSeedJob(vmarchive::Source& source);
+#endif
 
 	// This slot's fetched mailbox listing, valid once a List job for it has
 	// gone Done. Fixed-size (POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX per

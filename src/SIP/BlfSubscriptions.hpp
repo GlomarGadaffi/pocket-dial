@@ -42,18 +42,32 @@ public:
 	// next refresh() NOTIFYs the slots whose token changed.
 	//   deposit:  new+1.   listened: new=0, old=<messages listed>.   deleted: old-1.
 	//
-	// ponytail: counts are RAM-only. After a reboot every lamp reads "no" until
-	// the owner dials 796 and the listing resyncs old=<listed>. Upgrade path: a
-	// count-only listMessages() job per voicemail extension on the vm_archive
-	// task at boot (#756).
+	// The counts are RAM-only, so the engine rebuilds them at boot (#756) in three
+	// steps, one mailbox at a time:
+	//   request: this voicemail mailbox wants its stored-message count.
+	//   next:    the first mailbox still waiting ("" = none). The SIP thread hands it
+	//            to the vm_archive task, which counts the messages on the SD card.
+	//   apply:   counts those messages as NEW, so the lamp relights after a reboot
+	//            until the owner dials 796 (owner ruling 2026-10-19: nothing on the
+	//            card records what was heard, and none is added). An already-heard
+	//            mailbox therefore lights too: a known false positive.
+	// apply never lowers a count, and does nothing once a listing (796) has answered
+	// the mailbox: the listing is the truth. An empty answer leaves an all-zero box,
+	// which stays reclaimable like any other.
 #if POCKETDIAL_MWI
 	void mwiDeposit(std::string_view ext);
 	void mwiListened(std::string_view ext, size_t listed);
 	void mwiDeleted(std::string_view ext);
+	void mwiSeedRequest(std::string_view ext);
+	std::string_view mwiSeedNext() const;
+	void mwiSeedApply(std::string_view ext, size_t stored);
 #else
 	void mwiDeposit(std::string_view) {}
 	void mwiListened(std::string_view, size_t) {}
 	void mwiDeleted(std::string_view) {}
+	void mwiSeedRequest(std::string_view) {}
+	std::string_view mwiSeedNext() const { return {}; }
+	void mwiSeedApply(std::string_view, size_t) {}
 #endif
 
 private:
@@ -106,6 +120,7 @@ private:
 		char     ext[33] = {};   // "" = free
 		uint16_t newMsgs = 0;
 		uint16_t oldMsgs = 0;
+		bool     seedPending = false;   // boot count requested, not applied yet (#756)
 	};
 	// Find `ext`'s box; with `create`, claim a free (or all-zero) one. nullptr if full.
 	MwiBox* mwiBox(std::string_view ext, bool create);

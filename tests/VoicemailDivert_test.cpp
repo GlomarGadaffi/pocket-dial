@@ -1191,3 +1191,354 @@ TEST(VoicemailDivert, ASecondSlotWithAPendingFlushCannotBeReusedByAThirdDeposit)
 	EXPECT_TRUE(handler.getSession("Call-ID: vm-flush-c2").has_value())
 		<< "both staging buffers are drained now -- a deposit must succeed";
 }
+
+// ── Issue #1023 ─────────────────────────────────────────────────────────────
+// A 480 the PBX answers a caller with itself is a UAS final response, so its To
+// carries a tag (RFC 3261 s8.2.6.2). It was cloned from the caller's INVITE with
+// the status line swapped, so it went out with the INVITE's bare To. When a
+// provisional already gave the caller a tag (the callee's relayed 180, or the
+// PBX's own hunt 180) the 480 reuses it, so the final stays in that early dialog.
+
+namespace
+{
+	// The tag parameter of a raw message's To header, or empty.
+	std::string toTagOf(const std::string& raw)
+	{
+		const std::string to = extractHeaderLine(raw, "To:");
+		const size_t at = to.find(";tag=");
+		if (at == std::string::npos) return {};
+		const size_t start = at + 5;
+		const size_t end = to.find_first_of(";> \r", start);
+		return to.substr(start, end == std::string::npos ? std::string::npos : end - start);
+	}
+}
+
+// DND: no session exists, so the tag is a fresh one.
+TEST(UnavailableToTag, DndRefusalCarriesAToTag)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in callerAddr = addrFor("192.168.47.20");  // 402
+	handler.handle(makeRegister("401", "192.168.47.10", "reg-401-t"));
+	handler.handle(makeRegister("402", "192.168.47.20", "reg-402-t"));
+	handler.setDnd("401", true);
+
+	handler.handle(makeInvite("402", "401", "192.168.47.20", "tag-dnd-1", "z9hG4bKtagdnd1"));
+
+	const std::string refusal = findSentTo(sent, callerAddr, "SIP/2.0 480");
+	ASSERT_FALSE(refusal.empty()) << "a DND extension answers the caller 480";
+	EXPECT_FALSE(toTagOf(refusal).empty())
+		<< "a UAS final response carries a To tag (RFC 3261 s8.2.6.2): " << refusal;
+}
+
+// The plain no-answer sweep (#1022), the callee never sent a 180: a fresh tag.
+TEST(UnavailableToTag, PlainNoAnswerCarriesAToTag)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in callerAddr = addrFor("192.168.47.21");  // 412
+	handler.handle(makeRegister("411", "192.168.47.11", "reg-411-t"));
+	handler.handle(makeRegister("412", "192.168.47.21", "reg-412-t"));
+
+	const std::string callId = "tag-plain-1";
+	handler.handle(makeInvite("412", "411", "192.168.47.21", callId, "z9hG4bKtagplain1"));
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+
+	const std::string unavailable = findSentTo(sent, callerAddr, "SIP/2.0 480");
+	ASSERT_FALSE(unavailable.empty()) << "the no-answer sweep answers the caller 480";
+	EXPECT_FALSE(toTagOf(unavailable).empty())
+		<< "a UAS final response carries a To tag (RFC 3261 s8.2.6.2): " << unavailable;
+}
+
+// The callee rang with a tag of its own, which the PBX relayed to the caller. The 480 that
+// follows stays in that early dialog: same tag, not a second one.
+TEST(UnavailableToTag, PlainNoAnswerReusesTheTagOfTheCalleesRinging)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in calleeAddr = addrFor("192.168.47.12");  // 421
+	const sockaddr_in callerAddr = addrFor("192.168.47.22");  // 422
+	handler.handle(makeRegister("421", "192.168.47.12", "reg-421-t"));
+	handler.handle(makeRegister("422", "192.168.47.22", "reg-422-t"));
+
+	const std::string callId = "tag-plain-180";
+	handler.handle(makeInvite("422", "421", "192.168.47.22", callId, "z9hG4bKtagplain180"));
+	const std::string inviteToCallee = findSentTo(sent, calleeAddr, "Call-ID: " + callId);
+	ASSERT_FALSE(inviteToCallee.empty());
+
+	handler.handle(responseTo(inviteToCallee, "180 Ringing", "ring421", "192.168.47.12"));
+	ASSERT_EQ(toTagOf(findSentTo(sent, callerAddr, "SIP/2.0 180")), "ring421")
+		<< "precondition: the callee's 180 reaches the caller with the callee's own tag";
+
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+
+	const std::string unavailable = findSentTo(sent, callerAddr, "SIP/2.0 480");
+	ASSERT_FALSE(unavailable.empty()) << "the no-answer sweep answers the caller 480";
+	EXPECT_EQ(toTagOf(unavailable), "ring421")
+		<< "the 480 must carry the tag the caller's 180 carried: " << unavailable;
+}
+
+// A CFU-forwarded leg (#1024): the forward target's 180 is the one the caller saw.
+TEST(UnavailableToTag, ForwardedLegNoAnswerReusesTheTagOfTheTargetsRinging)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in targetAddr = addrFor("192.168.47.13");  // 432, the forward target
+	const sockaddr_in callerAddr = addrFor("192.168.47.23");  // 433
+	handler.handle(makeRegister("431", "192.168.47.14", "reg-431-t"));
+	handler.handle(makeRegister("432", "192.168.47.13", "reg-432-t"));
+	handler.handle(makeRegister("433", "192.168.47.23", "reg-433-t"));
+	handler.setForward("431", "always", "432");
+
+	const std::string callId = "tag-cfu-180";
+	handler.handle(makeInvite("433", "431", "192.168.47.23", callId, "z9hG4bKtagcfu180"));
+	const std::string inviteToTarget = findSentTo(sent, targetAddr, "Call-ID: " + callId);
+	ASSERT_FALSE(inviteToTarget.empty()) << "the call must be forwarded to 432";
+
+	handler.handle(responseTo(inviteToTarget, "180 Ringing", "ring432", "192.168.47.13"));
+	ASSERT_EQ(toTagOf(findSentTo(sent, callerAddr, "SIP/2.0 180")), "ring432")
+		<< "precondition: the target's 180 reaches the caller with the target's own tag";
+
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+
+	const std::string unavailable = findSentTo(sent, callerAddr, "SIP/2.0 480");
+	ASSERT_FALSE(unavailable.empty()) << "the forwarded leg's sweep answers the caller 480";
+	EXPECT_EQ(toTagOf(unavailable), "ring432")
+		<< "the 480 must carry the tag the caller's 180 carried: " << unavailable;
+}
+
+// CFNA to a target that is not registered (#716): the callee rang, then nobody answered and
+// there is nowhere to forward to. The 480 follows the callee's 180 tag.
+TEST(UnavailableToTag, CfnaFailureReusesTheTagOfTheCalleesRinging)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in calleeAddr = addrFor("192.168.47.15");  // 441
+	const sockaddr_in callerAddr = addrFor("192.168.47.25");  // 442
+	handler.handle(makeRegister("441", "192.168.47.15", "reg-441-t"));
+	handler.handle(makeRegister("442", "192.168.47.25", "reg-442-t"));
+	handler.setForward("441", "noanswer", "449");   // 449 never registers
+
+	const std::string callId = "tag-cfna-fail";
+	handler.handle(makeInvite("442", "441", "192.168.47.25", callId, "z9hG4bKtagcfnafail"));
+	const std::string inviteToCallee = findSentTo(sent, calleeAddr, "Call-ID: " + callId);
+	ASSERT_FALSE(inviteToCallee.empty());
+
+	handler.handle(responseTo(inviteToCallee, "180 Ringing", "ring441", "192.168.47.15"));
+	ASSERT_EQ(toTagOf(findSentTo(sent, callerAddr, "SIP/2.0 180")), "ring441")
+		<< "precondition: the callee's 180 reaches the caller with the callee's own tag";
+
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+
+	const std::string unavailable = findSentTo(sent, callerAddr, "SIP/2.0 480");
+	ASSERT_FALSE(unavailable.empty()) << "the caller must get a final response when the CFNA target is unregistered";
+	EXPECT_EQ(toTagOf(unavailable), "ring441")
+		<< "the 480 must carry the tag the caller's 180 carried: " << unavailable;
+}
+
+// A spent hunt group: the 180 the PBX itself sent the caller is the tag to keep.
+TEST(UnavailableToTag, ExhaustedHuntReusesTheTagOfItsOwnRinging)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in callerAddr = addrFor("192.168.47.26");  // 452
+	handler.handle(makeRegister("451", "192.168.47.16", "reg-451-t"));
+	handler.handle(makeRegister("452", "192.168.47.26", "reg-452-t"));
+	handler.setRingGroup("620", "451", "hunt");
+
+	const std::string callId = "tag-hunt-1";
+	handler.handle(makeInvite("452", "620", "192.168.47.26", callId, "z9hG4bKtaghunt1"));
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value()) << "the hunt must start";
+	const std::string ringTag = toTagOf(findSentTo(sent, callerAddr, "SIP/2.0 180"));
+	ASSERT_FALSE(ringTag.empty()) << "precondition: the PBX's own 180 carries a tag";
+
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+
+	const std::string unavailable = findSentTo(sent, callerAddr, "SIP/2.0 480");
+	ASSERT_FALSE(unavailable.empty()) << "a spent hunt answers the caller 480";
+	EXPECT_EQ(toTagOf(unavailable), ringTag)
+		<< "the 480 must carry the tag the caller's 180 carried: " << unavailable;
+}
+
+// A ring group with nobody registered: no session, no 180, a fresh tag.
+TEST(UnavailableToTag, RingGroupWithNoMemberOnlineCarriesAToTag)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in callerAddr = addrFor("192.168.47.27");  // 461
+	handler.handle(makeRegister("461", "192.168.47.27", "reg-461-t"));
+	handler.setRingGroup("610", "468,469", "ringall");   // never-registered members
+
+	handler.handle(makeInvite("461", "610", "192.168.47.27", "tag-group-1", "z9hG4bKtaggroup1"));
+
+	const std::string unavailable = findSentTo(sent, callerAddr, "SIP/2.0 480");
+	ASSERT_FALSE(unavailable.empty()) << "a group with no member online answers the caller 480";
+	EXPECT_FALSE(toTagOf(unavailable).empty())
+		<< "a UAS final response carries a To tag (RFC 3261 s8.2.6.2): " << unavailable;
+}
+
+// A page zone whose only member is the caller: nobody to page, no session, a fresh tag.
+TEST(UnavailableToTag, PageZoneWithNobodyToPageCarriesAToTag)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in callerAddr = addrFor("192.168.47.28");  // 471
+	handler.handle(makeRegister("471", "192.168.47.28", "reg-471-t"));
+	handler.setPageZone("980", "471");
+
+	handler.handle(makeInvite("471", "980", "192.168.47.28", "tag-zone-1", "z9hG4bKtagzone1"));
+
+	const std::string unavailable = findSentTo(sent, callerAddr, "SIP/2.0 480");
+	ASSERT_FALSE(unavailable.empty()) << "a zone with nobody to page answers the caller 480";
+	EXPECT_FALSE(toTagOf(unavailable).empty())
+		<< "a UAS final response carries a To tag (RFC 3261 s8.2.6.2): " << unavailable;
+}
+
+// The callee chooses its tag, and the PBX keeps it only when it fits a std::string's inline
+// buffer (15 characters), so storing it never allocates on the SIP receive path. A longer one
+// is not kept: the 480 carries a tag the PBX mints, not the callee's.
+TEST(UnavailableToTag, ACalleeTagTooLongToStoreIsNotReusedByThe480)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in calleeAddr = addrFor("192.168.47.31");  // 481
+	const sockaddr_in callerAddr = addrFor("192.168.47.32");  // 482
+	handler.handle(makeRegister("481", "192.168.47.31", "reg-481-t"));
+	handler.handle(makeRegister("482", "192.168.47.32", "reg-482-t"));
+
+	const std::string longTag(40, 'L');
+	const std::string callId = "tag-plain-long";
+	handler.handle(makeInvite("482", "481", "192.168.47.32", callId, "z9hG4bKtagplainlong"));
+	const std::string inviteToCallee = findSentTo(sent, calleeAddr, "Call-ID: " + callId);
+	ASSERT_FALSE(inviteToCallee.empty());
+
+	handler.handle(responseTo(inviteToCallee, "180 Ringing", longTag, "192.168.47.31"));
+	ASSERT_EQ(toTagOf(findSentTo(sent, callerAddr, "SIP/2.0 180")), longTag)
+		<< "precondition: the callee's 180 reaches the caller with its 40-character tag";
+
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+
+	const std::string unavailable = findSentTo(sent, callerAddr, "SIP/2.0 480");
+	ASSERT_FALSE(unavailable.empty()) << "the no-answer sweep answers the caller 480";
+	const std::string tag = toTagOf(unavailable);
+	EXPECT_FALSE(tag.empty()) << "the 480 still carries a To tag: " << unavailable;
+	EXPECT_LE(tag.size(), 15u) << "a tag that long is not the one the PBX stored: " << unavailable;
+	EXPECT_NE(tag, longTag) << "the callee's over-long tag must not be reused: " << unavailable;
+}
+
+// Positive control: a tag of 12 characters fits, so it is kept and reused exactly.
+TEST(UnavailableToTag, AShortCalleeTagIsStillReusedByThe480)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.47.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+
+	const sockaddr_in calleeAddr = addrFor("192.168.47.33");  // 491
+	const sockaddr_in callerAddr = addrFor("192.168.47.34");  // 492
+	handler.handle(makeRegister("491", "192.168.47.33", "reg-491-t"));
+	handler.handle(makeRegister("492", "192.168.47.34", "reg-492-t"));
+
+	const std::string shortTag(12, 'S');
+	const std::string callId = "tag-plain-short";
+	handler.handle(makeInvite("492", "491", "192.168.47.34", callId, "z9hG4bKtagplainshort"));
+	const std::string inviteToCallee = findSentTo(sent, calleeAddr, "Call-ID: " + callId);
+	ASSERT_FALSE(inviteToCallee.empty());
+
+	handler.handle(responseTo(inviteToCallee, "180 Ringing", shortTag, "192.168.47.33"));
+	ASSERT_EQ(toTagOf(findSentTo(sent, callerAddr, "SIP/2.0 180")), shortTag)
+		<< "precondition: the callee's 180 reaches the caller with its 12-character tag";
+
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+
+	const std::string unavailable = findSentTo(sent, callerAddr, "SIP/2.0 480");
+	ASSERT_FALSE(unavailable.empty()) << "the no-answer sweep answers the caller 480";
+	EXPECT_EQ(toTagOf(unavailable), shortTag)
+		<< "the 480 must carry the tag the caller's 180 carried: " << unavailable;
+}
+
+// #1089: the voicemail deposit's dest is a stand-in "700" carrying the CALLER's own
+// address, so a lease lapsing on the depositor must not BYE that address with the tags
+// reversed. The session still ends.
+TEST(VoicemailDivert, AnExpiredLeaseOnTheDepositorEndsTheCallWithoutAByeToItself)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.40.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.40.22");
+	handler.handle(makeRegister("305", "192.168.40.12", "reg-305-d"));
+	handler.handle(makeRegister("306", "192.168.40.22", "reg-306-d"));
+	handler.setVoicemail("305", true);
+	const std::string callId = "vm-1089-lease";
+	handler.handle(makeInvite("306", "305", "192.168.40.22", callId, "z9hG4bKvm1089"));
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+	ASSERT_FALSE(findSentTo(sent, callerAddr, "SIP/2.0 200 OK").empty()) << "precondition: deposit answered";
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	sent.clear();
+
+	handler.expireLeaseAndSweepForTest("306");
+
+	EXPECT_FALSE(handler.getSession("Call-ID: " + callId).has_value());
+	EXPECT_TRUE(findSentTo(sent, callerAddr, "BYE sip:").empty()) << "the departing phone was BYEd";
+}

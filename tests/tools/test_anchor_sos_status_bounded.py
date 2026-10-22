@@ -92,7 +92,7 @@ class AnchorSosStatusBoundedTest(unittest.TestCase):
         self.assertIn("catch (const std::bad_alloc&)", code_only(self.sos_hpp), "the hand-back assign has its own catch")
 
     def test_a_911_whose_list_reads_all_fail_is_refused_like_any_call(self):
-        # The operator kept the 503 on #948 (adopting an unkeyed leg on the 911 lane is #977).
+        # The operator kept the 503 on #948, and on #977 (option 2): no unkeyed leg is adopted on the 911 lane.
         make = code_only(body_of(self.src, "bool TelephonyAnchorClient::makeCall("))
         self.assertIn("telephony::readOwnLegWindow(", make)
         self.assertNotIn("unreadMakecallStep(", make, "the window loop lives in the host-tested helper")

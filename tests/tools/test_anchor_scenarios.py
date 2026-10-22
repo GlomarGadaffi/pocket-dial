@@ -149,6 +149,8 @@ class AgentCase(unittest.TestCase):
         a = sip_agent.Agent("6101", "127.0.0.1", peer.port, local_ip="127.0.0.1", timeout=2.0,
                             invite_timeout=4.0, **kw)
         self.addCleanup(a.close)
+        a.allow_outside(FAR, FAR2)      # the dial guard (sip_agent.target_allowed): the fictional far ends,
+        a.allow_targets("6102")         # and the peer's extension, are dialed on purpose against a fake
         return a
 
     def peer(self, on_msg):
@@ -587,10 +589,11 @@ class RefusalTest(unittest.TestCase):
         # x379_cancel_before_leg joined the registry with this change (the CANCEL-before-the-leg race)
         # h947_http_load joined the registry with #947 (the HTTP-under-load measurement; tests/tools/test_http_load.py)
         # x370_pressure_rebuild joined the registry with #370 (the GET handle's rebuild under a DRAM ballast)
+        # x370_get_sock_shutdown joined it with #370/#350 (the same rebuild, forced by the get_sock_shutdown fault)
         self.assertEqual(sorted(an.SCENARIOS), ["h947_http_load", "x279_degraded_bye", "x349_unread_makecall",
-                                                "x370_pressure_rebuild", "x379_cancel_before_leg",
-                                                "x379_never_opened", "x4_cancel_ringing", "x518_403_clean_giveup",
-                                                "x888_ws_upsert", "x952_token_age_held"])
+                                                "x370_get_sock_shutdown", "x370_pressure_rebuild",
+                                                "x379_cancel_before_leg", "x379_never_opened", "x4_cancel_ringing",
+                                                "x518_403_clean_giveup", "x888_ws_upsert", "x952_token_age_held"])
 
     def test_dry_run_prints_the_plan_and_the_ring_required_banner(self):
         rc, out = run_main(cli("--dry-run"), base_env(), http=NoNetwork())
@@ -660,6 +663,10 @@ class WitnessSampleTest(unittest.TestCase):
                                      "lifetime_used=3600 (seconds; -1: not read) (#951)",
         # #952/#945: main's token witnesses, as TelephonyAnchorClient.cpp and BenchProbe.cpp format them
         "bench_token_age": "W (51000) BenchProbe: BENCHFAULT token_age fired",
+        # #370/#350: the get_sock_shutdown fault's firing (BenchProbe.cpp fire()) and its shutdown (runRxLoop)
+        "bench_get_sock_shutdown": "W (51010) BenchProbe: BENCHFAULT get_sock_shutdown fired",
+        "get_sock_shutdown_applied": "W (51011) TelephonyAnchor: BENCHFAULT get_sock_shutdown applied: "
+                                     "shutdown(SHUT_RDWR) on the published GET socket, rc=0",
         "token_refresh_near_expiry": "I (51100) TelephonyAnchor: Access token near expiry — refreshing",
         "token_refresh_deferred_live": "W (51200) TelephonyAnchor: Token near expiry but media streams active "
                                        "— deferring refresh",
@@ -1895,7 +1902,7 @@ class X379RefusalTest(unittest.TestCase):
 
 # ---------------------------------------------------------------- the probe scenarios (#384 H1)
 PROBE_SCENARIOS = ("x349_unread_makecall", "x379_never_opened", "x518_403_clean_giveup", "x279_degraded_bye",
-                   "x888_ws_upsert", "x370_pressure_rebuild")
+                   "x888_ws_upsert", "x370_pressure_rebuild", "x370_get_sock_shutdown")
 PROBE_VERSION = "v1.5.0-fake-probe"
 EM_DASH = "—"
 
@@ -1906,7 +1913,8 @@ class FakeProbeBoard(FakeBoard):
     from what it really sent, a media port that counts RTP, and one anchor call flow per
     mode, each logging the esp_log lines the real board would. Knobs change one thing."""
 
-    NAMES = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age", "ws_upsert")
+    NAMES = ("makecall_read_fail", "get_status", "get_max_attempts", "post_stream_fail", "token_age", "ws_upsert",
+             "get_sock_shutdown")
 
     def __init__(self, mode):
         super().__init__()
@@ -2112,7 +2120,7 @@ class FakeProbeBoard(FakeBoard):
         return "https://%s/callcontrol/%s/participants/%s/stream" % (TENANT, self.route_dn, leg)
 
     def _on_invite(self, req, addr):
-        if self.mode in ("x888", "x370"):                # the plain ringing anchor call: CANCEL -> 487, one drop
+        if self.mode in ("x888", "x370", "x370s"):       # the plain ringing anchor call: CANCEL -> 487, one drop
             return FakeBoard._on_invite(self, req, addr)
         c = self.calls.get(req.call_id())
         if tag_of(req.get("to")):
@@ -2138,6 +2146,8 @@ class FakeProbeBoard(FakeBoard):
         super()._leg_up(c)
         if self.mode == "x370":
             threading.Thread(target=self._pressure_loop, args=(c,), daemon=True).start()
+        elif self.mode == "x370s":
+            threading.Thread(target=self._sock_loop, args=(c,), daemon=True).start()
 
     def _pressure_loop(self, c):
         time.sleep(0.05)
@@ -2167,6 +2177,39 @@ class FakeProbeBoard(FakeBoard):
             if k.get("x370_deadman_early"):                     # the dead-man fired before the harness released
                 self.ballast["held"] = False
                 self.ballast["released"]["deadman"] += 1
+
+    # #370/#350: the rx task's GET loop with get_sock_shutdown armed. The fault fires at the first open that
+    # published a socket and shuts it down, so the header read finds no response and the loop rebuilds its handle:
+    # an `applied` line, a transport failure at attempt 1, then the rebuilt handle's attempts. The knobs break one
+    # thing each (sock_never, sock_rc_fail, sock_no_applied, sock_no_failure, sock_no_followup, sock_rebuild_fail).
+    def _sock_loop(self, c):
+        time.sleep(0.05)
+        k = self.knobs
+        with self.lock:
+            status, budget = self.fire("get_status"), self.fire("get_max_attempts")
+            n, code = budget or 240, status or 404
+            shut = None if k.get("sock_never") else self.fire("get_sock_shutdown")
+            if shut is None:                               # nothing was shut down: the real answers, kept connection
+                for b in (1, 2, 3):
+                    self.log("TelephonyAnchor: GET stream not ready (HTTP %d), attempt %d/%d" % (code, b, n))
+            else:
+                if not k.get("sock_no_applied"):
+                    self.log("TelephonyAnchor: BENCHFAULT get_sock_shutdown applied: shutdown(SHUT_RDWR) on the "
+                             "published GET socket, rc=%d" % (-1 if k.get("sock_rc_fail") else 0))
+                if not k.get("sock_no_failure"):
+                    self.log("TelephonyAnchor: GET stream transport failure (no HTTP response, status=-1), "
+                             "attempt 1/%d" % n)
+                    if k.get("sock_rebuild_fail"):
+                        self.log("TelephonyAnchor: GET stream: could not rebuild client after transport failure %s "
+                                 "giving up" % EM_DASH)
+                    elif not k.get("sock_no_followup"):
+                        for b in (2, 3):
+                            self.log("TelephonyAnchor: GET stream not ready (HTTP %d), attempt %d/%d" % (code, b, n))
+                else:
+                    for b in (1, 2, 3):
+                        self.log("TelephonyAnchor: GET stream not ready (HTTP %d), attempt %d/%d" % (code, b, n))
+            if k.get("x370_panic"):
+                self.log("E (1) boot: Guru Meditation Error: Core 1 panic'ed (LoadProhibited)")
 
     def answer(self, c):
         self._reply(c["req"], c["addr"], 180, "Ringing", to_tag=c["tag"])
@@ -3129,6 +3172,133 @@ class X370Test(ProbeRunCase):
         during = [(m, p, f) for m, p, f, held in calls if held]
         self.assertEqual(during, [("POST", an.BENCH_PATH, {"ballast": "release"})])
         self.assertTrue(any(p == "/api/status" and not held for _, p, _, held in calls), "read after the release")
+
+
+class X370SockShutdownTest(ProbeRunCase):
+    """x370_get_sock_shutdown against a fake board whose GET loop logs what the probe image logs when the fault
+    shuts the rx task's socket down: the `applied` line, a transport failure, then the rebuilt handle's attempts.
+    No ballast by default, so the board's HTTP answers throughout. The verdict is the board's own lines (#370)."""
+    MODE = "x370s"
+    SCENARIO = "x370_get_sock_shutdown"
+    FAST = {"call_fire_wait_s": 3.0, "cancel_after_fire_s": 0.3, "recover_wait_s": 3.0, "settle_s": 0.4,
+            "drop_wait_s": 1.0}
+
+    def posts(self):
+        return self.board.bench_posts
+
+    def test_pass_a_forced_rebuild_whose_fresh_handshake_was_answered_under_one_ring(self):
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.manifest["verdict"], "PASS")
+        self.assertEqual(self.manifest["summary"]["outcome"], "rebuilt, the fresh handshake was answered")
+        self.assertEqual(self.manifest["summary"]["witness"],
+                         {"attempts": 1, "rebuilt": 1, "answered": 1, "failed": 0, "giveups": 0,
+                          "applied": 1, "rcs": [0]})
+        self.assertEqual(self.manifest["probe"]["fired"],
+                         {"get_sock_shutdown": 1, "get_status": 1, "get_max_attempts": 1})
+        self.assertEqual(self.manifest["log_counters"]["get_sock_shutdown_applied"], 1)
+        self.assertNotIn("ballast", self.manifest["probe"], "no ballast was held")
+        self.assertEqual(len(self.calls), 1)
+        c = self.calls[0]
+        self.assertEqual((c["final"], c["cancel_status"], self.board.invite_users), (487, 200, [FAR]))
+        self.assertFalse(c["cancel_when_expired"], "the CANCEL followed the failure line, not the wait bound")
+        self.assertEqual(len(self.board.cancels), 1, "one ring")
+        self.assertEqual(c["alive_problems"], [])
+        self.assertFalse(os.path.exists(os.path.join(self.res, "status.jsonl")))
+        self.assert_clean_probe(out)
+
+    def test_the_three_arms_go_first_in_order_and_no_ballast_is_held(self):
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        p = self.posts()
+        self.assertEqual(p[:3], [{"fault": "get_sock_shutdown"}, {"fault": "get_status", "value": "404"},
+                                 {"fault": "get_max_attempts", "value": "8"}])
+        self.assertEqual([x for x in p if "ballast" in x and x["ballast"] != "release"], [])
+        self.assertEqual(self.board.ballast["released"]["api"], 0, "nothing was held to release")
+
+    def test_pass_with_a_ballast_the_arms_precede_the_hold_and_the_release_precedes_the_disarm(self):
+        rc, out = self.go(overrides={"ballast_bytes": 16384, "ballast_deadman_s": 35})
+        self.assertEqual(rc, 0, out)
+        p = self.posts()
+        self.assertEqual(p[:4], [{"fault": "get_sock_shutdown"}, {"fault": "get_status", "value": "404"},
+                                 {"fault": "get_max_attempts", "value": "8"},
+                                 {"ballast": "16384", "deadman": "35"}])
+        self.assertLess(p.index({"ballast": "16384", "deadman": "35"}), p.index({"ballast": "release"}))
+        self.assertLess(p.index({"ballast": "release"}), p.index({"fault": "disarm"}))
+        self.assertEqual(self.manifest["probe"]["ballast"]["target"], 16384)
+
+    def test_invalid_when_the_shutdown_returned_minus_one(self):
+        self.board.knobs["sock_rc_fail"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("rc=-1", out)
+        self.assertIsNone(self.manifest["summary"]["outcome"])
+        self.assertEqual(self.manifest["summary"]["witness"]["rcs"], [-1])
+        self.assert_clean_probe(out)
+
+    def test_invalid_when_the_fault_fired_but_no_applied_line_reached_the_log(self):
+        self.board.knobs["sock_no_applied"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("0 'applied' lines", out)
+        self.assertIn("get_sock_shutdown_applied is 0", out)
+
+    def test_invalid_when_the_shutdown_was_issued_but_no_failure_followed(self):
+        self.board.knobs["sock_no_failure"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("no transport failure followed", out)
+        self.assertTrue(self.calls[0]["cancel_when_expired"], "no failure line: the CANCEL went at the wait bound")
+        self.assertEqual(self.calls[0]["final"], 487, "and the far end is not left ringing")
+
+    def test_invalid_when_a_failure_has_no_next_attempt(self):
+        self.board.knobs["sock_no_followup"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("no next attempt after one and no 'could not rebuild' line", out)
+
+    def test_invalid_when_the_rebuild_returned_false(self):
+        self.board.knobs["sock_rebuild_fail"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("the log cannot tell which", out)
+        self.assertEqual(self.manifest["summary"]["witness"]["failed"], 1)
+
+    def test_invalid_when_the_fault_never_fired(self):
+        self.board.knobs["sock_never"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("the fault get_sock_shutdown fired 0 times", out)
+        self.assertEqual(self.manifest["probe"]["fired"]["get_sock_shutdown"], 0)
+        self.assert_clean_probe(out)
+
+    def test_invalid_when_the_call_never_rings_and_the_reason_names_no_ballast(self):
+        self.board.refuse_calls = {0}
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("0 anchored legs started during the call, not 1", out)
+        self.assertNotIn("with the ballast held across", out)
+        self.assert_clean_probe(out)
+
+    def test_a_409_on_the_first_arm_stops_before_the_call(self):
+        self.board.knobs["emergency_on_arm"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 3, out)
+        self.assertIn("arming get_sock_shutdown: 409", out)
+        self.assertEqual(self.board.invite_users, [])
+        self.assert_clean_probe(out)
+
+    def test_fail_on_a_panic_line(self):
+        self.board.knobs["x370_panic"] = True
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("a panic line reached the syslog", out)
+
+    def test_fail_when_the_board_rebooted(self):
+        self.board.reboot_after_call = 0
+        rc, out = self.go()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("the board rebooted", out)
 
 
 class ProbeSafetyTest(ProbeRunCase):

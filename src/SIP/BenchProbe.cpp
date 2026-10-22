@@ -132,7 +132,9 @@ void dialEnd() { s_gate.dialEnd(); }
 
 void claimGetFaults(std::string_view leg, bool destinationEmergency)
 {
-	if (!g_faults.armedHint(Fault::GetStatus) && !g_faults.armedHint(Fault::GetMaxAttempts)) return;
+	if (!g_faults.armedHint(Fault::GetStatus) && !g_faults.armedHint(Fault::GetMaxAttempts) &&
+	    !g_faults.armedHint(Fault::GetSockShutdown))
+		return;
 	s_claim.claim(leg, destinationEmergency || s_gate.live());
 }
 
@@ -143,6 +145,9 @@ GetLoopFaults takeGetFaults(std::string_view leg)
 	int32_t v = 0;
 	if (fire(Fault::GetStatus, false, &v)) g.forcedStatus = v;
 	if (fire(Fault::GetMaxAttempts, false, &v)) g.maxAttempts = v;
+	// get_sock_shutdown (#370, #350) is not fired here: runRxLoop fires it where it shuts the socket down, once
+	// a socket is published, so an arm is never spent without a shutdown. This only marks the claimed leg.
+	g.sockShutdownLeg = true;
 	return g;
 }
 

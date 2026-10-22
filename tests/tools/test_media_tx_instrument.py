@@ -274,8 +274,8 @@ class TheNagleSwitch(unittest.TestCase):
         for bad in ("nvs_", "NvsWriter", "persist", "Persist", "DeviceConfig::"):
             self.assertNotIn(bad, func_body(hs, r"void HttpServer::sendApiMediaTx\("), bad)
         mentions = sorted(p for p, text in src_files() if re.search(r"nodelay", text, re.I))
-        self.assertEqual(mentions, ["Helpers/HttpServer.cpp", "SIP/MediaTxStats.hpp", "SIP/TelephonyAnchorClient.cpp"],
-                         "no store, no config key, no other reader of the flag")
+        self.assertEqual(mentions, ["Helpers/HttpServer.cpp", "Helpers/index_html.h", "SIP/MediaTxStats.hpp", "SIP/TelephonyAnchorClient.cpp"],
+                         "no store, no config key, no other reader of the flag (the page only posts it)")
 
     def test_tcp_nodelay_is_set_in_one_helper_and_nowhere_else_in_the_tree(self):
         users = [p for p, text in src_files() if "TCP_NODELAY" in text]

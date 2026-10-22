@@ -30,6 +30,7 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_pendingTargets.clear();
 	_inviteMessage.reset();
 	_ringTimerArmed = false;
+	_cancelAnswered = false;   // #1049: a recycled slot has no answered CANCEL
 	_noAnswerTarget.clear();
 	_huntActive = false;
 	_huntMembers.clear();
@@ -76,6 +77,7 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	//
 	// Deliberately NOT mirrored in release(): see the note there.
 	_isVoicemail = false;
+	_isToneCall = false;   // #1003: a recycled slot is not a tone call
 	_voicemailLegSlot = -1;
 	_voicemailPurpose = VoicemailPurpose::Deposit;
 	_voicemailDeadlineArmed = false;
@@ -166,6 +168,7 @@ void Session::release()
 	_pendingTargets.clear();
 	_inviteMessage.reset();
 	_ringTimerArmed = false;
+	_cancelAnswered = false;   // #1049: a recycled slot has no answered CANCEL
 	_noAnswerTarget.clear();
 	_huntActive = false;
 	_huntMembers.clear();

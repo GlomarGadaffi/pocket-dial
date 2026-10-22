@@ -361,6 +361,63 @@ TEST(ForceDisconnect, EchoLegFreesTheServerTransactionAndNeverByesTheStandInPeer
 	EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
 }
 
+TEST(ForceDisconnect, ToneLegByesTheKilledHandsetOnceAndNeverTheStandInPeer)
+{
+	// #1003: 100 dials the 440 tone. As on the echo leg above, the PBX is the UAS and the session's "dest" is a
+	// stand-in carrying 100's OWN address. The tone answer records its dialog headers (the 10-minute cap BYEs
+	// the phone from them), so a kill now has a src BYE to send, and the stand-in must stay silent: a second,
+	// tag-reversed BYE to the same phone is the #228 bug.
+	Rig rig;
+	const std::string callId = "kill-1003-tone";
+	{
+		std::string body = sdpBody(kCallerIp);
+		std::string raw =
+			"INVITE sip:440@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kCallerIp) + ":5060;branch=z9hG4bKi" + callId + "\r\n"
+			"From: <sip:100@server>;tag=ctag" + callId + "\r\n"
+			"To: <sip:440@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:100@" + std::string(kCallerIp) + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		rig.handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(kCallerIp)));
+	}
+	ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value())
+		<< "precondition: the tone call must be up before it is killed";
+
+	// The tone leg's own 200 OK carries the To-tag the Session must hold: capture it (it is random) so the
+	// BYE below is checked against the tag this call actually used.
+	std::string toneToTag;
+	for (const auto& [addr, msg] : rig.sent)
+	{
+		if (!msg) continue;
+		std::string raw = msg->toString();
+		if (raw.rfind("SIP/2.0 200 OK", 0) == 0 && headerValue(raw, "Call-ID") == callId)
+		{
+			toneToTag = headerValue(raw, "To");
+			break;
+		}
+	}
+	ASSERT_NE(toneToTag.find("tag="), std::string::npos)
+		<< "precondition: the tone leg's own 200 OK must carry a To-tag";
+
+	rig.sent.clear();
+	rig.handler.forceDisconnect("100");
+	flushAsyncOutbox(rig.handler);
+
+	const auto toCaller = byesTo(rig.sent, addrFor(kCallerIp));
+	ASSERT_EQ(toCaller.size(), 1u)
+		<< "exactly one BYE to the killed handset: the src leg's, never the dest stand-in's";
+	EXPECT_EQ(toCaller[0].rfind("BYE sip:100@" + std::string(kCallerIp) + ":5060 SIP/2.0", 0), 0u)
+		<< toCaller[0];
+	EXPECT_NE(headerValue(toCaller[0], "From").find(toneToTag.substr(toneToTag.find("tag="))),
+		std::string::npos) << toCaller[0];
+	EXPECT_NE(headerValue(toCaller[0], "To").find("tag=ctag" + callId), std::string::npos) << toCaller[0];
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
+}
+
 TEST(ForceDisconnect, KillingTheCalleeSideWorksToo)
 {
 	// The involvement check must match whichever leg the extension is on. This
@@ -418,4 +475,450 @@ TEST(ForceDisconnect, ExtensionOnNoCallSendsNothingAndLeavesOtherCallsAlone)
 	EXPECT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value())
 		<< "a call 107 is not on must survive 107's kill";
 	EXPECT_TRUE(rig.handler.cdrSnapshotForTest().empty());
+}
+
+// Issue #1089: REGISTER Expires: 0 reached unregisterClient(), which released
+// the pool SipClient (blanking its number) and ended none of its sessions. The
+// sessions kept pointing at the blank client, sweepExpired() matches by number,
+// so they leaked their pool slot for good (4 of 8 slots held for 10 h on .195).
+namespace
+{
+	void sendDeregister(RequestsHandler& handler, const std::string& ext, const std::string& ip,
+	                    const std::string& callId)
+	{
+		std::string raw =
+			"REGISTER sip:server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKd" + callId + "\r\n"
+			"From: <sip:" + ext + "@server>;tag=dt" + callId + "\r\n"
+			"To: <sip:" + ext + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 2 REGISTER\r\n"
+			"Contact: <sip:" + ext + "@" + ip + ":5060>;expires=0\r\n"
+			"Content-Length: 0\r\n\r\n";
+		handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(ip)));
+	}
+
+	void sendCallerBye(RequestsHandler& handler, const std::string& callId)
+	{
+		std::string raw =
+			"BYE sip:106@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kCallerIp) + ":5060;branch=z9hG4bKbye" + callId + "\r\n"
+			"From: <sip:100@server>;tag=ctag" + callId + "\r\n"
+			"To: <sip:106@server>;tag=etag" + callId + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 3 BYE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Content-Length: 0\r\n\r\n";
+		handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(kCallerIp)));
+	}
+
+	// The callee's 200 OK to the relayed BYE: that, not the BYE itself, ends the session.
+	void sendCalleeByeOk(RequestsHandler& handler, const std::string& callId)
+	{
+		std::string raw =
+			"SIP/2.0 200 OK\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kCallerIp) + ":5060;branch=z9hG4bKbye" + callId + "\r\n"
+			"From: <sip:100@server>;tag=ctag" + callId + "\r\n"
+			"To: <sip:106@server>;tag=etag" + callId + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 3 BYE\r\n"
+			"Content-Length: 0\r\n\r\n";
+		handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(kCalleeIp)));
+	}
+
+	bool isBoundExt(RequestsHandler& handler, const std::string& ext)
+	{
+		handler.forceNextTickForTest();
+		handler.tick();
+		for (const auto& [number, address] : handler.getActiveClients())
+		{
+			(void)address;
+			if (number == ext) return true;
+		}
+		return false;
+	}
+
+	size_t liveSessions(RequestsHandler& handler)
+	{
+		handler.forceNextTickForTest();
+		handler.tick();
+		return handler.getSessionCount();
+	}
+
+	// Both legs of a connected call are hung up by a de-REGISTER from `who`.
+	void expectDeregisterEndsTheCall(const std::string& who, const std::string& whoIp,
+	                                 const std::string& peerIp, const std::string& callId)
+	{
+		Rig rig;
+		sendInvite(rig.handler, callId);
+		sendAnswer(rig.handler, callId);
+		ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "precondition: call up";
+		ASSERT_EQ(liveSessions(rig.handler), 1u) << "precondition: one session";
+		ASSERT_TRUE(rig.handler.cdrSnapshotForTest().empty()) << "precondition: no CDR yet";
+
+		rig.sent.clear();
+		sendDeregister(rig.handler, who, whoIp, "dereg-" + callId);
+
+		EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
+		EXPECT_EQ(liveSessions(rig.handler), 0u) << "the session slot leaked";
+		EXPECT_EQ(byesTo(rig.sent, addrFor(peerIp)).size(), 1u) << "the far party must be told";
+		const auto cdr = rig.handler.cdrSnapshotForTest();
+		ASSERT_EQ(cdr.size(), 1u) << "exactly one CDR";
+		EXPECT_EQ(cdr[0].caller, "100");
+		EXPECT_EQ(cdr[0].callee, "106");
+		EXPECT_FALSE(isBoundExt(rig.handler, who)) << "the client must still be released";
+	}
+}
+
+TEST(DeregisterMidCall, CallersDeregisterEndsTheCallByesThePeerAndWritesTheCdr)
+{
+	expectDeregisterEndsTheCall("100", kCallerIp, kCalleeIp, "dereg-1089-a");
+}
+
+TEST(DeregisterMidCall, CalleesDeregisterEndsTheCallByesThePeerAndWritesTheCdr)
+{
+	expectDeregisterEndsTheCall("106", kCalleeIp, kCallerIp, "dereg-1089-b");
+}
+
+TEST(DeregisterMidCall, ADeregisterDuringAnEmergencyCallDefersUntilTheCallEnds)
+{
+	// Rule 5, matching sweepExpired()'s #712: a de-REGISTER never ends a 911/933
+	// and never blanks the number the call's BYE and CDR still read.
+	Rig rig;
+	const std::string callId = "dereg-1089-911";
+	sendInvite(rig.handler, callId);
+	sendAnswer(rig.handler, callId);
+	auto s = rig.handler.getSession("Call-ID: " + callId);
+	ASSERT_TRUE(s.has_value());
+	s.value()->setEmergency(true);
+
+	rig.sent.clear();
+	sendDeregister(rig.handler, "100", kCallerIp, "dereg-1089-911-r");
+
+	EXPECT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "the 911 was torn down";
+	EXPECT_TRUE(byesTo(rig.sent, addrFor(kCalleeIp)).empty()) << "the PSAP leg was hung up";
+	EXPECT_TRUE(byesTo(rig.sent, addrFor(kCallerIp)).empty());
+	ASSERT_TRUE(s.value()->getSrc());
+	EXPECT_EQ(s.value()->getSrc()->getNumber(), "100") << "the caller was blanked under the live 911";
+	EXPECT_TRUE(rig.handler.cdrSnapshotForTest().empty());
+	size_t finals200 = 0;
+	for (const auto& [addr, msg] : rig.sent)
+		if (msg && sameAddr(addr, addrFor(kCallerIp)) && msg->toString().rfind("SIP/2.0 200", 0) == 0) ++finals200;
+	EXPECT_EQ(finals200, 1u) << "the REGISTER is still answered normally";
+
+	// The 911 ends; the next sweep prunes the deferred binding.
+	sendCallerBye(rig.handler, callId);
+	sendCalleeByeOk(rig.handler, callId);
+	ASSERT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "precondition: BYE ended it";
+	EXPECT_EQ(rig.handler.cdrSnapshotForTest().size(), 1u);
+	rig.handler.idleClientAndSweepForTest("100", std::chrono::seconds(0));
+	EXPECT_FALSE(isBoundExt(rig.handler, "100")) << "the deferred de-register must complete";
+	EXPECT_EQ(liveSessions(rig.handler), 0u);
+}
+
+TEST(DeregisterMidCall, ADeregisterWithNoCallsReleasesTheClientAsBefore)
+{
+	Rig rig;
+	ASSERT_TRUE(isBoundExt(rig.handler, "100"));
+	rig.sent.clear();
+	sendDeregister(rig.handler, "100", kCallerIp, "dereg-1089-idle");
+	EXPECT_FALSE(isBoundExt(rig.handler, "100"));
+	EXPECT_TRUE(isBoundExt(rig.handler, "106")) << "another extension is untouched";
+	EXPECT_TRUE(byesTo(rig.sent, addrFor(kCallerIp)).empty());
+	EXPECT_TRUE(byesTo(rig.sent, addrFor(kCalleeIp)).empty());
+	EXPECT_TRUE(rig.handler.cdrSnapshotForTest().empty());
+	EXPECT_EQ(liveSessions(rig.handler), 0u);
+}
+
+// #1089 follow-ups: a freed pool slot is reused by a later REGISTER, the sweep path
+// shares the de-register path's BYE and CDR, and a lapsed client on a live call
+// keeps its slot.
+namespace
+{
+	size_t byeCount(const Sent& sent, const std::string& ip)
+	{
+		return byesTo(sent, addrFor(ip)).size();
+	}
+
+	void expectLeaseExpiryEndsTheCall(const std::string& who, const char* peerIp, const char* whoIp,
+	                                  const std::string& callId)
+	{
+		Rig rig;
+		sendInvite(rig.handler, callId);
+		sendAnswer(rig.handler, callId);
+		ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value());
+		rig.sent.clear();
+
+		rig.handler.expireLeaseAndSweepForTest(who);
+
+		EXPECT_EQ(byeCount(rig.sent, peerIp), 1u) << "exactly one BYE to the surviving phone";
+		EXPECT_EQ(byeCount(rig.sent, whoIp), 0u) << "none to the phone whose lease lapsed";
+		EXPECT_EQ(liveSessions(rig.handler), 0u);
+		const auto cdr = rig.handler.cdrSnapshotForTest();
+		ASSERT_EQ(cdr.size(), 1u);
+		EXPECT_EQ(cdr[0].caller, "100");
+		EXPECT_EQ(cdr[0].callee, "106");
+	}
+}
+
+TEST(DeregisterMidCall, ANewPhoneTakingAFreedSlotInheritsNoCall)
+{
+	Rig rig;
+	const std::string callId = "dereg-1089-slot";
+	sendInvite(rig.handler, callId);
+	sendAnswer(rig.handler, callId);
+	ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value());
+	sendDeregister(rig.handler, "100", kCallerIp, "dereg-1089-slot-a");
+	sendDeregister(rig.handler, "106", kCalleeIp, "dereg-1089-slot-b");
+	rig.handler.handle(makeRegister("107", kOtherIp, "reg-107"));   // takes 100's freed slot
+	ASSERT_TRUE(isBoundExt(rig.handler, "107")) << "precondition: 107 is registered";
+	rig.sent.clear();
+
+	EXPECT_EQ(liveSessions(rig.handler), 0u) << "a phantom session outlived its clients";
+	rig.handler.expireLeaseAndSweepForTest("107");
+	EXPECT_EQ(byeCount(rig.sent, kOtherIp), 0u) << "107 was BYEd for a dialog it never had";
+	EXPECT_EQ(rig.handler.cdrSnapshotForTest().size(), 1u) << "one CDR, for the real call only";
+}
+
+TEST(DeregisterMidCall, ALeaseExpiringOnTheCallerByesThePeerOnceAndKeepsTheCdrOrder)
+{
+	expectLeaseExpiryEndsTheCall("100", kCalleeIp, kCallerIp, "lease-1089-a");
+}
+
+TEST(DeregisterMidCall, ALeaseExpiringOnTheCalleeByesThePeerOnceAndKeepsTheCdrOrder)
+{
+	expectLeaseExpiryEndsTheCall("106", kCallerIp, kCalleeIp, "lease-1089-b");
+}
+
+TEST(DeregisterMidCall, ALapsedClientOnALiveEmergencyCallKeepsItsSlotWhenThePoolIsFull)
+{
+	Rig rig;
+	const std::string callId = "dereg-1089-evict";
+	sendInvite(rig.handler, callId);
+	sendAnswer(rig.handler, callId);
+	auto s = rig.handler.getSession("Call-ID: " + callId);
+	ASSERT_TRUE(s.has_value());
+	s.value()->setEmergency(true);
+	for (int i = 2; i < POCKETDIAL_MAX_CLIENTS; ++i)
+		rig.handler.handle(makeRegister("2" + std::to_string(100 + i), kOtherIp, "fill" + std::to_string(i)));
+	rig.handler.expireLeaseUnsweptForTest("100");   // lapsed, not yet swept
+	rig.handler.handle(makeRegister("300", kOtherIp, "reg-300"));   // pool full: would evict 100
+
+	ASSERT_TRUE(s.value()->getSrc());
+	EXPECT_EQ(s.value()->getSrc()->getNumber(), "100") << "the live 911 was handed to another number";
+	EXPECT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value());
+	EXPECT_FALSE(isBoundExt(rig.handler, "300")) << "no free slot: refused, as for any full pool";
+}
+
+// #1089 review: a BYE already in flight (onBye() keeps the session in Bye until the far
+// leg's 200) must not draw a second BYE when the sender then de-registers or lapses.
+TEST(DeregisterMidCall, ADeregisterAfterTheCallersByeSendsTheCalleeNoSecondBye)
+{
+	for (const bool lease : { false, true })
+	{
+		SCOPED_TRACE(lease ? "lease expiry" : "REGISTER Expires 0");
+		Rig rig;
+		const std::string callId = lease ? "dbl-1089-l" : "dbl-1089-d";
+		sendInvite(rig.handler, callId);
+		sendAnswer(rig.handler, callId);
+		rig.sent.clear();
+		sendCallerBye(rig.handler, callId);   // relayed to the callee; the session waits in Bye
+		ASSERT_EQ(byeCount(rig.sent, kCalleeIp), 1u) << "precondition: the relayed BYE";
+
+		if (lease) rig.handler.expireLeaseAndSweepForTest("100");
+		else sendDeregister(rig.handler, "100", kCallerIp, "dereg-" + callId);
+
+		EXPECT_EQ(byeCount(rig.sent, kCalleeIp), 1u) << "a second BYE draws a 481";
+	}
+}
+
+// A call still ringing has no dialog to BYE: the caller leaving CANCELs the callee, the
+// callee leaving answers the caller 480, and the session ends either way.
+TEST(DeregisterMidCall, ACallerDeregisteringWhileItRingsCancelsTheCallee)
+{
+	Rig rig;
+	const std::string callId = "ring-1089-a";
+	sendInvite(rig.handler, callId);
+	ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "precondition: ringing";
+	rig.sent.clear();
+
+	sendDeregister(rig.handler, "100", kCallerIp, "dereg-" + callId);
+
+	size_t cancels = 0;
+	for (const auto& [addr, msg] : rig.sent)
+		if (msg && sameAddr(addr, addrFor(kCalleeIp)) && msg->toString().rfind("CANCEL ", 0) == 0) ++cancels;
+	EXPECT_EQ(cancels, 1u) << "the callee keeps ringing a dead call";
+	EXPECT_EQ(byeCount(rig.sent, kCalleeIp), 0u);
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
+	EXPECT_EQ(liveSessions(rig.handler), 0u);
+}
+
+TEST(DeregisterMidCall, ACalleeDeregisteringWhileItRingsAnswersTheCaller480)
+{
+	Rig rig;
+	const std::string callId = "ring-1089-b";
+	sendInvite(rig.handler, callId);
+	ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "precondition: ringing";
+	rig.sent.clear();
+
+	sendDeregister(rig.handler, "106", kCalleeIp, "dereg-" + callId);
+
+	size_t finals480 = 0;
+	for (const auto& [addr, msg] : rig.sent)
+		if (msg && sameAddr(addr, addrFor(kCallerIp)) && msg->toString().rfind("SIP/2.0 480", 0) == 0) ++finals480;
+	EXPECT_EQ(finals480, 1u) << "the caller's INVITE got no final response";
+	size_t cancels = 0;
+	for (const auto& [addr, msg] : rig.sent)
+		if (msg && sameAddr(addr, addrFor(kCalleeIp)) && msg->toString().rfind("CANCEL ", 0) == 0) ++cancels;
+	EXPECT_EQ(cancels, 1u) << "the departing phone keeps ringing a call that is gone";
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
+	EXPECT_EQ(liveSessions(rig.handler), 0u);
+}
+
+// The Call-ID is copied to a fixed buffer, not a std::string: one past the SSO size works.
+TEST(DeregisterMidCall, ACallWithACallIdPastTheSsoSizeIsEnded)
+{
+	Rig rig;
+	const std::string callId = std::string(50, 'x') + "-1089-long";
+	ASSERT_LE(callId.size(), 127u);
+	sendInvite(rig.handler, callId);
+	sendAnswer(rig.handler, callId);
+	ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "precondition";
+	rig.sent.clear();
+
+	sendDeregister(rig.handler, "100", kCallerIp, "dereg-long");
+
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
+	EXPECT_EQ(byeCount(rig.sent, kCalleeIp), 1u);
+	EXPECT_EQ(rig.handler.cdrSnapshotForTest().size(), 1u);
+}
+
+// Rule 5 (#712): a PSAP callback still RINGING a handset is not torn down by that
+// handset's de-REGISTER or lapsed lease. Its Session has no dest yet, so only the
+// ringing-callee clause of sessionOnExtension() sees the handset as a party. The
+// call keeps ringing, nothing is CANCELled or answered 480, and the binding is
+// kept (lease lapsed) until the call has ended; the next sweep then prunes it.
+namespace
+{
+	size_t sentStartingWith(const Sent& sent, const std::string& ip, const std::string& prefix)
+	{
+		size_t n = 0;
+		for (const auto& [addr, msg] : sent)
+			if (msg && sameAddr(addr, addrFor(ip)) && msg->toString().rfind(prefix, 0) == 0) ++n;
+		return n;
+	}
+}
+
+TEST(DeregisterMidCall, APsapCallbackRingingAHandsetSurvivesItsDeregisterOrLapsedLease)
+{
+	for (const bool lease : { false, true })
+	{
+		SCOPED_TRACE(lease ? "lease expiry" : "REGISTER Expires 0");
+		Rig rig;
+		const std::string callId = lease ? "psap-1089-l" : "psap-1089-d";
+		sendInvite(rig.handler, callId);
+		auto s = rig.handler.getSession("Call-ID: " + callId);
+		ASSERT_TRUE(s.has_value());
+		s.value()->setEmergency(true);   // as onInvite() flags a call inside #659's window
+		ASSERT_EQ(s.value()->getState(), Session::State::Invited) << "precondition: ringing";
+		ASSERT_FALSE(s.value()->getDest()) << "precondition: no dest before the answer";
+		rig.sent.clear();
+
+		if (lease) rig.handler.expireLeaseAndSweepForTest("106");
+		else sendDeregister(rig.handler, "106", kCalleeIp, "dereg-" + callId);
+
+		EXPECT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "the callback was torn down";
+		EXPECT_EQ(sentStartingWith(rig.sent, kCalleeIp, "CANCEL "), 0u) << "the PSAP callback was CANCELled";
+		EXPECT_EQ(sentStartingWith(rig.sent, kCallerIp, "SIP/2.0 4"), 0u) << "the PSAP got a failure";
+		EXPECT_TRUE(isBoundExt(rig.handler, "106")) << "the binding must stay while it rings";
+
+		// The handset still answers, the call ends, and the next sweep prunes the binding.
+		sendAnswer(rig.handler, callId);
+		sendCallerBye(rig.handler, callId);
+		sendCalleeByeOk(rig.handler, callId);
+		ASSERT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "precondition: ended";
+		rig.handler.idleClientAndSweepForTest("106", std::chrono::seconds(0));
+		EXPECT_FALSE(isBoundExt(rig.handler, "106"));
+		EXPECT_EQ(liveSessions(rig.handler), 0u);
+	}
+}
+
+// A de-REGISTER naming no extension matches a free pool slot (empty number); the empty
+// string is a party to every non-ringing session, so it must end none of them.
+TEST(DeregisterMidCall, ADeregisterWithNoExtensionLeavesEveryCallAlone)
+{
+	Rig rig;
+	const std::string callId = "dereg-1089-empty";
+	sendInvite(rig.handler, callId);
+	sendAnswer(rig.handler, callId);
+	ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value());
+	rig.sent.clear();
+
+	sendDeregister(rig.handler, "", kOtherIp, "dereg-empty");
+
+	EXPECT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "an unrelated call was ended";
+	EXPECT_EQ(byeCount(rig.sent, kCalleeIp), 0u);
+	EXPECT_TRUE(rig.handler.cdrSnapshotForTest().empty());
+}
+
+// A caller de-registering while a hunt or ring group rings: the group number is no
+// client, so every still-ringing member must be CANCELled from the session's pending
+// targets (tick()'s hunt timeout does the same), or they ring a dead call.
+namespace
+{
+	void sendGroupInvite(RequestsHandler& handler, const std::string& callId)
+	{
+		std::string body = sdpBody(kCallerIp);
+		std::string raw =
+			"INVITE sip:600@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kCallerIp) + ":5060;branch=z9hG4bKi" + callId + "\r\n"
+			"From: <sip:100@server>;tag=ctag" + callId + "\r\n"
+			"To: <sip:600@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:100@" + std::string(kCallerIp) + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(kCallerIp)));
+	}
+
+	void expectGroupCancelledOnCallerDeregister(const char* mode, size_t membersRinging)
+	{
+		SCOPED_TRACE(mode);
+		Rig rig;
+		constexpr const char* kThirdIp = "192.168.40.30";
+		rig.handler.handle(makeRegister("107", kThirdIp, "reg-107g"));
+		rig.handler.setRingGroup("600", "106,107", mode);
+		const std::string callId = std::string("grp-1089-") + mode;
+		sendGroupInvite(rig.handler, callId);
+		auto s = rig.handler.getSession("Call-ID: " + callId);
+		ASSERT_TRUE(s.has_value()) << "precondition: the group is ringing";
+		ASSERT_EQ(s.value()->getState(), Session::State::Invited);
+		ASSERT_EQ(s.value()->getPendingTargets().size(), membersRinging) << "precondition";
+		rig.sent.clear();
+
+		sendDeregister(rig.handler, "100", kCallerIp, "dereg-" + callId);
+
+		size_t cancelled = 0;
+		for (const char* ip : { kCalleeIp, kThirdIp })
+		{
+			const size_t n = sentStartingWith(rig.sent, ip, "CANCEL ");
+			EXPECT_LE(n, 1u) << ip << " got a second CANCEL";
+			cancelled += n;
+		}
+		EXPECT_EQ(cancelled, membersRinging) << "every ringing member gets exactly one CANCEL";
+		EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
+		EXPECT_EQ(liveSessions(rig.handler), 0u);
+	}
+}
+
+TEST(DeregisterMidCall, ACallerDeregisteringWhileAHuntGroupRingsCancelsTheRingingMember)
+{
+	expectGroupCancelledOnCallerDeregister("hunt", 1u);
+}
+
+TEST(DeregisterMidCall, ACallerDeregisteringWhileARingAllGroupRingsCancelsEveryMember)
+{
+	expectGroupCancelledOnCallerDeregister("ringall", 2u);
 }

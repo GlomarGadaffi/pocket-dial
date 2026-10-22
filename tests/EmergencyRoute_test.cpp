@@ -1052,6 +1052,35 @@ TEST(EmergencyCallback, AnInternalCallbackWithinThirtyMinutesIsAnEmergencyCall)
 	EXPECT_TRUE(s.value()->isEmergency());
 }
 
+TEST(EmergencyCallback, ByeOnAnAnsweredCallbackIsRelayedAndNeverAnswered481)
+{
+	// Rule 5, audit row 20: the callback has a session, so its BYE is not the no-session 481 case.
+	Bench b;
+	b.handler->handle(makeRegister("102", kOtherIp));
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+	b.handler->handle(makeCall("102", kOtherIp, "101", "er-bye-cb"));
+	const std::string body =
+		"v=0\r\no=- 0 0 IN IP4 " + std::string(kHandsetIp) + "\r\ns=-\r\n"
+		"c=IN IP4 " + std::string(kHandsetIp) + "\r\nt=0 0\r\n"
+		"m=audio 40002 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	b.handler->handle(RequestsHandler::getMessageFromPool(
+		"SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP " + std::string(kOtherIp) + ":5060;branch=z9hG4bKer-bye-cb\r\n"
+		"From: <sip:102@server>;tag=fer-bye-cb\r\nTo: <sip:101@server>;tag=ter-bye-cb\r\n"
+		"Call-ID: er-bye-cb\r\nCSeq: 1 INVITE\r\nContact: <sip:101@" + std::string(kHandsetIp) + ":5060>\r\n"
+		"Content-Type: application/sdp\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body,
+		addrFor(kHandsetIp)));
+	const auto s = b.handler->getSession("Call-ID: er-bye-cb");
+	ASSERT_TRUE(s.has_value() && s.value()->isEmergency()) << b.dump();
+	b.sent.clear();
+	b.handler->handle(RequestsHandler::getMessageFromPool(
+		"BYE sip:101@server SIP/2.0\r\nVia: SIP/2.0/UDP " + std::string(kOtherIp) + ":5060;branch=z9hG4bKer-bye-cb2\r\n"
+		"From: <sip:102@server>;tag=fer-bye-cb\r\nTo: <sip:101@server>;tag=ter-bye-cb\r\n"
+		"Call-ID: er-bye-cb\r\nCSeq: 2 BYE\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n", addrFor(kOtherIp)));
+	EXPECT_EQ(b.count("SIP/2.0 200", kOtherIp), 1u) << b.dump();
+	EXPECT_EQ(b.count("BYE", kHandsetIp), 1u) << b.dump();
+	EXPECT_EQ(b.count("481"), 0u) << b.dump();
+}
+
 TEST(EmergencyCallback, ACallbackWithAnOversizeFromIsNotRefusedForItsLength)
 {
 	// #870 must not refuse an emergency callback for its header length (Rule 5).
@@ -1081,6 +1110,44 @@ TEST(EmergencyCallback, ACallbackWithAnOversizeFromIsNotRefusedForItsLength)
 	const auto s = b.handler->getSession("Call-ID: er-870-cb");
 	ASSERT_TRUE(s.has_value()) << "the callback must be placed, not refused:\n" << b.dump();
 	EXPECT_TRUE(s.value()->isEmergency());
+}
+
+TEST(EmergencyCallback, ACallbackAnsweredWithAnOversizeToIsNotRefusedForItsLength)
+{
+	// #1030 must not refuse the answer to an emergency callback for its header length (Rule 5).
+	Bench b;
+	b.handler->handle(makeRegister("102", kOtherIp));
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+	b.handler->handle(makeCall("102", kOtherIp, "101", "er-1030-cb"));
+	ASSERT_TRUE(b.handler->getSession("Call-ID: er-1030-cb").has_value()) << b.dump();
+
+	std::string fork;
+	for (const auto& [addr, raw] : b.sent)
+	{
+		if (addr.sin_addr.s_addr == inet_addr(kHandsetIp) && raw.rfind("INVITE ", 0) == 0) fork = raw;
+	}
+	ASSERT_FALSE(fork.empty()) << "the callback must ring 101:\n" << b.dump();
+	const auto lineOf = [&fork](const std::string& name) {
+		const size_t at = fork.find("\r\n" + name);
+		return fork.substr(at + 2, fork.find("\r\n", at + 2) - at - 2);
+	};
+	const std::string body =
+		"v=0\r\no=- 0 0 IN IP4 " + std::string(kHandsetIp) + "\r\ns=-\r\n"
+		"c=IN IP4 " + std::string(kHandsetIp) + "\r\nt=0 0\r\n"
+		"m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	const std::string ok =
+		"SIP/2.0 200 OK\r\n" + lineOf("Via:") + "\r\n" + lineOf("From:") + "\r\n"
+		"To: <sip:101@server>;tag=" + std::string(600, 't') + "\r\n"
+		"Call-ID: er-1030-cb\r\nCSeq: 1 INVITE\r\n"
+		"Contact: <sip:101@" + std::string(kHandsetIp) + ":5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+	b.handler->handle(RequestsHandler::getMessageFromPool(ok, addrFor(kHandsetIp)));
+
+	EXPECT_EQ(b.count("SIP/2.0 502", kOtherIp), 0u) << b.dump();
+	const auto s = b.handler->getSession("Call-ID: er-1030-cb");
+	ASSERT_TRUE(s.has_value()) << "the answered callback must stay up:\n" << b.dump();
+	EXPECT_EQ(s.value()->getState(), Session::State::Connected);
 }
 
 TEST(EmergencyCallback, ACallbackAfterThirtyMinutesIsNot)
@@ -2220,16 +2287,20 @@ TEST(EmergencyRoute, AnEscapedQuoteIsNotAQuoteInTheScanFromTheRight)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// G. #967 step 1: an inbound PSAP callback through the anchor while the media
-// bridges are full. These RECORD what the engine does today; they do not say it
-// is right. When the reserve-a-bridge / pre-empt decision is made, the first two
-// tests are the ones that change.
+// G. #967: an inbound PSAP callback through the anchor that finds the anchor
+// full. desmo's ruling (2026-10-19, option A): the callback ends ONE non-
+// emergency anchored call and is routed, as #624 does for an outbound 911/933.
+// It may end another anchor inbound that is ringing or up ("drop 2"). It never
+// ends an emergency call: with one live, it is dropped as before (a known limit,
+// docs/design/psap-callback-preempt.md). An ordinary inbound call is dropped as
+// before. The first three tests were written (#968) to record the drop; the
+// first now asserts the pre-emption.
 // ═════════════════════════════════════════════════════════════════════════════
 //
-// routeInboundAnchorCall() drops a new inbound anchor call when allBridgesBusy()
-// holds, BEFORE it computes isEmergencyCallback() on the targets (#659), so a
-// callback inside the window is dropped like any other call. Nothing on that
-// path pre-empts: preemptAnchorCallForEmergency() serves an outbound 911/933 only.
+// routeInboundAnchorCall() refuses a new inbound anchor call when allBridgesBusy()
+// holds or another anchor inbound is ringing or up. It used to refuse BEFORE it
+// computed isEmergencyCallback() on the targets (#659), so a callback inside the
+// window was dropped like any other call.
 //
 // The entry is the anchor's CallEvent::Incoming, not a SIP INVITE: the caller is
 // on the PSTN side, so there is no SIP request to answer and nothing is sent to
@@ -2279,14 +2350,83 @@ namespace
 		InboundOutcome o;
 		testing::internal::CaptureStdout();
 		o.callId = b.handler->routeInboundAnchorCallForTest("800", participantId, callerId);
+		b.handler->forceNextTickForTest();   // tick() runs at most once a second; a test may raise two events
 		b.handler->tick();
 		o.log = testing::internal::GetCapturedStdout();
 		o.drops = b.loopback()->dropCallCount() - dropsBefore;
 		return o;
 	}
+
+	// The first header line starting with `name` in a raw SIP message, without
+	// its CRLF; "" if there is none.
+	std::string headerLineOf(const std::string& raw, const std::string& name)
+	{
+		size_t pos = 0;
+		while (pos < raw.size())
+		{
+			size_t eol = raw.find("\r\n", pos);
+			if (eol == std::string::npos) eol = raw.size();
+			if (raw.compare(pos, name.size(), name) == 0) return raw.substr(pos, eol - pos);
+			pos = eol + 2;
+		}
+		return {};
+	}
+
+	// The raw fork INVITE the engine sent to `ip` for extension `user`; "" if none.
+	std::string forkInviteTo(const Bench& b, const char* ip, const char* user)
+	{
+		const std::string requestLine = std::string("INVITE sip:") + user + "@";
+		for (const auto& p : b.sent)
+		{
+			if (p.first.sin_addr.s_addr == inet_addr(ip) && p.second.compare(0, requestLine.size(), requestLine) == 0)
+			{
+				return p.second;
+			}
+		}
+		return {};
+	}
+
+	// Reach the "drop 2" state on a host that holds one anchor call. A 911 dialed
+	// while an ordinary inbound call rings would pre-empt it (#624), but a build
+	// that holds more does not, and then a PSAP callback can arrive while that
+	// call still rings. So a test dials the 911 first (the mark is now), calls
+	// closeCallbackWindow() to age it past the 30 min window, rings the ordinary
+	// call, and calls reopenCallbackWindow() so the 911 was 10 min ago.
+	void closeCallbackWindow(Bench& b)
+	{
+		b.handler->ageEmergencyCallbacksForTest(std::chrono::minutes(31));
+	}
+	void reopenCallbackWindow(Bench& b)
+	{
+		b.handler->ageEmergencyCallbacksForTest(-std::chrono::minutes(21));
+	}
+
+	// 102 answers a fork the engine sent it for `inboundCallId` (the full Call-ID
+	// line): the 200 OK echoes the fork's Via and From, carries a To tag and an
+	// SDP offer, as InboundAnchorReinvite_test.cpp's answeredInboundCall does.
+	void handset102Answers(Bench& b, const std::string& inboundCallId)
+	{
+		const std::string fork = forkInviteTo(b, kOtherIp, "102");
+		ASSERT_NE(fork, "") << "102 was not rung:\n" << b.dump();
+		const std::string sdp =
+			"v=0\r\no=- 0 0 IN IP4 " + std::string(kOtherIp) + "\r\ns=-\r\n"
+			"c=IN IP4 " + std::string(kOtherIp) + "\r\nt=0 0\r\n"
+			"m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+		const std::string ok =
+			"SIP/2.0 200 OK\r\n" +
+			headerLineOf(fork, "Via:") + "\r\n" +
+			headerLineOf(fork, "From:") + "\r\n"
+			"To: <sip:102@" + std::string(kServerIp) + ">;tag=hs102\r\n" +
+			inboundCallId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Contact: <sip:102@" + std::string(kOtherIp) + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
+		b.handler->handle(RequestsHandler::getMessageFromPool(ok, addrFor(kOtherIp)));
+	}
 }
 
-TEST(EmergencyCallback, InboundPsapCallbackWhileBridgesAreFullIsDroppedTodayAndRecordsIt)
+TEST(EmergencyCallback, InboundPsapCallbackWhileBridgesAreFullPreEmptsTheHoldAndIsRouted)
 {
 	Bench b;
 	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));   // 101 dialed 911: its window is open
@@ -2295,24 +2435,27 @@ TEST(EmergencyCallback, InboundPsapCallbackWhileBridgesAreFullIsDroppedTodayAndR
 
 	const InboundOutcome o = raiseInboundAnchorCall(b, "psap-967", "PSAP");
 
-	// Dropped by the allBridgesBusy() check, not the already-ringing one below it.
-	EXPECT_EQ(o.callId, "") << "no session is made for the callback; log:\n" << o.log;
-	EXPECT_EQ(o.drops, 1u) << "the only thing done to the caller is the anchor's drop";
-	EXPECT_NE(o.log.find("all media bridges busy"), std::string::npos) << o.log;
-	EXPECT_EQ(o.log.find("a call is already in progress"), std::string::npos) << o.log;
-	// No session, so no emergency flag; routeInboundAnchorCall() never reaches
-	// isEmergencyCallback(), and it has no notifyEmergency() on any path.
-	EXPECT_FALSE(b.handler->hasLiveEmergencyCall());
-	EXPECT_EQ(sentBesidesKeepalives(b), "") << "no fork INVITE, no BYE, no MESSAGE";
-	// Today nothing is pre-empted for it: the hold is untouched.
-	EXPECT_TRUE(b.handler->getSession("Call-ID: er-967-hold").has_value());
-	EXPECT_NE(b.handler->anchorBridgeForCallIdForTest("Call-ID: er-967-hold"), nullptr);
+	// Routed: a session for the callback, flagged as the emergency call it is.
+	ASSERT_NE(o.callId, "") << "the callback must not be dropped; log:\n" << o.log;
+	const auto cb = b.handler->getSession(o.callId);
+	ASSERT_TRUE(cb.has_value());
+	EXPECT_TRUE(cb.value()->isAnchorInbound());
+	EXPECT_TRUE(cb.value()->isEmergency()) << "10 min after the 911, a call to 101 is a PSAP callback";
+	EXPECT_EQ(b.count("INVITE sip:101@", kHandsetIp), 1u) << "101 must ring at once:\n" << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:102@", kOtherIp), 1u) << b.dump();
+	EXPECT_EQ(o.log.find("all media bridges busy"), std::string::npos) << o.log;
+	// The one non-emergency anchored call, 102's, was ended and its phone told.
+	EXPECT_FALSE(b.handler->getSession("Call-ID: er-967-hold").has_value());
+	EXPECT_EQ(b.count("BYE sip:102@", kOtherIp), 1u) << "the pre-empted caller gets a BYE:\n" << b.dump();
+	EXPECT_EQ(b.count("BYE sip:101@", kHandsetIp), 0u) << b.dump();
+	EXPECT_EQ(o.drops, 1u) << "exactly the victim's far leg is dropped, never the callback's";
+	EXPECT_TRUE(b.handler->hasLiveEmergencyCall()) << "the routed callback is a live emergency session";
 }
 
-TEST(EmergencyCallback, InboundOrdinaryCallWhileBridgesAreFullIsDroppedTodayAndRecordsIt)
+TEST(EmergencyCallback, InboundOrdinaryCallWhileBridgesAreFullIsStillDropped)
 {
-	// The control: 101 never dialed 911, so this is not a callback. It is dropped
-	// exactly as the PSAP callback is, which is the point of #967.
+	// The control: 101 never dialed 911, so this is not a callback. Only a PSAP
+	// callback pre-empts (#967), so this is dropped as ever and the hold is kept.
 	Bench b;
 	ASSERT_NO_FATAL_FAILURE(holdTheOnlyBridgeFrom102(b));
 
@@ -2348,4 +2491,163 @@ TEST(EmergencyCallback, InboundPsapCallbackWhileBridgesAreFreeIsRoutedAsAnEmerge
 	EXPECT_EQ(b.count("INVITE sip:101@", kHandsetIp), 1u) << "101 must ring:\n" << b.dump();
 	EXPECT_NE(o.log.find("Inbound: ringing"), std::string::npos) << o.log;
 	EXPECT_EQ(o.log.find("all media bridges busy"), std::string::npos) << o.log;
+}
+
+TEST(EmergencyCallback, InboundPsapCallbackPreEmptsAnOrdinaryInboundCallThatIsStillRinging)
+{
+	// "Drop 2": a bridge is free, but another anchor inbound is ringing, and the
+	// engine refuses a second one. The callback ends it (it is no emergency call)
+	// and rings the phones itself.
+	Bench b;
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+	closeCallbackWindow(b);
+	preemptBench(b);
+	const InboundOutcome ordinary = raiseInboundAnchorCall(b, "pstn-967-r", "5551234567");
+	ASSERT_NE(ordinary.callId, "") << ordinary.log;
+	{
+		const auto ringing = b.handler->getSession(ordinary.callId);
+		ASSERT_TRUE(ringing.has_value());
+		ASSERT_FALSE(ringing.value()->isEmergency()) << "precondition: the ringing call is an ordinary one";
+	}
+	ASSERT_EQ(b.count("INVITE sip:102@", kOtherIp), 1u) << "precondition: 102 is rung:\n" << b.dump();
+	ASSERT_EQ(b.handler->anchorBridgeForCallIdForTest(ordinary.callId), nullptr) << "precondition: no bridge yet";
+	b.sent.clear();
+	reopenCallbackWindow(b);
+
+	const InboundOutcome o = raiseInboundAnchorCall(b, "psap-967", "PSAP");
+
+	ASSERT_NE(o.callId, ordinary.callId) << "the callback must be routed, not dropped; log:\n" << o.log;
+	ASSERT_NE(o.callId, "") << o.log;
+	const auto cb = b.handler->getSession(o.callId);
+	ASSERT_TRUE(cb.has_value());
+	EXPECT_TRUE(cb.value()->isAnchorInbound());
+	EXPECT_TRUE(cb.value()->isEmergency()) << "10 min after the 911, a call to 101 is a PSAP callback";
+	EXPECT_FALSE(b.handler->getSession(ordinary.callId).has_value()) << "the ringing ordinary call was ended";
+	EXPECT_EQ(b.count("CANCEL sip:101@", kHandsetIp), 1u) << "its ringing forks are cancelled:\n" << b.dump();
+	EXPECT_EQ(b.count("CANCEL sip:102@", kOtherIp), 1u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:101@", kHandsetIp), 1u) << "the callback rings 101:\n" << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:102@", kOtherIp), 1u) << b.dump();
+	EXPECT_EQ(o.drops, 1u) << "the ordinary call's PSTN leg is dropped, never the callback's";
+	EXPECT_EQ(o.log.find("a call is already in progress"), std::string::npos) << o.log;
+}
+
+TEST(EmergencyCallback, InboundPsapCallbackPreEmptsAnOrdinaryInboundCallThatIsUpAndHoldsTheBridge)
+{
+	// "Drop 2" with the other inbound answered: it holds the only bridge too, so
+	// ending it clears both reasons to refuse. 102 answered it, so 102 gets a BYE.
+	Bench b;
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+	closeCallbackWindow(b);
+	preemptBench(b);
+	const InboundOutcome ordinary = raiseInboundAnchorCall(b, "pstn-967-u", "5551234567");
+	ASSERT_NE(ordinary.callId, "") << ordinary.log;
+	ASSERT_NO_FATAL_FAILURE(handset102Answers(b, ordinary.callId));
+	{
+		const auto up = b.handler->getSession(ordinary.callId);
+		ASSERT_TRUE(up.has_value());
+		ASSERT_EQ(up.value()->getState(), Session::State::Connected) << b.dump();
+		ASSERT_FALSE(up.value()->isEmergency()) << "precondition: the call that is up is an ordinary one";
+	}
+	ASSERT_NE(b.handler->anchorBridgeForCallIdForTest(ordinary.callId), nullptr)
+		<< "precondition: it holds the only bridge";
+	b.sent.clear();
+	reopenCallbackWindow(b);
+
+	const InboundOutcome o = raiseInboundAnchorCall(b, "psap-967", "PSAP");
+
+	ASSERT_NE(o.callId, ordinary.callId) << "the callback must be routed, not dropped; log:\n" << o.log;
+	ASSERT_NE(o.callId, "") << o.log;
+	const auto cb = b.handler->getSession(o.callId);
+	ASSERT_TRUE(cb.has_value());
+	EXPECT_TRUE(cb.value()->isAnchorInbound());
+	EXPECT_TRUE(cb.value()->isEmergency());
+	EXPECT_FALSE(b.handler->getSession(ordinary.callId).has_value()) << "the call that was up was ended";
+	EXPECT_EQ(b.count("BYE sip:102@", kOtherIp), 1u) << "the phone that answered it gets a BYE:\n" << b.dump();
+	EXPECT_EQ(b.count("BYE", kHandsetIp), 0u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:101@", kHandsetIp), 1u) << "the callback rings 101:\n" << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:102@", kOtherIp), 1u) << b.dump();
+	EXPECT_EQ(o.drops, 1u) << "the ended call's PSTN leg is dropped, never the callback's";
+}
+
+TEST(EmergencyCallback, InboundPsapCallbackNeverEndsTheLiveNineOneOneAndIsDroppedAsBefore)
+{
+	// The known limit (desmo, 2026-10-19): the original 911 is still up and holds
+	// the only bridge, and a callback arrives. An emergency call is never ended
+	// for it, so the callback is dropped as it always was.
+	Bench b;
+	preemptBench(b);
+	b.handler->handle(makeInvite("911", "er-967-911"));
+	{
+		const auto live = b.handler->getSession("Call-ID: er-967-911");
+		ASSERT_TRUE(live.has_value()) << b.dump();
+		ASSERT_TRUE(live.value()->isEmergency());
+	}
+	ASSERT_NE(b.handler->anchorBridgeForCallIdForTest("Call-ID: er-967-911"), nullptr)
+		<< "precondition: the 911 holds the only bridge";
+	b.sent.clear();
+
+	const InboundOutcome o = raiseInboundAnchorCall(b, "psap-967", "PSAP");
+
+	EXPECT_EQ(o.callId, "") << "no session is made for the callback; log:\n" << o.log;
+	EXPECT_EQ(o.drops, 1u) << "only the callback's own anchor leg is dropped, not the 911's";
+	EXPECT_NE(o.log.find("all media bridges busy"), std::string::npos) << o.log;
+	EXPECT_EQ(sentBesidesKeepalives(b), "") << "no BYE to the 911's caller, no fork INVITE";
+	EXPECT_TRUE(b.handler->getSession("Call-ID: er-967-911").has_value());
+	EXPECT_NE(b.handler->anchorBridgeForCallIdForTest("Call-ID: er-967-911"), nullptr);
+	EXPECT_TRUE(b.handler->hasLiveEmergencyCall());
+}
+
+TEST(EmergencyCallback, InboundPsapCallbackNeverEndsAnEarlierCallbackStillRinging)
+{
+	// The same limit for "drop 2": the inbound already ringing is itself a
+	// callback, an emergency call, so the second callback is dropped.
+	Bench b;
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+	preemptBench(b);
+	b.handler->ageEmergencyCallbacksForTest(std::chrono::minutes(10));
+	const InboundOutcome first = raiseInboundAnchorCall(b, "psap-967-a", "PSAP");
+	ASSERT_NE(first.callId, "") << first.log;
+	{
+		const auto s = b.handler->getSession(first.callId);
+		ASSERT_TRUE(s.has_value());
+		ASSERT_TRUE(s.value()->isEmergency()) << "precondition: the ringing call is a callback";
+	}
+	b.sent.clear();
+
+	const InboundOutcome second = raiseInboundAnchorCall(b, "psap-967-b", "PSAP");
+
+	EXPECT_EQ(second.callId, first.callId) << "no second session; the first callback is still the only inbound";
+	EXPECT_TRUE(b.handler->getSession(first.callId).has_value()) << "the earlier callback was not ended";
+	EXPECT_EQ(second.drops, 1u) << "only the second callback's own anchor leg is dropped";
+	EXPECT_NE(second.log.find("a call is already in progress"), std::string::npos) << second.log;
+	EXPECT_EQ(sentBesidesKeepalives(b), "") << "no CANCEL to the first callback's forks, no new INVITE";
+}
+
+TEST(EmergencyCallback, InboundPsapCallbackThatOneEndedCallCannotMakeRoomForEndsNothing)
+{
+	// An ordinary inbound call rings (no bridge) and 102's 555 call holds the only
+	// bridge. Ending the hold would free the bridge but leave the ringing call,
+	// and ending the ringing call would leave the bridge full: one call cannot
+	// make room, so the callback is dropped as before and neither call is ended.
+	Bench b;
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+	closeCallbackWindow(b);
+	preemptBench(b);
+	const InboundOutcome ordinary = raiseInboundAnchorCall(b, "pstn-967-b", "5551234567");
+	ASSERT_NE(ordinary.callId, "") << ordinary.log;
+	b.handler->handle(makeInvite("555", "er-967-hold", 0, "102", kOtherIp));
+	ASSERT_EQ(b.count("SIP/2.0 200", kOtherIp), 1u) << "102's call must hold the bridge:\n" << b.dump();
+	ASSERT_NE(b.handler->anchorBridgeForCallIdForTest("Call-ID: er-967-hold"), nullptr);
+	b.sent.clear();
+	reopenCallbackWindow(b);
+
+	const InboundOutcome o = raiseInboundAnchorCall(b, "psap-967", "PSAP");
+
+	EXPECT_EQ(o.callId, ordinary.callId) << "no session for the callback; the ringing call is still the only inbound";
+	EXPECT_EQ(o.drops, 1u) << "only the callback's own anchor leg is dropped";
+	EXPECT_NE(o.log.find("all media bridges busy"), std::string::npos) << o.log;
+	EXPECT_EQ(sentBesidesKeepalives(b), "") << "nothing was ended, so nothing is sent";
+	EXPECT_TRUE(b.handler->getSession(ordinary.callId).has_value());
+	EXPECT_TRUE(b.handler->getSession("Call-ID: er-967-hold").has_value());
+	EXPECT_NE(b.handler->anchorBridgeForCallIdForTest("Call-ID: er-967-hold"), nullptr);
 }

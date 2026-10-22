@@ -454,8 +454,8 @@ private:
 	// above (POST for activate since it has no body to speak of, mirroring
 	// sendApiKill's shape).
 	void sendApiTelephonyConfigList(int sock);
-	void sendApiTelephonyConfigSet(int sock, size_t slotIdx, const std::string& body);
-	void sendApiTelephonyConfigActivate(int sock, size_t slotIdx);
+	void sendApiTelephonyConfigSet(int sock, size_t slotIdx, const std::string& body, uint8_t role);
+	void sendApiTelephonyConfigActivate(int sock, size_t slotIdx, const std::string& body, uint8_t role);
 	void sendApiTelephonyConfigTest(int sock, size_t slotIdx);
 	void sendApiTelephonyConfigDelete(int sock, size_t slotIdx);
 	// DID -> extension inbound routing (new). GET lists all configured
@@ -468,7 +468,7 @@ private:
 	void sendApiE911Get(int sock);
 	void sendApiE911Set(int sock, const std::string& body);
 	void sendApiSbcModeGet(int sock);
-	void sendApiSbcModeSet(int sock, const std::string& body);
+	void sendApiSbcModeSet(int sock, const std::string& body, uint8_t role);
 	// Issue #800: multicast paging (997). Defined only when POCKETDIAL_MULTICAST_PAGING.
 	void sendApiMulticastPagingGet(int sock);
 	void sendApiMulticastPagingSet(int sock, const std::string& body);

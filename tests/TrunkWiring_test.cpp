@@ -437,6 +437,29 @@ TEST(TrunkWiring, TheHandsetAnswerCarriesNoSessionTimer)
 	EXPECT_EQ(ok.find("\r\nRequire:"), std::string::npos) << ok;
 }
 
+// #1042: the strip above is for a handset that merely supports timer. One that
+// REQUIRES it (pjsua --use-timer=2) is owed Session-Expires and Require: timer
+// in the 2xx (RFC 4028 §9) and hangs up on its own call without them.
+TEST(TrunkWiring, TheHandsetAnswerKeepsTheTimerAHandsetRequires)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-se-rq", 40000,
+		"Supported: timer\r\nRequire: timer\r\nSession-Expires: 1800\r\n"));
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+
+	const std::string ok = b.firstWith("200 OK");
+	ASSERT_FALSE(ok.empty()) << "the handset was never answered";
+	EXPECT_NE(ok.find("a=sendrecv"), std::string::npos) << ok;   // the handset's two-way answer
+	EXPECT_NE(ok.find("\r\nSession-Expires: 1800\r\n"), std::string::npos)
+		<< "a handset that Requires timer is owed Session-Expires (RFC 4028 §9)\n" << ok;
+	EXPECT_NE(ok.find("\r\nRequire: timer\r\n"), std::string::npos) << ok;
+}
+
 TEST(TrunkWiring, AnAnswerWithNoUsableMediaHangsTheCarrierUpRatherThanConnectSilence)
 {
 	Bench b;

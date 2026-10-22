@@ -1,0 +1,2 @@
+# FinalFailureRelay_test.cpp: 6 (#1049: a silent callee's CANCEL is ended at 32 s with the caller's own 487; an emergency Cancel is not; the callee's 487 leaves nothing behind; a 200 that crosses the CANCEL disarms the bounded wait; a retransmitted CANCEL keeps it armed; a late 487 or CANCEL after the reap sends nothing more)
+6

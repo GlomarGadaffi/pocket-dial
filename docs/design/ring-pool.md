@@ -104,6 +104,8 @@ Facts that bound the answer:
   No pre-emption is attempted for it. The only production caller is the `Incoming` event handler (:574-576), which
   calls it directly. The callback tests ring it after the 911 has ended (EmergencyRoute_test.cpp:956-966,
   AdminHttpGate_test.cpp:1751); none fills the bridges first. A ring reserve cannot help: the refusal precedes any ring request.
+  Superseded by #967 (desmo, 2026-10-19, option A): an inbound PSAP callback now ends one non-emergency call and is
+  routed. See [`psap-callback-preempt.md`](psap-callback-preempt.md). The line numbers in this bullet are as read at 7bcf952f.
 
 Exact count if a pool is built (option D):
 

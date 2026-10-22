@@ -1,0 +1,37 @@
+<h2>Call handling</h2>
+
+<h3>Ring and hunt groups</h3>
+<p class="hint">Ring all or hunt. Members are extension numbers, separated by commas. Outside lines are routed under Routing.</p>
+<div id="ch-groups-list" role="list"></div>
+<div class="field"><label class="lbl" for="ch-grp-ext">Group extension</label><input id="ch-grp-ext" type="text" inputmode="numeric" autocomplete="off"></div>
+<div class="field"><label class="lbl" for="ch-grp-members">Members (comma separated)</label><input id="ch-grp-members" type="text" autocomplete="off" aria-describedby="ch-grp-hint"></div>
+<div class="field"><label class="lbl" for="ch-grp-mode">Mode</label>
+  <select id="ch-grp-mode"><option value="ringall">Ring all</option><option value="hunt">Hunt</option></select>
+</div>
+<div class="btns">
+  <button class="btn" id="ch-grp-save" onclick="chSaveGroup()">[ ARM ] Delete group</button>
+  <span class="hint" id="ch-grp-hint">Empty members deletes the group.</span>
+</div>
+<div class="msg" id="ch-grp-msg" role="status"></div>
+
+<div id="paging-slot"></div>
+
+<h3>Parked calls</h3>
+<p class="hint">Read-only. Park and pick-up are not controlled from this page.</p>
+<div class="msg" id="ch-parked-count" role="status"></div>
+<div id="ch-parked-list" role="list"></div>
+
+<h3>Reserved extension ranges</h3>
+<p class="hint">Fixed in firmware and shown for reference. The firmware refuses these numbers for registration and in config, so they cannot be used as extensions, group members or forward targets. Not editable here.</p>
+<dl class="kv">
+  <div class="kvrow"><dt class="mono">700-709</dt><dd>Park orbits</dd></div>
+  <div class="kvrow"><dt class="mono">980-989</dt><dd>Paging zones</dd></div>
+  <div class="kvrow"><dt class="mono">997</dt><dd>Multicast paging</dd></div>
+  <div class="kvrow"><dt class="mono">999</dt><dd>All-page (ring all)</dd></div>
+  <div class="kvrow"><dt class="mono">777</dt><dd>Echo test</dd></div>
+  <div class="kvrow"><dt class="mono">888</dt><dd>Conference room</dd></div>
+  <div class="kvrow"><dt class="mono">555</dt><dd>Anchor media bridge</dd></div>
+  <div class="kvrow"><dt class="mono">440</dt><dd>Busy and error tone</dd></div>
+  <div class="kvrow"><dt class="mono">796</dt><dd>Voicemail retrieval</dd></div>
+  <div class="kvrow"><dt class="mono">911, 933</dt><dd>Emergency numbers, handled before ring groups and the dial plan</dd></div>
+</dl>

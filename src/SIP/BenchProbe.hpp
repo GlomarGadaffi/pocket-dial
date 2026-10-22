@@ -49,8 +49,8 @@ private:
 	bool _on;
 };
 
-// get_status / get_max_attempts: claimed by makeCall() for its own leg,
-// taken once by that leg's rx loop.
+// get_status / get_max_attempts / get_sock_shutdown: claimed by makeCall() for its own leg,
+// taken once by that leg's rx loop (arm before the INVITE).
 void claimGetFaults(std::string_view leg, bool destinationEmergency);
 GetLoopFaults takeGetFaults(std::string_view leg);
 

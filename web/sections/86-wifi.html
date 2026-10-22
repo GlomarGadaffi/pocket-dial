@@ -1,0 +1,22 @@
+<h3>Network</h3>
+<div class="row"><button class="btn" id="mnt-scan-btn">Scan Wi-Fi</button></div>
+<div class="msg" id="mnt-scan-msg"></div>
+<div id="mnt-wifi-list" role="group" aria-label="Wi-Fi networks"></div>
+<div class="grp" id="mnt-wifi-connect" hidden>
+  <p>Network: <span class="mono" id="mnt-wifi-ssid"></span></p>
+  <div class="field">
+    <label for="mnt-wifi-pw">Password</label>
+    <input type="password" id="mnt-wifi-pw" autocomplete="off" data-needs="login">
+  </div>
+  <div class="row">
+    <button class="btn btn-primary" id="mnt-wifi-connect-btn" data-needs="login">Connect</button>
+    <button class="btn" id="mnt-wifi-cancel-btn">Cancel</button>
+  </div>
+  <div class="msg" id="mnt-wifi-msg"></div>
+</div>
+<div class="row">
+  <button class="btn" id="mnt-ap-btn" data-needs="login">[ ARM ] Switch to Standalone AP</button>
+  <button class="btn" id="mnt-cfg-btn" data-needs="login">Hold setup mode</button>
+</div>
+<p class="hint">Standalone AP stores that as the operating mode and reboots the board about one second later. Hold setup mode pauses the automatic switch to Standalone while you configure the board.</p>
+<div class="msg" id="mnt-net-msg"></div>

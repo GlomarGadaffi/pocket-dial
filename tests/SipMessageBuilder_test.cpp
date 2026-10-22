@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "IDGen.hpp"
+#include "SipMessage.hpp"
 #include "SipMessageBuilder.hpp"
 #include "support/AllocCounter.hpp"
 
@@ -423,6 +424,30 @@ TEST(SipMessageBuilder, ByeWorstCaseIs820Bytes)
 	EXPECT_EQ(wire.len, 820u);
 	EXPECT_LT(wire.len, sipb::kMaxByeBytes);
 	EXPECT_NE(std::string_view(wire.bytes, wire.len).find("\r\nCSeq: 4294967295 BYE\r\n"), std::string_view::npos);
+}
+
+// #1030: the From and To lines a dialog may store (SipLimits), written with the shortest header
+// names ("f:", "t:", which the builder strips to values of 198 and 213 B), with every other
+// field at its worst. The static_assert at the INVITE gate is hand-derived; this measures it.
+TEST(SipMessageBuilder, ByeWithTheDialogLinesAtTheirBoundsIsBuildable)
+{
+	const std::string contact = "sip:" + std::string(128 - 4, 'u');
+	const std::string from = "f:" + std::string(SipLimits::kMaxDialogLineBytes - 2, 'f');
+	const std::string to = "t:" + std::string(SipLimits::kMaxDialogToLineBytes - 2, 't');
+	const std::string callId(125, 'c');
+	sipb::ByeParams p = validBye();
+	p.requestUri = contact;
+	p.localIp = "255.255.255.255";
+	p.localPort = 65535;
+	p.from = from;
+	p.to = to;
+	p.callId = callId;
+	p.cseq = 4294967295u;
+
+	sipb::ByeWire wire;
+	ASSERT_EQ(sipb::bye(wire, p), sipb::Err::Ok);
+	EXPECT_EQ(wire.len, 831u) << "the largest BYE the bounds allow is the largest the cap sends";
+	EXPECT_LT(wire.len, sipb::kMaxByeBytes);
 }
 
 // The cap itself: a BYE of kMaxByeBytes - 1 bytes is sent, one byte more is

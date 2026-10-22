@@ -213,8 +213,21 @@ flowchart TD
     E -->|yes| R4["403 setup_required"]
     E -->|no| F{"Owner session, or sysop with no owner account?"}
     F -->|no| R5["403 owner privilege required"]
-    F -->|yes| G["Stream the body into the inactive slot"]
+    F -->|yes| H{"Any call up or ringing?"}
+    H -->|yes| R6["409 busy, call in progress"]
+    H -->|no| G["Stream the body into the inactive slot"]
 ```
+
+**No upload while a call is live (#986).** A flash erase or write stalls every task
+that runs from flash, the SIP engine's included: holds of its lock of 93, 190 and
+296 ms were measured across three OTA flashes. So after the gate, and before the
+body is read, the upload is refused with
+`409 {"error":"busy","message":"call in progress; firmware upload refused until no call is up or ringing"}`
+while any call is up or ringing (a 911/933 and a PSAP callback included). It is not
+deferred or buffered; retry on an idle line (`sessionCount` on `/api/status` is
+`0`). The body is not drained, so a client still sending may see the connection
+reset instead of the `409`. The check is made once, at the start: a call that
+begins while the image is streaming is not covered.
 
 **There is no login-free path to OTA.** A fresh device ships with a default login
 credential, so the session check applies from the first boot. Check 4 refuses OTA
@@ -424,6 +437,7 @@ refinement.
 
 | Failure | Behaviour |
 |---------|-----------|
+| A call is up or ringing when the upload starts | `409 busy` before anything is read or written (§3.1). The running image and the inactive slot are untouched. Retry when the line is idle. |
 | Upload truncated (Wi-Fi drop mid-stream) | The `esp_ota_write` stream ends short. The handler calls `ota.abort()` and returns `400`. The boot partition is unchanged, and the device keeps running the current image. |
 | Corrupt image | `esp_ota_end()` returns `ESP_ERR_OTA_VALIDATE_FAILED` → `422`. Slot not activated. |
 | Power loss during write | The slot is partially written but never activated; `otadata` still points at the running slot. Next boot is the old image. Re-upload to retry. |

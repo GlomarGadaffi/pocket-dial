@@ -1,0 +1,121 @@
+<div class="tabs" role="group" aria-label="Extensions and devices"><button type="button" data-sec="extensions">Extensions</button><button type="button" data-sec="devices">Devices</button></div>
+<h2>Devices</h2>
+<p class="hint">Registration, SIP PnP and zero-touch for phones on this board. State is read when you open this section; use Refresh to read it again.</p>
+
+<h3 class="sect-t">Registration</h3>
+<dl class="kv">
+  <div class="kvrow"><div><dt>Current mode</dt><dd id="reg-mode-cur">—</dd></div></div>
+</dl>
+<div class="btns">
+  <div class="field">
+    <label for="reg-mode">Registration mode</label>
+    <select id="reg-mode">
+      <option value="learn">Learn: adopt new phones on first contact</option>
+      <option value="secure" disabled>Secure: digest auth required</option>
+    </select>
+  </div>
+  <button class="btn btn-primary" onclick="devSaveMode()">Apply mode</button>
+</div>
+<div class="hint" id="reg-secure-why">Secure needs a SIP password (not yet supported).</div>
+<div class="msg" id="reg-msg"></div>
+
+<h3 class="sect-t">Adopted devices</h3>
+<div class="hint" id="reg-roster-note">
+  Phones seen while in Learn mode. <strong>Secure</strong> locks one to its
+  extension and starts enforcing digest auth for it; <strong>Forget</strong> drops
+  the record so the phone is re-adopted on its next registration. A
+  <strong>locked</strong> row is bound to its phone's MAC. A
+  <strong>shared</strong> row (a NAT router, or a phone moved while unlocked)
+  never locks: Forget it so the right phone can lock.
+</div>
+<div class="scroll">
+  <table class="data" id="reg-roster">
+    <thead><tr><th>Extension</th><th>MAC</th><th>State</th><th><span class="sr">Action</span></th></tr></thead>
+    <tbody id="reg-roster-body"></tbody>
+  </table>
+</div>
+<div class="btns">
+  <button class="btn" onclick="devicesShown()">Refresh</button>
+  <button class="btn" id="reg-forget-all" aria-disabled="true" onclick="devForgetLearned()" aria-label="[ ARM ] Forget all learned">[ ARM ] Forget all</button>
+</div>
+
+<h3 class="sect-t">SIP PnP</h3>
+<dl class="kv">
+  <div class="kvrow"><div><dt>Current mode</dt><dd id="pnp-mode-cur">—</dd></div></div>
+  <div class="kvrow"><div><dt>Listening</dt><dd id="pnp-listening">—</dd></div></div>
+  <div class="kvrow"><div><dt>Socket errno</dt><dd><span class="well" id="pnp-errno">—</span><span class="unit">errno</span></dd></div></div>
+  <div class="kvrow"><div><dt>Netmask</dt><dd id="pnp-netmask" class="mono">—</dd></div></div>
+  <div class="kvrow"><div><dt>Datagrams</dt><dd><span class="well" id="pnp-rx-dgram">—</span><span class="unit">datagrams</span></dd></div></div>
+  <div class="kvrow"><div><dt>Off subnet</dt><dd><span class="well" id="pnp-rx-off">—</span><span class="unit">datagrams</span></dd></div></div>
+  <div class="kvrow"><div><dt>Not PnP</dt><dd><span class="well" id="pnp-rx-notpnp">—</span><span class="unit">datagrams</span></dd></div></div>
+  <div class="kvrow"><div><dt>Answered</dt><dd><span class="well" id="pnp-rx-answered">—</span><span class="unit">datagrams</span></dd></div></div>
+</dl>
+<div class="btns">
+  <div class="field">
+    <label for="pnp-mode">PnP mode</label>
+    <select id="pnp-mode">
+      <option value="off">Off (default): nothing is parsed or recorded</option>
+      <option value="discover">Discover: phones are recorded, never answered</option>
+      <option value="provision">Provision: answers snom and Yealink phones this board has a config for</option>
+    </select>
+  </div>
+  <button class="btn btn-primary" id="pnp-apply" onclick="devSavePnp()">Apply PnP mode</button>
+</div>
+<div class="hint">Only phones on this board's own subnet are recorded or answered.</div>
+<div class="msg" id="pnp-msg"></div>
+<div class="scroll">
+  <table class="data" id="pnp-roster">
+    <thead><tr><th>MAC</th><th>Vendor</th><th>Model</th><th>Version</th><th>IP</th><th>Seen</th><th>Last seen</th><th>Notified</th></tr></thead>
+    <tbody id="pnp-body"></tbody>
+  </table>
+</div>
+
+<h3 class="sect-t">Zero-touch claim window</h3>
+<dl class="kv">
+  <div class="kvrow"><div><dt>Window</dt><dd id="zt-state">—</dd></div></div>
+  <div class="kvrow"><div><dt>Range</dt><dd id="zt-range">—</dd></div></div>
+  <div class="kvrow"><div><dt>Seconds left (at last read)</dt><dd><span class="well" id="zt-secs">—</span><span class="unit">s</span></dd></div></div>
+  <div class="kvrow"><div><dt>Unclaimed</dt><dd><span class="well" id="zt-unclaimed">—</span><span class="unit">ext</span></dd></div></div>
+  <div class="kvrow"><div><dt>Free in range</dt><dd><span class="well" id="zt-free">—</span><span class="unit">ext</span></dd></div></div>
+  <div class="kvrow"><div><dt>Refusals</dt><dd><span class="well" id="zt-refusals">—</span><span class="unit">refusals</span></dd></div></div>
+  <div class="kvrow"><div><dt>Last refusal</dt><dd id="zt-lastref">—</dd></div></div>
+  <div class="kvrow"><div><dt>Learn only</dt><dd id="zt-learnonly">—</dd></div></div>
+</dl>
+<div class="btns">
+  <div class="field">
+    <label for="zt-lo">First extension</label>
+    <input type="text" id="zt-lo" inputmode="numeric" autocomplete="off">
+  </div>
+  <div class="field">
+    <label for="zt-hi">Last extension</label>
+    <input type="text" id="zt-hi" inputmode="numeric" autocomplete="off">
+  </div>
+  <div class="field">
+    <label for="zt-minutes">Minutes open</label>
+    <input type="text" id="zt-minutes" inputmode="numeric" autocomplete="off">
+  </div>
+</div>
+<div class="hint">Minutes 1 to 120. First and last extension take 3 to 6 digits, the first must not exceed the last, and the two must be fewer than 500 apart.</div>
+<div class="btns">
+  <button class="btn btn-primary" onclick="devOpenZeroTouch()">Open window</button>
+  <button class="btn" onclick="devCloseZeroTouch()">Close window</button>
+</div>
+<div class="msg" id="zt-msg"></div>
+
+<h3 class="sect-t">Phone provisioning URLs</h3>
+<div class="hint">Phones fetch these URLs themselves. This page does not push configuration to a phone. The board serves a file only for an adopted MAC, or for the fixed master and bootstrap names.</div>
+<div class="scroll">
+  <table class="data" id="cfg-patterns">
+    <thead><tr><th>URL pattern</th><th>Format</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">/config/&lt;mac&gt;.cfg</td><td>Yealink (not hardware-verified)</td></tr>
+      <tr><td class="mono">/config/000000000000.cfg</td><td>Polycom master (fixed name)</td></tr>
+      <tr><td class="mono">/config/&lt;mac&gt;-phone.cfg</td><td>Polycom, per phone</td></tr>
+      <tr><td class="mono">/config/spa&lt;mac&gt;.cfg</td><td>Cisco SPA, macro-expanded</td></tr>
+      <tr><td class="mono">/config/spa&lt;model&gt;.cfg</td><td>Cisco SPA, keyed by model</td></tr>
+      <tr><td class="mono">/config/snom&lt;mac&gt;.xml</td><td>snom</td></tr>
+      <tr><td class="mono">/config/cfg&lt;mac&gt;.xml</td><td>XML</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="hint">&lt;mac&gt; is 12 hex digits with no colons.</div>

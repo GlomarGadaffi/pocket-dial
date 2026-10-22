@@ -29,6 +29,7 @@
 // declare pd_sd_mounted()).
 
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -204,6 +205,13 @@ bool parseTombstoneLine(const char* line, char* nameOut, size_t nameCap);
 // it retires.
 bool parseEntryLine(const char* line, MessageInfo& info);
 
+// The index.csv half of Source::listMessages(), over an already-open file
+// (rewound by the call). `out` may be nullptr: count only (#756).
+size_t listIndexFile(std::FILE* f, MessageInfo* out, size_t maxCount);
+
+// True if any tombstone row anywhere in `f` names `name` (rewinds `f`).
+bool indexFileHasTombstone(std::FILE* f, const char* name);
+
 class Source
 {
 public:
@@ -214,6 +222,12 @@ public:
 	// the menu decides playback/deletion order, not this call. Returns N.
 	// Returns 0, not an error, for an extension with no mailbox directory
 	// yet (nobody has ever left it a message).
+	//
+	// `out` may be nullptr: COUNT ONLY (#756, the MWI boot seed). Same tombstone
+	// filtering and the same `maxCount` cap, so the count equals what a real
+	// listing would return, but nothing is copied -- the caller needs no
+	// MessageInfo buffer, which on the 6 KB vm_archive stack it could not afford.
+	// Every implementation must honour it.
 	virtual size_t listMessages(const char* extension, MessageInfo* out, size_t maxCount) const = 0;
 
 	// Reads message `name`'s raw mu-law body (the .wav file's audio, past

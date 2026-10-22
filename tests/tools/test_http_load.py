@@ -329,6 +329,7 @@ class InviteBoundTest(unittest.TestCase):
         agent = an.sip_agent.Agent("6101", "127.0.0.1", peer.port, local_ip="127.0.0.1", timeout=1.0,
                                    invite_timeout=0.6)
         self.addCleanup(agent.close)
+        agent.allow_outside(FAR)                                # the dial guard: this fake far end is dialed on purpose
         due = threading.Event()
         threading.Timer(1.2, due.set).start()                   # well past the default bound
         dlg = agent.invite(FAR, cancel_when=lambda since: time.monotonic() if due.is_set() else None,
@@ -344,6 +345,7 @@ class InviteBoundTest(unittest.TestCase):
         agent = an.sip_agent.Agent("6101", "127.0.0.1", peer.port, local_ip="127.0.0.1", timeout=1.0,
                                    invite_timeout=0.6)
         self.addCleanup(agent.close)
+        agent.allow_outside(FAR)
         dlg = agent.invite(FAR, cancel_when=lambda since: None, cancel_when_timeout_s=0.8)
         self.assertIsNone(dlg.final_status, "the 0.6 s default bound ended the wait before the 487 could be read")
 
@@ -1107,7 +1109,7 @@ class DriftTest(unittest.TestCase):
         for path, period, _ in hl.POLLS:
             self.assertIn(interval[path] % int(period * 1000), html, path)
             self.assertIn('fetch("%s"' % path, html, path)
-        self.assertIn('$("pbx-modal").classList.contains("show"))fetchMohStatus()', html)    # moh: panel open only
+        self.assertIn('nav.current==="audio")fetchMohStatus()', html)    # moh: Audio section shown only
         self.assertEqual([p for p, _, always in hl.POLLS if not always], ["/api/trace", "/api/moh"])
 
     def test_the_stack_and_per_source_constants_are_the_firmwares(self):
