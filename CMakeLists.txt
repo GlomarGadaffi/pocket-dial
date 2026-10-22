@@ -59,7 +59,15 @@ if(DEFINED ENV{IDF_PATH})
     # now, after project(); the test in tests/tools/test_task_stack_gate.py reads
     # this line, and the gate's two cJSON rows follow it.
     idf_component_get_property(pd_cjson_lib espressif__cjson COMPONENT_LIB)
-    target_compile_definitions(${pd_cjson_lib} PRIVATE "CJSON_NESTING_LIMIT=16")
+    # The component already defines CJSON_NESTING_LIMIT=1000 itself, and a second
+    # -D of the same macro is "redefined" under -Werror. So replace it: drop the
+    # component's own value from its COMPILE_DEFINITIONS, then add ours.
+    get_target_property(pd_cjson_defs ${pd_cjson_lib} COMPILE_DEFINITIONS)
+    if(NOT pd_cjson_defs)
+        set(pd_cjson_defs "")
+    endif()
+    list(FILTER pd_cjson_defs EXCLUDE REGEX "^CJSON_NESTING_LIMIT=")
+    set_property(TARGET ${pd_cjson_lib} PROPERTY COMPILE_DEFINITIONS ${pd_cjson_defs} "CJSON_NESTING_LIMIT=16")
 
     # Issues #410 / #328, BENCH ONLY (docs/BENCH_PROBE.md): the HTTP DRAM accounting image
     # reads lwIP's per-pool memp counters (httpDramAccount.memp). lwIP keeps them only when

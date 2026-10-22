@@ -762,8 +762,12 @@ class Gate(unittest.TestCase):
         with open(os.path.join(g.REPO, "CMakeLists.txt"), encoding="utf-8") as f:
             text = f.read()
         lib = re.search(r"idf_component_get_property\(\s*(\w+)\s+espressif__cjson\s+COMPONENT_LIB\s*\)", text)
-        m = lib and re.search(r"target_compile_definitions\(\s*\$\{" + lib.group(1) +
-                              r"\}\s+PRIVATE\s+\"?CJSON_NESTING_LIMIT=(\d+)\"?\s*\)", text)
+        m = lib and re.search(r"set_property\(\s*TARGET\s+\$\{" + lib.group(1) +
+                              r"\}\s+PROPERTY\s+COMPILE_DEFINITIONS\s+\$\{\w+\}\s+\"CJSON_NESTING_LIMIT=(\d+)\"\s*\)", text)
+        # The component defines CJSON_NESTING_LIMIT=1000 itself: a second -D is a -Werror redefinition,
+        # so the build must drop the component's value first (run 39355912998 failed on exactly this).
+        self.assertFalse(m and "EXCLUDE REGEX \"^CJSON_NESTING_LIMIT=\"" not in text,
+                         "appending a second CJSON_NESTING_LIMIT -D fails -Werror; replace the component's")
         if m:
             self.assertLess(text.index('project("SipServer")'), m.start(), "the cjson target exists only after project()")
         return int(m.group(1)) if m else None
@@ -811,6 +815,34 @@ class Gate(unittest.TestCase):
         row = [t for t in table["tasks"] if t["name"] == "http_conn"]
         self.assertEqual([(t["bytes"], t["file"]) for t in row], [(4096, "src/Helpers/HttpServer.cpp")])
         self.assertEqual((table["margin_bytes"], table["frame_ceiling_bytes"]), (512, 1024))
+
+    def test_indirect_call_sites_are_reported_per_task_not_silently_zero(self):
+        # An indirect site is charged 0 B (the walk cannot follow it), so the task line must say
+        # how many the task reaches and who makes them: a fit is a fit for direct calls only.
+        self.add_ci(node("ind", "Indirect Call Placeholder", 0, kind="static") + edge("mid", "ind"))
+        self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
+        rc, out = self.run_gate()
+        self.assertIn("indirect call sites: 1 reachable", out)
+        small = out.split("small:")[1].split("big:")[0]
+        self.assertIn("indirect call sites: 0 reachable", small)
+        self.assertIn("big:", out)
+        self.assertRegex(out.split("big:")[1], r"indirect call sites: 1 reachable, 1 function\(s\) on the worst chain.*mid")
+
+    def test_known_finding_is_reported_but_only_while_it_does_not_get_worse(self):
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["bytes"] = 2000                        # 1900 + 512 margin > 2000: over budget
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)                      # control: red without a known_findings row
+        self.table["known_findings"] = {"big": {"max_total": 1900, "reason": "pending measurement"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("KNOWN big: 1900 B", out)
+        self.assertIn("pending measurement", out)
+        self.table["known_findings"]["big"]["max_total"] = 1800     # deeper than recorded: new
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("a new finding", out)
 
 
 if __name__ == "__main__":

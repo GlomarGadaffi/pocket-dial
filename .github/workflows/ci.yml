@@ -781,6 +781,9 @@ jobs:
         env:
           EXTRA_CFLAGS: "-fcallgraph-info=su -fstack-usage"
           EXTRA_CXXFLAGS: "-fcallgraph-info=su -fstack-usage"
+          # A ccache hit need not reproduce the .ci/.su side files the flags ask for, so
+          # every object here is compiled for real and the gate reads a complete set.
+          IDF_CCACHE_ENABLE: "0"
         run: |
           . $IDF_PATH/export.sh
           idf.py set-target esp32s3

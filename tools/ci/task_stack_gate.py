@@ -106,6 +106,9 @@ CREATE_RE = re.compile(r"\b(?:xTaskCreate\w*|pd::createTaskPreferPsram)\s*\("
                        r"|\bstd::j?thread\s*(?:\w+\s*)?[({]")
 
 
+INDIRECT_RE = re.compile(r"^Indirect Call Placeholder$")
+
+
 def count_sites(src_root):
     """{relpath: number of task-creation call sites} over src/ and main/."""
     out = {}
@@ -247,6 +250,11 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
     ceiling = table["frame_ceiling_bytes"]
     allow = table.get("frame_allowlist", {})
     tasks = table["tasks"]
+    known = table.get("known_findings", {})
+    for k, row in sorted(known.items()):
+        if not (isinstance(row.get("max_total"), int) and row["max_total"] >= 1 and row.get("reason")):
+            print(f"FAIL known_findings row '{k}': needs a whole-number max_total >= 1 and a reason")
+            return 1
     nodes, edges, frames = load_graph(ci_dir)
     roots = project_roots(project_root or src_root)
 
@@ -378,9 +386,30 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
         total, path = max((worst_chain(unit.get(h, h), succ, cost, memo) for h in hits),
                           key=lambda r: r[0])
         ok = total + margin <= t["bytes"]
-        rc |= 0 if ok else 1
-        print(f"{'ok  ' if ok else 'FAIL'} {t['name']}: {total} B + {margin} margin "
+        # known_findings: a reported over-budget task that does not fail the job, so a red job means
+        # something new. It holds only while the chain is no deeper than the recorded max_total; a
+        # deeper chain is a new finding and fails. A known task that fits again is called out.
+        kf = known.get(t["name"])
+        known_hit = bool(kf) and not ok and total <= kf["max_total"]
+        rc |= 0 if (ok or known_hit) else 1
+        print(f"{'ok  ' if ok else 'KNOWN' if known_hit else 'FAIL'} {t['name']}: {total} B + {margin} margin "
               f"{'<=' if ok else '>'} {t['bytes']} B ({t['file']}:{t['line']})")
+        # The walk cannot follow an indirect call (a vtable, std::function, a callback pointer), and
+        # the placeholder is charged 0 B. So a pass is a fit only for the direct calls: say how many
+        # indirect sites the task reaches and which chain functions make one, never a silent 0.
+        reached = reachable(hits, edges)
+        sites = sorted(v for v in reached if INDIRECT_RE.search(pretty(nodes.get(v, v))))
+        on_chain = sorted({pretty(nodes.get(m, m))[:80] for x in path for m in members.get(x, (x,))
+                           if any(w in sites for w in edges.get(m, ()))})
+        print(f"        indirect call sites: {len(sites)} reachable, {len(on_chain)} function(s) on "
+              f"the worst chain make one; callee frames are not charged"
+              + ("" if not sites else (" -- " + "; ".join(on_chain[:6]) if on_chain else "")))
+        if known_hit:
+            print(f"        known finding (<= {kf['max_total']} B, not failing the job): {kf['reason']}")
+        elif kf and ok:
+            print(f"        note: known finding for {t['name']} no longer applies; remove it from task_stacks.json")
+        elif kf:
+            print(f"        FAIL: deeper than the known finding's {kf['max_total']} B: a new finding")
         for x in path:
             print(f"        {cost[x]:6d}  {cycle_label.get(x) or pretty(nodes.get(x, x))[:100]}")
 
