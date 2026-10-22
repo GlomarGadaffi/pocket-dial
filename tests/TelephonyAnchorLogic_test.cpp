@@ -842,4 +842,104 @@ TEST(GetForbidden, AnEmergencyOrInboundLegNeverGivesUpEarly)
 	}
 }
 
+// ── #1097: a WS Remove that names no slot ends no call ─────────────────────────
+// processWsWork()'s Remove branch drops the slot removeTargetSlot() returns: stopMediaStreams()
+// on its leg and CallEvent::Dropped for it, so RequestsHandler BYEs that call. -1 drops no slot;
+// the branch then reports Dropped for the Remove's own id (#533), which matches no live session.
+// The race (#1095, .244 2026-10-21): 3CX's "Participant Remove 1276" for another handset's
+// refused makecall arrived 5 ms before the response named 1276, so no slot held it.
+// The fields beyond the two ids are what the slot carries; the decision must not need them.
+struct RemoveSlot
+{
+	std::string   participantId;   // our own leg; "" = free
+	std::string   farPartId;       // recorded at Answered when the far leg surfaced; else ""
+	std::uint32_t emergency = 0;   // CallSlot::emergency: the 911/933 makeCall placed
+	bool          inbound = false; // an inbound leg (a PSAP callback is one; the slot cannot tell which)
+};
+
+constexpr const char* kUnknownRemove = "1276";   // the #1095 leg: no slot holds it
+
+TEST(RemoveTarget, ALive911IsNotDroppedByARemoveForALegNoSlotHolds)
+{
+	RemoveSlot slots[4];
+	slots[0] = {"1275", "1280", 911, false};   // the only active call: an answered 911
+	EXPECT_EQ(removeTargetSlot(slots, "1275"), 0) << "positive control: the 911's own Remove ends it";
+	EXPECT_EQ(removeTargetSlot(slots, kUnknownRemove), -1)
+	    << "a Remove for another handset's leg stopped the 911's media and BYEd it (Rule 5)";
+}
+
+TEST(RemoveTarget, ALive911WhoseFarLegWasNeverRecordedIsNotDroppedEither)
+{
+	// farPartId stays "" when the Answered upset named our own leg: no Remove can be tied to the
+	// far leg, so "far leg still unknown" is not evidence that this Remove is the 911's.
+	RemoveSlot slots[4];
+	slots[2] = {"1275", "", 933, false};
+	EXPECT_EQ(removeTargetSlot(slots, kUnknownRemove), -1) << "a 933 with no far-leg id was dropped";
+}
+
+TEST(RemoveTarget, AnAnsweredPsapCallbackIsNotDroppedByARemoveForALegNoSlotHolds)
+{
+	// The PSAP's callback is an inbound leg: CallSlot::emergency is 0 and farPartId is never recorded
+	// for inbound, so nothing on the slot can exempt it. Only an exact match may end it.
+	RemoveSlot slots[4];
+	slots[1] = {"1290", "", 0, true};
+	EXPECT_EQ(removeTargetSlot(slots, "1290"), 1) << "positive control: the callback's own Remove ends it";
+	EXPECT_EQ(removeTargetSlot(slots, kUnknownRemove), -1) << "a Remove for another leg hung up on the PSAP";
+}
+
+TEST(RemoveTarget, AnOrdinarySoleCallIsNotDroppedByARemoveForALegNoSlotHolds)
+{
+	// Pinned on purpose (#1097): no "only active slot" fallback for any call. The far-end hangups
+	// captured on .244 (#533, three X1 runs) named our own leg, as did every other captured
+	// teardown (#379, #901, #548, #681, #370, #1095): no capture needed the fallback, and what it
+	// could end was the wrong call.
+	RemoveSlot slots[4];
+	slots[3] = {"1275", "", 0, false};
+	EXPECT_EQ(removeTargetSlot(slots, kUnknownRemove), -1) << "an ordinary call was dropped by another leg's Remove";
+}
+
+TEST(RemoveTarget, TheEchoOfOurOwnDropDoesNotEndTheOtherCall)
+{
+	// Two calls; this unit drops 1274, whose slot is freed before 3CX's Remove 1274 arrives
+	// (#533's "echo of our own drop"). 1275 is now the only active slot.
+	RemoveSlot slots[4];
+	slots[0] = {"1275", "", 0, false};
+	slots[1] = {"", "1281", 0, false};   // 1274's slot, freed (a stale far id left on a free slot)
+	EXPECT_EQ(removeTargetSlot(slots, "1274"), -1) << "the echo of our own drop ended the other call";
+	EXPECT_EQ(removeTargetSlot(slots, "1281"), -1) << "a free slot's stale far id matched";
+}
+
+TEST(RemoveTarget, ARemoveThatNamesASlotStillEndsThatSlotOnly)
+{
+	RemoveSlot slots[4];
+	slots[0] = {"1270", "1271", 0, false};
+	slots[1] = {"1272", "", 911, false};
+	slots[2] = {"1290", "", 0, true};
+	EXPECT_EQ(removeTargetSlot(slots, "1270"), 0) << "own leg";
+	EXPECT_EQ(removeTargetSlot(slots, "1271"), 0) << "the recorded far leg";
+	EXPECT_EQ(removeTargetSlot(slots, "1272"), 1) << "a 911 3CX ended is gone: its own Remove ends it";
+	EXPECT_EQ(removeTargetSlot(slots, "1290"), 2) << "inbound own leg";
+	EXPECT_EQ(removeTargetSlot(slots, "127"), -1) << "a prefix is another participant";
+	EXPECT_EQ(removeTargetSlot(slots, "12700"), -1);
+	EXPECT_EQ(removeTargetSlot(slots, ""), -1) << "an empty id names nobody, not a slot with no far id";
+}
+
+TEST(RemoveTarget, TheDecisionAllocatesNothing)
+{
+	RemoveSlot slots[4];
+	slots[0] = {"1275", "1280", 911, false};
+	int a = 0;
+	int b = 0;
+	std::size_t allocs = 0;
+	{
+		AllocGuard g;
+		a = removeTargetSlot(slots, std::string_view("1280"));
+		b = removeTargetSlot(slots, std::string_view(kUnknownRemove));
+		allocs = g.delta();
+	}
+	EXPECT_EQ(a, 0);
+	EXPECT_EQ(b, -1);
+	EXPECT_EQ(allocs, 0u) << "the WS worker's Remove decision runs after init: no heap";
+}
+
 }  // namespace

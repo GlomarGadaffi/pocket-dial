@@ -3302,31 +3302,17 @@ void TelephonyAnchorClient::processWsWork(const WsWorkItem& w)
 
 	if (w.kind == WsWork::Remove)
 	{
-		// #100: map the removed participant to a slot. Telephony may name our own leg or (issue #40) the
-		// far leg; match by id first, else fall back to the sole active call (single-leg DN). The
-		// teardown frees the slot (idempotent via its per-slot tearingDown gate); freeSlotLocked
-		// also clears its inboundSignaledPartId so a recycled partId can re-announce next time.
+		// #100: map the removed participant to a slot. Telephony may name our own leg or the far leg
+		// recorded at Answered; telephony::removeTargetSlot() matches either exactly. #1097: a Remove
+		// that names no slot ends no call -- no fallback to the sole active call, which can be a live
+		// 911/933 or a PSAP callback (Rule 5). The teardown frees the slot (idempotent via its per-slot
+		// tearingDown gate); freeSlotLocked also clears its inboundSignaledPartId so a recycled partId
+		// can re-announce next time.
 		std::string dropLeg;
 		{
 			std::lock_guard<std::mutex> lock(_mutex);
-			CallSlot* s = slotForLocked(w.partId);
-			if (!s)
-			{
-				// Far-leg Remove: Telephony names the external party's participant id, not ours.
-				// Match against each slot's recorded far-leg id so N-call teardown works.
-				for (auto& c : _calls)
-					if (!c.participantId.empty() && c.farPartId == w.partId) { s = &c; break; }
-			}
-			if (s)
-			{
-				dropLeg = s->participantId;
-			}
-			else
-			{
-				CallSlot* only = nullptr; int active = 0;
-				for (auto& c : _calls) if (!c.participantId.empty()) { ++active; only = &c; }
-				if (active == 1) dropLeg = only->participantId;
-			}
+			const int i = telephony::removeTargetSlot(_calls, w.partId);
+			if (i >= 0) dropLeg = _calls[i].participantId;
 		}
 		if (!dropLeg.empty())
 		{
