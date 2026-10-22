@@ -1327,6 +1327,12 @@ TEST(TrunkInbound, AByeOnALive911DialogSurvivesTheHandsetsDrainedBucket)
 
 	EXPECT_FALSE(b.handler.getSession("Call-ID: rl-911-c").has_value())
 		<< "the BYE that ends a live 911 was dropped by the rate limiter";
+
+	// The exemption is the live call's, not the Call-ID's forever: once the call ended it is gone.
+	const uint32_t before = b.handler.getDropProbe().rateCount();
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		phoneBye("rl-911-c", field(ok, "To: "), "rlbye2"), addrFor(kPhoneIp)));
+	EXPECT_EQ(b.handler.getDropProbe().rateCount(), before + 1u) << "an ended call's Call-ID is limited again";
 }
 
 TEST(TrunkInbound, AFloodingNonTrunkIpIsStillRateLimitedAndSpoofedHeadersBuyNothing)

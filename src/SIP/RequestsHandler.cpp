@@ -963,7 +963,10 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	// touch only the rate state, which _rateMutex now guards.
 	{
 		std::lock_guard<std::mutex> rlock(_rateMutex);
-		if (!ipAllowed(request->getSource()) || !allowPacket(request->getSource()))
+		// #1092, Rule 5: the trunk peer and a live emergency Call-ID skip the bucket and the
+		// 256-entry cap. The allowlist still applies. One memcmp scan, no _mutex.
+		if (!ipAllowed(request->getSource()) ||
+			(!rateExempt(*request) && !allowPacket(request->getSource())))
 		{
 			const sockaddr_in src = request->getSource();
 			_dropProbe.note(DropProbe::Reason::Rate, src.sin_addr.s_addr, src.sin_port, rawBytes);
@@ -1332,6 +1335,9 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// registration appear/disappear, session create/transition/teardown.
 		// NOTIFYs land in _outbox and ride out with this pass (after unlock).
 		_blf.refresh();
+
+		// #1092: a session this packet created or ended changes the emergency Call-ID set.
+		publishRateExemptions();
 
 		// #462 (#284 rank 5): into the receive path's own persistent scratch.
 		// Safe without a lock of their own: handle() has exactly one production
@@ -11183,6 +11189,11 @@ void RequestsHandler::tick()
 			}
 		}
 
+		// #1092: re-publish the limiter's exemptions every pass (a trunk name resolving,
+		// a session ending without a packet).
+		publishTrunkPeer();
+		publishRateExemptions();
+
 		// Belt-and-suspenders (Fix #4): drop DTMF accumulators whose dialog is gone,
 		// in case a teardown path bypassed endCall(). Bounded by the small session pool.
 		_dtmf.sweepStale();
@@ -12142,6 +12153,79 @@ bool RequestsHandler::ipAllowed(const sockaddr_in& src) const
 	if (_allowMask == 0) return true; // No allowlist configured
 	uint32_t ip = ntohl(src.sin_addr.s_addr);
 	return (ip & _allowMask) == _allowNet;
+}
+
+bool RequestsHandler::emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId)
+{
+	// A Call-ID that does not fit is not stored truncated: a prefix would exempt other dialogs.
+	if (callId.empty() || callId.size() >= kRateExemptCallIdBytes || set.count >= kMaxRateExemptCallIds)
+		return false;
+	if (emergencyIdsHas(set, callId)) return true;
+	std::memcpy(set.id[set.count].data(), callId.data(), callId.size());
+	set.len[set.count] = static_cast<uint8_t>(callId.size());
+	++set.count;
+	return true;
+}
+
+bool RequestsHandler::emergencyIdsHas(const EmergencyCallIds& set, std::string_view callId)
+{
+	for (size_t i = 0; i < set.count && i < kMaxRateExemptCallIds; ++i)
+	{
+		if (set.len[i] == callId.size() && std::memcmp(set.id[i].data(), callId.data(), callId.size()) == 0)
+			return true;
+	}
+	return false;
+}
+
+bool RequestsHandler::emergencyIdsEqual(const EmergencyCallIds& a, const EmergencyCallIds& b)
+{
+	if (a.count != b.count) return false;
+	for (size_t i = 0; i < a.count && i < kMaxRateExemptCallIds; ++i)
+	{
+		if (a.len[i] != b.len[i] || std::memcmp(a.id[i].data(), b.id[i].data(), a.len[i]) != 0)
+			return false;
+	}
+	return true;
+}
+
+void RequestsHandler::publishRateExemptions()
+{
+	// Member scratch (guarded by _mutex), not a stack local: it is ~2 KB and this runs from the SIP task.
+	EmergencyCallIds& fresh = _emergencyIdsScratch;
+	fresh.count = 0;   // entries past count are never read
+	for (const auto& [callID, s] : _sessions)
+	{
+		if (!s || !s->isEmergency()) continue;
+		(void)emergencyIdsAdd(fresh, callID);
+		// #818: the carrier speaks on the trunk dialog's own Call-ID, not the handset leg's.
+		if (const SipTrunk::Dialog* d = _sipTrunk.findByCallID(callID); d)
+			(void)emergencyIdsAdd(fresh, d->callID);
+	}
+	std::lock_guard<std::mutex> rlock(_rateMutex);
+	if (!emergencyIdsEqual(fresh, _emergencyCallIds)) _emergencyCallIds = fresh;
+}
+
+void RequestsHandler::publishTrunkPeer()
+{
+	uint32_t peer = 0;
+	if (_sipTrunk.config().valid())
+	{
+		sockaddr_in sbc{};
+		// Cache-only lookup: tick() is what resolves. 0.0.0.0 names no carrier.
+		if (_trunkResolver.lookup(_sipTrunk.config().transportHost(), _sipTrunk.config().transportPort(),
+				sbc, std::chrono::steady_clock::now()) == TrunkResolver::Status::Hit)
+		{
+			peer = sbc.sin_addr.s_addr;
+		}
+	}
+	std::lock_guard<std::mutex> rlock(_rateMutex);
+	_trunkPeerIp = peer;
+}
+
+bool RequestsHandler::rateExempt(const SipMessage& m) const
+{
+	if (_trunkPeerIp != 0 && m.getSource().sin_addr.s_addr == _trunkPeerIp) return true;
+	return emergencyIdsHas(_emergencyCallIds, m.getCallID());
 }
 
 bool RequestsHandler::allowPacket(const sockaddr_in& src)
@@ -13714,6 +13798,7 @@ void RequestsHandler::setTrunkConfig(const SipTrunk::Config& cfg)
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
+	publishTrunkPeer();   // #1092: the old carrier IP stops being exempt now
 }
 
 SipTrunk::Config RequestsHandler::getTrunkConfig()
@@ -13774,6 +13859,7 @@ void RequestsHandler::applyStoredTrunkConfig()
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
+	publishTrunkPeer();   // #1092: the old carrier IP stops being exempt now
 
 	// Checked, not discarded. The HTTP route caps the password well below
 	// kMaxSecret, but this path reads raw NVS, which an older or different

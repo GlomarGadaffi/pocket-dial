@@ -2464,10 +2464,38 @@ private:
 	std::shared_ptr<SipMessage> buildPagingBye(const std::shared_ptr<SipMessage>& ok,
 		const std::shared_ptr<SipClient>& answerer);
 
-	// Issue #38: per-source-IP token bucket + optional allowlist. Both helpers
-	// assume the caller already holds _mutex.
+	// Issue #38: per-source-IP token bucket + optional allowlist. These two
+	// assume the caller holds _rateMutex (not _mutex).
 	bool ipAllowed(const sockaddr_in& src) const;
 	bool allowPacket(const sockaddr_in& src);
+
+	// #1092, Rule 5: what the per-IP limiter must never refuse. Both published
+	// from the _mutex side (tick(), setTrunkConfig(), end of handle()) INTO
+	// _rateMutex, the sanctioned _mutex -> _rateMutex order; the flood path in
+	// handle() reads them under _rateMutex alone and never takes _mutex.
+	//   (a) the configured trunk's resolved IPv4 (a PSAP calls back, and the
+	//       carrier signals a live 911, from the one carrier IP); and
+	//   (b) the Call-IDs of live emergency sessions (and the trunk dialog's own
+	//       Call-ID for the same call), so an in-dialog BYE/ACK/re-INVITE from
+	//       any source gets through. A Call-ID is not spoofable into the set:
+	//       it is only ever added from a session the engine itself marked
+	//       emergency, never from a header on a packet.
+	static constexpr size_t kMaxRateExemptCallIds  = 2 * POCKETDIAL_MAX_SESSIONS;
+	static constexpr size_t kRateExemptCallIdBytes = SipLimits::kMaxCallIdLine + 1;
+	struct EmergencyCallIds
+	{
+		std::array<std::array<char, kRateExemptCallIdBytes>, kMaxRateExemptCallIds> id{};
+		std::array<uint8_t, kMaxRateExemptCallIds> len{};   // bytes used in id[i], no NUL counted
+		uint8_t count = 0;
+	};
+	static bool emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId);
+	static bool emergencyIdsHas(const EmergencyCallIds& set, std::string_view callId);
+	static bool emergencyIdsEqual(const EmergencyCallIds& a, const EmergencyCallIds& b);
+	// Caller holds _mutex.
+	void publishRateExemptions();
+	void publishTrunkPeer();
+	// Caller holds _rateMutex. True for a packet from the trunk peer or on a live emergency Call-ID.
+	bool rateExempt(const SipMessage& m) const;
 
 	void endHandle(std::string_view destNumber, std::shared_ptr<SipMessage> message);
 	std::string buildContact(std::string_view number) const;
@@ -3237,6 +3265,10 @@ private:
 		std::chrono::steady_clock::time_point last;
 	};
 	std::unordered_map<uint32_t, RateBucket> _rateBuckets;
+	// #1092: both guarded by _rateMutex. 0 = no trunk peer known (never matches).
+	uint32_t _trunkPeerIp = 0;   // network-order s_addr
+	EmergencyCallIds _emergencyCallIds;
+	EmergencyCallIds _emergencyIdsScratch;   // publishRateExemptions() build area; guarded by _mutex
 	// Optional CIDR allowlist (host order). _allowMask == 0 means "no allowlist".
 	uint32_t _allowNet  = 0;
 	uint32_t _allowMask = 0;
@@ -3244,8 +3276,9 @@ private:
 	// for the per-packet admission check BEFORE the big handler _mutex so a flood
 	// from blocked IPs is dropped without ever serializing on _mutex against
 	// legitimate signaling. Lock order: never acquire _mutex while holding this;
-	// tick() may nest this inside _mutex (the only place both are held), so the
-	// one ordering is _mutex → _rateMutex and handle() holds them disjointly.
+	// _mutex → _rateMutex is the one ordering. The flood check at the top of handle()
+	// holds _rateMutex alone; the _mutex side nests it in tick()'s bucket sweep and
+	// in publishRateExemptions()/publishTrunkPeer() (#1092).
 	std::mutex _rateMutex;
 
 	std::chrono::steady_clock::time_point _lastSweep{};
