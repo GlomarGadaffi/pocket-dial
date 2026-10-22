@@ -2409,7 +2409,10 @@ private:
 
 	void unregisterClient(std::string_view number);
 	// #1089: end every session `extension` is on through endCall(); caller holds _mutex.
-	void endClientCalls(std::string extension, const std::string& reason);
+	void endClientCalls(const std::string& extension, const std::string& reason);
+	// #1089: is `ext` a party to `s`, including the callee of a plain call still ringing?
+	static std::string_view ringingCalleeOf(const Session& s);
+	static bool sessionOnExtension(const Session& s, std::string_view ext);
 
 	// Registration-lease handling (RFC 3261 §10.2.1)
 	int parseRequestedExpires(const std::shared_ptr<SipMessage>& data) const;

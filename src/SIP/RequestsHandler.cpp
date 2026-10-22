@@ -9422,15 +9422,15 @@ void RequestsHandler::unregisterClient(std::string_view number)
 			// the binding intact. The next sweep after the call prunes it.
 			for (const auto& [cid, s] : _sessions)
 			{
-				if (s->isEmergency() &&
-				    ((s->getSrc() && s->getSrc()->getNumber() == number) ||
-				     (s->getDest() && s->getDest()->getNumber() == number)))
+				if (s->isEmergency() && sessionOnExtension(*s, number))
 				{
 					client->expireLease();
 					return;
 				}
 			}
-			endClientCalls(client->getNumber(), "unregistered");
+			// Owning copy: endClientCalls() reads the number throughout, and release() below blanks it.
+			const std::string ext = client->getNumber();
+			endClientCalls(ext, "unregistered");
 			client->release();
 			break;
 		}
@@ -9499,54 +9499,130 @@ int RequestsHandler::parseRequestedExpires(const std::shared_ptr<SipMessage>& da
 	return DEFAULT_EXPIRES;
 }
 
-void RequestsHandler::endClientCalls(std::string extension, const std::string& reason)
+// #1089: the callee of a plain call that is still ringing. Its Session has no dest yet
+// (dest is set at the answer), so only the INVITE names it. Empty for anything else, and
+// for a call with a no-answer forward, which the ring timer carries on to the forward.
+std::string_view RequestsHandler::ringingCalleeOf(const Session& s)
+{
+	if (s.getState() != Session::State::Invited || s.getDest() || s.isBroadcast() || s.isHunt() ||
+	    s.isTrunk() || s.isAnchor() || !s.getNoAnswerTarget().empty())
+		return {};
+	if (s.getForwardLegInvite()) return s.getForwardLegTarget();
+	const auto invite = s.getInviteMessage();
+	return invite ? invite->getToNumber() : std::string_view();
+}
+
+bool RequestsHandler::sessionOnExtension(const Session& s, std::string_view ext)
+{
+	return (s.getSrc() && s.getSrc()->getNumber() == ext) ||
+	       (s.getDest() && s.getDest()->getNumber() == ext) ||
+	       ringingCalleeOf(s) == ext;
+}
+
+void RequestsHandler::endClientCalls(const std::string& extension, const std::string& reason)
 {
 	// Issue #533 (#603 review): end this client's calls through endCall(),
 	// not a hand-rolled erase, so the peer leg is hung up (trunk BYE), relays
 	// and bridges are released and the CDR is written -- the same teardown
-	// every other path gets. Call-IDs are collected first: endCall() erases
-	// from _sessions.
-	struct Ending { std::string cid, src, dest; };
-	std::vector<Ending> ending;
-	for (const auto& [cid, s] : _sessions)
+	// every other path gets. One session per pass: endCall() erases from
+	// _sessions and recycles the pooled Session, so its Call-ID is copied to a
+	// stack buffer first (a Call-ID is at most SipLimits::kMaxCallIdLine, #1089:
+	// no std::string, no vector on the REGISTER path). Bounded by the session pool.
+	for (int pass = 0; pass < POCKETDIAL_MAX_SESSIONS; ++pass)
 	{
-		const bool isSrc = s->getSrc() && s->getSrc()->getNumber() == extension;
-		const bool isDest = s->getDest() && s->getDest()->getNumber() == extension;
-		if (!isSrc && !isDest) continue;
-		ending.push_back({cid, s->getSrc() ? s->getSrc()->getNumber() : std::string(),
-		                  s->getDest() ? s->getDest()->getNumber() : std::string()});
-#if POCKETDIAL_TRUNK_INBOUND
-		if (isTrunkInbound(*s)) continue;   // endTrunkInboundCall() below BYEs the handset
-#endif
-		// #1089: endCall() sends no BYE to a surviving phone, so hang it up here, on
-		// the dialog's own tags and our CSeq space (forceDisconnect()'s shape; same
-		// #72 empty-tag guard). A virtual-extension or trunk peer has no second phone.
-		const auto& peer = isSrc ? s->getDest() : s->getSrc();
-		const std::string& dFrom = s->getDialogFrom();
-		const std::string& dTo = s->getDialogTo();
-		const std::string peerNum = peer ? peer->getNumber() : std::string();
-		const bool peerVirtual = peerNum == "777" || peerNum == "440" || peerNum == ConferenceRoom::EXT ||
-		                        peerNum == kAnchorCallExt || s->isTrunk() || s->isAnchor() || s->isAnchorInbound() || isMulticastPageCall(cid);
-		if (peer && !peerVirtual && !dFrom.empty() && !dTo.empty())
+		char cid[SipLimits::kMaxCallIdLine + 1];
+		std::string_view src, dest;
+		bool trunkInbound = false;
+		bool found = false;
+		for (const auto& [key, s] : _sessions)
 		{
-			const uint32_t byeCSeq = s->nextServerCSeq();
-			auto b = isSrc ? buildServerBye(peer->getNumber(), peer->getAddress(), cid, dFrom, dTo, byeCSeq)
-			               : buildServerBye(peer->getNumber(), peer->getAddress(), cid, dTo, dFrom, byeCSeq);
-			if (b) _outbox.emplace_back(peer->getAddress(), std::move(b));
-			s->noteServerCSeq(byeCSeq);
+			if (!sessionOnExtension(*s, extension) || key.size() >= sizeof(cid)) continue;
+			const auto& ssrc = s->getSrc();
+			const auto& sdest = s->getDest();
+			const bool isSrc = ssrc && ssrc->getNumber() == extension;
+			const bool ringingCallee = !isSrc && !(sdest && sdest->getNumber() == extension);
+#if POCKETDIAL_TRUNK_INBOUND
+			trunkInbound = isTrunkInbound(*s);   // endTrunkInboundCall() BYEs/CANCELs the handset
+#endif
+			if (!trunkInbound)
+			{
+				const auto state = s->getState();
+				if (state == Session::State::Invited)
+				{
+					// Still ringing: no dialog to BYE. The caller leaving CANCELs the callee
+					// (tick()'s no-answer shape); the callee leaving answers the caller 480.
+					const auto invite = s->getForwardLegInvite() ? s->getForwardLegInvite() : s->getInviteMessage();
+					if (invite && isSrc)
+					{
+						const auto callee = findClient(s->getForwardLegInvite() ? std::string_view(s->getForwardLegTarget())
+						                                                         : invite->getToNumber());
+						if (callee.has_value())
+						{
+							if (auto cancel = _forker.buildCancel(invite, callee.value()))
+								_outbox.emplace_back(callee.value()->getAddress(), std::move(cancel));
+						}
+					}
+					else if (invite && ringingCallee && ssrc)
+					{
+						if (auto resp = getMessageFromPool(*invite))
+						{
+							resp->setHeader(SipMessageTypes::UNAVAILABLE);
+							resp->clearBody();
+							resp->setTo(toWithTag(invite->getTo(), s->getLocalTag()));   // as tick()'s no-answer 480
+							resp->setVia(sipwire::viaWithReceived(invite->getVia(), invite->getSource()));
+							resp->setContact(buildContact(ssrc->getNumber()));
+							_outbox.emplace_back(invite->getSource(), std::move(resp));
+						}
+					}
+				}
+				else if (state == Session::State::Connected || state == Session::State::Held)
+				{
+					// #1089: endCall() sends no BYE to a surviving phone, so hang it up here, on
+					// the dialog's own tags and our CSeq space (forceDisconnect()'s shape; same
+					// #72 empty-tag guard). Only an established dialog: Bye already has one in
+					// flight (onBye() keeps the session until the far leg's 200), and a second
+					// BYE with a new CSeq would draw a 481. A virtual-extension, voicemail,
+					// anchor or trunk peer has no second phone.
+					const auto& peer = isSrc ? sdest : ssrc;
+					const std::string& dFrom = s->getDialogFrom();
+					const std::string& dTo = s->getDialogTo();
+					bool peerVirtual = !peer || s->isTrunk() || s->isAnchor() || s->isAnchorInbound() ||
+					                   s->isVoicemail() || isMulticastPageCall(key);
+					for (const auto& vp : _virtualPeerPool)
+						if (vp == peer) peerVirtual = true;
+					if (!peerVirtual && !dFrom.empty() && !dTo.empty())
+					{
+						const uint32_t byeCSeq = s->nextServerCSeq();
+						auto b = isSrc ? buildServerBye(peer->getNumber(), peer->getAddress(), key, dFrom, dTo, byeCSeq)
+						               : buildServerBye(peer->getNumber(), peer->getAddress(), key, dTo, dFrom, byeCSeq);
+						if (b) _outbox.emplace_back(peer->getAddress(), std::move(b));
+						s->noteServerCSeq(byeCSeq);
+					}
+				}
+			}
+			std::memcpy(cid, key.data(), key.size());
+			cid[key.size()] = '\0';
+			// Numbers live in the clients (released after this loop), so views are stable.
+			if (ssrc) src = ssrc->getNumber();
+			if (sdest) dest = sdest->getNumber();
+			if (ringingCallee) dest = extension;
+			found = true;
+			break;
 		}
-	}
-	for (const auto& e : ending)
-	{
+		if (!found) break;
+		const std::string_view id(cid);
 #if POCKETDIAL_TRUNK_INBOUND
 		// #398: a carrier's call to this handset: BYE it (best effort) and the carrier.
-		if (const auto s = getSession(e.cid); s.has_value() && isTrunkInbound(*s.value()))
+		if (trunkInbound)
 		{
-			endTrunkInboundCall(e.cid, s.value(), _outbox, reason);
-			continue;
+			if (const auto s = getSession(std::string(id)); s.has_value())
+			{
+				endTrunkInboundCall(std::string(id), s.value(), _outbox, reason);
+				continue;
+			}
 		}
 #endif
-		endCall(e.cid, e.src, e.dest, reason);
+		endCall(id, src, dest, reason);
 	}
 }
 
@@ -9591,9 +9667,7 @@ void RequestsHandler::sweepExpired()
 			bool emergencyLive = false;
 			for (const auto& [cid, s] : _sessions)
 			{
-				if (s->isEmergency() &&
-				    ((s->getSrc() && s->getSrc()->getNumber() == client->getNumber()) ||
-				     (s->getDest() && s->getDest()->getNumber() == client->getNumber())))
+				if (s->isEmergency() && sessionOnExtension(*s, client->getNumber()))
 				{
 					emergencyLive = true;
 					break;
@@ -9610,8 +9684,9 @@ void RequestsHandler::sweepExpired()
 				queueLog("Pruning client due to missed OPTIONS keepalive pings: " + client->getNumber());
 			}
 
-			endClientCalls(client->getNumber(), leaseExpired ? "registration lease expired"
-			                                                 : "missed OPTIONS keepalive pings");
+			const std::string ext = client->getNumber();   // owning copy, as for unregisterClient()
+			endClientCalls(ext, leaseExpired ? "registration lease expired"
+			                                 : "missed OPTIONS keepalive pings");
 
 			client->release();
 		}
@@ -11951,8 +12026,7 @@ std::shared_ptr<SipClient> RequestsHandler::allocateClient(std::string number, s
 		bool inCall = false;
 		for (const auto& [cid, sess] : _sessions)
 		{
-			if ((sess->getSrc() && sess->getSrc()->getNumber() == client->getNumber()) ||
-			    (sess->getDest() && sess->getDest()->getNumber() == client->getNumber()))
+			if (sessionOnExtension(*sess, client->getNumber()))
 			{
 				inCall = true;
 				break;

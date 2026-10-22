@@ -1,3 +1,3 @@
 # ForceDisconnect_test.cpp: DeregisterMidCall x4. #1089.
-# follow-ups: slot reuse, lease expiry caller/callee (2), eviction guard (4 total in ForceDisconnect_test.cpp); TrunkInbound x1; AnchorRouting x1.
-10
+# follow-ups: ForceDisconnect_test.cpp +8 (slot reuse, lease x2, eviction, double BYE, ringing x2, long Call-ID); TrunkInbound +1; AnchorRouting +1; InboundAnchor +1; VoicemailDivert +1
+16

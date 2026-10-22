@@ -709,3 +709,82 @@ TEST(DeregisterMidCall, ALapsedClientOnALiveEmergencyCallKeepsItsSlotWhenThePool
 	EXPECT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value());
 	EXPECT_FALSE(isBoundExt(rig.handler, "300")) << "no free slot: refused, as for any full pool";
 }
+
+// #1089 review: a BYE already in flight (onBye() keeps the session in Bye until the far
+// leg's 200) must not draw a second BYE when the sender then de-registers or lapses.
+TEST(DeregisterMidCall, ADeregisterAfterTheCallersByeSendsTheCalleeNoSecondBye)
+{
+	for (const bool lease : { false, true })
+	{
+		SCOPED_TRACE(lease ? "lease expiry" : "REGISTER Expires 0");
+		Rig rig;
+		const std::string callId = lease ? "dbl-1089-l" : "dbl-1089-d";
+		sendInvite(rig.handler, callId);
+		sendAnswer(rig.handler, callId);
+		rig.sent.clear();
+		sendCallerBye(rig.handler, callId);   // relayed to the callee; the session waits in Bye
+		ASSERT_EQ(byeCount(rig.sent, kCalleeIp), 1u) << "precondition: the relayed BYE";
+
+		if (lease) rig.handler.expireLeaseAndSweepForTest("100");
+		else sendDeregister(rig.handler, "100", kCallerIp, "dereg-" + callId);
+
+		EXPECT_EQ(byeCount(rig.sent, kCalleeIp), 1u) << "a second BYE draws a 481";
+	}
+}
+
+// A call still ringing has no dialog to BYE: the caller leaving CANCELs the callee, the
+// callee leaving answers the caller 480, and the session ends either way.
+TEST(DeregisterMidCall, ACallerDeregisteringWhileItRingsCancelsTheCallee)
+{
+	Rig rig;
+	const std::string callId = "ring-1089-a";
+	sendInvite(rig.handler, callId);
+	ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "precondition: ringing";
+	rig.sent.clear();
+
+	sendDeregister(rig.handler, "100", kCallerIp, "dereg-" + callId);
+
+	size_t cancels = 0;
+	for (const auto& [addr, msg] : rig.sent)
+		if (msg && sameAddr(addr, addrFor(kCalleeIp)) && msg->toString().rfind("CANCEL ", 0) == 0) ++cancels;
+	EXPECT_EQ(cancels, 1u) << "the callee keeps ringing a dead call";
+	EXPECT_EQ(byeCount(rig.sent, kCalleeIp), 0u);
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
+	EXPECT_EQ(liveSessions(rig.handler), 0u);
+}
+
+TEST(DeregisterMidCall, ACalleeDeregisteringWhileItRingsAnswersTheCaller480)
+{
+	Rig rig;
+	const std::string callId = "ring-1089-b";
+	sendInvite(rig.handler, callId);
+	ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "precondition: ringing";
+	rig.sent.clear();
+
+	sendDeregister(rig.handler, "106", kCalleeIp, "dereg-" + callId);
+
+	size_t finals480 = 0;
+	for (const auto& [addr, msg] : rig.sent)
+		if (msg && sameAddr(addr, addrFor(kCallerIp)) && msg->toString().rfind("SIP/2.0 480", 0) == 0) ++finals480;
+	EXPECT_EQ(finals480, 1u) << "the caller's INVITE got no final response";
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
+	EXPECT_EQ(liveSessions(rig.handler), 0u);
+}
+
+// The Call-ID is copied to a fixed buffer, not a std::string: one past the SSO size works.
+TEST(DeregisterMidCall, ACallWithACallIdPastTheSsoSizeIsEnded)
+{
+	Rig rig;
+	const std::string callId = std::string(50, 'x') + "-1089-long";
+	ASSERT_LE(callId.size(), 127u);
+	sendInvite(rig.handler, callId);
+	sendAnswer(rig.handler, callId);
+	ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "precondition";
+	rig.sent.clear();
+
+	sendDeregister(rig.handler, "100", kCallerIp, "dereg-long");
+
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
+	EXPECT_EQ(byeCount(rig.sent, kCalleeIp), 1u);
+	EXPECT_EQ(rig.handler.cdrSnapshotForTest().size(), 1u);
+}

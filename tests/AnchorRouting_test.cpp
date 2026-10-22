@@ -1729,11 +1729,15 @@ TEST(AnchorRouting, AnExpiredLeaseOnAnAnchoredCallSendsTheHandsetNoByeOfItsOwn)
 	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
 	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-1089"));
 	ASSERT_TRUE(handler.getSession("Call-ID: anchor-1089").has_value()) << "precondition: anchored call up";
+	MediaBridge* bridge = handler.anchorBridgeForCallIdForTest("Call-ID: anchor-1089");
+	ASSERT_NE(bridge, nullptr) << "precondition: a bridge backs the call";
+	ASSERT_TRUE(bridge->isActive()) << "precondition: and it is active";
 	sent.clear();
 
 	handler.expireLeaseAndSweepForTest("501");
 
 	EXPECT_FALSE(handler.getSession("Call-ID: anchor-1089").has_value());
+	EXPECT_FALSE(bridge->isActive()) << "endCall() dropped the anchor leg through its bridge";
 	for (const auto& [addr, msg] : sent)
 	{
 		(void)addr;
