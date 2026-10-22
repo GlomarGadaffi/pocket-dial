@@ -204,3 +204,73 @@ jobs:
           fi
 
           echo "Clean: no Claude-Session trailer in this PR's commits or description."
+
+      - name: No noreply attribution address in this PR's commits or description
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # Project convention. Pattern built from two pieces so this file
+          # never holds the address itself.
+          ADDR_USER="noreply"
+          ADDR_HOST="anthropic\.com"
+          ADDR_RE="${ADDR_USER}@${ADDR_HOST}"
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            if [ -z "$PUSH_BEFORE" ] || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              RANGE_ARGS="-1 ${HEAD_SHA}"
+            else
+              RANGE_ARGS="${PUSH_BEFORE}..${HEAD_SHA}"
+            fi
+            echo "Checking pushed commits ${RANGE_ARGS}"
+            FOUND=0
+            for sha in $(git rev-list ${RANGE_ARGS}); do
+              if git log -1 --format=%B "$sha" | grep -Eic "$ADDR_RE" >/dev/null; then
+                echo "::error::Commit ${sha} (\"$(git log -1 --format=%s "$sha")\") landed on main with the noreply attribution address."
+                FOUND=1
+              fi
+            done
+            if [ "$FOUND" -ne 0 ]; then
+              echo "A merge-time message edit or a direct push slipped the address past the PR check."
+              exit 1
+            fi
+            echo "Clean: no noreply attribution address in the pushed commits."
+            exit 0
+          fi
+
+          BASE="$(git merge-base "origin/${BASE_REF}" HEAD)"
+
+          echo "Checking commit range ${BASE}..${HEAD_SHA}"
+
+          FOUND=0
+
+          # grep -c, not -q: see the SIGPIPE note in the step above.
+          for sha in $(git rev-list "${BASE}..${HEAD_SHA}"); do
+            if git log -1 --format=%B "$sha" | grep -Eic "$ADDR_RE" >/dev/null; then
+              subject="$(git log -1 --format=%s "$sha")"
+              echo "::error::Commit ${sha} (\"${subject}\") carries the noreply attribution address."
+              FOUND=1
+            fi
+          done
+
+          if printf '%s\n' "$PR_BODY" | grep -Eic "$ADDR_RE" >/dev/null; then
+            echo "::error::The PR description carries the noreply attribution address."
+            FOUND=1
+          fi
+
+          if [ "$FOUND" -ne 0 ]; then
+            echo ""
+            echo "pocket-dial's convention: no noreply attribution address in"
+            echo "commit messages or PR bodies."
+            echo ""
+            echo "Fix a commit: amend it and force-push the branch."
+            echo "Fix the PR body: edit the description directly."
+            exit 1
+          fi
+
+          echo "Clean: no noreply attribution address in this PR's commits or description."
