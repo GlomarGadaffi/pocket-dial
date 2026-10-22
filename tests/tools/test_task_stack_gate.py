@@ -867,7 +867,7 @@ class Gate(unittest.TestCase):
     def test_a_row_must_name_targets_and_a_reason(self):
         self.indirect_fixture()
         for row in ({"reason": "x"}, {"targets": "SlowSink", "reason": "x"}, {"targets": ["SlowSink"], "reason": " "}):
-            self.table["indirect_allowlist"] = {"mid()": row}
+            self.table["indirect_allowlist"] = {r"void mid()": row}
             rc, out = self.run_gate()
             self.assertEqual(rc, 1, out)
             self.assertIn("indirect_allowlist row 'void mid", out)
