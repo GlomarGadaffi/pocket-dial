@@ -203,19 +203,38 @@ The upload gate, as a decision path:
 
 ```mermaid
 flowchart TD
-    A["POST /api/ota/upload"] --> B{"Origin sent and not an allowed local host?"}
+    A["POST /api/ota/upload, intercepted in handleClient (HttpServer.cpp:963)"] --> B{"Origin sent and not an allowed local host? (:4741)"}
     B -->|yes| R1["403 cross-origin request rejected"]
-    B -->|no| C{"Valid pd_session cookie?"}
+    B -->|no| C{"Valid pd_session cookie? (:4753)"}
     C -->|no| R2["401 authentication required"]
-    C -->|yes| D{"Valid X-CSRF token?"}
+    C -->|yes| D{"Valid X-CSRF token? (:4764)"}
     D -->|no| R3["403 missing or invalid CSRF token"]
-    D -->|yes| E{"Still on default admin/admin?"}
+    D -->|yes| E{"Still on default admin/admin? (:4775)"}
     E -->|yes| R4["403 setup_required"]
-    E -->|no| F{"Owner session, or sysop with no owner account?"}
+    E -->|no| F{"Owner session, or sysop with no owner account? (:4788)"}
     F -->|no| R5["403 owner privilege required"]
-    F -->|yes| H{"Any call up or ringing?"}
+    F -->|yes| L{"Content-Length present and non-zero? (:1009)"}
+    L -->|no| R7["411 OTA upload requires a non-zero Content-Length"]
+    L -->|yes| H{"Any call up or ringing? hasLiveCall (:8014)"}
     H -->|yes| R6["409 busy, call in progress"]
-    H -->|no| G["Stream the body into the inactive slot"]
+    H -->|no| G["handleOtaUpload streams the body into the inactive slot"]
+```
+
+Once past the gate, `handleOtaUpload` (`HttpServer.cpp:8000`) runs on the `http_conn`
+connection thread and drives `OtaUpdater` (`src/Helpers/OtaUpdater.cpp`) in a fixed order. Each
+step has its own refusal, and none of them touches the running slot:
+
+```mermaid
+flowchart TD
+    S["handleOtaUpload, bytes streamed by streamBody"] --> BG["OtaUpdater::begin: esp_ota_get_next_update_partition, then esp_ota_begin (OtaUpdater.cpp:48-83)"]
+    BG -->|fails| E1["body drained, 500 ota begin failed (HttpServer.cpp:8036)"]
+    BG -->|ok| W["OtaUpdater::write per chunk: esp_ota_write (OtaUpdater.cpp:99)"]
+    W -->|fails or short body| E2["OtaUpdater::abort, 400 incomplete upload or flash write failed (:8047)"]
+    W -->|all bytes written| EN["OtaUpdater::end: esp_ota_end validates the image (OtaUpdater.cpp:118)"]
+    EN -->|fails| E3["422 image rejected (:8056)"]
+    EN -->|ok| AC["OtaUpdater::activate: esp_ota_set_boot_partition (OtaUpdater.cpp:149)"]
+    AC -->|fails| E4["500 activate failed (:8063)"]
+    AC -->|ok| OK["200 status ok, bytes, rebootRequired true, nextPartition (:8073)"]
 ```
 
 **No upload while a call is live (#986).** A flash erase or write stalls every task
@@ -392,12 +411,19 @@ is what `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` is built for.
 
 ```mermaid
 flowchart TD
-    A["Upload written and validated"] --> B["Slot set as boot partition, marked PENDING_VERIFY"]
-    B --> C["POST /api/ota/reboot"]
-    C --> D["Next boot: bootloader sees PENDING_VERIFY"]
-    D --> E{"App runs 5 s and calls markValid()?"}
-    E -->|yes| F["Slot marked VALID"]
-    E -->|"no, crash or boot loop"| G["Next reset: bootloader rolls back to previous valid slot"]
+    A["Upload staged: boot partition now points at the inactive slot (ota_0 at 0x20000 or ota_1 at 0x620000, 6 MB each, otadata at 0xf000)"] --> C["POST /api/ota/reboot: requireAdmin with CSRF (HttpServer.cpp:1753)"]
+    C --> X{"Staged? boot partition differs from running partition (:8184)"}
+    X -->|"no staged image, no confirm=1"| X1["400 reboot with no staged image requires confirm=1 (:8189)"]
+    X -->|"no staged image, confirm=1, emergency call live"| X2["409 emergency call in progress (:8197)"]
+    X -->|"staged image, or a confirmed plain restart"| R["200 ok with staged flag, then task ota_reboot, 4 KB stack, prio 5, waits 1 s (:8217)"]
+    R --> HOLD{"hasLiveEmergencyCall? (:8210)"}
+    HOLD -->|yes| HOLD2["restart held, polled every 1 s until the 911 or 933 call ends"]
+    HOLD2 --> HOLD
+    HOLD -->|no| RS["esp_restart"]
+    RS --> D["Bootloader: CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y, new image is PENDING_VERIFY (sdkconfig.defaults:106)"]
+    D --> E{"http_server_task loop, 1 s tick: 5 s elapsed and isPendingVerify? (esp_main.cpp:345)"}
+    E -->|yes| F["OtaUpdater::markValid: esp_ota_mark_app_valid_cancel_rollback, slot VALID"]
+    E -->|"no: crash or boot loop first"| G["Next reset: bootloader rolls back to the previous valid slot"]
 ```
 
 ### 4.1 Where the firmware calls markValid()

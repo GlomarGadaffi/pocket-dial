@@ -11,7 +11,7 @@ loaded. The ordinary extension-to-extension call is the one path that never touc
 
 | Path | Does the board touch RTP? | Detail |
 | :--- | :--- | :--- |
-| **Ordinary extension → extension** | **No.** Pure peer-to-peer. | SDP is relayed; the `c=` connection line is **never** rewritten. Only the codec list is narrowed, by `SipMessage::filterAudioCodecs(/*allowWideband=*/true)`. |
+| **Ordinary extension → extension** | **No.** Pure peer-to-peer. | SDP is relayed with the body unchanged; the `c=` connection line is **never** rewritten. An offer with no PCMU, PCMA or G.722 is refused up front with `488` (`RequestsHandler.cpp:2428`). `SipMessage::filterAudioCodecs(/*allowWideband=*/true)` runs only on forks, transfers, park and pickup. |
 | **Hold / resume, blind & attended transfer, ring/hunt groups, pickup** | **No.** | Same property kept deliberately, see `RequestsHandler.cpp:11798` ("Relay the SDP UNTOUCHED"), `CallForker.cpp:56`, `CallPickup.cpp:99`. |
 | **Call parked on an orbit** | **Only with music on hold configured, and then transmit only.** | With a MoH clip loaded, park answers `sendonly` from the `HoldMusic` port and adds the parked leg to the shared clip stream (`ParkOrbit.cpp:68-86`), so the board transmits to the parked phone for the whole park. One-way only: the parked phone's own audio is not carried, and the retrieve is still an SDP swap back to peer-to-peer. With no clip loaded (the default), park answers `a=inactive` and the board sources nothing. |
 | **`777` echo test** | **No.** | It is an SDP loopback: the answer is the caller's own offer handed back (narrowed to PCMU), so the phone streams to its own address. `RequestsHandler.cpp:2467-2620`. A code comment elsewhere in the tree that implies the server echoes the audio is wrong. |
@@ -24,7 +24,7 @@ loaded. The ordinary extension-to-extension call is the one path that never touc
 emits `m=audio <port> RTP/AVP 0`, and adds the caller's telephone-event payload type to that
 line when the offer carried one. Each such leg admits a caller only if it offers PCMU
 (`offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false)`, for example
-`RequestsHandler.cpp:3012` for `440` and `:3221` for `888`), answering `488 Not Acceptable Here`
+`RequestsHandler.cpp:3136` for `440` and `:3408` for `888`), answering `488 Not Acceptable Here`
 otherwise. The `777` echo answer is narrowed by
 `filterAudioCodecs(/*allowWideband=*/false, /*allowPcma=*/false)` (`RequestsHandler.cpp:2617`).
 Relayed peer-to-peer legs admit PCMU, PCMA **and G.722**.
@@ -80,9 +80,11 @@ narrower form than the plan in §3(c). These are still absent:
 The device is a registrar + proxy/redirect-ish B2B-light signalling box. When A calls B:
 
 1. A's INVITE (with SDP offering `m=audio <portA> RTP/AVP ...`) reaches the server. The
-   server narrows the codec list with `filterAudioCodecs()` and forwards the offer toward B.
-2. B answers `200 OK` with its own SDP (`m=audio <portB> ...`). The server narrows and
-   forwards it back to A.
+   server refuses it with `488` if the offer has no PCMU, PCMA or G.722 (`offersSupportedAudio`,
+   `RequestsHandler.cpp:2428`), otherwise forwards the offer toward B with the SDP body unchanged.
+2. B answers `200 OK` with its own SDP (`m=audio <portB> ...`). The server forwards it back
+   to A with the body unchanged (`:7910`). `filterAudioCodecs()` narrows the list only where the
+   board builds a new offer or answer: ring-group forks, transfers, park, pickup.
 3. **The `c=` connection address and `m=` port in each SDP still point at the phones
    themselves.** Once both sides have each other's `IP:port`, they stream RTP directly. The
    server is out of the media path entirely.
@@ -90,14 +92,22 @@ The device is a registrar + proxy/redirect-ish B2B-light signalling box. When A 
 ```mermaid
 sequenceDiagram
     participant A as Phone A
-    participant S as pocket-dial
+    participant U as udp_receiver_task
     participant B as Phone B
-    A->>S: INVITE with SDP offer
-    S->>B: INVITE, codec list narrowed
-    B-->>S: 200 OK with SDP answer
-    S-->>A: 200 OK, codec list narrowed
-    Note over S: c= and m= still point at the phones
-    Note over A,B: RTP flows directly. The server is out of the media path.
+    A->>U: INVITE to B with SDP offer
+    Note over U: handle() runs inline on this task. onInvite RequestsHandler.cpp:2332
+    alt offer has no PCMU, PCMA or G.722 (gate at :2428)
+        U-->>A: 488 Not Acceptable Here, Warning 304
+    else offer relayable
+        Note over U: 911 and 933 never reach this branch. routeEmergencyCall takes them first (:2455-2459)
+        U->>B: INVITE relayed by endHandle (:3025), SDP body not rewritten
+        B-->>U: 200 OK with SDP answer
+        U-->>A: 200 OK relayed by endHandle (:7910), SDP body not rewritten
+        A->>U: ACK
+        U->>B: ACK relayed (:8010)
+        Note over U: c= and m= still point at the phones
+        A-->B: RTP direct. No board task touches it.
+    end
 ```
 
 This is why `PoolConfig.hpp` can say a `Session` "costs the server only signalling/bookkeeping
@@ -368,27 +378,68 @@ Proposed, and largely followed:
 The proposal said a media-pool exhaustion should "fall back to P2P gracefully". It does not. The
 call is refused:
 
-* a second `440` while a tone stream is live gets **486 Busy Here** (`RequestsHandler.cpp:3027`);
+* a second `440` while a tone stream is live gets **486 Busy Here** (`RequestsHandler.cpp:3155`);
 * a conference leg beyond the room's cap (a fifth, on the default build) gets **486 Busy Here**,
-  "room full or media failed to start" (`RequestsHandler.cpp:3255`);
+  "room full or media failed to start" (`RequestsHandler.cpp:3444`);
 * a `555` dialled while every anchor bridge slot is in use gets **503 Service Unavailable**,
   deliberately *not* 486, because 486 would mean the called party is busy when in fact every
-  bridge slot is (`RequestsHandler.cpp:5202-5208`). The comment at `RequestsHandler.cpp:5202`
+  bridge slot is (`RequestsHandler.cpp:5491-5497`). The comment at `RequestsHandler.cpp:5491`
   also intends a `Retry-After` header, but this refusal does not set one.
 
 There is no P2P fallback for a server-terminated feature, because these features *are* the
 server media; there is no far phone to fall back to. The refusal order for a server-terminated
-extension, leaving out the pool-exhaustion 503s, is:
+extension, in the order each handler checks it, is:
 
 ```mermaid
 flowchart TD
-    A["INVITE to 440, 555 or 888"] --> B{"Offer includes PCMU?"}
-    B -- No --> C["488 Not Acceptable Here"]
-    B -- Yes --> D{"Capacity free?"}
-    D -- "No, 440 or 888 room" --> E["486 Busy Here"]
-    D -- "No, 555 bridge" --> F["503 Service Unavailable"]
-    D -- Yes --> G["200 OK, server media starts"]
+    subgraph T440["440 tone: onMediaInvite, RequestsHandler.cpp:3125"]
+        T1["488 no PCMU offered (:3140)"] --> T2["486 Busy Here: a tone stream is already live (:3155)"]
+        T2 --> T3["400 no usable RTP destination (:3171)"]
+        T3 --> T4["500 RtpSender.start failed (:3188)"]
+        T4 --> T5["503 session pool full (:3210)"]
+        T5 --> T6["503 virtual-peer pool exhausted (:3239)"]
+        T6 --> T7["200 OK, rtp_media_tx streams"]
+    end
+    subgraph C888["888 conference: onConferenceInvite, :3382"]
+        C1["403 no room on this build (:3399)"] --> C2["488 no PCMU offered (:3410)"]
+        C2 --> C3["400 no usable RTP destination (:3419)"]
+        C3 --> C4["503 conf_mix_tick could not start (:3434)"]
+        C4 --> C5["486 Busy Here: room full or media failed (:3444)"]
+        C5 --> C6["503 session pool full (:3452)"]
+        C6 --> C7["503 virtual-peer pool exhausted (:3464)"]
+        C7 --> C8["200 OK, leg joins the MixBus"]
+    end
+    subgraph A555["555 anchor: originateAnchorCall, :5343"]
+        A1["404 no anchor client connected (:5425)"] --> A2["488 no PCMU offered (:5467)"]
+        A2 --> A3["400 no usable RTP destination (:5476)"]
+        A3 --> A4["911 or 933 only: preemptAnchorCallForEmergency ends one non-emergency anchored call if the anchor is full (:5480)"]
+        A4 --> A5["503 every anchor bridge slot busy (:5497 loopback, :5604 WAN)"]
+        A5 --> A6["503 makeCall declined, bridge failed, session or virtual-peer pool (:5511-5543)"]
+        A6 --> A7["200 OK, MediaBridge rtp_media_rx/tx"]
+    end
 ```
+
+The `555` lane is also the 911/933 route (`routeEmergencyCall`, `RequestsHandler.cpp:5050`).
+It is reached before the dial plan, the secure-mode challenge and the `422` floor
+(`:2443-2459`), and `originateAnchorCall` is called with `respondIfDisconnected=false`, so a
+down anchor never produces the `404` above. When no route exists the answer is
+`503 Emergency Call Not Routable` with a `Warning: 399` header and no `Retry-After`
+(`:5177`). A full anchor is a `503 Service Unavailable` only after one non-emergency call has
+been ended to make room.
+
+The tasks behind those server-terminated legs, as created in code:
+
+```mermaid
+flowchart LR
+    U["udp_receiver_task<br/>prio 5, 16 KB, core from POCKETDIAL_UDP_RX_CORE (default 1)<br/>(UdpServer.cpp:163-173)"] -->|"onMediaInvite, onConferenceInvite, originateAnchorCall"| H["RequestsHandler under _mutex"]
+    H -->|"RtpSender::start"| TX["rtp_media_tx<br/>prio 6, Core 0, 3 KB static stack, pool of 6<br/>(RtpSender.cpp:356, PoolConfig.hpp:245)"]
+    H -->|"RtpReceiver::start(0)"| RX["rtp_media_rx<br/>prio 6, Core 0, 6 KB static stack<br/>(RtpReceiver.cpp:619)"]
+    H -->|"ConferenceRoom::startDriver"| MIX["conf_mix_tick<br/>prio 6, Core 0, 3 KB, one for the room<br/>(ConferenceRoom.cpp:308)"]
+    H -->|"HoldMusic::start, park only"| MOH["moh_tx<br/>prio 5, Core 0, 6 KB<br/>(HoldMusic.cpp:517)"]
+```
+
+`440` transmits from fixed UDP port `5062` (`RtpSender.cpp:36`). Every `RtpReceiver` binds an
+OS-chosen port (`start(0, ...)`, `MediaBridge.cpp:97`) and advertises it in the answer SDP.
 
 ### 4.6 Interaction with codec enforcement
 
@@ -397,7 +448,7 @@ could be fixed-format with no negotiation logic. **`enforceG711()` is deprecated
 production callers** (`SipMessage.hpp:172`). The live guarantee comes from a different place and
 is narrower: the server builds its own PCMU-only SDP (`buildMediaSdp()`), and admits a caller
 onto a server-terminated leg only if it offers PCMU, answering `488 Not Acceptable Here`
-otherwise (`RequestsHandler.cpp:3012` for `440`, `:3221` for `888`). The practical effect the
+otherwise (`RequestsHandler.cpp:3136` for `440`, `:3408` for `888`). The practical effect the
 media layer depends on is the same (**server-terminated legs are PCMU, 160 B payload, 20 ms**),
 but relayed peer-to-peer legs are *not* so constrained: they may negotiate PCMA or G.722 between
 the phones, and the media layer never sees them.
