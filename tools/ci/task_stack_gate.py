@@ -398,12 +398,14 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
         # the placeholder is charged 0 B. So a pass is a fit only for the direct calls: say how many
         # indirect sites the task reaches and which chain functions make one, never a silent 0.
         reached = reachable(hits, edges)
-        sites = sorted(v for v in reached if INDIRECT_RE.search(pretty(nodes.get(v, v))))
-        on_chain = sorted({pretty(nodes.get(m, m))[:80] for x in path for m in members.get(x, (x,))
-                           if any(w in sites for w in edges.get(m, ()))})
-        print(f"        indirect call sites: {len(sites)} reachable, {len(on_chain)} function(s) on "
-              f"the worst chain make one; callee frames are not charged"
-              + ("" if not sites else (" -- " + "; ".join(on_chain[:6]) if on_chain else "")))
+        ind = {v for v in nodes if INDIRECT_RE.search(pretty(nodes.get(v, v)))}
+        # GCC names every indirect site by one shared placeholder node, so a site is its caller.
+        callers = sorted(v for v in reached if ind & set(edges.get(v, ())))
+        chain = {m for x in path for m in members.get(x, (x,))}
+        on_chain = [v for v in callers if v in chain]
+        print(f"        indirect call sites: {len(callers)} function(s) reachable make one, "
+              f"{len(on_chain)} of them on the worst chain; callee frames are not charged (0 B)"
+              + ("" if not on_chain else ": " + "; ".join(pretty(nodes.get(v, v)).split("(")[0][-50:] for v in on_chain[:8])))
         if known_hit:
             print(f"        known finding (<= {kf['max_total']} B, not failing the job): {kf['reason']}")
         elif kf and ok:

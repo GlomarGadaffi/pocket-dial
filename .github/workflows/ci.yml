@@ -737,7 +737,10 @@ jobs:
   # data, recursion cycles in IDF, lwIP and mbedtls, dynamic frames in mdns, and
   # a constructor template the C1/C2 alias rule missed. Those are modelled now in
   # tools/ci/task_stacks.json, each row with its provenance; estimates say so.
-  # One finding stays red on purpose:
+  # Estimate-driven over-budget tasks (http_conn, conf_mix_tick, rtp_media_tx) are
+  # listed in known_findings of task_stacks.json: printed as KNOWN, not failing, and
+  # a deeper chain than the recorded one fails. Red here means something new.
+  # The first of them, and the reason it is not a budget change:
   #   * http_conn: 4768 B + 512 B margin against its 4096 B stack in the first
   #     run. 2048 B of that is the newlib snprintf estimate at the end of the
   #     chain (sendApiKill -> forceDisconnect -> endCall -> cdrarchive::record ->

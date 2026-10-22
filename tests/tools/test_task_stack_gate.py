@@ -822,11 +822,11 @@ class Gate(unittest.TestCase):
         self.add_ci(node("ind", "Indirect Call Placeholder", 0, kind="static") + edge("mid", "ind"))
         self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
         rc, out = self.run_gate()
-        self.assertIn("indirect call sites: 1 reachable", out)
+        self.assertIn("indirect call sites: 1 function(s) reachable", out)
         small = out.split("small:")[1].split("big:")[0]
-        self.assertIn("indirect call sites: 0 reachable", small)
+        self.assertIn("indirect call sites: 0 function(s) reachable", small)
         self.assertIn("big:", out)
-        self.assertRegex(out.split("big:")[1], r"indirect call sites: 1 reachable, 1 function\(s\) on the worst chain.*mid")
+        self.assertRegex(out.split("big:")[1], r"indirect call sites: 1 function\(s\) reachable make one, 1 of them on the worst chain.*mid")
 
     def test_known_finding_is_reported_but_only_while_it_does_not_get_worse(self):
         for t in self.table["tasks"]:
