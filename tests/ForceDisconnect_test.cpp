@@ -767,6 +767,10 @@ TEST(DeregisterMidCall, ACalleeDeregisteringWhileItRingsAnswersTheCaller480)
 	for (const auto& [addr, msg] : rig.sent)
 		if (msg && sameAddr(addr, addrFor(kCallerIp)) && msg->toString().rfind("SIP/2.0 480", 0) == 0) ++finals480;
 	EXPECT_EQ(finals480, 1u) << "the caller's INVITE got no final response";
+	size_t cancels = 0;
+	for (const auto& [addr, msg] : rig.sent)
+		if (msg && sameAddr(addr, addrFor(kCalleeIp)) && msg->toString().rfind("CANCEL ", 0) == 0) ++cancels;
+	EXPECT_EQ(cancels, 1u) << "the departing phone keeps ringing a call that is gone";
 	EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
 	EXPECT_EQ(liveSessions(rig.handler), 0u);
 }
@@ -787,4 +791,72 @@ TEST(DeregisterMidCall, ACallWithACallIdPastTheSsoSizeIsEnded)
 	EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
 	EXPECT_EQ(byeCount(rig.sent, kCalleeIp), 1u);
 	EXPECT_EQ(rig.handler.cdrSnapshotForTest().size(), 1u);
+}
+
+// Rule 5 (#712): a PSAP callback still RINGING a handset is not torn down by that
+// handset's de-REGISTER or lapsed lease. Its Session has no dest yet, so only the
+// ringing-callee clause of sessionOnExtension() sees the handset as a party. The
+// call keeps ringing, nothing is CANCELled or answered 480, and the binding is
+// kept (lease lapsed) until the call has ended; the next sweep then prunes it.
+namespace
+{
+	size_t sentStartingWith(const Sent& sent, const std::string& ip, const std::string& prefix)
+	{
+		size_t n = 0;
+		for (const auto& [addr, msg] : sent)
+			if (msg && sameAddr(addr, addrFor(ip)) && msg->toString().rfind(prefix, 0) == 0) ++n;
+		return n;
+	}
+}
+
+TEST(DeregisterMidCall, APsapCallbackRingingAHandsetSurvivesItsDeregisterOrLapsedLease)
+{
+	for (const bool lease : { false, true })
+	{
+		SCOPED_TRACE(lease ? "lease expiry" : "REGISTER Expires 0");
+		Rig rig;
+		const std::string callId = lease ? "psap-1089-l" : "psap-1089-d";
+		sendInvite(rig.handler, callId);
+		auto s = rig.handler.getSession("Call-ID: " + callId);
+		ASSERT_TRUE(s.has_value());
+		s.value()->setEmergency(true);   // as onInvite() flags a call inside #659's window
+		ASSERT_EQ(s.value()->getState(), Session::State::Invited) << "precondition: ringing";
+		ASSERT_FALSE(s.value()->getDest()) << "precondition: no dest before the answer";
+		rig.sent.clear();
+
+		if (lease) rig.handler.expireLeaseAndSweepForTest("106");
+		else sendDeregister(rig.handler, "106", kCalleeIp, "dereg-" + callId);
+
+		EXPECT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "the callback was torn down";
+		EXPECT_EQ(sentStartingWith(rig.sent, kCalleeIp, "CANCEL "), 0u) << "the PSAP callback was CANCELled";
+		EXPECT_EQ(sentStartingWith(rig.sent, kCallerIp, "SIP/2.0 4"), 0u) << "the PSAP got a failure";
+		EXPECT_TRUE(isBoundExt(rig.handler, "106")) << "the binding must stay while it rings";
+
+		// The handset still answers, the call ends, and the next sweep prunes the binding.
+		sendAnswer(rig.handler, callId);
+		sendCallerBye(rig.handler, callId);
+		sendCalleeByeOk(rig.handler, callId);
+		ASSERT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "precondition: ended";
+		rig.handler.idleClientAndSweepForTest("106", std::chrono::seconds(0));
+		EXPECT_FALSE(isBoundExt(rig.handler, "106"));
+		EXPECT_EQ(liveSessions(rig.handler), 0u);
+	}
+}
+
+// A de-REGISTER naming no extension matches a free pool slot (empty number); the empty
+// string is a party to every non-ringing session, so it must end none of them.
+TEST(DeregisterMidCall, ADeregisterWithNoExtensionLeavesEveryCallAlone)
+{
+	Rig rig;
+	const std::string callId = "dereg-1089-empty";
+	sendInvite(rig.handler, callId);
+	sendAnswer(rig.handler, callId);
+	ASSERT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value());
+	rig.sent.clear();
+
+	sendDeregister(rig.handler, "", kOtherIp, "dereg-empty");
+
+	EXPECT_TRUE(rig.handler.getSession("Call-ID: " + callId).has_value()) << "an unrelated call was ended";
+	EXPECT_EQ(byeCount(rig.sent, kCalleeIp), 0u);
+	EXPECT_TRUE(rig.handler.cdrSnapshotForTest().empty());
 }

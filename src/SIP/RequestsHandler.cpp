@@ -9528,6 +9528,8 @@ void RequestsHandler::endClientCalls(const std::string& extension, const std::st
 	// _sessions and recycles the pooled Session, so its Call-ID is copied to a
 	// stack buffer first (a Call-ID is at most SipLimits::kMaxCallIdLine, #1089:
 	// no std::string, no vector on the REGISTER path). Bounded by the session pool.
+	// An empty number is a party to every non-ringing session (sessionOnExtension): never end by it.
+	if (extension.empty()) return;
 	for (int pass = 0; pass < POCKETDIAL_MAX_SESSIONS; ++pass)
 	{
 		char cid[SipLimits::kMaxCallIdLine + 1];
@@ -9564,6 +9566,13 @@ void RequestsHandler::endClientCalls(const std::string& extension, const std::st
 					}
 					else if (invite && ringingCallee && ssrc)
 					{
+						// The departing phone is still alive after Expires 0: stop its ringing while
+						// its address is valid (before release()), as tick()'s no-answer path does.
+						if (const auto me = findClient(extension); me.has_value())
+						{
+							if (auto cancel = _forker.buildCancel(invite, me.value()))
+								_outbox.emplace_back(me.value()->getAddress(), std::move(cancel));
+						}
 						if (auto resp = getMessageFromPool(*invite))
 						{
 							resp->setHeader(SipMessageTypes::UNAVAILABLE);
