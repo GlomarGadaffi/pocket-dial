@@ -963,10 +963,11 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	// touch only the rate state, which _rateMutex now guards.
 	{
 		std::lock_guard<std::mutex> rlock(_rateMutex);
-		// #1092, Rule 5: the trunk peer and a live emergency Call-ID skip the bucket and the
-		// 256-entry cap. The allowlist still applies. One memcmp scan, no _mutex.
+		// #1092, Rule 5: a live emergency Call-ID skips the bucket; the trunk peer has its own
+		// high-ceiling bucket outside the 256-entry cap (allowPacket). The allowlist still
+		// applies. No _mutex.
 		if (!ipAllowed(request->getSource()) ||
-			(!rateExempt(*request) && !allowPacket(request->getSource())))
+			(!rateExemptByCallId(*request) && !allowPacket(request->getSource())))
 		{
 			const sockaddr_in src = request->getSource();
 			_dropProbe.note(DropProbe::Reason::Rate, src.sin_addr.s_addr, src.sin_port, rawBytes);
@@ -11191,7 +11192,7 @@ void RequestsHandler::tick()
 
 		// #1092: re-publish the limiter's exemptions every pass (a trunk name resolving,
 		// a session ending without a packet).
-		publishTrunkPeer();
+		publishTrunkPeer(/*retire=*/false);
 		publishRateExemptions();
 
 		// Belt-and-suspenders (Fix #4): drop DTMF accumulators whose dialog is gone,
@@ -12157,12 +12158,12 @@ bool RequestsHandler::ipAllowed(const sockaddr_in& src) const
 
 uint32_t RequestsHandler::nextTrunkPeerIp(uint32_t current, TrunkResolver::Status st, uint32_t found)
 {
-	(void)current;
-	return st == TrunkResolver::Status::Hit ? found : 0;
+	return (st == TrunkResolver::Status::Hit && found != 0) ? found : current;
 }
 
 bool RequestsHandler::emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId)
 {
+	callId = siphdr::stripHeaderNameView(callId);   // bare value, whatever form the caller holds
 	// A Call-ID that does not fit is not stored truncated: a prefix would exempt other dialogs.
 	if (callId.empty() || callId.size() >= kRateExemptCallIdBytes || set.count >= kMaxRateExemptCallIds)
 		return false;
@@ -12175,6 +12176,7 @@ bool RequestsHandler::emergencyIdsAdd(EmergencyCallIds& set, std::string_view ca
 
 bool RequestsHandler::emergencyIdsHas(const EmergencyCallIds& set, std::string_view callId)
 {
+	callId = siphdr::stripHeaderNameView(callId);
 	for (size_t i = 0; i < set.count && i < kMaxRateExemptCallIds; ++i)
 	{
 		if (set.len[i] == callId.size() && std::memcmp(set.id[i].data(), callId.data(), callId.size()) == 0)
@@ -12211,33 +12213,49 @@ void RequestsHandler::publishRateExemptions()
 	if (!emergencyIdsEqual(fresh, _emergencyCallIds)) _emergencyCallIds = fresh;
 }
 
-void RequestsHandler::publishTrunkPeer()
+void RequestsHandler::publishTrunkPeer(bool retire)
 {
-	uint32_t peer = 0;
-	if (_sipTrunk.config().valid())
-	{
-		sockaddr_in sbc{};
-		// Cache-only lookup: tick() is what resolves. 0.0.0.0 names no carrier.
-		if (_trunkResolver.lookup(_sipTrunk.config().transportHost(), _sipTrunk.config().transportPort(),
-				sbc, std::chrono::steady_clock::now()) == TrunkResolver::Status::Hit)
-		{
-			peer = sbc.sin_addr.s_addr;
-		}
-	}
+	const auto now = std::chrono::steady_clock::now();
+	const bool valid = _sipTrunk.config().valid();
+	sockaddr_in sbc{};
+	// Cache-only lookup: tick() is what resolves. It stops answering Hit once its entry ages
+	// out (300 s) and while a failure is cached (30 s), so the last Hit is latched below.
+	const TrunkResolver::Status st = valid
+		? _trunkResolver.lookup(_sipTrunk.config().transportHost(), _sipTrunk.config().transportPort(), sbc, now)
+		: TrunkResolver::Status::Refused;
 	std::lock_guard<std::mutex> rlock(_rateMutex);
-	_trunkPeerIp = peer;
+	const uint32_t next = valid ? nextTrunkPeerIp(retire ? 0 : _trunkPeerIp, st, sbc.sin_addr.s_addr) : 0;
+	if (next != _trunkPeerIp)
+	{
+		_trunkPeerIp = next;
+		_trunkBucket = { kTrunkBucketBurst, now };
+	}
 }
 
-bool RequestsHandler::rateExempt(const SipMessage& m) const
+bool RequestsHandler::rateExemptByCallId(const SipMessage& m) const
 {
-	if (_trunkPeerIp != 0 && m.getSource().sin_addr.s_addr == _trunkPeerIp) return true;
 	return emergencyIdsHas(_emergencyCallIds, m.getCallID());
+}
+
+bool RequestsHandler::takeToken(RateBucket& bucket, std::chrono::steady_clock::time_point now,
+	double burst, double perSec)
+{
+	const double elapsedSec = std::chrono::duration<double>(now - bucket.last).count();
+	bucket.last = now;
+	bucket.tokens = (std::min)(burst, bucket.tokens + elapsedSec * perSec);
+	if (bucket.tokens < 1.0) return false;
+	bucket.tokens -= 1.0;
+	return true;
 }
 
 bool RequestsHandler::allowPacket(const sockaddr_in& src)
 {
 	auto now = std::chrono::steady_clock::now();
 	uint32_t ip = src.sin_addr.s_addr; // Key by raw network-byte-order IP
+
+	// #1092: the carrier has its own bucket, outside the table and its cap.
+	if (_trunkPeerIp != 0 && ip == _trunkPeerIp)
+		return takeToken(_trunkBucket, now, kTrunkBucketBurst, kTrunkBucketRate);
 
 	auto it = _rateBuckets.find(ip);
 	if (it == _rateBuckets.end())
@@ -12252,20 +12270,8 @@ bool RequestsHandler::allowPacket(const sockaddr_in& src)
 		return true;
 	}
 
-	auto& bucket = it->second;
-	double elapsedSec = std::chrono::duration<double>(now - bucket.last).count();
-	bucket.last = now;
-
-	// Replenish tokens (sustained rate = 20 tokens/sec)
-	bucket.tokens = (std::min)(40.0, bucket.tokens + elapsedSec * 20.0);
-
-	if (bucket.tokens >= 1.0)
-	{
-		bucket.tokens -= 1.0;
-		return true;
-	}
-
-	return false; // Denied (Rate limit exceeded)
+	// Replenish tokens (burst 40, sustained rate = 20 tokens/sec); false = rate limit exceeded
+	return takeToken(it->second, now, 40.0, 20.0);
 }
 
 bool RequestsHandler::isValidAor(std::string_view s) const
@@ -13804,7 +13810,7 @@ void RequestsHandler::setTrunkConfig(const SipTrunk::Config& cfg)
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
-	publishTrunkPeer();   // #1092: the old carrier IP stops being exempt now
+	publishTrunkPeer(/*retire=*/true);   // #1092: the old carrier IP loses its bucket now
 }
 
 SipTrunk::Config RequestsHandler::getTrunkConfig()
@@ -13865,7 +13871,7 @@ void RequestsHandler::applyStoredTrunkConfig()
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
-	publishTrunkPeer();   // #1092: the old carrier IP stops being exempt now
+	publishTrunkPeer(/*retire=*/true);   // #1092: the old carrier IP loses its bucket now
 
 	// Checked, not discarded. The HTTP route caps the password well below
 	// kMaxSecret, but this path reads raw NVS, which an older or different

@@ -2488,6 +2488,8 @@ private:
 	//       emergency, never from a header on a packet.
 	static constexpr size_t kMaxRateExemptCallIds  = 2 * POCKETDIAL_MAX_SESSIONS;
 	static constexpr size_t kRateExemptCallIdBytes = SipLimits::kMaxCallIdLine + 1;
+	static_assert(kMaxRateExemptCallIds <= 255, "EmergencyCallIds::count/len are uint8_t");
+	static_assert(kRateExemptCallIdBytes <= 256, "EmergencyCallIds::len is uint8_t");
 	struct EmergencyCallIds
 	{
 		std::array<std::array<char, kRateExemptCallIdBytes>, kMaxRateExemptCallIds> id{};
@@ -2499,9 +2501,11 @@ private:
 	static bool emergencyIdsEqual(const EmergencyCallIds& a, const EmergencyCallIds& b);
 	// Caller holds _mutex.
 	void publishRateExemptions();
-	void publishTrunkPeer();
-	// Caller holds _rateMutex. True for a packet from the trunk peer or on a live emergency Call-ID.
-	bool rateExempt(const SipMessage& m) const;
+	// retire = the trunk was reconfigured: forget the old peer before looking the new one up.
+	void publishTrunkPeer(bool retire);
+	// Caller holds _rateMutex. True when the packet's Call-ID is a live emergency dialog's. Bare
+	// Call-ID values on both sides (the sessions are keyed on the whole "Call-ID: x" line).
+	bool rateExemptByCallId(const SipMessage& m) const;
 
 	void endHandle(std::string_view destNumber, std::shared_ptr<SipMessage> message);
 	std::string buildContact(std::string_view number) const;
@@ -3271,6 +3275,17 @@ private:
 		std::chrono::steady_clock::time_point last;
 	};
 	std::unordered_map<uint32_t, RateBucket> _rateBuckets;
+	// #1092: the trunk peer's own bucket, outside the 256-entry table (a reserved slot: a full
+	// table never refuses the carrier), with a ceiling 10x an ordinary source's. Sized for
+	// POCKETDIAL_MAX_TRUNK_CALLS (2) dialogs plus REGISTER and OPTIONS, retransmits included:
+	// real carrier traffic is a few packets a second; 200/s sustained is ~100/s per call slot.
+	// Past it the packet is dropped like any flood, which caps what a source forged as the
+	// carrier can push at _mutex.
+	static constexpr double kTrunkBucketBurst = 400.0;
+	static constexpr double kTrunkBucketRate  = 200.0;   // tokens per second
+	RateBucket _trunkBucket{ 0.0, {} };   // guarded by _rateMutex; reset when _trunkPeerIp changes
+	static bool takeToken(RateBucket& bucket, std::chrono::steady_clock::time_point now,
+		double burst, double perSec);
 	// #1092: both guarded by _rateMutex. 0 = no trunk peer known (never matches).
 	uint32_t _trunkPeerIp = 0;   // network-order s_addr
 	EmergencyCallIds _emergencyCallIds;
