@@ -1,6 +1,77 @@
 {
   "releases": [
     {
+      "tag": "v1.7.0-rc.2",
+      "prerelease": true,
+      "date": "2026-10-22",
+      "files": [
+        {
+          "name": "SipServer-esp32s3-display.bin",
+          "size": 2954352
+        },
+        {
+          "name": "SipServer-esp32s3-eth.bin",
+          "size": 2436144
+        },
+        {
+          "name": "SipServer-esp32s3-wifi.bin",
+          "size": 2652592
+        },
+        {
+          "name": "bootloader-esp32s3-display.bin",
+          "size": 22576
+        },
+        {
+          "name": "bootloader-esp32s3-eth.bin",
+          "size": 22576
+        },
+        {
+          "name": "bootloader-esp32s3-wifi.bin",
+          "size": 22576
+        },
+        {
+          "name": "flasher_args-esp32s3-display.json",
+          "size": 1051
+        },
+        {
+          "name": "flasher_args-esp32s3-eth.json",
+          "size": 1051
+        },
+        {
+          "name": "flasher_args-esp32s3-wifi.json",
+          "size": 1051
+        },
+        {
+          "name": "manifest.json",
+          "size": 2543
+        },
+        {
+          "name": "ota_data_initial-esp32s3-display.bin",
+          "size": 8192
+        },
+        {
+          "name": "ota_data_initial-esp32s3-eth.bin",
+          "size": 8192
+        },
+        {
+          "name": "ota_data_initial-esp32s3-wifi.bin",
+          "size": 8192
+        },
+        {
+          "name": "partition-table-esp32s3-display.bin",
+          "size": 3072
+        },
+        {
+          "name": "partition-table-esp32s3-eth.bin",
+          "size": 3072
+        },
+        {
+          "name": "partition-table-esp32s3-wifi.bin",
+          "size": 3072
+        }
+      ]
+    },
+    {
       "tag": "v1.7.0-rc.1",
       "prerelease": true,
       "date": "2026-10-21",
