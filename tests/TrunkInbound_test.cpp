@@ -978,6 +978,90 @@ TEST(TrunkInbound, AnExpiredLeaseByesTheHandsetAndTheCarrier)
 	expectAllReleased(b, a.forkId);
 }
 
+// #1089: the shared teardown helper must not double-BYE a trunk-inbound call.
+TEST(TrunkInbound, AnExpiredLeaseSendsExactlyOneByeToEachSide)
+{
+	Bench b;
+	const Answered a = answer(b, "in-lease-once");
+	(void)a;
+	b.sent.clear();
+
+	b.handler.expireLeaseAndSweepForTest(kExt);
+
+	auto byes = [&](const std::string& ip) {
+		const uint32_t want = inet_addr(ip.c_str());
+		size_t n = 0;
+		for (const auto& [addr, msg] : b.sent)
+			if (msg && addr.sin_addr.s_addr == want && msg->toString().rfind("BYE ", 0) == 0) ++n;
+		return n;
+	};
+	EXPECT_EQ(byes(kPhoneIp), 1u);
+	EXPECT_EQ(byes(kSbcIp), 1u);
+}
+
+// Rule 5 (#712): a PSAP callback arriving through the carrier and ringing the handset
+// is not torn down by that handset's de-REGISTER or lapsed lease: no CANCEL to the
+// handset, no 480 to the carrier. The call ends later and the binding is pruned then.
+TEST(TrunkInbound, ADeregisterOrLapsedLeaseNeverEndsAPsapCallbackThatIsRinging)
+{
+	for (const bool lease : { false, true })
+	{
+		SCOPED_TRACE(lease ? "lease expiry" : "REGISTER Expires 0");
+		Bench b;
+		const std::string id = lease ? "in-psap-l" : "in-psap-d";
+		const std::string fork = ringFork(b, id);
+		ASSERT_FALSE(fork.empty());
+		const std::string forkId = "Call-ID: " + field(fork, "Call-ID: ");
+		b.handler.handle(handsetReply(fork, "SIP/2.0 180 Ringing"));
+		auto s = b.handler.getSession(forkId);
+		ASSERT_TRUE(s.has_value());
+		s.value()->setEmergency(true);   // as onInvite() flags a call inside #659's window
+		ASSERT_EQ(s.value()->getState(), Session::State::Invited) << "precondition: ringing";
+		b.sent.clear();
+
+		if (lease)
+		{
+			b.handler.expireLeaseAndSweepForTest(kExt);
+		}
+		else
+		{
+			std::string raw =
+				"REGISTER sip:server SIP/2.0\r\n"
+				"Via: SIP/2.0/UDP " + std::string(kPhoneIp) + ":5060;branch=z9hG4bKd" + id + "\r\n"
+				"From: <sip:2001@server>;tag=rt2001\r\n"
+				"To: <sip:2001@server>\r\n"
+				"Call-ID: dereg-" + id + "\r\n"
+				"CSeq: 2 REGISTER\r\n"
+				"Contact: <sip:2001@" + std::string(kPhoneIp) + ":5060>;expires=0\r\n"
+				"Content-Length: 0\r\n\r\n";
+			b.handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(kPhoneIp)));
+		}
+
+		EXPECT_TRUE(b.handler.getSession(forkId).has_value()) << "the callback was torn down";
+		EXPECT_TRUE(b.firstTo("CANCEL ", kPhoneIp).empty()) << "the ringing handset was CANCELled";
+		EXPECT_TRUE(b.firstTo("SIP/2.0 480", kSbcIp).empty()) << "the carrier got a 480";
+		EXPECT_TRUE(b.firstTo("SIP/2.0 4", kSbcIp).empty());
+
+		// The handset answers, the carrier hangs up, and the next sweep prunes the binding.
+		b.handler.handle(handsetReply(fork, "SIP/2.0 200 OK", kHandsetAnswer));
+		const std::string ok = b.firstTo("SIP/2.0 200 OK", kSbcIp);
+		ASSERT_FALSE(ok.empty());
+		b.handler.handle(makeCarrierAck(kDid, field(ok, "To: "), id));
+		b.handler.handle(carrierRequest("BYE", id, field(ok, "To: "), 2));
+		ASSERT_FALSE(b.handler.getSession(forkId).has_value()) << "precondition: ended";
+		b.handler.idleClientAndSweepForTest(kExt, std::chrono::seconds(0));
+		b.handler.forceNextTickForTest();
+		b.handler.tick();
+		bool bound = false;
+		for (const auto& [number, address] : b.handler.getActiveClients())
+		{
+			(void)address;
+			if (number == kExt) bound = true;
+		}
+		EXPECT_FALSE(bound) << "the deferred de-register must complete";
+	}
+}
+
 TEST(TrunkInbound, AnRtpAddressThatIsNotAUnicastDottedQuadIsNeverARelayPeer)
 {
 	// C review: inet_addr("999.0.113.5") is 255.255.255.255, which setRawPeer()
