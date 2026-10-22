@@ -4,9 +4,23 @@
     "theme": "base",
     "fontFamily": "ui-monospace,\"SF Mono\",\"Cascadia Code\",Consolas,\"Liberation Mono\",monospace",
     "fontSize": 13,
-    "flowchart": { "useMaxWidth": true, "htmlLabels": false, "padding": 8, "nodeSpacing": 24, "rankSpacing": 36 },
-    "sequence": { "useMaxWidth": true, "mirrorActors": false, "wrap": false, "actorMargin": 40, "messageMargin": 32 },
-    "state": { "useMaxWidth": true },
+    "flowchart": {
+      "useMaxWidth": true,
+      "htmlLabels": false,
+      "padding": 8,
+      "nodeSpacing": 24,
+      "rankSpacing": 36
+    },
+    "sequence": {
+      "useMaxWidth": true,
+      "mirrorActors": false,
+      "wrap": false,
+      "actorMargin": 40,
+      "messageMargin": 32
+    },
+    "state": {
+      "useMaxWidth": true
+    },
     "themeVariables": {
       "fontFamily": "ui-monospace,Consolas,monospace",
       "primaryColor": "#eef2f5",
@@ -58,5 +72,11 @@
       "labelTextColor": "#4a1410",
       "loopTextColor": "#4a1410"
     }
+  },
+  "hardware": {
+    "flowchart": {
+      "htmlLabels": true
+    },
+    "themeCSS": ".cluster-label div, .cluster-label span, .node div, .node span {white-space: nowrap !important; max-width: none !important;}"
   }
 }

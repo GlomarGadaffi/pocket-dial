@@ -134,7 +134,7 @@ sequenceDiagram
             P->>N: correction, NOT ROUTED
         end
     else no real anchor, not connected, no free slot, or the offer has PCMA or G.722 but no PCMU
-        P->>H: 503 Emergency Call Not Routable, Warning says why, no Retry-After (for that offer: no G.711 codec offered)
+        P->>H: 503 Emergency Call Not Routable, Warning says why, no Retry-After (for that offer, if the anchor is connected: no G.711 codec offered)
         P->>N: notification, NOT ROUTED and the reason
     end
     Note over P: never a SIP trunk, never a 404, never reaped for RTP silence

@@ -10,7 +10,7 @@ await p.addScriptTag({ url: 'https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/me
 for (const [k,src] of Object.entries(d)) {
   const svg = await p.evaluate(async ([k,src,cfg]) => {
     const c = JSON.parse(JSON.stringify(cfg.base)); const o = cfg[k] || {};
-    for (const kk of Object.keys(o)) c[kk] = Object.assign({}, c[kk] || {}, o[kk]);
+    for (const kk of Object.keys(o)) c[kk] = typeof o[kk] === 'object' ? Object.assign({}, c[kk] || {}, o[kk]) : o[kk];
     mermaid.initialize(c);
     return (await mermaid.render('m_'+k, src)).svg;
   }, [k,src,cfg]);
