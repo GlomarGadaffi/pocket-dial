@@ -243,7 +243,7 @@ The REGISTER path through `allocateClient()`, in order:
 flowchart TD
     A["REGISTER, onRegister (RequestsHandler.cpp:1462)"] --> X{"Expires 0?"}
     X -->|yes| U["unregisterClient (RequestsHandler.cpp:1587)"]
-    X -->|no| Q["allocateClient (RequestsHandler.cpp:12054)"]
+    X -->|no| Q["allocateClient (RequestsHandler.cpp:12077)"]
     Q --> B{"Pool entry with this number?"}
     B -->|yes| C["Re-REGISTER: reset that entry in place (12057-12064)"]
     B -->|no| D{"Pool entry with an empty number?"}

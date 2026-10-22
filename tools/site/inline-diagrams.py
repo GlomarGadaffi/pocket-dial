@@ -7,6 +7,7 @@ committed page. A new key in diagrams.json needs its figure placed once by hand
 """
 import os
 import re
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 S = os.path.join(HERE, 'svg')
@@ -26,13 +27,21 @@ def svg(n, minw=None):
     return f'<figure class="dg"><div>{s}</div></figure>'
 
 
-h = open(PAGE, encoding='utf-8').read()
+h = open(PAGE, encoding='utf-8', newline='').read()
+missing = []
 for f in sorted(os.listdir(S)):
     if not f.endswith('.svg'):
         continue
     key = f[:-4]
-    pat = re.compile(r'<figure class="dg"><div><svg [^>]*id="m_' + key + r'".*?</svg></div></figure>', re.S)
+    pat = re.compile(r'<figure class="dg"><div><svg [^>]*id="m_' + re.escape(key) + r'".*?</svg></div></figure>', re.S)
     fig = svg(key, MINW.get(key))
     h, n = pat.subn(lambda _m: fig, h)
-    print(key, 'replaced' if n == 1 else f'NOT FOUND ({n}): place its <figure> by hand first')
+    if n == 1:
+        print(key, 'replaced')
+    else:
+        print(key, f'NOT FOUND ({n} matches, need exactly 1): place its <figure> by hand first' if n == 0
+              else f'AMBIGUOUS ({n} matches, need exactly 1): remove the duplicate figures')
+        missing.append(key)
+if missing:
+    sys.exit(f'{PAGE} not written; fix: ' + ', '.join(missing))
 open(PAGE, 'w', encoding='utf-8', newline='').write(h)

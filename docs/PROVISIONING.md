@@ -486,7 +486,7 @@ sequenceDiagram
         T->>P: OPTIONS keepalive
         P-->>T: 200 OK
     end
-    Note over P,T: tick() prunes a phone after 15 s of silence or an expired lease, unless it is in a call or on a live 911/933.
+    Note over P,T: tick() prunes a phone after 15 s of silence or an expired lease. A phone in a call is spared only on a missed keepalive; an expired lease still prunes it. A live 911/933 spares it on either.
     P->>U: (6) INVITE sip:1002@...
     Note right of U: onInvite() relays the call peer to peer. filterAudioCodecs(allowWideband=true) narrows the codec list only. The c= line is never rewritten.
     U-->>P: 180 (relayed as-is), 200 + SDP

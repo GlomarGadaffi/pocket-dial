@@ -83,7 +83,7 @@ The device is a registrar + proxy/redirect-ish B2B-light signalling box. When A 
    server refuses it with `488` if the offer has no PCMU, PCMA or G.722 (`offersSupportedAudio`,
    `RequestsHandler.cpp:2428`), otherwise forwards the offer toward B with the SDP body unchanged.
 2. B answers `200 OK` with its own SDP (`m=audio <portB> ...`). The server forwards it back
-   to A with the body unchanged (`:7910`). `filterAudioCodecs()` narrows the list only where the
+   to A with the body unchanged (`:7933`). `filterAudioCodecs()` narrows the list only where the
    board builds a new offer or answer: ring-group forks, transfers, park, pickup.
 3. **The `c=` connection address and `m=` port in each SDP still point at the phones
    themselves.** Once both sides have each other's `IP:port`, they stream RTP directly. The
@@ -102,9 +102,9 @@ sequenceDiagram
         Note over U: 911 and 933 never reach this branch. routeEmergencyCall takes them first (:2455-2459)
         U->>B: INVITE relayed by endHandle (:3025), SDP body not rewritten
         B-->>U: 200 OK with SDP answer
-        U-->>A: 200 OK relayed by endHandle (:7910), SDP body not rewritten
+        U-->>A: 200 OK relayed by endHandle (:7933), SDP body not rewritten
         A->>U: ACK
-        U->>B: ACK relayed (:8010)
+        U->>B: ACK relayed (:8033)
         Note over U: c= and m= still point at the phones
         A-->B: RTP direct. No board task touches it.
     end
@@ -410,7 +410,7 @@ flowchart TD
         C7 --> C8["200 OK, leg joins the MixBus"]
     end
     subgraph A555["555 anchor: originateAnchorCall, :5343"]
-        A1["404 no anchor client connected (:5425)"] --> A2["488 no PCMU offered (:5467)"]
+        A1["404 no anchor client connected (:5425)<br/>911 or 933: nothing sent, 503 Emergency Call Not Routable (:5177)"] --> A2["488 no PCMU offered (:5467)<br/>911 or 933: 503 Emergency Call Not Routable, Warning: no G.711 codec offered (:5455-5462, :5177)"]
         A2 --> A3["400 no usable RTP destination (:5476)"]
         A3 --> A4["911 or 933 only: preemptAnchorCallForEmergency ends one non-emergency anchored call if the anchor is full (:5480)"]
         A4 --> A5["503 every anchor bridge slot busy (:5497 loopback, :5604 WAN)"]
@@ -424,15 +424,16 @@ It is reached before the dial plan, the secure-mode challenge and the `422` floo
 (`:2443-2459`), and `originateAnchorCall` is called with `respondIfDisconnected=false`, so a
 down anchor never produces the `404` above. When no route exists the answer is
 `503 Emergency Call Not Routable` with a `Warning: 399` header and no `Retry-After`
-(`:5177`). A full anchor is a `503 Service Unavailable` only after one non-emergency call has
-been ended to make room.
+(`:5177`). A full anchor is different: `refuseBeforeDispatch` sends nothing for a 911/933, and the
+caller gets the same `503 Emergency Call Not Routable` (`:5177`), only after one non-emergency
+call has been ended to make room. A non-emergency call gets `503 Service Unavailable` there.
 
 The tasks behind those server-terminated legs, as created in code:
 
 ```mermaid
 flowchart LR
     U["udp_receiver_task<br/>prio 5, 16 KB, core from POCKETDIAL_UDP_RX_CORE (default 1)<br/>(UdpServer.cpp:163-173)"] -->|"onMediaInvite, onConferenceInvite, originateAnchorCall"| H["RequestsHandler under _mutex"]
-    H -->|"RtpSender::start"| TX["rtp_media_tx<br/>prio 6, Core 0, 3 KB static stack, pool of 6<br/>(RtpSender.cpp:356, PoolConfig.hpp:245)"]
+    H -->|"RtpSender::start"| TX["rtp_media_tx<br/>prio 6, Core 0, 3 KB static stack, pool of 6<br/>(RtpSender.cpp:356-364, PoolConfig.hpp:245)"]
     H -->|"RtpReceiver::start(0)"| RX["rtp_media_rx<br/>prio 6, Core 0, 6 KB static stack<br/>(RtpReceiver.cpp:619)"]
     H -->|"ConferenceRoom::startDriver"| MIX["conf_mix_tick<br/>prio 6, Core 0, 3 KB, one for the room<br/>(ConferenceRoom.cpp:308)"]
     H -->|"HoldMusic::start, park only"| MOH["moh_tx<br/>prio 5, Core 0, 6 KB<br/>(HoldMusic.cpp:517)"]

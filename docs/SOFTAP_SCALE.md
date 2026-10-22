@@ -180,7 +180,7 @@ One caveat applies if the board itself is the `wifi` build in `TOPOLOGY_CLIENT`,
 `eth` build. TB-1 does not disappear. It becomes a fallback.
 
 On boot in `TOPOLOGY_CLIENT`, the board needs a saved SSID. If none is saved, `wifi_init_sta()`
-gives up at `main/esp_main.cpp:213-216`. If one is saved, the board has 15 s to join the upstream
+gives up at `main/esp_main.cpp:218-221`. If one is saved, the board has 15 s to join the upstream
 network (`main/esp_main.cpp:233-237`), and `wifi_init_sta()` gives up if it does not. In either case
 the boot path falls straight back to `wifi_init_softap()` (`main/esp_main.cpp:477-498`), which
 silently re-creates the board's own SoftAP. That AP is open unless `ap_secure` is set.

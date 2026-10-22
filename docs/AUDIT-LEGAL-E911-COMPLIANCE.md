@@ -40,7 +40,7 @@ RAY BAUM'S Act requires all 911 calls from MLTS and interconnected VoIP systems 
 - **Pre-dialplan priority bypass:** Emergency classification runs strictly before operator-configured dial plans (`DialPlan.hpp`), ring groups, speed dials, and policy locks. An operator rule such as `9*` (strip 1 digit) cannot intercept or rewrite `911` into `11`.
 - **Policy gate bypass:** The call bypasses Do-Not-Disturb (DND), call forwarding (CFNA/CFU), and administrative PIN authentication.
 
-The decision path for a new INVITE in `RequestsHandler::onInvite()` is below. Only the dialog, syntax, registration and codec gates come before the emergency check. Every policy gate comes after it:
+The decision path for a new INVITE in `RequestsHandler::onInvite()` is below. Inside `onInvite()`, only the dialog, syntax, registration and codec gates come before the emergency check, and every policy gate comes after it. Two gates run earlier, before `onInvite()` is reached, and can drop a 911/933: the per-source rate limiter and `ipAllowed()` allowlist (`RequestsHandler.cpp:962-971`), which discard the packet without any response, and the SDP admission gate (`:1097-1110`), which yields to emergency traffic only for a `TooManyAudioStreams` verdict. The rate-limit exemption for emergency traffic is open as #1092. The diagram starts at `onInvite()`:
 
 ```mermaid
 flowchart TD
@@ -122,9 +122,11 @@ flowchart TD
     CD -- "no" --> W2["Warning detail: no G.711 codec offered"]
     CD -- "yes" --> RTP{"Usable RTP address in the SDP?"}
     RTP -- "no" --> R400["400 Bad Request, notifyEmergency routed=false"]
+    R400 -. "the anchor answered, so the call counts as owned" .-> MK
     RTP -- "yes" --> PRE["preemptAnchorCallForEmergency(): when full, end one non-emergency anchor call"]
     PRE --> CAP{"Bridge, session and virtual peer free, and the tel_sos queue takes the makeCall job?"}
     CAP -- "no, nothing sent" --> W3
+    CAP -- "no, but the anchor answered its own 503" -.-> MK
     CAP -- "yes" --> RING["Session Invited, 180 Ringing to the handset"]
     RING --> MK["markEmergency(): setEmergency, open the PSAP callback window"]
     MK --> NT["notifyEmergency routed=true, on the same outbox pass as the 180"]

@@ -242,7 +242,7 @@ concurrent tick read. This maintains the invariant **"a `Free` slot has empty ri
 is why `attach()` need only flip the flag.
 
 ```cpp
-int MixBus attach() {                          // cold path
+int MixBus::attach() {                          // cold path
     for (int p = 0; p < MAX_PORTS; ++p) {
         State expected = State::Free;
         if (_ports[p].state.compare_exchange_strong(

@@ -436,7 +436,7 @@ flowchart TD
     W --> EM
     EM -->|"no"| X["esp_restart()"]
     X --> F["Bootloader starts the new slot in state ESP_OTA_IMG_PENDING_VERIFY"]
-    F --> G{"HTTP task loop survives 5 passes of 1 s? (esp_main.cpp:345, esp_main_eth.cpp:545)"}
+    F --> G{"HTTP task loop survives 5 passes of 1 s? (esp_main.cpp:345, esp_main_eth.cpp:543)"}
     G -->|"yes"| V["OtaUpdater markValid(): esp_ota_mark_app_valid_cancel_rollback (OtaUpdater.cpp:200)"]
     G -->|"no: panic, watchdog or reset before confirm"| RO["Bootloader rolls back to the previous slot"]
 ```
