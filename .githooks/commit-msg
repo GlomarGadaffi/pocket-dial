@@ -1,8 +1,8 @@
 #!/bin/sh
 # Reject a commit outright if its message carries a Claude-Session: trailer
 # -- pocket-dial's convention forbids it (see CONTRIBUTING_FIRMWARE.md and
-# issue #326). Co-Authored-By is fine and should stay; only the session-URL
-# trailer is the problem.
+# issue #326). Commits end with the single line --superlite and no other
+# attribution trailer; this hook only blocks the session-URL trailer.
 #
 # Not installed by default -- git only runs hooks from .git/hooks, so this
 # has no effect until each clone opts in once with:
@@ -42,17 +42,17 @@ check_message() {
 if [ "$1" = "--selftest" ]; then
     bad="fix: something
 
-Co-authored-by: Claude Sonnet 5 <noreply@anthropic.com>
+Co-authored-by: Claude Sonnet 5 <bot@example.invalid>
 Claude-Session: https://claude.ai/code/session_selftest"
     bad_lower="fix: something
 
 claude-session: https://claude.ai/code/session_selftest"
     bad_reflowed="fix: something
 
-Co-authored-by: Claude Sonnet 5 <noreply@anthropic.com> Claude-Session: https://claude.ai/code/session_selftest"
+Co-authored-by: Claude Sonnet 5 <bot@example.invalid> Claude-Session: https://claude.ai/code/session_selftest"
     good="fix: something
 
-Co-authored-by: Claude Sonnet 5 <noreply@anthropic.com>"
+Co-authored-by: Claude Sonnet 5 <bot@example.invalid>"
     good_prose="docs: the Claude-Session trailer stays forbidden (see #326)"
 
     for name in bad bad_lower bad_reflowed; do
@@ -101,7 +101,7 @@ if check_message "$MSG_BODY"; then
     echo "#  trailer. pocket-dial's convention forbids it (see         " >&2
     echo "#  CONTRIBUTING_FIRMWARE.md, issue #326).                    " >&2
     echo "#                                                            " >&2
-    echo "#  Remove that line and keep Co-Authored-By -- that part's   " >&2
+    echo "#  Remove that line. Commits end with --superlite only.      " >&2
     echo "#  fine. If your harness auto-appends the trailer, strip it  " >&2
     echo "#  before committing rather than after.                      " >&2
     echo "############################################################" >&2

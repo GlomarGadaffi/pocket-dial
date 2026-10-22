@@ -191,8 +191,7 @@ jobs:
           if [ "$FOUND" -ne 0 ]; then
             echo ""
             echo "pocket-dial's convention: no Claude-Session URL in commit"
-            echo "messages or PR bodies (Co-Authored-By is fine and should"
-            echo "stay -- only the session-URL trailer is the problem)."
+            echo "messages or PR bodies. Commits end with --superlite only."
             echo ""
             echo "Fix a commit: amend it and force-push the branch."
             echo "Fix the PR body: edit the description directly."
