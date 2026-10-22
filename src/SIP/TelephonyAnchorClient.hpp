@@ -403,6 +403,10 @@ private:
 	// #977: the orphan sweep has a task of its own. Its I/O (a list GET, a drop POST, a getaddrinfo with no timeout)
 	// cannot be stopped once started, and a restart runs on tel_maint, so tel_maint never runs, joins or waits for it.
 	std::atomic<TaskHandle_t> _sweepHandle{nullptr};
+	// Its stack and TCB, allocated once at construction (#479, like a call slot's rxMem) so start() allocates nothing
+	// and the 6 KB sit in PSRAM, not internal RAM. Safe: nothing on the sweep's path writes flash or runs in an ISR.
+	static constexpr uint32_t kSweepStackBytes = 6144;
+	pd::StaticTaskSlot _sweepMem;
 	bool wakeSweep();   // false: no tel_sweep task
 	static void sweepTaskTrampoline(void* arg);
 	// Issue #336: same _restartRequested mechanism as the leak-count path above,

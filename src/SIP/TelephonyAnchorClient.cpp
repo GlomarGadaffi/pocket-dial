@@ -133,6 +133,10 @@ TelephonyAnchorClient::TelephonyAnchorClient()
 		s.rxArg = RxTaskArg{this, &s};   // constant for the slot's life, so never rewritten
 		s.rxDoneSem = xSemaphoreCreateBinary();   // #479: once, never recreated per call
 	}
+	// #977: tel_sweep's stack + TCB, once. The sweep does socket + TLS I/O and in-memory work only (no flash write:
+	// no nvs_*, esp_partition_*, esp_flash_*, esp_ota_*, no CdrRing, no endCall), like tel_ctl's makeCall and dropCall
+	// on a PSRAM stack. Internal fallback if PSRAM is short; a failed allocation leaves the sweep off, logged.
+	_sweepMem.alloc("tel_sweep", kSweepStackBytes, PD_TASK_STACK_CAPS, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
 TelephonyAnchorClient::~TelephonyAnchorClient()
@@ -194,17 +198,19 @@ bool TelephonyAnchorClient::start()
 		}
 	}
 	// #977: the orphan sweep's own task, once, beside tel_maint. Priority 4, below tel_maint (5): a restart is never
-	// held up behind it. Internal stack, as tel_maint's (resolveOutboundLeg and httpPostBody run on it).
+	// held up behind it. A static task on the boot-allocated stack + TCB (_sweepMem): no heap here, and the stack is
+	// in PSRAM. A construction-time allocation failure leaves it off (the arm then finds no worker).
 	if (!_sweepHandle.load(std::memory_order_acquire))
 	{
-		TaskHandle_t h = nullptr;
-		if (xTaskCreate(&TelephonyAnchorClient::sweepTaskTrampoline, "tel_sweep", 6144, this, 4, &h) != pdPASS)
+		TaskHandle_t h = (_sweepMem.stack == nullptr) ? nullptr
+			: xTaskCreateStatic(&TelephonyAnchorClient::sweepTaskTrampoline, "tel_sweep",
+			                    _sweepMem.bytes, this, 4, _sweepMem.stack, _sweepMem.tcb);
+		if (h == nullptr)
 		{
 			ESP_LOGE(TAG, "start: failed to create tel_sweep (no 911 orphan sweep)");
 		}
 		else
 		{
-			psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
 			_sweepHandle.store(h, std::memory_order_release);
 		}
 	}

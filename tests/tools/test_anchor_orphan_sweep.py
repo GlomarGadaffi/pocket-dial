@@ -117,7 +117,6 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertNotIn("wakeMaint", self.arm)
         self.assertIn("wakeSweep()", self.arm)
         start = body_of(self.cpp, "bool TelephonyAnchorClient::start(")
-        self.assertRegex(start, r'xTaskCreate\(&TelephonyAnchorClient::sweepTaskTrampoline, "tel_sweep", 6144, this, 4, &h\)')
         self.assertLess(start.index('"tel_maint"'), start.index('"tel_sweep"'))
         dtor = body_of(self.cpp, "TelephonyAnchorClient::~TelephonyAnchorClient(")
         self.assertIn("_sweepHandle.exchange(nullptr)", dtor)
@@ -130,6 +129,33 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         gate = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools", "ci", "task_stacks.json"),
                     encoding="utf-8").read()
         self.assertIn('"name": "tel_sweep", "entry": "sweepTaskTrampoline\\\\("', gate, "the stack gate knows the new task")
+
+    def test_tel_sweep_is_a_static_task_on_a_boot_allocated_psram_stack(self):
+        # Round 9: a dynamic internal 6 KB stack cost ~6.7 KB of internal heap for good (BigDog's bench). The sweep's
+        # call graph (resolveOutboundLeg, httpPostBody, cJSON, the in-memory tables, esp_log witnesses) does no flash
+        # write (nvs_*, esp_partition_*, esp_flash_*, esp_ota_*) and no ISR-context code, and tel_ctl, which runs the
+        # same httpPostBody/resolveOutboundLeg, is already PSRAM-stacked. So it takes the rx-slot pattern (#479).
+        self.assertIn("pd::StaticTaskSlot _sweepMem;", self.hpp)
+        ctor = body_of(self.cpp, "TelephonyAnchorClient::TelephonyAnchorClient(")
+        self.assertIn(
+            '_sweepMem.alloc("tel_sweep", kSweepStackBytes, PD_TASK_STACK_CAPS, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);', ctor,
+            "allocated once at construction, so start() allocates nothing")
+        self.assertIn("kSweepStackBytes = 6144", self.hpp)
+        start = body_of(self.cpp, "bool TelephonyAnchorClient::start(")
+        self.assertRegex(start, r'xTaskCreateStatic\(&TelephonyAnchorClient::sweepTaskTrampoline, "tel_sweep",\s*'
+                                r'_sweepMem\.bytes, this, 4, _sweepMem\.stack, _sweepMem\.tcb\)')
+        self.assertNotIn('xTaskCreate(&TelephonyAnchorClient::sweepTaskTrampoline', start)
+        self.assertIn("_sweepMem.stack == nullptr", start, "a failed boot allocation refuses, logged, never a crash")
+        # nothing on the sweep's path reaches a flash write
+        for text in (self.sweep, body_of(self.cpp, "bool TelephonyAnchorClient::dropOrphanLeg("),
+                     body_of(self.cpp, "std::string TelephonyAnchorClient::resolveOutboundLeg(")):
+            self.assertIsNone(re.search(r"nvs_|esp_partition|esp_flash|esp_ota|spi_flash|CdrRing|endCall\(", text))
+
+    def test_the_tel_sweep_stack_watermark_is_on_status(self):
+        with open(os.path.join(SIP, "..", "Helpers", "HttpServer.cpp"), encoding="utf-8") as f:
+            http = f.read()
+        self.assertIn('pdAppendHwmField(json, "stackHwm_tel_sweep", pdStackHwmBytes("tel_sweep"));', http)
+        self.assertIn('\\"stackHwm_tel_sweep\\":null', http, "and the host / no-ESP path keeps the key as null")
 
     def test_the_comments_state_the_guarantee_exactly(self):
         # The other pins read comment-stripped code; this one reads the files as they are.
