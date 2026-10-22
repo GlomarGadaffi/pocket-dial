@@ -454,6 +454,21 @@ public:
 		if (Entry* e = put(id, nowUs)) e->removedSeq = removedSeq > postSeq ? removedSeq : 0;
 	}
 
+	// #1095: did 3CX remove this id after the makecall went out (a Remove numbered after
+	// postSeq)? Then the leg the response names is gone before it is keyed: 3CX refused the
+	// call while the makecall was pending (on .244, 5 ms before the response). The order of
+	// the WS events decides, not a time: a Remove numbered at or before postSeq is an
+	// earlier participant's. Exact id only; a Remove pushed out of the ring (8 later ones)
+	// or of an id that does not fit is not seen, and the call goes on as before.
+	bool removedSince(std::string_view id, uint64_t postSeq) const
+	{
+		for (const Removed& r : _removed)
+		{
+			if (r.seq > postSeq && id == r.id) return true;
+		}
+		return false;
+	}
+
 	// Held from nowUs (our outbound slot was freed); a Remove already seen stands.
 	void note(std::string_view id, int64_t nowUs) { put(id, nowUs); }
 
