@@ -66,6 +66,12 @@ public:
 	// any Answered event arrives — keeping call correlation correct under concurrency.
 	virtual bool makeCall(const std::string& destination, std::string* ownLegOut = nullptr) = 0;
 
+	// #1095: has the external system removed this leg since makeCall() named it? Asked
+	// once, after the engine has bound the leg to its session: a removal that came in
+	// before the bind reached the engine as a Dropped with no session to match. Quick,
+	// non-blocking, no allocation. Default: no provider reports one.
+	virtual bool ownLegRemovedSinceNamed(const std::string& ownLeg) { (void)ownLeg; return false; }
+
 	// Accept an inbound call the external system is delivering (mirror of makeCall).
 	// Call this once the local extension has accepted; participantId is from CallEvent::Incoming.
 	virtual bool answerCall(const std::string& participantId) = 0;

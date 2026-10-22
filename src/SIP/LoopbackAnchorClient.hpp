@@ -37,7 +37,36 @@ public:
 	// makeCall() supersedes the previous one rather than running alongside it.
 	// Reported explicitly rather than left to the base default so that raising
 	// POCKETDIAL_MAX_ANCHOR_CALLS can never quietly enable concurrency here.
-	unsigned maxConcurrentCalls() const override { return 1; }
+	unsigned maxConcurrentCalls() const override
+	{
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+		if (_maxConcurrentForTest) return _maxConcurrentForTest;
+#endif
+		return 1;
+	}
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	// Test hooks (#1095), host only. ownLegRemovedSinceNamed() answers what the hook
+	// says (a real anchor's answer: 3CX's Remove of the leg was received after the
+	// makecall named it). The concurrency override lets a test hold a 911 on one leg
+	// while another call fails; the constant leg id still collides, so a test that
+	// uses it binds its own legs.
+	bool ownLegRemovedSinceNamed(const std::string& ownLeg) override
+	{
+		std::function<bool(const std::string&)> hook;
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			hook = _removedHookForTest;
+		}
+		return hook ? hook(ownLeg) : false;
+	}
+	void setOwnLegRemovedHookForTest(std::function<bool(const std::string&)> hook)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_removedHookForTest = std::move(hook);
+	}
+	void setMaxConcurrentCallsForTest(unsigned n) { _maxConcurrentForTest = n; }
+#endif
 
 	// Test hook: pretend the upstream is delivering a PSTN call to the monitored DN.
 	// Fires a single CallEvent::Incoming (participant id "mock-in-<n>", the given
@@ -85,6 +114,10 @@ private:
 
 	std::vector<std::thread> _simThreads;
 	std::atomic<bool> _stopSimThread{false};
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	std::function<bool(const std::string&)> _removedHookForTest;
+	std::atomic<unsigned> _maxConcurrentForTest{0};
+#endif
 };
 
 #endif // LOOPBACK_ANCHOR_CLIENT_HPP

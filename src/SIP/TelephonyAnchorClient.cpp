@@ -36,6 +36,11 @@ bool TelephonyAnchorClient::makeCall(const std::string&, std::string*)
 	return false;
 }
 
+bool TelephonyAnchorClient::ownLegRemovedSinceNamed(const std::string&)
+{
+	return false;
+}
+
 bool TelephonyAnchorClient::answerCall(const std::string&)
 {
 	return false;
@@ -624,10 +629,23 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 			// #379: the CANCEL may already have ended this leg's session; an upsert for
 			// it that finds no outbound slot is still ours, never an inbound call.
 			const bool ownLegHeld = telephony::ownLegMayBeHeld(ownLegSource);
+			bool removedAlready = false;   // #1095
 			if (ownLegHeld)
 			{
 				std::lock_guard<std::mutex> lock(_mutex);
 				_ownLegs.noteNamed(ownLeg, esp_timer_get_time(), postSeq);
+				removedAlready = _ownLegs.removedSince(ownLeg, postSeq);
+				if (removedAlready) _droppedLegs.add(ownLeg);   // #554: a late upsert cannot key it either
+			}
+			if (removedAlready)
+			{
+				// #1095: 3CX removed this leg after the makecall went out, before its response named it:
+				// it refused the call. No slot, no media. The caller is answered now (runTelCtl: 503, and
+				// NOT ROUTED for a 911/933, which is the truth: the call is gone), not left ringing.
+				ESP_LOGW(TAG, "makeCall: 3CX removed own leg %s before the response named it -- failing the call (#1095)",
+					ownLeg.c_str());
+				if (ownLegOut) ownLegOut->clear();
+				return false;
 			}
 			// Alloc THIS call's slot (startRxIfNeeded find-or-claims it for ownLeg) + prime the GET
 			// loop, then mark the slot outbound-in-flight so the WS upsets for ownLeg classify as
@@ -738,6 +756,17 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		// No slot was allocated (we alloc only after resolveOutboundLeg), so nothing to clear.
 	}
 	return success;
+}
+
+// #1095 backstop. makeCall()'s own check sees a Remove received up to the response; this one,
+// asked by runTelCtl() after it has bound the leg to its session, sees one received after
+// that check. The WS task records each Remove (_ownLegs.release, under _mutex) before it
+// queues the Remove for the worker, so a Remove this answers false for reaches the engine
+// as Dropped after the bind, and #880 fails the call there. Lock, fixed-storage lookup, no I/O.
+bool TelephonyAnchorClient::ownLegRemovedSinceNamed(const std::string& ownLeg)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _ownLegs.removedSinceNamed(ownLeg);
 }
 
 bool TelephonyAnchorClient::dropCall(const std::string& participantId)

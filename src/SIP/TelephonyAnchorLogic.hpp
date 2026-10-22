@@ -454,6 +454,33 @@ public:
 		if (Entry* e = put(id, nowUs)) e->removedSeq = removedSeq > postSeq ? removedSeq : 0;
 	}
 
+	// #1095: did 3CX remove this id after the makecall went out (a Remove numbered after
+	// postSeq)? Then the leg the response names is gone before it is keyed: 3CX refused the
+	// call while the makecall was pending (on .244, 5 ms before the response). The order of
+	// the WS events decides, not a time: a Remove numbered at or before postSeq is an
+	// earlier participant's. Exact id only; a Remove pushed out of the ring (8 later ones)
+	// or of an id that does not fit is not seen, and the call goes on as before.
+	bool removedSince(std::string_view id, uint64_t postSeq) const
+	{
+		for (const Removed& r : _removed)
+		{
+			if (r.seq > postSeq && id == r.id) return true;
+		}
+		return false;
+	}
+
+	// #1095 backstop, asked once the engine has bound the leg to its session: has 3CX
+	// removed this named leg since its makecall went out? noteNamed() keeps a Remove
+	// numbered after postSeq, and release() records a later one, on the leg's own entry,
+	// so a Remove pushed out of the ring is still seen. The WS task calls release()
+	// before it queues the Remove for the worker, so a Remove this answers false for
+	// reaches the engine as Dropped after the bind, where #880 fails the call.
+	bool removedSinceNamed(std::string_view id) const
+	{
+		const std::size_t i = indexOf(id);
+		return i != N && _e[i].removedSeq != 0;
+	}
+
 	// Held from nowUs (our outbound slot was freed); a Remove already seen stands.
 	void note(std::string_view id, int64_t nowUs) { put(id, nowUs); }
 

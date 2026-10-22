@@ -5954,8 +5954,24 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 	// internally) so a later Answered/Dropped maps to the right call when
 	// several are in flight.
 	const bool bound = bindOutboundParticipant(job.callId, ownLeg);
+	// #1095 backstop, asked after the bind and before _mutex: did 3CX remove this leg
+	// after makeCall()'s own check? Its Dropped may have come before the bind and
+	// matched no session. The anchor records a Remove before it queues the Dropped, so a
+	// Remove this misses is matched after the bind, by #880. Asked before _mutex is
+	// taken, so the anchor's lock is not nested inside it here.
+	const bool removedBeforeBind = bound && _anchorClient->ownLegRemovedSinceNamed(ownLeg);
 	std::lock_guard<pd::TimedMutex> lock(_mutex);
-	if (!bound && !ownLeg.empty())
+	if (removedBeforeBind)
+	{
+		// What the missed Dropped would have done (#880: a final 503 to the ringing caller,
+		// NOT ROUTED for a 911/933). It matches only this leg's session, and only once: a
+		// Dropped already handled, or one still to come, finds no session. 3CX has ended
+		// the leg; the drop only frees the slot makeCall() keyed for it (tel_drop).
+		queueLog("[Telephony] 3CX removed leg " + ownLeg + " before the call was bound -- failing it (#1095)", true);
+		anchorDroppedLocked(ownLeg);
+		asyncDropCall(ownLeg);
+	}
+	else if (!bound && !ownLeg.empty())
 	{
 		// Issue #379: the handset hung up while makeCall() was still on the
 		// wire (a ~0.8 s TLS round trip), so the CANCEL path's endCall()
