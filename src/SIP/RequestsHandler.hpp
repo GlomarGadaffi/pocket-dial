@@ -2274,6 +2274,9 @@ private:
 	void refuseRingingAnchor(const std::string& callId,
 		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outbox);
 	void asyncDropCall(const std::string& participantId);
+	// #1103: free a leg 3CX has already removed, on tel_drop, with no drop request
+	// (AnchorClient::releaseRemovedLeg). Same threading rules as asyncDropCall().
+	void asyncReleaseRemovedLeg(const std::string& participantId);
 	// #379: the one place a teardown path marks a session's far leg released, so endCall()'s
 	// no-bridge fallback does not drop it a second time. `dropLeg` true (the default): post the
 	// session's drop first, then mark. False: mark only, for a leg 3CX already dropped, or whose
@@ -2322,7 +2325,7 @@ private:
 	// post under _mutex (runTelCtl()'s #379 orphan drop).
 	struct TelCtlJob
 	{
-		enum Kind : uint8_t { Make, Answer, Drop } kind = Drop;
+		enum Kind : uint8_t { Make, Answer, Drop, Release } kind = Drop;   // Release: #1103
 		std::string dest;
 		std::string callId;
 		std::string callerNumber;

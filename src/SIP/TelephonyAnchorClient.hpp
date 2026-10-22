@@ -43,6 +43,7 @@ public:
 	bool isStreaming() const;
 	bool makeCall(const std::string& destination, std::string* ownLegOut = nullptr) override;
 	bool ownLegRemovedSinceNamed(const std::string& ownLeg) override;   // #1095
+	void releaseRemovedLeg(const std::string& ownLeg) override;         // #1103
 	bool answerCall(const std::string& participantId) override;
 	bool dropCall(const std::string& participantId) override;
 	void setEventCallback(EventCallback cb) override;
