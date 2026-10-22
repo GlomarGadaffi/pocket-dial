@@ -475,6 +475,9 @@ public:
 	// so a Remove pushed out of the ring is still seen. The WS task calls release()
 	// before it queues the Remove for the worker, so a Remove this answers false for
 	// reaches the engine as Dropped after the bind, where #880 fails the call.
+	// No postSeq here: it relies on noteNamed() having normalised the entry first (a
+	// removedSeq at or before postSeq was zeroed there), so any nonzero removedSeq is a
+	// Remove after the makecall went out. Ask it only of a leg noteNamed() has seen.
 	bool removedSinceNamed(std::string_view id) const
 	{
 		const std::size_t i = indexOf(id);

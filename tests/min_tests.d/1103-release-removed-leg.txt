@@ -1,0 +1,2 @@
+# EmergencyNotify_test.cpp: AnchorLegRemovedBeforeBind.APsapAnswerNeverWaitsOnADropPostForTheRemovedLeg (#1103: the backstop frees a removed leg locally, no drop POST)
+1

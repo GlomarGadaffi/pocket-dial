@@ -1343,14 +1343,55 @@ TEST(AnchorLegRemovedBeforeBind, ARinging911WhoseLegWasRemovedBeforeTheBindGetsO
 	EXPECT_EQ(countStartingAt(b, "BYE "), 0) << b.dump();
 	EXPECT_EQ(b.countOf("NOT ROUTED"), 1) << b.dump();
 	EXPECT_FALSE(b.handler->getSession("Call-ID: en-1095-911").has_value());
-	EXPECT_TRUE(waitUntil([&] { return b.loopback()->dropCallCount() == drops + 1; }))
-		<< "the dead leg's slot is freed by one drop; drops=" << b.loopback()->dropCallCount() - drops;
+	// #1103: 3CX already removed the leg, so its slot is freed locally, not by a drop POST.
+	ASSERT_TRUE(b.loopback()->waitTelDropReachedForTest(1, std::chrono::seconds(10))) << "the leg was never freed";
+	EXPECT_EQ(b.loopback()->dropCallCount(), drops) << "no drop POST to a leg 3CX already removed";
+	EXPECT_EQ(b.loopback()->releasedLegsForTest(), std::vector<std::string>{ kLoopLeg });
 
 	// The worker's Dropped may also come after the bind (the other order): still once.
 	b.handler->anchorDroppedForTest(kLoopLeg);
 	flushAsyncOutbox(b);
 	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << b.dump();
 	EXPECT_EQ(b.countOf("NOT ROUTED"), 1) << b.dump();
+	endParked(b);
+}
+
+// #1103: the backstop used to POST a drop to the removed leg. On a real anchor that
+// POST holds _ctrlMutex for its round trip (5-7 s on a stall) and answerCall() waits
+// on it, so a PSAP callback answered meanwhile queued behind a request 3CX refuses.
+// The loopback marks its control connection busy for a drop's span and runs the
+// PSAP answer inside it; the answer is issued again after the tel_drop job ran, in
+// case no drop came. Ordering is by the tel_drop job reaching the anchor, not time.
+TEST(AnchorLegRemovedBeforeBind, APsapAnswerNeverWaitsOnADropPostForTheRemovedLeg)
+{
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.wire.clear();
+	ASSERT_NO_FATAL_FAILURE(dialAnchoredParked(b, "911", "en-1103-911"));
+	LoopbackAnchorClient* lb = b.loopback();
+	const unsigned drops = lb->dropCallCount();
+	lb->setDropHookForTest([lb] { EXPECT_TRUE(lb->answerCall("psap-callback-1103")); });   // answered mid-POST
+
+	b.handler->anchorDroppedForTest(kLoopLeg);   // the worker's Dropped, before the bind
+	lb->setOwnLegRemovedHookForTest([](const std::string& leg) { return leg == kLoopLeg; });
+	b.handler->runAnchorMakeJobForTest("Call-ID: en-1103-911", "911", "101");
+	flushAsyncOutbox(b);
+	ASSERT_TRUE(lb->waitTelDropReachedForTest(1, std::chrono::seconds(10))) << "no tel_drop job reached the anchor";
+	EXPECT_TRUE(lb->answerCall("psap-callback-1103"));
+
+	EXPECT_EQ(lb->dropCallCount(), drops) << "a drop POST went to a leg 3CX already removed";
+	EXPECT_EQ(lb->answersThatWaitedForTest(), 0u) << "the PSAP callback's answer queued behind that POST";
+	EXPECT_EQ(lb->releasedLegsForTest(), std::vector<std::string>{ kLoopLeg })
+		<< "the removed leg's slot and media must still be freed, once";
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << b.dump();
+	EXPECT_EQ(b.countOf("NOT ROUTED"), 1) << b.dump();
+	EXPECT_FALSE(b.handler->getSession("Call-ID: en-1103-911").has_value());
+
+	b.handler->anchorDroppedForTest(kLoopLeg);   // a late Dropped too: still once
+	flushAsyncOutbox(b);
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << b.dump();
+	EXPECT_EQ(b.countOf("NOT ROUTED"), 1) << b.dump();
+	lb->setDropHookForTest({});
 	endParked(b);
 }
 

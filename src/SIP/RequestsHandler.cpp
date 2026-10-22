@@ -5755,6 +5755,22 @@ void RequestsHandler::asyncDropCall(const std::string& participantId)
 	}
 }
 
+void RequestsHandler::asyncReleaseRemovedLeg(const std::string& participantId)
+{
+	if (!_anchorClient) return;
+	if (anchorIsSynchronous())
+	{
+		_anchorClient->releaseRemovedLeg(participantId);
+		return;
+	}
+	// tel_drop, as the drop it replaces (kTelDropDepth budgets one per makeCall in
+	// flight): stopMediaStreams() may join the leg's rx task, so not tel_sos or tel_ctl.
+	if (!postTelCtl(new TelCtlJob{ TelCtlJob::Release, {}, {}, {}, participantId }, kLaneDrop))
+	{
+		queueLog("[Telephony] asyncReleaseRemovedLeg: tel_drop queue full — leg " + participantId + " NOT released", true);
+	}
+}
+
 void RequestsHandler::releaseFarLeg(Session& s, bool dropLeg)
 {
 	if (dropLeg) asyncDropCall(s.getAnchorParticipantId());
@@ -5921,6 +5937,11 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 		_anchorClient->dropCall(job.partId);
 		return;
 	}
+	if (job.kind == TelCtlJob::Release)
+	{
+		_anchorClient->releaseRemovedLeg(job.partId);   // #1103: no request, no _ctrlMutex
+		return;
+	}
 	if (job.kind == TelCtlJob::Answer)
 	{
 		if (!_anchorClient->answerCall(job.partId))
@@ -5966,10 +5987,12 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 		// What the missed Dropped would have done (#880: a final 503 to the ringing caller,
 		// NOT ROUTED for a 911/933). It matches only this leg's session, and only once: a
 		// Dropped already handled, or one still to come, finds no session. 3CX has ended
-		// the leg; the drop only frees the slot makeCall() keyed for it (tel_drop).
+		// the leg, so it is freed locally (#1103): tombstoned and its media stopped on
+		// tel_drop, with no drop POST, which would draw 403 and hold the anchor's control
+		// connection a PSAP callback's answer waits on.
 		queueLog("[Telephony] 3CX removed leg " + ownLeg + " before the call was bound -- failing it (#1095)", true);
 		anchorDroppedLocked(ownLeg);
-		asyncDropCall(ownLeg);
+		asyncReleaseRemovedLeg(ownLeg);
 	}
 	else if (!bound && !ownLeg.empty())
 	{

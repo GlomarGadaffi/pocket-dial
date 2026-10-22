@@ -5,6 +5,9 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -66,6 +69,45 @@ public:
 		_removedHookForTest = std::move(hook);
 	}
 	void setMaxConcurrentCallsForTest(unsigned n) { _maxConcurrentForTest = n; }
+
+	// #1103 test hooks, host only. A real anchor's dropCall() holds _ctrlMutex across its
+	// POST and answerCall() waits on it. Here dropCall() marks the control connection busy
+	// while it runs dropHook (the test's PSAP answer, issued mid-POST), and an answerCall()
+	// that finds it busy is counted as one that would have waited.
+	void releaseRemovedLeg(const std::string& ownLeg) override
+	{
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			_releasedLegs.push_back(ownLeg);
+		}
+		noteTelDropReached();
+	}
+	std::vector<std::string> releasedLegsForTest() const
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		return _releasedLegs;
+	}
+	void setDropHookForTest(std::function<void()> hook)
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_dropHookForTest = std::move(hook);
+	}
+	unsigned answersThatWaitedForTest() const { return _answersWaited.load(); }
+	// Bounded wait for a tel_drop job (drop or release) to reach this client; ordering
+	// only, the bound just turns a lost job into a failure instead of a hang.
+	bool waitTelDropReachedForTest(unsigned n, std::chrono::milliseconds bound)
+	{
+		std::unique_lock<std::mutex> lock(_telDropMutex);
+		return _telDropCv.wait_for(lock, bound, [&] { return _telDropReached >= n; });
+	}
+	void noteTelDropReached()
+	{
+		{
+			std::lock_guard<std::mutex> lock(_telDropMutex);
+			++_telDropReached;
+		}
+		_telDropCv.notify_all();
+	}
 #endif
 
 	// Test hook: pretend the upstream is delivering a PSTN call to the monitored DN.
@@ -117,6 +159,13 @@ private:
 #if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	std::function<bool(const std::string&)> _removedHookForTest;
 	std::atomic<unsigned> _maxConcurrentForTest{0};
+	std::vector<std::string> _releasedLegs;
+	std::function<void()> _dropHookForTest;
+	std::atomic<unsigned> _answersWaited{0};
+	std::atomic<bool> _ctrlBusyForTest{false};
+	std::mutex _telDropMutex;
+	std::condition_variable _telDropCv;
+	unsigned _telDropReached = 0;
 #endif
 };
 
