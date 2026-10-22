@@ -999,6 +999,14 @@ public:
 		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		anchorDroppedLocked(participantId);
 	}
+	// Test-only (#1095): run an outbound anchor call's Make job on the calling
+	// thread, as a tel_ctl worker does, so a test orders the anchor's events
+	// around it with no worker in between.
+	void runAnchorMakeJobForTest(const std::string& callId, const std::string& dest,
+		const std::string& callerNumber)
+	{
+		runTelCtl(TelCtlJob{ TelCtlJob::Make, dest, callId, callerNumber, {} });
+	}
 
 	// Test-only: drive an inbound anchored call (PSTN -> handset) the way a real
 	// anchor's CallEvent::Incoming does, and return the new session's Call-ID

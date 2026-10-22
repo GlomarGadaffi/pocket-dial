@@ -747,6 +747,66 @@ TEST(MakecallLegRemoved, AFullRingForgetsTheOldestRemoveAndAllocatesNothing)
 	EXPECT_TRUE(eighth) << "the 8 latest Removes are all kept";
 }
 
+// ── #1095 backstop: a Remove taken after makeCall()'s check, before the bind ──
+// The WS task records the Remove (release) before it queues it for the worker. If the
+// worker gets to it before the engine binds the session, its Dropped matches nothing.
+// runTelCtl() asks removedSinceNamed() after the bind, and fails the call on yes.
+constexpr uint64_t kSeqLateRemove1095 = 72;   // after makeCall()'s check at the response
+
+TEST(MakecallLegRemovedAfterCheck, ARemoveAfterTheLegWasNamedIsSeenAfterTheBind)
+{
+	AnchorOwnLegs own;
+	own.noteNamed("1276", kNamed, kSeqPost1095);
+	EXPECT_FALSE(own.removedSince("1276", kSeqPost1095)) << "precondition: makeCall()'s check passed";
+	EXPECT_FALSE(own.removedSinceNamed("1276")) << "nothing removed yet";
+	own.release("1276", kSeqLateRemove1095);   // the WS task, between the check and the bind
+	EXPECT_TRUE(own.removedSinceNamed("1276")) << "the Remove the engine never matched must fail the call";
+}
+
+TEST(MakecallLegRemovedAfterCheck, ARemoveBeforeTheMakecallWentOutIsNotThisLegs)
+{
+	AnchorOwnLegs own;
+	own.release("1276", kSeqPost1095);   // an earlier participant's, received before the POST
+	own.noteNamed("1276", kNamed, kSeqPost1095);
+	EXPECT_FALSE(own.removedSinceNamed("1276")) << "an earlier participant's Remove failed a live call";
+	own.release("1276", kSeqLateRemove1095);
+	EXPECT_TRUE(own.removedSinceNamed("1276")) << "positive control: this leg's own Remove";
+}
+
+TEST(MakecallLegRemovedAfterCheck, OnlyTheNamedLegExactly)
+{
+	AnchorOwnLegs own;
+	own.noteNamed("1276", kNamed, kSeqPost1095);
+	own.noteNamed("911", kNamed, kSeqPost1095);   // another call's leg, a live 911
+	own.release("1276", kSeqLateRemove1095);
+	EXPECT_TRUE(own.removedSinceNamed("1276")) << "positive control";
+	EXPECT_FALSE(own.removedSinceNamed("911")) << "another leg's Remove failed a live 911";
+	EXPECT_FALSE(own.removedSinceNamed("127"));
+	EXPECT_FALSE(own.removedSinceNamed("12760"));
+	EXPECT_FALSE(own.removedSinceNamed(""));
+	EXPECT_FALSE(own.removedSinceNamed("1277")) << "a leg never named is never failed (list-fallback scope)";
+}
+
+TEST(MakecallLegRemovedAfterCheck, TheLegsEntryOutlivesTheRingAndAllocatesNothing)
+{
+	// The ring keeps the last 8 Removes; the leg's own entry keeps its Remove past them.
+	AnchorOwnLegs own;
+	AllocGuard guard;
+	own.noteNamed("1276", kNamed, kSeqPost1095);
+	own.release("1276", kSeqLateRemove1095);
+	for (int i = 0; i < 8; ++i)
+	{
+		char id[8] = { 'f', 'a', 'r', static_cast<char>('0' + i), '\0' };
+		own.release(id, kSeqLateRemove1095 + 1 + i);
+	}
+	const bool ring = own.removedSince("1276", kSeqPost1095);
+	const bool entry = own.removedSinceNamed("1276");
+	const std::size_t allocs = guard.delta();
+	EXPECT_EQ(allocs, 0u);
+	EXPECT_FALSE(ring) << "precondition: the ring forgot 1276's Remove";
+	EXPECT_TRUE(entry) << "the bound leg's Remove was forgotten with the ring";
+}
+
 // ── #349: the makecall POST reached 3CX and its response was never read ──────
 // The x349_unread_makecall run on .244 (main 61132ada, #349 issuecomment-6004433436):
 // 3CX had already named the leg (the probe threw result.id away), the list read

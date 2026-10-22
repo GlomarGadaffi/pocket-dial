@@ -70,5 +70,48 @@ class AnchorRemovedBeforeNamedTest(unittest.TestCase):
         self.assertIn("/*routed=*/false", branch, "a 911/933 is reported NOT ROUTED")
 
 
+class AnchorRemovedBeforeBindTest(unittest.TestCase):
+    """The backstop for a Remove received after makeCall()'s check, before the engine
+    binds the leg (EmergencyNotify_test.cpp AnchorLegRemovedBeforeBind drives the
+    engine side). Its proof rests on three ESP-only facts pinned here."""
+    longMessage = False
+
+    def setUp(self):
+        self.client = read("TelephonyAnchorClient.cpp")
+        self.query = body_of(self.client, "bool TelephonyAnchorClient::ownLegRemovedSinceNamed(")
+        self.run_tel_ctl = body_of(read("RequestsHandler.cpp"), "void RequestsHandler::runTelCtl(")
+
+    def test_the_ws_task_records_a_remove_before_it_queues_the_dropped(self):
+        remove = self.client.find("else if (evTypeNum == TEL_EV_REMOVE)")
+        self.assertNotEqual(remove, -1, "positive control: the WS task's Remove branch")
+        released = self.client.find("_ownLegs.release(partId, ++_wsSeq);", remove)
+        queued = self.client.find("item->kind   = WsWork::Remove;", remove)
+        self.assertNotEqual(released, -1, "the Remove must be recorded on the WS task")
+        self.assertNotEqual(queued, -1, "positive control: the Remove is queued for the worker")
+        self.assertLess(released, queued,
+                        "recorded before the worker can report Dropped, or the backstop has a window")
+        self.assertIn("std::lock_guard<std::mutex> lock(_mutex);", self.client[remove:released])
+
+    def test_the_esp_query_is_a_locked_lookup_with_no_io_or_allocation(self):
+        self.assertIn("std::lock_guard<std::mutex> lock(_mutex);", self.query)
+        self.assertIn("_ownLegs.removedSinceNamed(ownLeg)", self.query)
+        for word in ("new ", "std::string ", "http", "vTaskDelay", "evCb", "_eventCb"):
+            self.assertNotIn(word, self.query, "the query must stay a lookup: " + word)
+
+    def test_run_tel_ctl_asks_after_the_bind_outside_its_lock_and_fails_once(self):
+        bind = self.run_tel_ctl.find("bindOutboundParticipant(job.callId, ownLeg)")
+        ask = self.run_tel_ctl.find("_anchorClient->ownLegRemovedSinceNamed(ownLeg)")
+        lock = self.run_tel_ctl.find("std::lock_guard<pd::TimedMutex> lock(_mutex);", bind)
+        self.assertNotEqual(bind, -1, "positive control: the bind")
+        self.assertNotEqual(ask, -1, "runTelCtl must ask whether 3CX removed the bound leg")
+        self.assertLess(bind, ask, "asked after the bind: a Remove it misses is matched by #880")
+        self.assertLess(ask, lock, "asked outside RequestsHandler's _mutex: no nested anchor lock")
+        self.assertIn("bound &&", self.run_tel_ctl[bind:lock], "only a bound leg is asked about")
+        branch = self.run_tel_ctl[lock:]
+        self.assertIn("anchorDroppedLocked(ownLeg);", branch, "the missed Dropped is replayed for this leg only")
+        for word in ("sosLane", "isEmergency", "emergency"):
+            self.assertNotIn(word, self.run_tel_ctl[ask - 60:ask + 60], "no 911/933 exemption or gate")
+
+
 if __name__ == "__main__":
     unittest.main()

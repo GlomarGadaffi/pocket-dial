@@ -36,6 +36,11 @@ bool TelephonyAnchorClient::makeCall(const std::string&, std::string*)
 	return false;
 }
 
+bool TelephonyAnchorClient::ownLegRemovedSinceNamed(const std::string&)
+{
+	return false;
+}
+
 bool TelephonyAnchorClient::answerCall(const std::string&)
 {
 	return false;
@@ -751,6 +756,17 @@ bool TelephonyAnchorClient::makeCall(const std::string& destination, std::string
 		// No slot was allocated (we alloc only after resolveOutboundLeg), so nothing to clear.
 	}
 	return success;
+}
+
+// #1095 backstop. makeCall()'s own check sees a Remove received up to the response; this one,
+// asked by runTelCtl() after it has bound the leg to its session, sees one received after
+// that check. The WS task records each Remove (_ownLegs.release, under _mutex) before it
+// queues the Remove for the worker, so a Remove this answers false for reaches the engine
+// as Dropped after the bind, and #880 fails the call there. Lock, fixed-storage lookup, no I/O.
+bool TelephonyAnchorClient::ownLegRemovedSinceNamed(const std::string& ownLeg)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _ownLegs.removedSinceNamed(ownLeg);
 }
 
 bool TelephonyAnchorClient::dropCall(const std::string& participantId)

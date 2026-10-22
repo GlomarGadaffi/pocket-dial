@@ -469,6 +469,18 @@ public:
 		return false;
 	}
 
+	// #1095 backstop, asked once the engine has bound the leg to its session: has 3CX
+	// removed this named leg since its makecall went out? noteNamed() keeps a Remove
+	// numbered after postSeq, and release() records a later one, on the leg's own entry,
+	// so a Remove pushed out of the ring is still seen. The WS task calls release()
+	// before it queues the Remove for the worker, so a Remove this answers false for
+	// reaches the engine as Dropped after the bind, where #880 fails the call.
+	bool removedSinceNamed(std::string_view id) const
+	{
+		const std::size_t i = indexOf(id);
+		return i != N && _e[i].removedSeq != 0;
+	}
+
 	// Held from nowUs (our outbound slot was freed); a Remove already seen stands.
 	void note(std::string_view id, int64_t nowUs) { put(id, nowUs); }
 
