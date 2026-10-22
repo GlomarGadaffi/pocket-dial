@@ -31,7 +31,7 @@ sequenceDiagram
     participant B as Phone 1002
     A->>P: INVITE sip:1002 (SDP offer)
     P->>B: INVITE to 1002's registered Contact, Contact rewritten to the board, SDP unchanged
-    Note over P: ring timer armed, 20 s unless 1002 sets its own
+    Note over P: ring timer armed, 20 s or 1002's configured no-answer time
     B->>P: 100 Trying, 180 Ringing
     P->>A: 100 Trying, 180 Ringing (relayed)
     B->>P: 200 OK (SDP answer)
