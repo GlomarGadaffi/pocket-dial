@@ -828,6 +828,56 @@ class Gate(unittest.TestCase):
         self.assertIn("big:", out)
         self.assertRegex(out.split("big:")[1], r"indirect call sites: 1 function\(s\) reachable make one, 1 of them on the worst chain.*mid")
 
+    # #1031 review: an indirect call is charged 0 B, so a task that carries a 911 path must not
+    # pass on that. Such a task is marked "indirect": "bounded" in the table; every function it
+    # reaches that makes an indirect call then needs an indirect_allowlist row naming the
+    # possible targets, and the walk charges the heaviest of them.
+    def indirect_fixture(self, flag=True):
+        self.add_ci(node("ind", "Indirect Call Placeholder", 0)
+                    + node("slow", "void SlowSink::write()", 1000) + edge("mid", "ind"))
+        self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
+        if flag:
+            for t in self.table["tasks"]:
+                if t["name"] == "big":
+                    t["indirect"] = "bounded"
+
+    def test_an_unbounded_indirect_site_on_a_911_task_fails_the_gate(self):
+        self.indirect_fixture()
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"FAIL big: .*indirect_allowlist.*void mid\(\)")
+
+    def test_a_bounded_indirect_site_passes_and_the_heaviest_target_is_charged(self):
+        self.indirect_fixture()
+        self.table["indirect_allowlist"] = {"mid()": {
+            "targets": [r"SlowSink::write\("], "reason": "fixture: the one sink installed at boot"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("big: 2000 B", out)         # 400 + 600 (mid) + 1000 (SlowSink::write) beats helper and buildOptionsPing
+        self.assertIn("SlowSink::write", out)
+
+    def test_a_target_that_matches_no_function_bounds_nothing_and_fails(self):
+        self.indirect_fixture()
+        self.table["indirect_allowlist"] = {"mid()": {
+            "targets": [r"NoSuchSink::write\("], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("matches no function", out)
+
+    def test_a_row_must_name_targets_and_a_reason(self):
+        self.indirect_fixture()
+        for row in ({"targets": [], "reason": "x"}, {"targets": ["SlowSink"], "reason": " "}):
+            self.table["indirect_allowlist"] = {"mid()": row}
+            rc, out = self.run_gate()
+            self.assertEqual(rc, 1, out)
+            self.assertIn("indirect_allowlist row 'mid()'", out)
+
+    def test_a_task_not_marked_bounded_stays_report_only(self):
+        self.indirect_fixture(flag=False)
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("indirect call sites: 1 function(s) reachable", out)
+
     def test_known_finding_is_reported_but_only_while_it_does_not_get_worse(self):
         for t in self.table["tasks"]:
             if t["name"] == "big":
