@@ -550,6 +550,29 @@ inline bool inboundAnnounceAllowed(const OwnLegs<N, Len>& own, std::string_view 
 	return !own.holds(partId, nowUs, wsSeq);
 }
 
+// #1097: the call slot a WS "Participant Remove" for partId ends, as an index into
+// slots, or -1 for none. A slot is free when its participantId is empty. Slot is any
+// type with std::string participantId and farPartId (the client's CallSlot).
+template <class Slot, std::size_t N>
+inline int removeTargetSlot(const Slot (&slots)[N], std::string_view partId)
+{
+	for (std::size_t i = 0; i < N && !partId.empty(); ++i)
+	{
+		if (slots[i].participantId == partId) return static_cast<int>(i);
+	}
+	for (std::size_t i = 0; i < N; ++i)
+	{
+		if (!slots[i].participantId.empty() && slots[i].farPartId == partId) return static_cast<int>(i);
+	}
+	int active = 0;
+	int only = -1;
+	for (std::size_t i = 0; i < N; ++i)
+	{
+		if (!slots[i].participantId.empty()) { ++active; only = static_cast<int>(i); }
+	}
+	return active == 1 ? only : -1;
+}
+
 // Where makeCall() got its own leg's id (resolveOutboundLeg).
 enum class OwnLegSource : uint8_t
 {
