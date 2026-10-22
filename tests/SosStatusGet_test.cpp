@@ -910,7 +910,7 @@ TEST(SosOrphanSweep, TwoCandidatesAreNeverDroppedBecauseOneMayBeAPsapCallback)
 TEST(SosOrphanSweep, ASweepTelMaintReachesAfterTheBoundReadsNothing)
 {
 	SweepRun late;
-	late.t = kOrphanSweepWindowUs;   // a restart job ran first on tel_maint
+	late.t = kOrphanSweepWindowUs;   // an earlier sweep still held tel_sweep
 	const OrphanSweepResult r = late.run();
 	EXPECT_EQ(r.end, OrphanSweepEnd::TooLate);
 	EXPECT_EQ(r.reads, 0);
@@ -1302,8 +1302,9 @@ TEST(SosOrphanSweep, AnUnslotted911WhosePostSeqIsZeroStillEndsEverySweep)
 	EXPECT_EQ(w.count("drop:"), 0) << "B's live PSAP call is not dropped";
 }
 
-// 2. tel_maint runs the sweep, and a restart queues behind it; makeCall refuses 911s while the anchor is down. A
-// sweep never delays a restart: it yields at once when one is wanted, before a read and before a drop.
+// 2. A restart runs on tel_maint and the sweep on its own task, so a restart never waits on the sweep's I/O; and
+// makeCall refuses 911s while the anchor is down, so a sweep starts no operation once one is wanted, before a read
+// or a drop.
 TEST(SosOrphanSweep, ARestartWantedWhileASweepIsArmedIsNotDelayedByIt)
 {
 	EXPECT_TRUE(sweepMayContinue(true, false));
@@ -1343,7 +1344,7 @@ TEST(SosOrphanSweep, TheArmedWindowAndNumberAreTakenTogetherAndOnlyOnce)
 	EXPECT_FALSE(slot.take(snap)) << "nothing armed";
 
 	slot.arm(1000, 40, 60, "911");
-	slot.arm(2000, 70, 90, "+1 (933)");   // a second 911 arms before tel_maint runs
+	slot.arm(2000, 70, 90, "+1 (933)");   // a second 911 arms before tel_sweep runs
 	ASSERT_TRUE(slot.take(snap));
 	EXPECT_EQ(snap.armedUs, 2000);
 	EXPECT_EQ(snap.postSeq, 70u);
@@ -1452,10 +1453,10 @@ TEST(SosOrphanSweepWitness, EachEndIsCountedAndItsLineIsCappedAndCarriesNoNumber
 	EXPECT_EQ(pdwitness::count("911 orphan sweep: the leg left on 3CX was found, the drop failed (#977)"), 1u);
 	EXPECT_EQ(pdwitness::count("911 orphan sweep: more than one candidate leg, none dropped (#977)"), 1u);
 	EXPECT_EQ(pdwitness::count("911 orphan sweep: anchor stopping, ended (#977)"), 1u);
-	EXPECT_EQ(pdwitness::count("911 orphan sweep: tel_maint reached it after the bound, nothing read (#977)"), 1u);
+	EXPECT_EQ(pdwitness::count("911 orphan sweep: tel_sweep reached it after the bound, nothing read (#977)"), 1u);
 	EXPECT_EQ(pdwitness::count("911 orphan sweep: no leg was upserted in the window, nothing to find, no read (#977)"), 1u);
 	EXPECT_EQ(pdwitness::count("911 orphan sweep: another 911 succeeded with no own leg after this one, its leg may be that live call, none dropped (#977)"), 1u);
-	EXPECT_EQ(pdwitness::count("911 orphan sweep: no tel_maint task, not armed (#977)"), 1u);
+	EXPECT_EQ(pdwitness::count("911 orphan sweep: no tel_sweep task, not armed (#977)"), 1u);
 
 	const std::vector<std::string> lines = pdwitness::lines();
 	EXPECT_EQ(lines.size(), std::size_t{ OrphanSweepWitness::kLinesPerEnd } + 8u);

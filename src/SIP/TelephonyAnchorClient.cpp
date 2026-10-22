@@ -140,6 +140,7 @@ TelephonyAnchorClient::~TelephonyAnchorClient()
 	shutdownImpl();   // non-virtual: never dispatch a virtual call from a destructor
 	// #658: tel_maint holds `this`; it must not outlive the object.
 	if (TaskHandle_t h = _maintHandle.exchange(nullptr)) vTaskDelete(h);
+	if (TaskHandle_t h = _sweepHandle.exchange(nullptr)) vTaskDelete(h);   // #977
 	// #100: free each slot's done-sem (a raw FreeRTOS handle — CallSlot's dtor won't reclaim it).
 	for (auto& s : _calls)
 	{
@@ -190,6 +191,21 @@ bool TelephonyAnchorClient::start()
 		{
 			psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
 			_maintHandle.store(h, std::memory_order_release);
+		}
+	}
+	// #977: the orphan sweep's own task, once, beside tel_maint. Priority 4, below tel_maint (5): a restart is never
+	// held up behind it. Internal stack, as tel_maint's (resolveOutboundLeg and httpPostBody run on it).
+	if (!_sweepHandle.load(std::memory_order_acquire))
+	{
+		TaskHandle_t h = nullptr;
+		if (xTaskCreate(&TelephonyAnchorClient::sweepTaskTrampoline, "tel_sweep", 6144, this, 4, &h) != pdPASS)
+		{
+			ESP_LOGE(TAG, "start: failed to create tel_sweep (no 911 orphan sweep)");
+		}
+		else
+		{
+			psram::dynamicTaskCreates().fetch_add(1, std::memory_order_relaxed);   // #479
+			_sweepHandle.store(h, std::memory_order_release);
 		}
 	}
 
@@ -2303,6 +2319,26 @@ bool TelephonyAnchorClient::wakeMaint(uint32_t job)
 	return true;
 }
 
+bool TelephonyAnchorClient::wakeSweep()
+{
+	const TaskHandle_t h = _sweepHandle.load(std::memory_order_acquire);
+	if (!h) return false;
+	xTaskNotify(h, 1, eSetBits);   // eSetBits always returns pdPASS
+	return true;
+}
+
+// #977: tel_sweep. One pass per wake; a wake while a pass runs stays pending and runs next (the arm slot holds the
+// latest arm, so a second wake with nothing armed finds none and returns).
+void TelephonyAnchorClient::sweepTaskTrampoline(void* arg)
+{
+	auto* self = static_cast<TelephonyAnchorClient*>(arg);
+	for (;;)
+	{
+		xTaskNotifyWait(0, UINT32_MAX, nullptr, portMAX_DELAY);
+		self->orphanSweepBody();
+	}
+}
+
 // #658: the persistent maintenance task. Each job's body clears its own in-flight gate and
 // returns; a bit set while a body runs stays pending and runs on the next pass.
 void TelephonyAnchorClient::maintTaskTrampoline(void* arg)
@@ -2311,11 +2347,7 @@ void TelephonyAnchorClient::maintTaskTrampoline(void* arg)
 	{
 		uint32_t jobs = 0;
 		xTaskNotifyWait(0, UINT32_MAX, &jobs, portMAX_DELAY);
-		// #977: a restart first. makeCall refuses 911s while the anchor is down, so the sweep (which also yields to
-		// _restartRequested) does not start in front of one; a sweep that follows a long restart is TooLate, harmlessly.
-		// A sweep operation already in flight delays a restart by at most about kOrphanOpBudgetUs.
 		if (jobs & kMaintRestart)   restartTaskTrampoline(arg);
-		if (jobs & kMaintOrphanSweep) orphanSweepTaskTrampoline(arg);
 		if (jobs & kMaintRewarm)    rewarmTaskTrampoline(arg);
 		if (jobs & kMaintReconcile) reconcileTaskTrampoline(arg);
 		if (jobs & kMaintTokenRefresh) maintRefreshTaskTrampoline(arg);
@@ -2358,9 +2390,9 @@ void TelephonyAnchorClient::armOrphanSweep(uint64_t postSeq, uint64_t armSeq, co
 		_orphanArm.arm(nowUs, postSeq, armSeq, destination);
 	}
 	_orphanHoldUntilUs.store(telephony::orphanHoldUntil(nowUs), std::memory_order_release);
-	if (!wakeMaint(kMaintOrphanSweep))
+	if (!wakeSweep())
 	{
-		// No tel_maint task: nothing will sweep, so take the hold back.
+		// No tel_sweep task: nothing will sweep, so take the hold back.
 		{
 			std::lock_guard<std::mutex> lock(_mutex);
 			_orphanArm.disarm();
@@ -2370,12 +2402,7 @@ void TelephonyAnchorClient::armOrphanSweep(uint64_t postSeq, uint64_t armSeq, co
 	}
 }
 
-void TelephonyAnchorClient::orphanSweepTaskTrampoline(void* arg)
-{
-	static_cast<TelephonyAnchorClient*>(arg)->orphanSweepBody();
-}
-
-// Runs on tel_maint, after the 503 has gone. Reads the list again on the ORDINARY status lane (an empty
+// Runs on tel_sweep, after the 503 has gone. Reads the list again on the ORDINARY status lane (an empty
 // destination: the sos handle's claim is a 911's own GET, and a sweep read holding it would make an
 // overlapping 911's status GET fast-fail) and drops the one leg that shows.
 //
@@ -2386,13 +2413,17 @@ void TelephonyAnchorClient::orphanSweepTaskTrampoline(void* arg)
 //   Locks (Rule 5 review of #1040). The drop is a fresh-client POST (dropOrphanLeg): it never takes _ctrlMutex,
 //   so answerCall() cannot queue behind it. The read is a fresh-client GET (fresh): it never takes _statusMutex,
 //   which an inbound leg's getParticipantCaller() waits on before the handsets ring. No 911/933 status read
-//   takes _statusMutex (#941). Cost: a cold TLS handshake per sweep read, at most ten, on tel_maint.
+//   takes _statusMutex (#941). Cost: a cold TLS handshake per sweep read, at most ten, on tel_sweep.
 //   Callbacks. Only a leg upserted while a makeCall was pending (_pendingSeen) is held by the hold or dropped by
 //   the sweep. A PSAP callback is a participant this unit never saw in that window: it is announced at once and
 //   never a drop candidate.
 //   Heap. This allocates after init, unlike the 911 lane's own GET: the status GET's vector, cJSON and the
 //   strings, as the reconcile watchdog's do. It is off the 911 lane, and a std::bad_alloc is a failed read.
-//   Delay. It delays no call and no drop: only tel_maint's other jobs, which run after it.
+//   Delay. It delays no call and no drop. tel_maint, which runs a restart, never waits on the sweep: the sweep has
+//   its own task, takes no lock across I/O, and a restart wanted stops it between operations (sweepMayContinue).
+//   An operation in flight, a getaddrinfo with no timeout included, can only hold tel_sweep itself; a later sweep
+//   then waits for it (the arm and its hold lapse by time, which is the safe direction). Its own GET and POST are
+//   each bounded to about kOrphanOpBudgetUs (the deadline), so tel_sweep is not held for long in the ordinary case.
 void TelephonyAnchorClient::orphanSweepBody()
 {
 	// Take the arm. A wake whose arm an earlier pass already took finds 0 and returns.
@@ -2445,8 +2476,9 @@ void TelephonyAnchorClient::orphanSweepBody()
 					destDigits);
 			},
 			[] { return esp_timer_get_time(); },
-			// Yields between operations to a restart (a WS drop with a stale token wants one, and makeCall refuses 911s
-			// until it is done); an operation in flight is bounded by kOrphanOpBudgetUs (the deadline below).
+			// Starts no operation once a restart is wanted (a WS drop with a stale token, and makeCall refuses 911s
+			// until it is done). The restart does not wait for an operation in flight: it runs on tel_maint, and this
+			// sweep on tel_sweep.
 			[this] {
 				return telephony::sweepMayContinue(_running.load(std::memory_order_acquire),
 				                                   _restartRequested.load(std::memory_order_acquire));

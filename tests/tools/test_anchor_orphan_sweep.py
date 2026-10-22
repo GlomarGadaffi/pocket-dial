@@ -1,14 +1,15 @@
 """#977 (owner ruling, option 2): a 911/933 whose #349 window ended with every participant-list read errored
 is still refused (503, NOT ROUTED) at the end of the window, as on main. 3CX may nevertheless hold a live call
-to the PSAP, so makeCall() arms a sweep before it returns and tel_maint runs it after: it reads the list again,
+to the PSAP, so makeCall() arms a sweep before it returns and tel_sweep runs it after: it reads the list again,
 within the window's own bound, and drops the one leg that shows. The decisions are host-tested
 (tests/SosStatusGet_test.cpp, src/SIP/SosStatusGet.hpp); the anchor client is ESP-only, so no host test reaches
 the wiring. This pins where the decisions are applied, by substring and order on source text: it proves no
 timing, and not the branch structure around what it quotes."""
+import os
 import re
 import unittest
 
-from test_anchor_own_leg_not_inbound import body_of, read
+from test_anchor_own_leg_not_inbound import SIP, body_of, read
 
 LOCK = re.compile(r"lock_guard|unique_lock|scoped_lock|\.lock\(\)|xSemaphoreTake")
 IO = re.compile(r"httpGetBody|httpPostBody|performCtrl|resolveOutboundLeg|dropCall|vTaskDelay|esp_http_client")
@@ -20,8 +21,8 @@ LINES = (
     "911 orphan sweep: no leg listed within the bound, none dropped (#977)",
     "911 orphan sweep: more than one candidate leg, none dropped (#977)",
     "911 orphan sweep: anchor stopping, ended (#977)",
-    "911 orphan sweep: tel_maint reached it after the bound, nothing read (#977)",
-    "911 orphan sweep: no tel_maint task, not armed (#977)",
+    "911 orphan sweep: tel_sweep reached it after the bound, nothing read (#977)",
+    "911 orphan sweep: no tel_sweep task, not armed (#977)",
 )
 
 
@@ -72,7 +73,7 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertIsNone(IO.search(self.arm), "no I/O, no vTaskDelay")
         arm = self.arm.index("_orphanArm.arm(")
         hold = self.arm.index("_orphanHoldUntilUs.store(telephony::orphanHoldUntil(nowUs)")
-        wake = self.arm.index("wakeMaint(kMaintOrphanSweep)")
+        wake = self.arm.index("wakeSweep()")
         self.assertTrue(arm < hold < wake, "armed, then the hold is raised, and the wake is last")
         after = self.arm[wake:]
         self.assertIn("_orphanHoldUntilUs.store(0", after, "a wake with no task takes the hold back")
@@ -99,19 +100,53 @@ class AnchorOrphanSweepTest(unittest.TestCase):
 
     # ── the job ───────────────────────────────────────────────────────────────────
 
-    def test_the_job_has_its_own_bit_and_tel_maint_runs_it_first(self):
-        self.assertIn("kMaintOrphanSweep = 1u << 4", self.hpp)
+    def test_the_sweep_runs_on_its_own_task_so_a_restart_on_tel_maint_never_waits_on_its_io(self):
+        # Round 8: tel_maint runs the restart. A sweep op in flight (a GET or POST, a getaddrinfo with no timeout)
+        # cannot be stopped, so the sweep has a task of its own and tel_maint never runs, joins or waits for it.
         loop = body_of(self.cpp, "void TelephonyAnchorClient::maintTaskTrampoline(")
-        self.assertRegex(loop, r"jobs & kMaintOrphanSweep\)\s*orphanSweepTaskTrampoline\(arg\)")
-        self.assertLess(loop.index("jobs & kMaintRestart"), loop.index("jobs & kMaintOrphanSweep"),
-                        "a restart never waits behind a sweep (makeCall refuses 911s while the anchor is down)")
-        self.assertLess(loop.index("jobs & kMaintOrphanSweep"), loop.index("jobs & kMaintRewarm"))
+        self.assertNotIn("OrphanSweep", loop, "tel_maint no longer runs the sweep")
+        self.assertNotIn("orphanSweepBody", loop)
+        self.assertNotIn("kMaintOrphanSweep", self.hpp)
+        self.assertIn("std::atomic<TaskHandle_t> _sweepHandle{nullptr};", self.hpp)
+        task = body_of(self.cpp, "void TelephonyAnchorClient::sweepTaskTrampoline(")
+        self.assertIn("xTaskNotifyWait(0, UINT32_MAX, nullptr, portMAX_DELAY);", task)
+        self.assertIn("self->orphanSweepBody();", task)
+        wake = body_of(self.cpp, "bool TelephonyAnchorClient::wakeSweep(")
+        self.assertIn("_sweepHandle.load(std::memory_order_acquire)", wake)
+        self.assertNotIn("_maintHandle", wake, "the arm never wakes tel_maint")
+        self.assertNotIn("wakeMaint", self.arm)
+        self.assertIn("wakeSweep()", self.arm)
+        start = body_of(self.cpp, "bool TelephonyAnchorClient::start(")
+        self.assertRegex(start, r'xTaskCreate\(&TelephonyAnchorClient::sweepTaskTrampoline, "tel_sweep", 6144, this, 4, &h\)')
+        self.assertLess(start.index('"tel_maint"'), start.index('"tel_sweep"'))
+        dtor = body_of(self.cpp, "TelephonyAnchorClient::~TelephonyAnchorClient(")
+        self.assertIn("_sweepHandle.exchange(nullptr)", dtor)
         self.assertRegex(self.sweep, r"telephony::sweepMayContinue\(_running\.load\(std::memory_order_acquire\),\s*"
                                      r"_restartRequested\.load\(std::memory_order_acquire\)\)",
-                         "the sweep yields at once when a restart is wanted")
-        self.assertNotIn("vTaskDelete", self.sweep, "it runs on tel_maint and must return")
+                         "and it still starts no op once a restart is wanted")
+        self.assertNotIn("vTaskDelete", self.sweep, "it runs on its own task and must return")
         self.assertIsNone(ALLOC.search(self.sweep), "no task, thread or new/malloc of its own")
         self.assertIsNone(ALLOC.search(self.arm))
+        gate = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools", "ci", "task_stacks.json"),
+                    encoding="utf-8").read()
+        self.assertIn('"name": "tel_sweep", "entry": "sweepTaskTrampoline\\\\("', gate, "the stack gate knows the new task")
+
+    def test_the_comments_state_the_guarantee_exactly(self):
+        # The other pins read comment-stripped code; this one reads the files as they are.
+        raw = {}
+        for name in ("TelephonyAnchorClient.cpp", "TelephonyAnchorClient.hpp", "SosStatusGet.hpp"):
+            with open(os.path.join(SIP, name), encoding="utf-8") as f:
+                raw[name] = f.read()
+        for text in raw.values():
+            self.assertNotIn("tel_maint runs it", text)
+            self.assertNotIn("Runs on tel_maint, after the 503", text)
+            self.assertNotIn("ever delays a restart", text)
+            self.assertNotIn("never waits in front of one", text)
+            self.assertNotIn("must not wait behind a sweep", text)
+        cpp = raw["TelephonyAnchorClient.cpp"]
+        sweep_doc = cpp[cpp.index("// Runs on tel_sweep"):cpp.index("void TelephonyAnchorClient::orphanSweepBody(")]
+        self.assertIn("never waits on the sweep", sweep_doc)
+        self.assertIn("kOrphanOpBudgetUs", raw["SosStatusGet.hpp"])
 
     def test_the_sweep_state_is_a_few_atomics_and_nothing_that_allocates(self):
         decls = [l for l in self.hpp.split("\n") if "_orphan" in l and ";" in l and "(" not in l and "//" not in l.split("_orphan")[0]]
@@ -253,14 +288,6 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         get = body_of(self.cpp, "bool TelephonyAnchorClient::httpGetBody(")
         self.assertGreaterEqual(get.count("armTokenOpTimeout(client, deadlineUs)"), 3, "open, headers, each drain read")
         self.assertIn("deadlineUs", self.hpp)
-
-    def test_no_comment_says_the_sweep_never_delays_a_restart(self):
-        for text in (self.cpp, self.hpp, self.sos):
-            self.assertNotIn("ever delays a restart", text)
-            self.assertNotIn("never waits in front of one", text)
-            self.assertNotIn("must not wait behind a sweep", text)
-            self.assertNotIn("no drop that would delay it", text)
-        self.assertIn("kOrphanOpBudgetUs", self.sos)
 
     # ── the list read ─────────────────────────────────────────────────────────────
 

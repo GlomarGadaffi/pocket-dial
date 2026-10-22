@@ -370,7 +370,7 @@ inline UnreadOutcome unreadOutcome(bool legFound)
 // errors, a 911/933 is refused (503, NOT ROUTED) at the end of that window exactly as unreadOutcome() says:
 // no early answer to the caller, and no leg adopted that was never listed. 3CX may nevertheless hold a live
 // call to the PSAP that this unit can no longer see. makeCall() arms a sweep before it returns (a few atomic
-// stores and a wake: no lock, no I/O, no wait) and tel_maint runs it after: it reads the list again, within
+// stores and a wake: no lock, no I/O, no wait) and tel_sweep runs it after: it reads the list again, within
 // the same bound as the window, and DROPS the one leg that shows. It never answers, adopts or keys a leg.
 //
 //   Hold. From the arm until the sweep ends, or the bound passes if that is first, an unmatched upsert is
@@ -413,7 +413,7 @@ inline OrphanSweepStep orphanSweepStep(int candidates, int64_t sinceArmUs)
 // classifier promotes an unmatched upsert to an inbound call only when that count is 0.
 inline int64_t orphanHoldUntil(int64_t armedUs)
 {
-	return armedUs + kOrphanSweepWindowUs;   // from the arm: a sweep tel_maint is late to cannot stretch it
+	return armedUs + kOrphanSweepWindowUs;   // from the arm: a sweep tel_sweep is late to cannot stretch it
 }
 
 // holdUntilUs 0: no sweep is armed. The hold counts as one pending makeCall when none is, and never changes
@@ -527,7 +527,7 @@ struct OrphanSweepResult
 
 // The sweep. unslotted() is true once any 911/933 makeCall succeeded with no own leg
 // (UnslottedRecord): its live leg may be any listed leg, so the sweep ends before a drop. hasCandidate() is false when no leg was upserted in the window (PendingSeenIds::anyIn): the sweep
-// then has nothing it may drop, and it ends at once without a read. armedUs is the time makeCall() armed it (the bound runs from there, not from when tel_maint
+// then has nothing it may drop, and it ends at once without a read. armedUs is the time makeCall() armed it (the bound runs from there, not from when tel_sweep
 // got to it). readOnce() -> OrphanRead; nowUs() is a microsecond clock; keepGoing() is false once the
 // anchor is stopping; pause() sleeps one poll gap; holdLeg(leg) notes the leg as ours; dropLeg(leg) -> bool
 // drops it. The order is the contract: holdLeg, then dropLeg, once each, and only for a single candidate.
@@ -555,7 +555,7 @@ OrphanSweepResult runOrphanSweep(int64_t armedUs, ReadFn&& readOnce, NowFn&& now
 			r.end = OrphanSweepEnd::NoCandidate;
 			break;
 		}
-		// tel_maint was busy past the bound (a restart job ahead of this one): the hold has lapsed, so a
+		// tel_sweep reached this past the bound (an earlier sweep still held it): the hold has lapsed, so a
 		// read now has no hold to protect it. Inside the bound it reads at least once.
 		if (r.reads == 0 && nowUs() - armedUs >= kOrphanSweepWindowUs)
 		{
@@ -639,22 +639,23 @@ private:
 
 // One sweep I/O operation (its list GET, its drop POST) runs under this overall deadline: each esp_http_client
 // step (open, write, headers, each read) is armed from what is left of it (opTimeoutMs, capped at kOrphanOpCapMs),
-// and a step that finds it spent is not started. keepGoing is only checked between operations, so this is what bounds
-// the time a restart wanted mid-operation (a WS drop with a stale token, #336; makeCall refuses 911s until it is done)
-// waits on the sweep: about kOrphanOpBudgetUs, plus at most one step's overshoot inside a TLS handshake, not the
-// 2 s per step of the client's usual timeout. 1.5 s leaves a cold software ECDHE (about 0.5 to 1 s) room to finish.
+// and a step that finds it spent is not started. The sweep runs on its own task (tel_sweep), so a restart on tel_maint
+// never waits on any of this; the deadline bounds how long tel_sweep itself is held by one operation (about
+// kOrphanOpBudgetUs, plus at most one step's overshoot inside a TLS handshake; a getaddrinfo has no timeout and is
+// not covered). 1.5 s leaves a cold software ECDHE (about 0.5 to 1 s) room to finish.
 inline constexpr int64_t kOrphanOpBudgetUs = 1'500'000;
 inline constexpr int     kOrphanOpCapMs    = 1500;
 static_assert(kOrphanOpBudgetUs < 2'000'000, "shorter than the client's usual three 2 s steps");
 
 // Does the sweep go on? A restart wanted (a WS drop with a stale token, #336) ends the sweep between operations: it
-// reads nothing more and starts no drop. An operation already in flight is bounded by kOrphanOpBudgetUs.
+// reads nothing more and starts no drop. The restart itself does not wait for an operation in flight (it runs on
+// tel_maint, the sweep on tel_sweep).
 inline bool sweepMayContinue(bool running, bool restartRequested)
 {
 	return running && !restartRequested;
 }
 
-// The armed sweep's state, written by makeCall() and taken by tel_maint. NOT synchronised: the client holds its
+// The armed sweep's state, written by makeCall() and taken by tel_sweep. NOT synchronised: the client holds its
 // _mutex around arm() and take() (no I/O inside), so a take never pairs one arm's window with another's number.
 // The destination is kept as digits, at most kDestDigits (the longest string a std::string holds without a heap
 // allocation in libstdc++ is 15 characters).
@@ -692,7 +693,7 @@ public:
 		return true;
 	}
 
-	// A wake with no tel_maint task: nothing will sweep.
+	// A wake with no tel_sweep task: nothing will sweep.
 	void disarm() { _s.armedUs = 0; }
 
 	uint64_t postSeq() const { return _s.postSeq; }
@@ -762,7 +763,7 @@ public:
 				PD_WITNESS_W("anchor", "911 orphan sweep: anchor stopping, ended (#977)");
 				break;
 			case OrphanSweepEnd::TooLate:
-				PD_WITNESS_W("anchor", "911 orphan sweep: tel_maint reached it after the bound, nothing read (#977)");
+				PD_WITNESS_W("anchor", "911 orphan sweep: tel_sweep reached it after the bound, nothing read (#977)");
 				break;
 			case OrphanSweepEnd::UnslottedLiveEmergency:
 				PD_WITNESS_W("anchor", "911 orphan sweep: another 911 succeeded with no own leg after this one, its leg may be that live call, none dropped (#977)");
@@ -774,12 +775,12 @@ public:
 		return true;
 	}
 
-	// makeCall() armed a sweep and there was no tel_maint task to wake: the hold was taken back.
+	// makeCall() armed a sweep and there was no tel_sweep task to wake: the hold was taken back.
 	bool noteNoWorker()
 	{
 		const uint32_t seen = _noWorker.fetch_add(1, std::memory_order_relaxed);
 		if (seen >= kLinesPerEnd) return false;
-		PD_WITNESS_W("anchor", "911 orphan sweep: no tel_maint task, not armed (#977)");
+		PD_WITNESS_W("anchor", "911 orphan sweep: no tel_sweep task, not armed (#977)");
 		return true;
 	}
 
