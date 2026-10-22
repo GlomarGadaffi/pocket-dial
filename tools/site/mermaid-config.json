@@ -1,0 +1,62 @@
+{
+  "base": {
+    "startOnLoad": false,
+    "theme": "base",
+    "fontFamily": "ui-monospace,\"SF Mono\",\"Cascadia Code\",Consolas,\"Liberation Mono\",monospace",
+    "fontSize": 13,
+    "flowchart": { "useMaxWidth": true, "htmlLabels": false, "padding": 8, "nodeSpacing": 24, "rankSpacing": 36 },
+    "sequence": { "useMaxWidth": true, "mirrorActors": false, "wrap": false, "actorMargin": 40, "messageMargin": 32 },
+    "state": { "useMaxWidth": true },
+    "themeVariables": {
+      "fontFamily": "ui-monospace,Consolas,monospace",
+      "primaryColor": "#eef2f5",
+      "primaryBorderColor": "#5d6c78",
+      "primaryTextColor": "#14181b",
+      "secondaryColor": "#f3f3f3",
+      "tertiaryColor": "#f6f6f6",
+      "lineColor": "#4a4f54",
+      "textColor": "#14181b",
+      "edgeLabelBackground": "#fefefe",
+      "clusterBkg": "#f6f7f8",
+      "clusterBorder": "#8d979f",
+      "noteBkgColor": "#f1f3f4",
+      "noteBorderColor": "#7d8890",
+      "noteTextColor": "#14181b",
+      "actorBkg": "#e3edf4",
+      "actorBorder": "#3f6f8c",
+      "actorTextColor": "#102330",
+      "actorLineColor": "#9aa6af",
+      "signalColor": "#2b2f33",
+      "signalTextColor": "#14181b",
+      "labelBoxBkgColor": "#eef2f5",
+      "labelBoxBorderColor": "#6d7b86",
+      "labelTextColor": "#14181b",
+      "loopTextColor": "#14181b",
+      "activationBkgColor": "#e3edf4",
+      "activationBorderColor": "#3f6f8c",
+      "stateBkg": "#eef2f5",
+      "stateLabelColor": "#14181b",
+      "specialStateColor": "#4a4f54",
+      "transitionColor": "#4a4f54",
+      "transitionLabelColor": "#14181b",
+      "compositeBackground": "#f6f7f8",
+      "compositeBorder": "#8d979f",
+      "compositeTitleBackground": "#eef2f5"
+    }
+  },
+  "emergency": {
+    "themeVariables": {
+      "actorBkg": "#fbe6e3",
+      "actorBorder": "#b3362a",
+      "actorTextColor": "#4a1410",
+      "actorLineColor": "#c9a19c",
+      "noteBkgColor": "#fbe6e3",
+      "noteBorderColor": "#b3362a",
+      "noteTextColor": "#4a1410",
+      "labelBoxBkgColor": "#fbe6e3",
+      "labelBoxBorderColor": "#b3362a",
+      "labelTextColor": "#4a1410",
+      "loopTextColor": "#4a1410"
+    }
+  }
+}

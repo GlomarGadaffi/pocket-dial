@@ -7,8 +7,10 @@ To regenerate after the README diagrams change:
 
 ```sh
 # 1. edit tools/site/diagrams.json (same sources as README.md, one key per
-#    diagram; topology and learn are rendered top-to-bottom for the narrow column, and the hardware
-#    subgraphs are declared ESP32-first so the S3 boards land on top)
+#    diagram, in the 800 px column: long labels are wrapped with <br/>, learn is a composite
+#    state diagram with numbered edges (full text in the <ol class="dgl"> under it), the hardware
+#    subgraphs are declared ESP32-first so the S3 boards land on top; colours and spacing live in
+#    mermaid-config.json, with a per-key override such as emergency's red accent)
 # 2. render with headless Chromium (needs playwright + mermaid from jsdelivr)
 cd tools/site && node render-diagrams.mjs
 # 3. replace each <figure> in docs/index.html in place, by its svg id (m_<key>)
