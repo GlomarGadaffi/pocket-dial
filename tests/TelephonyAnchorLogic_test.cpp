@@ -889,9 +889,10 @@ TEST(RemoveTarget, AnAnsweredPsapCallbackIsNotDroppedByARemoveForALegNoSlotHolds
 
 TEST(RemoveTarget, AnOrdinarySoleCallIsNotDroppedByARemoveForALegNoSlotHolds)
 {
-	// Pinned on purpose (#1097): no "only active slot" fallback for any call. Every far-end
-	// hangup captured on .244 (#533 x3, #379, #901) named our own leg, so the fallback ended no
-	// call the exact match would not; what it did end was the wrong call.
+	// Pinned on purpose (#1097): no "only active slot" fallback for any call. The far-end hangups
+	// captured on .244 (#533, three X1 runs) named our own leg, as did every other captured
+	// teardown (#379, #901, #548, #681, #370, #1095): no capture needed the fallback, and what it
+	// could end was the wrong call.
 	RemoveSlot slots[4];
 	slots[3] = {"1275", "", 0, false};
 	EXPECT_EQ(removeTargetSlot(slots, kUnknownRemove), -1) << "an ordinary call was dropped by another leg's Remove";
