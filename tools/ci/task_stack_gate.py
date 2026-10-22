@@ -315,6 +315,13 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             if not found:
                 rc_rows = 1
                 print(f"FAIL indirect_allowlist row '{k}': target '{pat}' matches no function, so it bounds nothing")
+                # Show what the graph calls the nearest names, so the pattern can be fixed from the log.
+                toks = re.findall(r"[A-Za-z_][A-Za-z0-9_]{5,}", pat)
+                if toks:
+                    tok = max(toks, key=len)
+                    near = sorted({pretty(nodes[x])[:150] for x in nodes if x not in ind and tok in pretty(nodes[x])})
+                    for n in near[:8]:
+                        print(f"        near '{tok}': {n}")
             hit += found
         for v in callers:
             if v in bound_of:
