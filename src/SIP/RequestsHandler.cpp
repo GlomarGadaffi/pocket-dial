@@ -9512,11 +9512,22 @@ std::string_view RequestsHandler::ringingCalleeOf(const Session& s)
 	return invite ? invite->getToNumber() : std::string_view();
 }
 
+// #1098: an inbound anchored call rings every handset in its pendingTargets and has no dest
+// until one answers. A ringing handset is a party to it, as for ringingCalleeOf().
+static bool ringsAnchorTarget(const Session& s, std::string_view ext)
+{
+	if (ext.empty() || !s.isAnchorInbound() || s.getState() != Session::State::Invited || s.getDest())
+		return false;
+	for (const auto& t : s.getPendingTargets())
+		if (t && t->getNumber() == ext) return true;
+	return false;
+}
+
 bool RequestsHandler::sessionOnExtension(const Session& s, std::string_view ext)
 {
 	return (s.getSrc() && s.getSrc()->getNumber() == ext) ||
 	       (s.getDest() && s.getDest()->getNumber() == ext) ||
-	       ringingCalleeOf(s) == ext;
+	       ringingCalleeOf(s) == ext || ringsAnchorTarget(s, ext);
 }
 
 void RequestsHandler::endClientCalls(const std::string& extension, const std::string& reason)
@@ -9539,6 +9550,22 @@ void RequestsHandler::endClientCalls(const std::string& extension, const std::st
 		for (const auto& [key, s] : _sessions)
 		{
 			if (!sessionOnExtension(*s, extension) || key.size() >= sizeof(cid)) continue;
+			if (ringsAnchorTarget(*s, extension))
+			{
+				// #1098: an ordinary inbound call (a PSAP callback never gets here: the callers
+				// defer it) rings this handset among others. Only it leaves: CANCEL its fork, as
+				// tick()'s no-answer path does, and drop it from pendingTargets. The call ends,
+				// as that path ends it, only when no handset is left to answer.
+				for (const auto& t : s->getPendingTargets())
+				{
+					if (t->getNumber() != extension) continue;
+					if (auto cancel = buildInboundCancelTo(s, t)) _outbox.emplace_back(t->getAddress(), std::move(cancel));
+					break;
+				}
+				s->removePendingTarget(extension);
+				if (!s->getPendingTargets().empty()) continue;
+				releaseFarLeg(*s);
+			}
 			const auto& ssrc = s->getSrc();
 			const auto& sdest = s->getDest();
 			const bool isSrc = ssrc && ssrc->getNumber() == extension;
