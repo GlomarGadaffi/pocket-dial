@@ -845,7 +845,7 @@ class Gate(unittest.TestCase):
         self.indirect_fixture()
         rc, out = self.run_gate()
         self.assertEqual(rc, 1, out)
-        self.assertRegex(out, r"FAIL big: .*indirect_allowlist.*void mid\(\)")
+        self.assertRegex(out, r"(?s)FAIL big: .*FAIL big: .*indirect_allowlist.*void mid\(\)")
 
     def test_a_bounded_indirect_site_passes_and_the_heaviest_target_is_charged(self):
         self.indirect_fixture()

@@ -20,6 +20,8 @@ Fails (exit 1) when, for any task,
   * no function in the graph is under the project root (fails closed), or
   * a cycle (recursion, direct or mutual) is reachable from a walked task and
     has no recursion_allowlist row stating a depth bound and a reason;
+  * a task marked "indirect": "bounded" (a 911 path: tel_sweep, tel_ctl, sip_server)
+    reaches a function that makes an indirect call no indirect_allowlist row bounds;
 and when the number of task-creation sites (xTaskCreate*, including Static
 and WithCaps, pd::createTaskPreferPsram, std::thread/jthread) in a
 source file differs from the number of table entries for that file (a new
@@ -31,7 +33,17 @@ The numbers only mean something on Xtensa .ci files from the ESP build
 the call-graph flags; BigDog's gate runs it by hand; the Call-Graph Guard job runs
 the self-test only). Host
 x86-64 frames differ. Static depth is an upper bound over direct calls; it
-can't see indirect calls. The runtime stackHwm_* (#451) stays ground truth.
+can't see indirect calls, except where indirect_allowlist names the targets of a site
+(see below). The runtime stackHwm_* (#451) stays ground truth.
+
+Indirect calls: GCC names every indirect site by one placeholder node, so a site is the
+function that calls it. A task row marked "indirect": "bounded" must have every such
+function it reaches matched by an indirect_allowlist row {"targets": [regex over a
+function name, ...], "reason": "who installs the pointer, file:line"}; the key is a
+substring of the caller's name. The walk of those tasks (and only those) gets an edge
+from the caller to every function a target regex matches, so the heaviest target chain
+is charged, and a target nothing matches, or a row no indirect caller matches, fails.
+Any other task keeps the base graph and only reports its sites, charging 0 B.
 
 Recursion: the call graph is condensed first (Tarjan, reused from T-7), so a
 cycle can't be walked as a longest simple path, which is no upper bound. Every
@@ -266,6 +278,44 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             nodes.setdefault(w, w)   # a callee seen only as an edge target
     lib = [(re.compile(k), b) for k, b in sorted(table.get("library_defaults", {}).items())]
 
+    # Indirect calls (a vtable, std::function, a callback pointer). GCC names every site by one
+    # shared placeholder node, so a site is its caller. A task marked "indirect": "bounded" (the
+    # ones that carry a 911 path) fails when a function it reaches makes an indirect call that no
+    # indirect_allowlist row bounds. A row names the targets that can be installed there; the
+    # walk of those tasks gets an edge from the caller to each, so the heaviest target chain is
+    # charged. Other tasks keep the base graph and report the sites, charging 0 B.
+    ind = {v for v in nodes if INDIRECT_RE.search(pretty(nodes.get(v, v)))}
+    makers = sorted(v for v in nodes if ind & set(edges.get(v, ())))
+    bounded_edges = {v: set(ws) for v, ws in edges.items()}
+    bound_of, rc_rows = {}, 0
+    irows = table.get("indirect_allowlist", {})
+    for k in sorted(irows):
+        row = irows[k]
+        tg = row.get("targets") if isinstance(row, dict) else None
+        if not (isinstance(tg, list) and tg and all(isinstance(x, str) and x for x in tg)
+                and isinstance(row.get("reason"), str) and row["reason"].strip()):
+            rc_rows = 1
+            print(f"FAIL indirect_allowlist row '{k}': needs a non-empty list of target patterns and a reason")
+            continue
+        callers = [v for v in makers if k in pretty(nodes[v])]
+        if not callers:
+            rc_rows = 1
+            print(f"FAIL indirect_allowlist row '{k}': matches no function that makes an indirect call")
+        hit = []
+        for pat in tg:
+            rx = re.compile(pat)
+            found = sorted(x for x in nodes if x not in ind and rx.search(pretty(nodes[x])))
+            if not found:
+                rc_rows = 1
+                print(f"FAIL indirect_allowlist row '{k}': target '{pat}' matches no function, so it bounds nothing")
+            hit += found
+        for v in callers:
+            if v in bound_of:
+                rc_rows = 1
+                print(f"FAIL indirect_allowlist: '{pretty(nodes[v])[:100]}' matches rows '{bound_of[v]}' and '{k}' (ambiguous)")
+            bound_of[v] = k
+            bounded_edges.setdefault(v, set()).update(hit)
+
     def allowed(x):
         return any(k in pretty(nodes.get(x, x)) for k in allow)
 
@@ -290,7 +340,7 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                     problem[v] = "library callee with no frame data, no library_defaults match"
     print(f"call graph: {len(nodes)} functions, {len(frames)} frames with stack data; "
           f"margin {margin} B, frame ceiling {ceiling} B")
-    rc = 0
+    rc = rc_rows
 
     # .ci files compiled in another checkout have none of our paths in them, and
     # "nothing of ours to cap" would then pass any frame: fail closed.
@@ -328,92 +378,118 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             continue
         walked.append((t, hits))
 
-    # Recursion: every cycle a walked task reaches needs a row with a bound and a reason.
-    reach_of = [reachable(hits, edges) for _, hits in walked]
-    reach = set().union(*reach_of)
-    sub = {v: {w for w in edges.get(v, ()) if w in reach} for v in sorted(reach)}
-    cycles = sorted(sorted(c) for c in find_cycles(nodes, sub))
-    rows = table.get("recursion_allowlist", {})
-    bad = {k for k in rows if not valid_row(rows[k])}
-    for k in sorted(bad):
-        rc = 1
-        print(f"FAIL recursion_allowlist row '{k}': needs a whole-number depth >= 1 and a reason")
-    unit, members, cycle_cost, cycle_label = {}, {}, {}, {}
-    row_cycles = {k: 0 for k in rows}
-    for c in cycles:
-        rep = c[0]
-        members[rep] = c
-        unit.update({m: rep for m in c})
-        names = sorted(pretty(nodes.get(m, m)) for m in c)
-        shown = "; ".join(n[:80] for n in names[:4]) + (f"; +{len(names) - 4} more" if len(names) > 4 else "")
-        by = ",".join(sorted({t["name"] for (t, _), r in zip(walked, reach_of) if any(m in r for m in c)}))
-        matched = [k for k in sorted(rows) if any(k in n for n in names)]
-        for k in matched:
-            row_cycles[k] += 1
-        depth = 1
-        if not matched:
+    def analyse(batch, edges, strict):
+        """Recursion, cost and report for the tasks in `batch`, over the edges given."""
+        # Recursion: every cycle a walked task reaches needs a row with a bound and a reason.
+        reach_of = [reachable(hits, edges) for _, hits in batch]
+        reach = set().union(*reach_of)
+        sub = {v: {w for w in edges.get(v, ()) if w in reach} for v in sorted(reach)}
+        cycles = sorted(sorted(c) for c in find_cycles(nodes, sub))
+        rc = 0
+        rows = table.get("recursion_allowlist", {})
+        bad = {k for k in rows if not valid_row(rows[k])}
+        for k in sorted(bad):
             rc = 1
-            print(f"FAIL recursion: cycle of {len(c)} function(s) reachable from {by} has no "
-                  f"recursion_allowlist row (a depth bound and a reason): {shown}")
-        elif len(matched) > 1:
-            rc = 1
-            print(f"FAIL recursion: cycle of {len(c)} function(s) reachable from {by} matches "
-                  f"{len(matched)} recursion_allowlist rows (ambiguous): {', '.join(repr(k) for k in matched)}")
-        elif matched[0] not in bad:
-            depth = rows[matched[0]]["depth"]
-        trip = heaviest_round(c, edges, size)
-        if trip is None:
-            trip = sum(size[m] for m in c)      # too many cycles to list: charge every member
-        cycle_cost[rep] = depth * trip
-        cycle_label[rep] = f"recursion x{depth} of {trip} B, {len(c)} function(s): {names[0][:50]}"
-        if len(matched) == 1 and matched[0] not in bad:
-            print(f"ok   recursion: {len(c)} function(s), depth {depth} x {trip} B a level "
-                  f"= {cycle_cost[rep]} B charged ({by}): {shown}")
-    for k in sorted(row_cycles):
-        if row_cycles[k] > 1:
-            rc = 1
-            print(f"FAIL recursion_allowlist row '{k}' matches {row_cycles[k]} cycles (ambiguous): "
-                  f"a row names one cycle")
+            print(f"FAIL recursion_allowlist row '{k}': needs a whole-number depth >= 1 and a reason")
+        unit, members, cycle_cost, cycle_label = {}, {}, {}, {}
+        row_cycles = {k: 0 for k in rows}
+        for c in cycles:
+            rep = c[0]
+            members[rep] = c
+            unit.update({m: rep for m in c})
+            names = sorted(pretty(nodes.get(m, m)) for m in c)
+            shown = "; ".join(n[:80] for n in names[:4]) + (f"; +{len(names) - 4} more" if len(names) > 4 else "")
+            by = ",".join(sorted({t["name"] for (t, _), r in zip(batch, reach_of) if any(m in r for m in c)}))
+            matched = [k for k in sorted(rows) if any(k in n for n in names)]
+            for k in matched:
+                row_cycles[k] += 1
+            depth = 1
+            if not matched:
+                rc = 1
+                print(f"FAIL recursion: cycle of {len(c)} function(s) reachable from {by} has no "
+                      f"recursion_allowlist row (a depth bound and a reason): {shown}")
+            elif len(matched) > 1:
+                rc = 1
+                print(f"FAIL recursion: cycle of {len(c)} function(s) reachable from {by} matches "
+                      f"{len(matched)} recursion_allowlist rows (ambiguous): {', '.join(repr(k) for k in matched)}")
+            elif matched[0] not in bad:
+                depth = rows[matched[0]]["depth"]
+            trip = heaviest_round(c, edges, size)
+            if trip is None:
+                trip = sum(size[m] for m in c)      # too many cycles to list: charge every member
+            cycle_cost[rep] = depth * trip
+            cycle_label[rep] = f"recursion x{depth} of {trip} B, {len(c)} function(s): {names[0][:50]}"
+            if len(matched) == 1 and matched[0] not in bad:
+                print(f"ok   recursion: {len(c)} function(s), depth {depth} x {trip} B a level "
+                      f"= {cycle_cost[rep]} B charged ({by}): {shown}")
+        for k in sorted(row_cycles):
+            if row_cycles[k] > 1:
+                rc = 1
+                print(f"FAIL recursion_allowlist row '{k}' matches {row_cycles[k]} cycles (ambiguous): "
+                      f"a row names one cycle")
 
-    cost = collections.ChainMap(cycle_cost, size)
+        cost = collections.ChainMap(cycle_cost, size)
 
-    def succ(u):
-        out = {unit.get(w, w) for s in members.get(u, (u,)) for w in edges.get(s, ())}
-        return sorted(out - {u})
+        def succ(u):
+            out = {unit.get(w, w) for s in members.get(u, (u,)) for w in edges.get(s, ())}
+            return sorted(out - {u})
 
-    memo = {}
-    for t, hits in walked:
-        total, path = max((worst_chain(unit.get(h, h), succ, cost, memo) for h in hits),
-                          key=lambda r: r[0])
-        ok = total + margin <= t["bytes"]
-        # known_findings: a reported over-budget task that does not fail the job, so a red job means
-        # something new. It holds only while the chain is no deeper than the recorded max_total; a
-        # deeper chain is a new finding and fails. A known task that fits again is called out.
-        kf = known.get(t["name"])
-        known_hit = bool(kf) and not ok and total <= kf["max_total"]
-        rc |= 0 if (ok or known_hit) else 1
-        print(f"{'ok  ' if ok else 'KNOWN' if known_hit else 'FAIL'} {t['name']}: {total} B + {margin} margin "
-              f"{'<=' if ok else '>'} {t['bytes']} B ({t['file']}:{t['line']})")
-        # The walk cannot follow an indirect call (a vtable, std::function, a callback pointer), and
-        # the placeholder is charged 0 B. So a pass is a fit only for the direct calls: say how many
-        # indirect sites the task reaches and which chain functions make one, never a silent 0.
-        reached = reachable(hits, edges)
-        ind = {v for v in nodes if INDIRECT_RE.search(pretty(nodes.get(v, v)))}
-        # GCC names every indirect site by one shared placeholder node, so a site is its caller.
-        callers = sorted(v for v in reached if ind & set(edges.get(v, ())))
-        chain = {m for x in path for m in members.get(x, (x,))}
-        on_chain = [v for v in callers if v in chain]
-        print(f"        indirect call sites: {len(callers)} function(s) reachable make one, "
-              f"{len(on_chain)} of them on the worst chain; callee frames are not charged (0 B)"
-              + ("" if not on_chain else ": " + "; ".join(pretty(nodes.get(v, v)).split("(")[0][-50:] for v in on_chain[:8])))
-        if known_hit:
-            print(f"        known finding (<= {kf['max_total']} B, not failing the job): {kf['reason']}")
-        elif kf and ok:
-            print(f"        note: known finding for {t['name']} no longer applies; remove it from task_stacks.json")
-        elif kf:
-            print(f"        FAIL: deeper than the known finding's {kf['max_total']} B: a new finding")
-        for x in path:
-            print(f"        {cost[x]:6d}  {cycle_label.get(x) or pretty(nodes.get(x, x))[:100]}")
+        memo = {}
+        for t, hits in batch:
+            total, path = max((worst_chain(unit.get(h, h), succ, cost, memo) for h in hits),
+                              key=lambda r: r[0])
+            ok = total + margin <= t["bytes"]
+            # known_findings: a reported over-budget task that does not fail the job, so a red job means
+            # something new. It holds only while the chain is no deeper than the recorded max_total; a
+            # deeper chain is a new finding and fails. A known task that fits again is called out.
+            kf = known.get(t["name"])
+            known_hit = bool(kf) and not ok and total <= kf["max_total"]
+            rc |= 0 if (ok or known_hit) else 1
+            # The walk cannot follow an indirect call (a vtable, std::function, a callback pointer), and
+            # the placeholder is charged 0 B. A task marked "indirect": "bounded" gets the edges of its
+            # indirect_allowlist rows instead and fails on a site with no row. Any other task passes
+            # as a fit for the direct calls only: say how many sites it reaches and which chain
+            # functions make one, never a silent 0.
+            reached = reachable(hits, edges)
+            # GCC names every indirect site by one shared placeholder node, so a site is its caller.
+            callers = sorted(v for v in reached if ind & set(edges.get(v, ())))
+            unbounded = [v for v in callers if v not in bound_of] if strict else []
+            rc |= 1 if unbounded else 0
+            label = "FAIL" if unbounded else "ok  " if ok else "KNOWN" if known_hit else "FAIL"
+            print(f"{label} {t['name']}: {total} B + {margin} margin "
+                  f"{'<=' if ok else '>'} {t['bytes']} B ({t['file']}:{t['line']})")
+            chain = {m for x in path for m in members.get(x, (x,))}
+            on_chain = [v for v in callers if v in chain]
+            if strict:
+                print(f"        indirect call sites: {len(callers)} function(s) reachable make one, "
+                      f"{len(callers) - len(unbounded)} bounded by an indirect_allowlist row (the heaviest target chain is charged)")
+                if unbounded:
+                    print(f"        FAIL {t['name']}: {len(unbounded)} reachable indirect call site(s) have no "
+                          f"indirect_allowlist row, so the chain above is not an upper bound (a 911 task):")
+                    for v in unbounded:
+                        print(f"            {pretty(nodes.get(v, v))}")
+            else:
+                print(f"        indirect call sites: {len(callers)} function(s) reachable make one, "
+                      f"{len(on_chain)} of them on the worst chain; callee frames are not charged (0 B)"
+                      + ("" if not on_chain else ": " + "; ".join(pretty(nodes.get(v, v)).split("(")[0][-50:] for v in on_chain[:8])))
+            if known_hit:
+                print(f"        known finding (<= {kf['max_total']} B, not failing the job): {kf['reason']}")
+            elif kf and ok:
+                print(f"        note: known finding for {t['name']} no longer applies; remove it from task_stacks.json")
+            elif kf:
+                print(f"        FAIL: deeper than the known finding's {kf['max_total']} B: a new finding")
+            for x in path:
+                print(f"        {cost[x]:6d}  {cycle_label.get(x) or pretty(nodes.get(x, x))[:100]}")
+        return rc, reach
+
+    plain = [w for w in walked if w[0].get("indirect") != "bounded"]
+    strict = [w for w in walked if w[0].get("indirect") == "bounded"]
+    reach = set()
+    for batch, ev, st in ((plain, edges, False), (strict, bounded_edges, True)):
+        if batch:
+            r, rr = analyse(batch, ev, st)
+            rc |= r
+            reach |= rr
 
     for x in sorted(reach & set(problem)):
         rc = 1
