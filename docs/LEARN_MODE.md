@@ -161,30 +161,49 @@ whole box challenges every REGISTER and no new unverified phone can be adopted.
 
 ## 4. Sequence diagram (Learn-mode cutover)
 
+This sequence follows one phone (ext 106) through the Learn-mode REGISTER path (`Registrar::admitLearn`) and then through Secured enforcement (`Registrar::admitSecure`). The secret and Secured steps are the intended design: see the Step 4 warning above.
+
 ```mermaid
 sequenceDiagram
-    participant P as Existing phone (ext 106)
-    participant PD as pocket-dial registrar
-    participant A as ARP table (LAN)
+    participant P as Phone (ext 106)
+    participant PD as RequestsHandler::onRegister
+    participant R as Registrar
+    participant A as ARP table (lwIP)
     participant OP as Installer (admin)
 
-    Note over PD: Mode = LEARN
-    P->>PD: REGISTER ext 106 (current creds)
-    PD->>A: resolve src-IP → MAC
-    A-->>PD: MAC aa:bb:cc:dd:ee:ff
-    Note over PD: unknown MAC → TOFU accept,<br/>record {MAC, 106, LEARNED}
-    PD-->>P: 200 OK  (phone stays alive)
-    OP->>PD: verify roster (MAC · ext · state)
-    OP->>PD: set/rotate secret for 106 → store HA1
-    OP->>P: enter new secret on handset
-    OP->>PD: mark device SECURED (lock 106 ↔ MAC)
-    P->>PD: REGISTER ext 106 (no/zero auth)
-    PD-->>P: 401 challenge (nonce, realm)
+    Note over R: reg_mode = Learn (Mode 1)
+    P->>PD: REGISTER ext 106
+    PD->>R: admitLearn(ext 106)
+    R->>A: pdLookupMac(source IP)
+    A-->>R: MAC aa:bb:cc:dd:ee:ff
+    alt MAC unknown
+        Note over R: spend an adoption token (burst 4, one back per 15 s)<br/>record DeviceState Learned, unlocked, seq n
+        alt no token left
+            R-->>P: 503 Service Unavailable + Retry-After
+        else token spent
+            R-->>PD: Accept
+            PD-->>P: 200 OK (binding granted, register beep follows from tick)
+        end
+    else MAC known, same ext, unlocked, 30 s or more after its first sighting, first claim on the ext
+        Note over R: locked = true (Learn locks ext 106 to this MAC)
+        R-->>PD: Accept
+        PD-->>P: 200 OK
+    end
+    OP->>PD: GET /api/registrar (verify MAC, extension, state)
+    OP->>PD: POST /api/config/import, owner session (the only writer of a SIP secret HA1)
+    OP->>P: enter the new secret on the handset
+    OP->>PD: POST /api/registrar/device action=secure
+    Note over R: Registrar::secure() refuses with no stored secret (HTTP 409 no SIP secret for ext)<br/>else DeviceState Secured
+    P->>PD: REGISTER ext 106 (no Authorization)
+    PD->>R: admitLearn then admitSecure
+    R-->>P: 401 Unauthorized + WWW-Authenticate (realm, fresh nonce)
     P->>PD: REGISTER + Authorization (digest)
-    Note over PD: response == MD5(HA1:nonce:...:HA2)?
-    PD-->>P: 200 OK  (authenticated)
-    Note over P,PD: rogue MAC claiming ext 106 → 403/401 (lock)
-    OP->>PD: all devices secured → Mode = SECURE
+    Note over R: nonce valid, uri equals Request-URI, SipDigest::verify against HA1, nc not reused
+    R-->>PD: Accept
+    PD-->>P: 200 OK
+    Note over P,R: other MAC REGISTERs ext 106 while it is locked or Secured: 403 Extension Locked To Another Device
+    OP->>PD: POST /api/registrar mode=secure
+    Note over R: 409 unless one device is Secured, or confirm=LOCKOUT<br/>then Mode 2: admitSecure for every REGISTER
 ```
 
 ASCII fallback:
