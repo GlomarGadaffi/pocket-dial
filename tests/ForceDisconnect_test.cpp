@@ -860,3 +860,65 @@ TEST(DeregisterMidCall, ADeregisterWithNoExtensionLeavesEveryCallAlone)
 	EXPECT_EQ(byeCount(rig.sent, kCalleeIp), 0u);
 	EXPECT_TRUE(rig.handler.cdrSnapshotForTest().empty());
 }
+
+// A caller de-registering while a hunt or ring group rings: the group number is no
+// client, so every still-ringing member must be CANCELled from the session's pending
+// targets (tick()'s hunt timeout does the same), or they ring a dead call.
+namespace
+{
+	void sendGroupInvite(RequestsHandler& handler, const std::string& callId)
+	{
+		std::string body = sdpBody(kCallerIp);
+		std::string raw =
+			"INVITE sip:600@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + std::string(kCallerIp) + ":5060;branch=z9hG4bKi" + callId + "\r\n"
+			"From: <sip:100@server>;tag=ctag" + callId + "\r\n"
+			"To: <sip:600@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:100@" + std::string(kCallerIp) + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(kCallerIp)));
+	}
+
+	void expectGroupCancelledOnCallerDeregister(const char* mode, size_t membersRinging)
+	{
+		SCOPED_TRACE(mode);
+		Rig rig;
+		constexpr const char* kThirdIp = "192.168.40.30";
+		rig.handler.handle(makeRegister("107", kThirdIp, "reg-107g"));
+		rig.handler.setRingGroup("600", "106,107", mode);
+		const std::string callId = std::string("grp-1089-") + mode;
+		sendGroupInvite(rig.handler, callId);
+		auto s = rig.handler.getSession("Call-ID: " + callId);
+		ASSERT_TRUE(s.has_value()) << "precondition: the group is ringing";
+		ASSERT_EQ(s.value()->getState(), Session::State::Invited);
+		ASSERT_EQ(s.value()->getPendingTargets().size(), membersRinging) << "precondition";
+		rig.sent.clear();
+
+		sendDeregister(rig.handler, "100", kCallerIp, "dereg-" + callId);
+
+		size_t cancelled = 0;
+		for (const char* ip : { kCalleeIp, kThirdIp })
+		{
+			const size_t n = sentStartingWith(rig.sent, ip, "CANCEL ");
+			EXPECT_LE(n, 1u) << ip << " got a second CANCEL";
+			cancelled += n;
+		}
+		EXPECT_EQ(cancelled, membersRinging) << "every ringing member gets exactly one CANCEL";
+		EXPECT_FALSE(rig.handler.getSession("Call-ID: " + callId).has_value());
+		EXPECT_EQ(liveSessions(rig.handler), 0u);
+	}
+}
+
+TEST(DeregisterMidCall, ACallerDeregisteringWhileAHuntGroupRingsCancelsTheRingingMember)
+{
+	expectGroupCancelledOnCallerDeregister("hunt", 1u);
+}
+
+TEST(DeregisterMidCall, ACallerDeregisteringWhileARingAllGroupRingsCancelsEveryMember)
+{
+	expectGroupCancelledOnCallerDeregister("ringall", 2u);
+}

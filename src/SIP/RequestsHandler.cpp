@@ -9554,7 +9554,14 @@ void RequestsHandler::endClientCalls(const std::string& extension, const std::st
 					// Still ringing: no dialog to BYE. The caller leaving CANCELs the callee
 					// (tick()'s no-answer shape); the callee leaving answers the caller 480.
 					const auto invite = s->getForwardLegInvite() ? s->getForwardLegInvite() : s->getInviteMessage();
-					if (invite && isSrc)
+					if (invite && isSrc && (s->isHunt() || s->isBroadcast()))
+					{
+						// A hunt or ring group rings its pending members, not the group number.
+						for (const auto& t : s->getPendingTargets())
+							if (auto cancel = _forker.buildCancel(invite, t))
+								_outbox.emplace_back(t->getAddress(), std::move(cancel));
+					}
+					else if (invite && isSrc)
 					{
 						const auto callee = findClient(s->getForwardLegInvite() ? std::string_view(s->getForwardLegTarget())
 						                                                         : invite->getToNumber());
