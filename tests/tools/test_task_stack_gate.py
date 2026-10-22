@@ -849,7 +849,7 @@ class Gate(unittest.TestCase):
 
     def test_a_bounded_indirect_site_passes_and_the_heaviest_target_is_charged(self):
         self.indirect_fixture()
-        self.table["indirect_allowlist"] = {"mid()": {
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {
             "targets": [r"SlowSink::write\("], "reason": "fixture: the one sink installed at boot"}}
         rc, out = self.run_gate()
         self.assertEqual(rc, 0, out)
@@ -858,7 +858,7 @@ class Gate(unittest.TestCase):
 
     def test_a_target_that_matches_no_function_bounds_nothing_and_fails(self):
         self.indirect_fixture()
-        self.table["indirect_allowlist"] = {"mid()": {
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {
             "targets": [r"NoSuchSink::write\("], "reason": "fixture"}}
         rc, out = self.run_gate()
         self.assertEqual(rc, 1, out)
@@ -866,11 +866,18 @@ class Gate(unittest.TestCase):
 
     def test_a_row_must_name_targets_and_a_reason(self):
         self.indirect_fixture()
-        for row in ({"targets": [], "reason": "x"}, {"targets": ["SlowSink"], "reason": " "}):
+        for row in ({"reason": "x"}, {"targets": "SlowSink", "reason": "x"}, {"targets": ["SlowSink"], "reason": " "}):
             self.table["indirect_allowlist"] = {"mid()": row}
             rc, out = self.run_gate()
             self.assertEqual(rc, 1, out)
-            self.assertIn("indirect_allowlist row 'mid()'", out)
+            self.assertIn("indirect_allowlist row 'void mid", out)
+
+    def test_a_row_with_no_targets_bounds_a_site_that_can_call_nothing(self):
+        self.indirect_fixture()
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture: pointer never installed"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("big: 1900 B", out)
 
     def test_a_task_not_marked_bounded_stays_report_only(self):
         self.indirect_fixture(flag=False)

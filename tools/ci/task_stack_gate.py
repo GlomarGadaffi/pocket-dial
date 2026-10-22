@@ -39,8 +39,9 @@ can't see indirect calls, except where indirect_allowlist names the targets of a
 Indirect calls: GCC names every indirect site by one placeholder node, so a site is the
 function that calls it. A task row marked "indirect": "bounded" must have every such
 function it reaches matched by an indirect_allowlist row {"targets": [regex over a
-function name, ...], "reason": "who installs the pointer, file:line"}; the key is a
-substring of the caller's name. The walk of those tasks (and only those) gets an edge
+function name, ...], "reason": "who installs the pointer, file:line"} ([] = no
+target exists in the image, the reason says why); the key is a
+regex searched in the caller's demangled name. The walk of those tasks (and only those) gets an edge
 from the caller to every function a target regex matches, so the heaviest target chain
 is charged, and a target nothing matches, or a row no indirect caller matches, fails.
 Any other task keeps the base graph and only reports its sites, charging 0 B.
@@ -292,12 +293,18 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
     for k in sorted(irows):
         row = irows[k]
         tg = row.get("targets") if isinstance(row, dict) else None
-        if not (isinstance(tg, list) and tg and all(isinstance(x, str) and x for x in tg)
+        if not (isinstance(tg, list) and all(isinstance(x, str) and x for x in tg)
                 and isinstance(row.get("reason"), str) and row["reason"].strip()):
             rc_rows = 1
-            print(f"FAIL indirect_allowlist row '{k}': needs a non-empty list of target patterns and a reason")
+            print(f"FAIL indirect_allowlist row '{k}': needs a list of target patterns (empty only when the reason shows nothing can be installed) and a reason")
             continue
-        callers = [v for v in makers if k in pretty(nodes[v])]
+        try:
+            krx = re.compile(k)
+        except re.error as e:
+            rc_rows = 1
+            print(f"FAIL indirect_allowlist row '{k}': key is not a regex ({e})")
+            continue
+        callers = [v for v in makers if krx.search(pretty(nodes[v]))]
         if not callers:
             rc_rows = 1
             print(f"FAIL indirect_allowlist row '{k}': matches no function that makes an indirect call")
