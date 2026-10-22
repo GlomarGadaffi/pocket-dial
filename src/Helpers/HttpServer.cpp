@@ -2857,6 +2857,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	pdAppendHwmField(json, "stackHwm_tel_ctl1", pdStackHwmBytes("tel_ctl1"));
 	pdAppendHwmField(json, "stackHwm_tel_drop", pdStackHwmBytes("tel_drop"));
 	pdAppendHwmField(json, "stackHwm_tel_sos", pdStackHwmBytes("tel_sos"));
+	// #977: the 911 orphan sweep's task (PSRAM stack, 6144 B unmeasured); null until it exists.
+	pdAppendHwmField(json, "stackHwm_tel_sweep", pdStackHwmBytes("tel_sweep"));
 	// #991: the one NVS-writing task (CDR ring + device table, forwards, DIDs);
 	// 6144 B kept from the two it replaced, this reading is what sizes it.
 	pdAppendHwmField(json, "stackHwm_flash_writer", pdStackHwmBytes("flash_writer"));
@@ -2878,7 +2880,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json.s(",\"stackHwm_sip_server_task\":null,\"stackHwm_udp_receiver_task\":null,"
 	       "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
 	       "\"stackHwm_conf_mix_tick\":null,\"stackHwm_tel_ctl0\":null,\"stackHwm_tel_ctl1\":null,"
-	       "\"stackHwm_tel_drop\":null,\"stackHwm_tel_sos\":null,\"stackHwm_flash_writer\":null,"
+	       "\"stackHwm_tel_drop\":null,\"stackHwm_tel_sos\":null,\"stackHwm_tel_sweep\":null,\"stackHwm_flash_writer\":null,"
 	       "\"stackHwm_http_conn\":null");
 #endif
 	// Issue #405: the route class that produced the stackHwm_http_conn minimum

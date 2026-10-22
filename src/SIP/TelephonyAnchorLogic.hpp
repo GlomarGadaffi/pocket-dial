@@ -614,6 +614,7 @@ inline ListLegVerdict classifyListLeg(DirectControlField dc, bool hasId, bool sl
 // reject (by how the field looked) is told apart from a slot claim or an old leg.
 struct ListLegCounts
 {
+	bool read = false;      // #977: 3CX's list was fetched and parsed as an array (an empty one counts)
 	int listed = 0;         // participant objects
 	int controllable = 0;   // direct_control true
 	int noId = 0;
