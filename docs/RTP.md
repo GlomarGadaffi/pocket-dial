@@ -425,8 +425,9 @@ It is reached before the dial plan, the secure-mode challenge and the `422` floo
 down anchor never produces the `404` above. When no route exists the answer is
 `503 Emergency Call Not Routable` with a `Warning: 399` header and no `Retry-After`
 (`:5177`). A full anchor is different: `refuseBeforeDispatch` sends nothing for a 911/933, and the
-caller gets the same `503 Emergency Call Not Routable` (`:5177`), only after one non-emergency
-call has been ended to make room. A non-emergency call gets `503 Service Unavailable` there.
+caller gets the same `503 Emergency Call Not Routable` (`:5177`), but only when
+`preemptAnchorCallForEmergency` ending one non-emergency call did not free a bridge slot. A
+non-emergency call gets `503 Service Unavailable` there.
 
 The tasks behind those server-terminated legs, as created in code:
 

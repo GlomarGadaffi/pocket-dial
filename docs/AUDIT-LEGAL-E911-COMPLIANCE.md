@@ -122,11 +122,11 @@ flowchart TD
     CD -- "no" --> W2["Warning detail: no G.711 codec offered"]
     CD -- "yes" --> RTP{"Usable RTP address in the SDP?"}
     RTP -- "no" --> R400["400 Bad Request, notifyEmergency routed=false"]
-    R400 -. "the anchor answered, so the call counts as owned" .-> MK
+    R400 -. "the anchor answered, so the call counts as owned" .-> MK2["markEmergency(): the callback window opens although the call was never placed"]
+    MK2 --> NF
     RTP -- "yes" --> PRE["preemptAnchorCallForEmergency(): when full, end one non-emergency anchor call"]
     PRE --> CAP{"Bridge, session and virtual peer free, and the tel_sos queue takes the makeCall job?"}
     CAP -- "no, nothing sent" --> W3
-    CAP -- "no, but the anchor answered its own 503" -.-> MK
     CAP -- "yes" --> RING["Session Invited, 180 Ringing to the handset"]
     RING --> MK["markEmergency(): setEmergency, open the PSAP callback window"]
     MK --> NT["notifyEmergency routed=true, on the same outbox pass as the 180"]
