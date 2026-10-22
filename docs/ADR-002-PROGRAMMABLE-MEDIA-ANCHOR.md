@@ -27,12 +27,16 @@ We define a standardized, decoupled **Programmable Media Anchor Interface** that
 
 ```mermaid
 flowchart TD
-    handset["Handset SIP dialogs"] <--> session["RequestsHandler / Session"]
-    session -->|"control plane"| iface["AnchorClient interface"]
-    session --> bridge["MediaBridge (PCM-16 / 8 kHz)"]
-    bridge -->|"media plane"| iface
-    iface --> threecx["3CX adapter, TelephonyAnchorClient (shipped)"]
-    iface --> apidaze["Apidaze adapter (planned)"]
+    handset["Handset"] <-->|"SIP on UDP 5060"| session["RequestsHandler, one Session per call"]
+    handset <-->|"mu-law RTP"| bridge["MediaBridge, PCM16 at 8 kHz"]
+    session -->|"startBridge, stopBridge, setHeld"| bridge
+    session -->|"control plane: makeCall, answerCall, dropCall on tel_ctl0/1, tel_sos, tel_drop"| iface["AnchorClient interface"]
+    iface -->|"setEventCallback: Answered, Incoming, Dropped, MediaNeverOpened"| session
+    bridge -->|"media plane: writeAudio"| iface
+    iface -->|"registerAudioRxCallback, then MediaBridge::feedRx"| bridge
+    iface --> threecx["TelephonyAnchorClient, 3CX Call Control, provider Telephony: shipped, the only provider that carries 911/933"]
+    iface --> loopback["LoopbackAnchorClient, provider Loopback: on-box mock, called inline, no events, a 911/933 gets a 503"]
+    iface --> apidaze["ApidazeAnchorClient: planned, a header and AudioSocket_test only, no provider id"]
 ```
 
 The 3CX adapter (`TelephonyAnchorClient`) is shipped. The Apidaze adapter is planned, and `ApidazeAnchorClient` is a host-test scaffold.

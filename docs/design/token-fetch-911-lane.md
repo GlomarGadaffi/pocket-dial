@@ -33,14 +33,26 @@ Nothing here is measured on a board. IDF facts were read in `/home/glomar/esp/es
 - The off-path half of option (b) is already built: `tel_maint` wakes the maintenance lane, which refreshes at 10 minutes
   before expiry (TAL.hpp:848, :890-914; TA.cpp:2053-2084). Host-tested; ESP side is compile-checked only (#945 body).
 
-The decision path for the two fetch cases above, on the [branch] code:
+The decision path for the two fetch cases above, on the [branch] code. `main` has carried the same path since 813cd80 (`makeCall`, TelephonyAnchorClient.cpp:333-513 at 8a279392):
 
 ```mermaid
 flowchart TD
-    A["911/933 makeCall"] --> B{"Cached token?"}
-    B -- "No" --> C["Fetch inline, then POST"]
-    B -- "Yes, even past expiry" --> D["POST at once"]
-    D -- "401" --> E["One bounded fetch, then one retry"]
+    A["makeCall(destination)"] --> G{"_running and _connected?"}
+    G -- "no" --> F0["return false, nothing fetched or posted"]
+    G -- "yes" --> K{"classifyEmergencyDial: 911 or 933?"}
+    K -- "no" --> O["ensureToken(): refresh inline if near expiry"]
+    K -- "yes" --> SC["EmergencyScope held to the end of makeCall: no ordinary refresh starts"]
+    SC --> B{"sosFirstStep(haveCachedToken())"}
+    B -- "FetchThenPost: no token at all" --> C["fetchToken on the Emergency lane, within kSosTokenBudgetUs 3 s, result not checked"]
+    B -- "PostNow: any token, even past expiry" --> D["POST makecall"]
+    C --> D
+    O --> D
+    D --> DV["Device path answered 404 only: re-resolve device_id, retry, then legacy makecall"]
+    DV --> R{"911/933 and the POST answered 401?"}
+    R -- "no" --> OUT["Result used as is"]
+    R -- "yes" --> F1["sosRetryOn401: one fetchToken on the Emergency lane"]
+    F1 -- "fails" --> OUT2["The 401 result is returned: the call fails as any failed makecall"]
+    F1 -- "succeeds" --> RT["One retry of the latest POST URL, its result returned"]
 ```
 
 ## 2. What still allocates in fetchToken on the 911 lane [branch, TA.cpp:997-1183]
