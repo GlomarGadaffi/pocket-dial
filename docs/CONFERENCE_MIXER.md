@@ -225,9 +225,15 @@ must be lock-free and a leg leaving must never corrupt or silence the others. Th
 
 ```mermaid
 stateDiagram-v2
-    Free --> Active: attach() by CAS
-    Active --> Draining: detach() by CAS
-    Draining --> Free: tick() clears rings and stores Free
+    [*] --> Free
+    Free --> Active: MixBus attach() CAS Free to Active, from MediaBridge startBridge (MediaBridge.cpp line 71)
+    Free --> Free: attach() finds no Free slot and returns -1 (bus full)
+    Active --> Draining: MixBus detach() CAS Active to Draining, from MediaBridge releaseBusPortLocked (MediaBridge.cpp line 451)
+    Draining --> Free: conf_mix_tick calls tick() every 20 ms, clears both rings and stores Free (MixBus.cpp lines 71-77)
+    note right of Draining
+        inputFrame() and outputFrame() return false unless the port is Active
+        (MixBus.cpp lines 48 and 55)
+    end note
 ```
 
 The rule: the tick is the *sole owner of ring teardown*. Reclamation (clear rings → return
@@ -236,7 +242,7 @@ concurrent tick read. This maintains the invariant **"a `Free` slot has empty ri
 is why `attach()` need only flip the flag.
 
 ```cpp
-int MixBus::attach() {                          // cold path
+int MixBus attach() {                          // cold path
     for (int p = 0; p < MAX_PORTS; ++p) {
         State expected = State::Free;
         if (_ports[p].state.compare_exchange_strong(

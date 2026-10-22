@@ -27,7 +27,7 @@ Use this matrix for rapid triage based on visible device indicators and active d
 | :--- | :--- | :--- | :--- |
 | **Every API call rejected `403 setup_required`** | • `{"error":"setup_required"}`<br>• Even read-only routes refused<br>• `/api/admin/status` → `needsSetup:true` | • Board still on the shipped `admin`/`admin` default; forced first-use setup | • Log in `admin`/`admin`, then `POST /api/admin/set-credential` with a real username+password (§4.8) |
 | **API call rejected `403` CSRF** | • `{"error":"missing or invalid CSRF token"}`<br>• Script/`curl` that worked before | • Every mutating route requires the per-session `X-CSRF` header | • Capture `"csrf"` from the login response, resend with `-H "X-CSRF: …"` (§4.6) |
-| **Dashboard refuses connections** | • *Connection refused*, not `401`/timeout | • **A real fault**, the listener is unconditional; there is no window to reopen | • Verify the IP and that nothing local filters port 80 (§6). **`http_dashboard` is a FreeRTOS task name, not a log line.** It is the task name on `eth` and `lan8720` builds (`main/esp_main_eth.cpp:798`). The `wifi` build calls its task `http_server_task` (`main/esp_main.cpp:509`). Neither name is printed at boot, so do not wait for it |
+| **Dashboard refuses connections** | • *Connection refused*, not `401`/timeout | • **A real fault**, the listener is unconditional; there is no window to reopen | • Verify the IP and that nothing local filters port 80 (§6). **`http_dashboard` is a FreeRTOS task name, not a log line.** It is the task name on `eth` and `lan8720` builds (`main/esp_main_eth.cpp:814`). The `wifi` build calls its task `http_server_task` (`main/esp_main.cpp:525`). Neither name is printed at boot, so do not wait for it |
 | **Login returns `429`** | • `{"error":"too many failed attempts…"}`<br>• Correct password also refused | • Login lockout (5 fails) or aggregate backstop (20 fails), **escalating**. The 5-fail lockout is per client since #530, but the 20-fail backstop is per principal, so another host's guessing can still lock you out (§4.7) | • Wait it out (cooldown doubles per trip, caps ~16 min; only a correct login clears it), or power-cycle, the counters are in-RAM (§4.7) |
 | **Port 5060 dead, port 80 alive, `wifi`/`eth`/`lan8720` board never configured** | • `[boot] device unprovisioned — SIP stack held dark…` in the serial log<br>• Board reboots every ~30 min | • Boot provisioning gate: SIP is not started until a credential exists (**not** on the `display` build) | • Complete setup over HTTP; watch for `[boot] credential set — unblocking SIP stack` (§8) |
 | **Whole fleet de-registers at once** | • Every handset "not registered"<br>• `GET /api/registrar` → `"mode":"secure"`, empty roster | • Registrar switched to `secure` before any extension was adopted/secured | • `POST /api/registrar mode=learn`, the light-touch fix, and the one to reach for. Factory reset also clears `reg_mode` since #188 (§4.3), but wipes far more. **Note: "re-adopt, secure, then re-switch" cannot currently be completed**, there is no way to set a per-extension secret, so no device can be marked Secured; see [LEARN_MODE.md](LEARN_MODE.md) Step 4 |
@@ -132,11 +132,20 @@ An NVS erase therefore **re-opens the access point, returns the login to the `ad
 
 ```mermaid
 flowchart TD
-    A["Device power-on"] --> B["nvs_flash_init()"]
-    B -->|Success| C["Load saved Wi-Fi mode and register SIP client"]
-    B -->|"Error (pages corrupted)"| D["nvs_flash_erase()"]
-    D -->|Re-init| E["nvs_flash_init()"]
-    E --> F["Load default standalone SoftAP mode configuration"]
+    A["app_main, wifi build (main/esp_main.cpp:410)"] --> B["nvs_flash_init()"]
+    B -->|"ESP_OK"| S
+    B -->|"ESP_ERR_NVS_NO_FREE_PAGES or ESP_ERR_NVS_NEW_VERSION_FOUND (esp_main.cpp:411)"| D["ESP_ERROR_CHECK(nvs_flash_erase()), whole partition erased"]
+    B -->|"any other error"| X["ESP_ERROR_CHECK(ret) aborts, board reboots (esp_main.cpp:415)"]
+    D --> E["nvs_flash_init() again (esp_main.cpp:413)"]
+    E -->|"ESP_OK"| S["ensureSchemaVersion() then applyFlashSeed() (esp_main.cpp:417-431)"]
+    E -->|"error"| X
+    S --> T["Read storage/wifi_mode, default TOPOLOGY_INFRA when absent (esp_main.cpp:464-473)"]
+    T --> U["Read storage/provisioned, absent means 0 (esp_main.cpp:506-516)"]
+    U --> V["http_server_task starts (priority 4, 8192 B stack), always"]
+    V --> W{"provisioned?"}
+    W -->|"no"| Y["SIP held dark, poll AdminAuth every 2 s, esp_restart after 1800 s (esp_main.cpp:529-545)"]
+    Y -->|"credential set, provisioned=1 stored"| Z
+    W -->|"yes"| Z["sip_server_task starts, priority 5, 8192 B stack, core 1 (esp_main.cpp:559-561). The eth build names it sip_server"]
 ```
 
 ### Detection & Symptoms
@@ -411,15 +420,25 @@ OTA updates use dual application partitions (`ota_0` and `ota_1`) along with a d
 
 ```mermaid
 flowchart TD
-    A["Initialize OTA update sequence"] --> B["Stream binary via Wi-Fi/ETH"]
-    B --> C["Write binary to secondary partition ota_1"]
-    C --> D["Finish stream and verify hash"]
-    D --> E["Set boot partition to ota_1 and trigger reboot with esp_restart()"]
-    E --> F["Bootloader starts ota_1 app"]
-    F --> G{"Healthy for 5 s?"}
-    G -->|Yes| H["Mark app valid with OtaUpdater::markValid(); state ESP_OTA_IMG_VALID; firmware update committed"]
-    G -->|"No: failure or watchdog crash"| I["Bootloader detects crash or panic; state ESP_OTA_IMG_INVALID"]
-    I --> J["Roll back boot partition to ota_0"]
+    A["POST /api/ota/upload (HttpServer.cpp:8000 handleOtaUpload)"] --> L{"hasLiveCall()? (HttpServer.cpp:8014)"}
+    L -->|"yes: any call up or ringing, 911 included"| R["409 busy, call in progress. Nothing is written (issue 986)"]
+    L -->|"no"| B["OtaUpdater begin() then write() streams into the inactive slot (HttpServer.cpp:8030-8042)"]
+    B -->|"begin or write fails"| ER["Error reply, ota.abort() (HttpServer.cpp:8046)"]
+    B --> C{"ota.end() accepts the image? esp_ota_end (HttpServer.cpp:8053)"}
+    C -->|"no"| E422["422 image rejected"]
+    C -->|"yes"| D{"ota.activate() sets the boot partition? (HttpServer.cpp:8061)"}
+    D -->|"no"| E500["500 activate failed"]
+    D -->|"yes"| ST["Image staged, boot partition is not the running one. The upload does NOT reboot"]
+    ST --> RB["POST /api/ota/reboot, requireAdmin (HttpServer.cpp:1753, 8178)"]
+    RB --> H["ota_reboot task, 1 s delay, 4096 B stack, priority 5 (HttpServer.cpp:8217)"]
+    H --> EM{"hasLiveEmergencyCall()? (HttpServer.cpp:8209)"}
+    EM -->|"yes"| W["Restart held, polled every 1 s until the 911/933 call ends (issue 652)"]
+    W --> EM
+    EM -->|"no"| X["esp_restart()"]
+    X --> F["Bootloader starts the new slot in state ESP_OTA_IMG_PENDING_VERIFY"]
+    F --> G{"HTTP task loop survives 5 passes of 1 s? (esp_main.cpp:345, esp_main_eth.cpp:545)"}
+    G -->|"yes"| V["OtaUpdater markValid(): esp_ota_mark_app_valid_cancel_rollback (OtaUpdater.cpp:200)"]
+    G -->|"no: panic, watchdog or reset before confirm"| RO["Bootloader rolls back to the previous slot"]
 ```
 
 Production builds confirm the new image after 5 s of healthy operation. The bench-only rollback probe (`POCKETDIAL_OTA_ROLLBACK_PROBE`, `main/esp_main_eth.cpp`) waits 60 s and restarts without confirming, so the bootloader's rollback can be exercised.
@@ -557,7 +576,7 @@ The `eth` build has no SoftAP; none of this applies to it.
 
 **Symptom:** Port 80 answers at once and port 5060 answers nothing. No phone can register. The board reboots about every 30 minutes.
 
-**This is `app_main()`'s provisioning gate, working as designed.** The HTTP dashboard task is launched first and unconditionally. It has to be, since it is the only way to configure the device. The SIP task is not created until an admin credential has been committed (`main/esp_main_eth.cpp:800-828`, and the matching blocks in `main/esp_main.cpp:511-543` and `main/esp_main_eth_lan8720.cpp:557-585`).
+**This is `app_main()`'s provisioning gate, working as designed.** The HTTP dashboard task is launched first and unconditionally. It has to be, since it is the only way to configure the device. The SIP task is not created until an admin credential has been committed (`main/esp_main_eth.cpp:817-842`, and the matching blocks in `main/esp_main.cpp:529-558` and `main/esp_main_eth_lan8720.cpp:557-585`).
 
 The **`display`** build deliberately omits this. Its onboarding model is "up usable, secure later": it boots straight into its normal network role and starts SIP regardless of whether a credential exists (`main/esp_main_display.cpp:908` and `:951`). On a display board, a dead port 5060 is therefore a real fault, not a gate. See §3.
 
@@ -574,7 +593,7 @@ I (…) app_main: [boot] credential set — unblocking SIP stack
 ### Recovery
 Complete forced setup over HTTP (§4.8). The SIP task starts within a couple of seconds.
 
-- The wait is bounded: `kMaxCredentialWaitSec` is 1800 s, after which the board reboots and re-enters the same wait rather than hanging with no watchdog on the gate (`main/esp_main_eth.cpp:805-814`).
+- The wait is bounded: `kMaxCredentialWaitSec` is 1800 s, after which the board reboots and re-enters the same wait rather than hanging with no watchdog on the gate (`main/esp_main_eth.cpp:822-830`).
 - Once passed, the gate latches. The firmware writes `provisioned=1` into `storage` and skips the gate on later boots.
 - On ESP builds, **`POST /api/factory-reset`** erases the whole NVS partition, which clears the latch as well. A factory-reset board therefore comes back on `admin`/`admin` with the gate closed, and SIP stays down until a credential is set. The per-key clears alone would not clear the latch. If the whole-partition erase fails, the log says so and the latch can survive.
 - Only a whole-partition NVS erase re-arms the gate. That covers a factory reset on ESP, a manual erase, and an NVS auto-erase after corruption. This is why a corrupted-NVS incident can present as "the phones all died" on a board that was working yesterday (§2).
