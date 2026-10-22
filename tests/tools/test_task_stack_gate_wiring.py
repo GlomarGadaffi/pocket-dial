@@ -90,7 +90,10 @@ class StackGateWiring(unittest.TestCase):
         self.assertIn("\n    runs-on: ubuntu-latest\n", self.head + "\n")
         # The matrix's one IDF version is this job's container.
         version = re.search(r"idf-version: \[ '([^']+)' \]", self.matrix).group(1)
-        self.assertIn("\n      image: espressif/idf:" + version + "\n", self.head + "\n")
+        # Pinned by digest: the tag may be followed by @sha256:<64 hex>, so a re-pushed tag
+        # cannot change the compiler the gate measures.
+        self.assertRegex(self.head + "\n", r"\n      image: espressif/idf:" + re.escape(version) + r"(@sha256:[0-9a-f]{64})?\n")
+        self.assertRegex(self.head, r"@sha256:[0-9a-f]{64}$")
 
     def test_nothing_waits_for_it_and_the_matrix_job_is_untouched(self):
         # hil-244 needs build-esp-idf; a red gate must reach neither of them.
@@ -151,6 +154,16 @@ class StackGateWiring(unittest.TestCase):
         self.assertFalse(mine.startswith(ship_restore), (mine, ship_restore))
         self.assertFalse(ship.startswith(mine_restore), (ship, mine_restore))
         self.assertNotEqual(mine, ship)
+
+    def test_the_build_runs_with_ccache_off_and_the_cache_does_not_carry_ccache(self):
+        # A ccache hit need not reproduce the .ci/.su side files the flags ask for, so the gate
+        # could read an incomplete set. The env is on the build step; code() dropped the comments,
+        # so the YAML comment that explains it cannot satisfy this.
+        self.assertIn('          IDF_CCACHE_ENABLE: "0"\n', self.build + "\n")
+        self.assertNotIn("IDF_CCACHE_ENABLE", self.head)
+        cache = step_named(self.steps, "Cache ESP-IDF Build Artifacts")
+        self.assertNotIn("ccache", cache, "ccache is off, so there is nothing in ~/.ccache to restore")
+        self.assertRegex(cache, r"(?m)^          path: build$")
 
     def test_nothing_hides_the_red_and_nothing_is_uploaded(self):
         self.assertNotIn("continue-on-error", self.job)

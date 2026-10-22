@@ -758,7 +758,9 @@ jobs:
     needs: site-gate
     if: ${{ !cancelled() && needs.site-gate.outputs.code != 'false' }}
     container:
-      image: espressif/idf:v6.0.1
+      # Pinned by digest (the multi-arch index of the v6.0.1 tag on Docker Hub, 2026-10-22): a re-pushed tag
+      # cannot change the compiler this gate measures. The tag stays for the reader.
+      image: espressif/idf:v6.0.1@sha256:efc19fae2f52fc6873630c668da26aa834139a063b5fb73a46ebc0dbd217b587
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -773,9 +775,8 @@ jobs:
       - name: Cache ESP-IDF Build Artifacts
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.ccache
-            build
+          # No ~/.ccache: IDF_CCACHE_ENABLE=0 below, so nothing writes to it.
+          path: build
           key: ${{ runner.os }}-idf-callgraph-su-v6.0.1-esp32s3-eth-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-idf-callgraph-su-v6.0.1-esp32s3-eth-
