@@ -879,6 +879,16 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("big: 1900 B", out)
 
+    def test_checked_in_table_has_no_duplicate_keys(self):
+        # json.load keeps the last of two equal keys, so a second, empty indirect_allowlist once
+        # silently replaced the filled one.
+        def no_dups(pairs):
+            keys = [k for k, _ in pairs]
+            self.assertEqual(len(keys), len(set(keys)), sorted(k for k in keys if keys.count(k) > 1))
+            return dict(pairs)
+        with open(os.path.join(os.path.dirname(GATE), "task_stacks.json"), encoding="utf-8") as f:
+            json.load(f, object_pairs_hook=no_dups)
+
     def test_a_task_not_marked_bounded_stays_report_only(self):
         self.indirect_fixture(flag=False)
         rc, out = self.run_gate()
