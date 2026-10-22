@@ -132,7 +132,7 @@ sequenceDiagram
             P->>H: 503 Service Unavailable
             P->>N: correction, NOT ROUTED
         end
-    else no real anchor, not connected, or no free slot
+    else no real anchor, not connected, no free slot, or no PCMU offered
         P->>H: 503 Emergency Call Not Routable, Warning says why, no Retry-After
         P->>N: notification, NOT ROUTED and the reason
     end
