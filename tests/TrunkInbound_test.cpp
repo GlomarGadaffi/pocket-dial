@@ -1246,6 +1246,7 @@ namespace
 				"CSeq: 1 OPTIONS\r\n"
 				"Content-Length: 0\r\n\r\n";
 			b.handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(ip)));
+			b.sent.clear();   // `sent` holds pool messages; a long flood must not run the pool dry
 		}
 	}
 
@@ -1327,6 +1328,7 @@ TEST(TrunkInbound, AByeOnALive911DialogSurvivesTheHandsetsDrainedBucket)
 
 	EXPECT_FALSE(b.handler.getSession("Call-ID: rl-911-c").has_value())
 		<< "the BYE that ends a live 911 was dropped by the rate limiter";
+	EXPECT_FALSE(b.firstTo("SIP/2.0 200", kPhoneIp).empty()) << "the BYE was not answered 200 OK";
 
 	// The exemption is the live call's, not the Call-ID's forever: once the call ended it is gone.
 	const uint32_t before = b.handler.getDropProbe().rateCount();
@@ -1351,4 +1353,58 @@ TEST(TrunkInbound, AFloodingNonTrunkIpIsStillRateLimitedAndSpoofedHeadersBuyNoth
 	b.handler.handle(RequestsHandler::getMessageFromPool(
 		phoneBye("rl-not-live", field(ok, "To: "), "rlforged"), addrFor(kForgerIp)));
 	EXPECT_EQ(b.handler.getDropProbe().rateCount(), afterFlood + 2u);
+}
+
+// #1092 review: the trunk dialog's own Call-ID (what the carrier speaks on) must be in the
+// exempt set too. From an IP that is NOT the trunk peer, so the peer exemption cannot mask it.
+TEST(TrunkInbound, ACarrierByeOnALiveEmergencyTrunkDialogFromAnotherIpPassesADrainedBucket)
+{
+	Bench b;
+	const std::string fork = ringFork(b, "rl-in-psap");
+	ASSERT_FALSE(fork.empty());
+	b.handler.handle(handsetReply(fork, "SIP/2.0 180 Ringing"));
+	auto s = b.handler.getSession("Call-ID: " + field(fork, "Call-ID: "));
+	ASSERT_TRUE(s.has_value());
+	s.value()->setEmergency(true);   // as onInvite() flags a call inside #659's window
+	b.handler.handle(handsetReply(fork, "SIP/2.0 200 OK", kHandsetAnswer));
+	const std::string ok = b.firstTo("SIP/2.0 200 OK", kSbcIp);
+	ASSERT_FALSE(ok.empty());
+	b.handler.handle(makeCarrierAck(kDid, field(ok, "To: "), "rl-in-psap"));
+	floodOptions(b, kForgerIp, 60, "rl-cdrain-");
+	const uint32_t before = b.handler.getDropProbe().rateCount();
+
+	const std::string raw =
+		"BYE sip:" + std::string(kDid) + "@" + kServerIp + ":5060 SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + std::string(kForgerIp) + ":5060;branch=z9hG4bKrlcbye\r\n"
+		"From: <sip:+12025550177@" + kSbcIp + ">;tag=cfrl-in-psap\r\n"
+		"To: " + field(ok, "To: ") + "\r\n"
+		"Call-ID: rl-in-psap\r\n"
+		"CSeq: 2 BYE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Content-Length: 0\r\n\r\n";
+	b.handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(kForgerIp)));
+
+	EXPECT_EQ(b.handler.getDropProbe().rateCount(), before)
+		<< "the carrier's Call-ID on a live emergency dialog was not in the exempt set";
+}
+
+TEST(TrunkInbound, TheCarrierIpHasItsOwnHighCeilingBucketNotABlankCheque)
+{
+	Bench b;
+	floodOptions(b, kSbcIp, 500, "rl-spoof-");   // a source forged as the carrier
+	EXPECT_GE(b.handler.getDropProbe().rateCount(), 50u) << "the carrier bucket must still have a ceiling";
+}
+
+TEST(TrunkInbound, TheTrunkPeerIsKeptAcrossAResolverMissAndRetiredByReconfiguration)
+{
+	using S = TrunkResolver::Status;
+	EXPECT_EQ(RequestsHandler::nextTrunkPeerIp(7u, S::Hit, 9u), 9u);
+	EXPECT_EQ(RequestsHandler::nextTrunkPeerIp(7u, S::Hit, 0u), 7u) << "0.0.0.0 names no carrier";
+	for (const S st : { S::Pending, S::Failed, S::Refused })
+		EXPECT_EQ(RequestsHandler::nextTrunkPeerIp(7u, st, 0u), 7u) << "a miss must not demote the carrier";
+
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig(true, "203.0.113.99"));   // the operator moved the trunk
+	floodOptions(b, kSbcIp, 100, "rl-old-");
+	EXPECT_GE(b.handler.getDropProbe().rateCount(), 50u) << "the old carrier IP is an ordinary source again";
 }

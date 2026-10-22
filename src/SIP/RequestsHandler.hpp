@@ -124,6 +124,12 @@ public:
 	// #838: a datagram off the socket; see sipmsgpool::getMessageFromWire.
 	static std::shared_ptr<SipMessage> getMessageFromWire(std::string_view message, sockaddr_in src);
 
+	// #1092: the trunk peer IP the rate limiter treats as the carrier, given the
+	// current one and this pass's resolver answer. A Hit that names a carrier
+	// replaces it; every other answer (Pending, Failed, an expired cache entry)
+	// keeps it, so the carrier is not demoted while a re-resolve is in flight.
+	static uint32_t nextTrunkPeerIp(uint32_t current, TrunkResolver::Status st, uint32_t found);
+
 	// ── Media beachhead static helpers (pure; host-unit-tested) ──────────────────
 	// Build the server's own SDP body for the 440 answer (server media: PCMU on the
 	// server's RTP port). Pure formatter — exposed so tests can assert its body and

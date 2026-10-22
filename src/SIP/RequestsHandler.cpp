@@ -12155,6 +12155,12 @@ bool RequestsHandler::ipAllowed(const sockaddr_in& src) const
 	return (ip & _allowMask) == _allowNet;
 }
 
+uint32_t RequestsHandler::nextTrunkPeerIp(uint32_t current, TrunkResolver::Status st, uint32_t found)
+{
+	(void)current;
+	return st == TrunkResolver::Status::Hit ? found : 0;
+}
+
 bool RequestsHandler::emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId)
 {
 	// A Call-ID that does not fit is not stored truncated: a prefix would exempt other dialogs.
