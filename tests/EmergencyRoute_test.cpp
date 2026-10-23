@@ -2651,3 +2651,185 @@ TEST(EmergencyCallback, InboundPsapCallbackThatOneEndedCallCannotMakeRoomForEnds
 	EXPECT_TRUE(b.handler->getSession("Call-ID: er-967-hold").has_value());
 	EXPECT_NE(b.handler->anchorBridgeForCallIdForTest("Call-ID: er-967-hold"), nullptr);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #1107. The relay codec gate and the unknown-caller 403 sit ahead of the
+// emergency intercept in onInvite(). A 911/933 refused there reached neither the
+// EMERGENCY log nor the E911 notify list. Rule 5: the refusal may stand (no codec
+// to relay, no known caller) but the emergency path must see it.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace
+{
+	// An Opus-only offer: no PCMU, PCMA or G.722, so the relay codec gate refuses it.
+	std::shared_ptr<SipMessage> makeOpusInvite(const std::string& dialed, const std::string& callId,
+		const std::string& ext = "101", const std::string& ip = kHandsetIp,
+		const std::string& pt = "111", const std::string& rtpmap = "opus/48000/2")
+	{
+		const std::string body =
+			"v=0\r\n"
+			"o=- 0 0 IN IP4 " + ip + "\r\n"
+			"s=-\r\n"
+			"c=IN IP4 " + ip + "\r\n"
+			"t=0 0\r\n"
+			"m=audio 40000 RTP/AVP " + pt + "\r\n"
+			"a=rtpmap:" + pt + " " + rtpmap + "\r\n";
+		const std::string raw =
+			"INVITE sip:" + dialed + "@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKei" + callId + "\r\n"
+			"From: <sip:" + ext + "@server>;tag=ef" + callId + "\r\n"
+			"To: <sip:" + dialed + "@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:" + ext + "@" + ip + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		return RequestsHandler::getMessageFromPool(raw, addrFor(ip));
+	}
+
+	size_t countOf(const std::string& hay, const std::string& needle)
+	{
+		size_t n = 0;
+		for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + needle.size()))
+		{
+			++n;
+		}
+		return n;
+	}
+
+	// Front desk 200 on the notify list, then the INVITE; returns the stderr log.
+	std::string inviteAndCaptureLog(Bench& b, const std::shared_ptr<SipMessage>& invite)
+	{
+		b.handler->handle(makeRegister("200", "192.168.79.20"));
+		b.handler->setE911Config("200", "", "");
+		b.sent.clear();
+		testing::internal::CaptureStderr();
+		b.handler->handle(invite);
+		return testing::internal::GetCapturedStderr();
+	}
+
+	void expectEmergencyCodecRefusal(const char* number, const char* kind, const char* callId)
+	{
+		Bench b;
+		b.handler->setAnchorPlacesRealCallsForTest(true);
+		const std::string log = inviteAndCaptureLog(b, makeOpusInvite(number, callId));
+
+		EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
+		EXPECT_EQ(b.count("SIP/2.0 488"), 0u) << b.dump();
+		EXPECT_TRUE(b.saw("no G.711 codec offered")) << b.dump();
+		EXPECT_EQ(countOf(log, std::string("EMERGENCY: ") + kind + " dialed by 101"), 1u) << log;
+		ASSERT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+		EXPECT_TRUE(b.saw("NOT ROUTED")) << b.dump();
+	}
+}
+
+TEST(EmergencyCodecGate, A911WithAnOpusOnlyOfferGetsTheEmergency503LogAndNotRoutedNotice)
+{
+	expectEmergencyCodecRefusal("911", "911", "er-1107-911");
+}
+
+TEST(EmergencyCodecGate, A933WithAnOpusOnlyOfferGetsTheEmergency503LogAndNotRoutedNotice)
+{
+	expectEmergencyCodecRefusal("933", "TEST 933", "er-1107-933");
+}
+
+TEST(EmergencyCodecGate, A911WithAnOpusOnlyOfferOnALoopbackOnlyBoardStillNamesTheCodec)
+{
+	Bench b;   // route None: the codec problem is the reason given, not the missing route
+	const std::string log = inviteAndCaptureLog(b, makeOpusInvite("911", "er-1107-loop"));
+
+	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
+	EXPECT_TRUE(b.saw("no G.711 codec offered")) << b.dump();
+	EXPECT_EQ(countOf(log, "EMERGENCY: 911 dialed by 101"), 1u) << log;
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+}
+
+TEST(EmergencyCodecGate, ANonEmergencyOpusOnlyOfferStillGets488WithTheSameWarning)
+{
+	Bench b;
+	b.handler->handle(makeRegister("102", "192.168.79.12"));
+	const std::string log = inviteAndCaptureLog(b, makeOpusInvite("102", "er-1107-plain"));
+
+	EXPECT_EQ(b.count("SIP/2.0 488 Not Acceptable Here"), 1u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 503"), 0u) << b.dump();
+	EXPECT_TRUE(b.saw("Warning: 304 192.168.79.1 \"No compatible audio codec (PCMU/PCMA/G722)\"")) << b.dump();
+	EXPECT_EQ(countOf(log, "EMERGENCY"), 0u) << log;
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 0u) << b.dump();
+}
+
+TEST(EmergencyCodecGate, A911FromAnUnknownCallerIsStill403ButReachesTheEmergencyPath)
+{
+	// Whether an unregistered device's 911 should be ROUTED is the maintainer's
+	// call (#1107); this pins only that the refusal is no longer silent.
+	Bench b;
+	const std::string log = inviteAndCaptureLog(b, makeInvite("911", "er-1107-unknown", 0, "999"));
+
+	EXPECT_EQ(b.count("SIP/2.0 403 Forbidden"), 1u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 503"), 0u) << b.dump();
+	EXPECT_EQ(countOf(log, "EMERGENCY: 911 dialed by 999"), 1u) << log;
+	ASSERT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+	EXPECT_TRUE(b.saw("NOT ROUTED")) << b.dump();
+}
+
+TEST(EmergencyCodecGate, ANonEmergencyCallFromAnUnknownCallerIsStill403AndSilentToTheEmergencyPath)
+{
+	Bench b;
+	b.handler->handle(makeRegister("102", "192.168.79.12"));
+	const std::string log = inviteAndCaptureLog(b, makeInvite("102", "er-1107-unknown-plain", 0, "999"));
+
+	EXPECT_EQ(b.count("SIP/2.0 403 Forbidden"), 1u) << b.dump();
+	EXPECT_EQ(countOf(log, "EMERGENCY"), 0u) << log;
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 0u) << b.dump();
+}
+
+// #1107 review: the same refusals when a dial-plan Trunk rule makes the 911, and the
+// G.722-only offer that passes the relay gate and is refused by the anchor's G.711 gate.
+
+TEST(EmergencyCodecGate, ARuleProduced911WithAnOpusOnlyOfferGetsTheEmergency503AndTheRuleLogLine)
+{
+	Bench b;
+	b.handler->setAnchorPlacesRealCallsForTest(true);
+	b.handler->setDialRule("0", "trunk", "911", 1);
+	const std::string log = inviteAndCaptureLog(b, makeOpusInvite("0", "er-1107-rule-opus"));
+
+	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 488"), 0u) << b.dump();
+	EXPECT_TRUE(b.saw("no G.711 codec offered")) << b.dump();
+	EXPECT_EQ(countOf(log, "EMERGENCY: a dial-plan rule turned 0 into 911; routing it as an emergency call"), 1u)
+		<< log;
+	EXPECT_EQ(countOf(log, "EMERGENCY: 911 dialed by 101"), 1u) << log;
+	ASSERT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+	EXPECT_TRUE(b.saw("NOT ROUTED")) << b.dump();
+}
+
+TEST(EmergencyCodecGate, ARuleProduced911FromAnUnknownCallerIs403AndNotifiesTheNumberTheRuleMade)
+{
+	// "0" -> "9911": the notification names what the rule produced ("as 9911"), as the
+	// emergency intercept and the codec path do, never the raw "0".
+	Bench b;
+	b.handler->setDialRule("0", "trunk", "9911", 1);
+	const std::string log = inviteAndCaptureLog(b, makeInvite("0", "er-1107-rule-unknown", 0, "999"));
+
+	EXPECT_EQ(b.count("SIP/2.0 403 Forbidden"), 1u) << b.dump();
+	EXPECT_EQ(countOf(log, "EMERGENCY: 911 dialed by 999"), 1u) << log;
+	ASSERT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+	EXPECT_TRUE(b.saw("(as 9911)")) << b.dump();
+	EXPECT_FALSE(b.saw("(as 0)")) << b.dump();
+}
+
+TEST(EmergencyCodecGate, A911WithAG722OnlyOfferIsRefusedByTheAnchorsG711GateWithTheEmergency503)
+{
+	// Pins today's behaviour: G.722 passes the relay gate, then the anchor leg refuses it.
+	Bench b;
+	b.handler->setAnchorPlacesRealCallsForTest(true);
+	const std::string log = inviteAndCaptureLog(b, makeOpusInvite("911", "er-1107-g722", "101",
+		kHandsetIp, "9", "G722/8000"));
+
+	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 488"), 0u) << b.dump();
+	EXPECT_TRUE(b.saw("no G.711 codec offered")) << b.dump();
+	EXPECT_EQ(countOf(log, "EMERGENCY: 911 dialed by 101"), 1u) << log;
+	ASSERT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+	EXPECT_TRUE(b.saw("NOT ROUTED")) << b.dump();
+}

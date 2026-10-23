@@ -2070,9 +2070,27 @@ private:
 		const std::string& fromExt, const std::string& dialed, bool routed,
 		std::string_view note = {}, bool callUp = false);
 
+	// #1107: `noRelayableCodec` is set by onInvite's relay codec gate for an emergency
+	// INVITE whose offer this PBX cannot carry. It skips the route and goes straight to
+	// the 503 below, with the codec named, the EMERGENCY log line and the routed=false
+	// notification; the anchor would refuse that offer anyway.
 	void routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller,
-		const pbx::EmergencyDial& emergency, const std::string& dialed);
+		const pbx::EmergencyDial& emergency, const std::string& dialed,
+		bool noRelayableCodec = false);
+
+	// #1107: the emergency number `dialed` names, directly or through a dial-plan Trunk
+	// rule (the two forms onInvite's intercept takes). False for anything else.
+	// Caller holds _mutex.
+	bool emergencyDialOf(const std::string& dialed, pbx::EmergencyDial& emergencyOut,
+		std::string& asDialedOut) const;
+	// #1107: onInvite's codec gate, for an emergency dial. True when it took the INVITE.
+	bool routeCodecRefusedEmergency(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<SipClient>& caller, const std::string& dialed);
+	// #1107: onInvite's 403 for an unknown caller, for an emergency dial: the status
+	// stands, the EMERGENCY log line and the routed=false notification are added.
+	void noteUnregisteredEmergencyDial(const std::shared_ptr<SipMessage>& data,
+		const std::string& dialed);
 
 	// #659: a call to `ext` is a PSAP callback (ext dialed 911/933 within
 	// pbx::kEmergencyCallbackWindow). Every path that creates a session for an
