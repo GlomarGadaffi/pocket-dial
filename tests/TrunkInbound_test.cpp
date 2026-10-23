@@ -1345,8 +1345,9 @@ TEST(TrunkInbound, AFloodingNonTrunkIpIsStillRateLimitedAndSpoofedHeadersBuyNoth
 	const uint32_t afterFlood = b.handler.getDropProbe().rateCount();
 	EXPECT_GE(afterFlood, 50u) << "100 packets against a burst of 40: most must be refused";
 
-	// To: 911 and an unknown Call-ID is a header anyone can write; it is not an exemption.
-	b.handler.handle(makeInvite("911", "911", "rl-forged-911", kForgerIp, true, "+12025550177"));
+	// To: 911 and an unknown Call-ID is a header anyone can write; it is not an exemption
+	// (the Request-URI is what earns the emergency INVITE budget; see the #1092 follow-up tests).
+	b.handler.handle(makeInvite("2002", "911", "rl-forged-911", kForgerIp, true, "+12025550177"));
 	EXPECT_EQ(b.handler.getDropProbe().rateCount(), afterFlood + 1u);
 
 	// A BYE on a Call-ID that is not a live emergency session is limited like any other.

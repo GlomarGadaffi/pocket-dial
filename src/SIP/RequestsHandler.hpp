@@ -3293,10 +3293,43 @@ private:
 	RateBucket _trunkBucket{ 0.0, {} };   // guarded by _rateMutex; reset when _trunkPeerIp changes
 	static bool takeToken(RateBucket& bucket, std::chrono::steady_clock::time_point now,
 		double burst, double perSec);
+
+	// #1092 follow-up: a handset's FIRST 911 INVITE has no session yet, and the handset is not
+	// the trunk peer, so neither exemption above can admit it. Two more, same locking.
+	//   (c) every registered extension's source IPv4 gets a RESERVED slot (fixed array, one per
+	//       client): it keeps a normal burst-40 bucket but is never refused for lack of a slot in
+	//       the 256-entry table, so spoofed sources filling the table cannot lock a real handset
+	//       out. Buckets carry over each rebuild; they are never reset to full by it.
+	//   (d) an INVITE whose REQUEST-URI user part is 911/933 (classifyEmergencyDial) may spend a
+	//       tiny separate budget when the ordinary bucket would drop it: burst 4, 1 per 10 s. A
+	//       registered source has its own; every unregistered source shares ONE, so a spoofer
+	//       gains kEmergencyInviteBurst packets in total however many addresses it forges. The To
+	//       header is not consulted (spoofable, #1108).
+	static constexpr size_t kMaxRateRegisteredSources = POCKETDIAL_MAX_CLIENTS;
+	static_assert(kMaxRateRegisteredSources > 0 && kMaxRateRegisteredSources <= 255,
+		"one reserved limiter slot per client");
+	static constexpr double kEmergencyInviteBurst  = 4.0;
+	static constexpr double kEmergencyInvitePerSec = 0.1;
+	struct RateSource
+	{
+		uint32_t ip = 0;   // network-order s_addr; 0 = unused
+		RateBucket ordinary{ 0.0, {} };
+		RateBucket emergency{ 0.0, {} };
+	};
+	// Caller holds _rateMutex. Null when `ip` is not a registered extension's source.
+	RateSource* findRateSource(uint32_t ip);
+	// Caller holds _rateMutex. The whole admission decision for one inbound packet.
+	bool admitPacket(const SipMessage& m);
+	bool allowEmergencyInvite(const SipMessage& m, const sockaddr_in& src);
+	// Caller holds _mutex.
+	void publishRegisteredSources();
 	// #1092: both guarded by _rateMutex. 0 = no trunk peer known (never matches).
 	uint32_t _trunkPeerIp = 0;   // network-order s_addr
 	EmergencyCallIds _emergencyCallIds;
 	EmergencyCallIds _emergencyIdsScratch;   // publishRateExemptions() build area; guarded by _mutex
+	std::array<RateSource, kMaxRateRegisteredSources> _rateSources{};          // guarded by _rateMutex
+	std::array<RateSource, kMaxRateRegisteredSources> _rateSourcesScratch{};   // build area; guarded by _mutex
+	RateBucket _unregisteredEmergency{ 0.0, {} };   // guarded by _rateMutex
 	// Optional CIDR allowlist (host order). _allowMask == 0 means "no allowlist".
 	uint32_t _allowNet  = 0;
 	uint32_t _allowMask = 0;
