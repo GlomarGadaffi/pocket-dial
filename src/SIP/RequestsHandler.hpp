@@ -638,6 +638,13 @@ public:
 	// #463: tick() runs at most once a second; this lets a test drive two passes
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
+	// #1092: forget one source's bucket-table entry (network-order s_addr), as tick()'s idle
+	// sweep does after 60 s, so a test can hold the table full with that source absent.
+	void eraseRateBucketForTest(uint32_t netIp)
+	{
+		std::lock_guard<std::mutex> rlock(_rateMutex);
+		_rateBuckets.erase(netIp);
+	}
 	// #986: hold _mutex for `d`, as a slow NVS commit or PIN hash would. Host builds
 	// only. Defined in the .cpp so every call is one site however the caller is inlined.
 	void holdMutexForTest(std::chrono::milliseconds d);

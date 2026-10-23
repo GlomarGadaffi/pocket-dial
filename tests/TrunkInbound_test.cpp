@@ -1408,3 +1408,101 @@ TEST(TrunkInbound, TheTrunkPeerIsKeptAcrossAResolverMissAndRetiredByReconfigurat
 	floodOptions(b, kSbcIp, 100, "rl-old-");
 	EXPECT_GE(b.handler.getDropProbe().rateCount(), 50u) << "the old carrier IP is an ordinary source again";
 }
+
+// ── #1092 follow-up: a handset's FIRST 911 INVITE must clear the per-source limiter ──
+//
+// No session exists yet for the initial INVITE, so the live-Call-ID exemption cannot help, and
+// the handset is not the trunk peer. Its own drained bucket, or a table filled by spoofed
+// sources, used to refuse it. Admission is read off the drop probe's rate counter: the limiter
+// is the only thing that bumps it.
+
+namespace
+{
+	// Hold the 256-entry table full with kExt's phone absent from it.
+	void fillTableWithoutPhone(Bench& b)
+	{
+		for (size_t i = 0; i < kRlTableCap + 20; ++i)
+		{
+			floodOptions(b, "10.88." + std::to_string(i / 250) + "." + std::to_string(i % 250 + 1), 1,
+				"rl2-fill-" + std::to_string(i) + "-");
+		}
+		b.handler.eraseRateBucketForTest(inet_addr(kPhoneIp));
+		floodOptions(b, "10.89.0.1", 1, "rl2-refill-");   // the freed slot goes to a spoofer
+		b.sent.clear();
+	}
+
+	// `n` INVITEs to `ruriUser` from `ip`; returns how many the limiter let through.
+	uint32_t inviteAdmitted(Bench& b, const std::string& ip, const std::string& ruriUser,
+		const std::string& toUser, size_t n, const std::string& tag)
+	{
+		const uint32_t before = b.handler.getDropProbe().rateCount();
+		for (size_t i = 0; i < n; ++i)
+		{
+			b.handler.handle(makeInvite(ruriUser, toUser, tag + std::to_string(i), ip, true, kExt));
+			b.sent.clear();
+		}
+		return static_cast<uint32_t>(n) - (b.handler.getDropProbe().rateCount() - before);
+	}
+}
+
+TEST(TrunkInbound, AHandsetsFirst911InviteIsAdmittedAfterItsOwnBucketDrained)
+{
+	Bench b;
+	floodOptions(b, kPhoneIp, 100, "rl2-drain911-");
+	EXPECT_EQ(inviteAdmitted(b, kPhoneIp, "911", "911", 1, "rl2-h911-"), 1u)
+		<< "the handset's initial 911 INVITE was refused by its own drained bucket";
+}
+
+TEST(TrunkInbound, AHandsetsFirst933InviteIsAdmittedAfterItsOwnBucketDrained)
+{
+	Bench b;
+	floodOptions(b, kPhoneIp, 100, "rl2-drain933-");
+	EXPECT_EQ(inviteAdmitted(b, kPhoneIp, "933", "933", 1, "rl2-h933-"), 1u)
+		<< "the handset's initial 933 INVITE was refused by its own drained bucket";
+}
+
+TEST(TrunkInbound, ARegisteredHandsets911InviteIsAdmittedWhenSpoofedSourcesFillTheTable)
+{
+	Bench b;
+	fillTableWithoutPhone(b);
+	EXPECT_EQ(inviteAdmitted(b, kPhoneIp, "911", "911", 1, "rl2-full911-"), 1u)
+		<< "a full table gave the registered handset's 911 INVITE the fail-safe drop";
+}
+
+TEST(TrunkInbound, ARegisteredHandsetsOrdinaryInviteGetsItsOwnBucketWhenTheTableIsFull)
+{
+	Bench b;
+	fillTableWithoutPhone(b);
+	EXPECT_EQ(inviteAdmitted(b, kPhoneIp, "2002", "2002", 1, "rl2-fullord-"), 1u)
+		<< "a registered handset was refused for lack of a table slot";
+	// It is still limited like any source: its own bucket, burst 40, not a free pass.
+	EXPECT_LT(inviteAdmitted(b, kPhoneIp, "2002", "2002", 100, "rl2-fullflood-"), 60u);
+}
+
+TEST(TrunkInbound, AnUnregisteredSourceFlooding911GetsExactlyTheTinyBudget)
+{
+	Bench b;
+	floodOptions(b, kForgerIp, 100, "rl2-drainF-");   // its ordinary bucket is empty
+	EXPECT_EQ(inviteAdmitted(b, kForgerIp, "911", "911", 30, "rl2-forge911-"), 4u)
+		<< "burst 4 emergency INVITEs, then dropped";
+}
+
+TEST(TrunkInbound, AForgedTo911WithANonEmergencyRequestUriIsStillLimited)
+{
+	Bench b;
+	floodOptions(b, kPhoneIp, 100, "rl2-drainT-");
+	EXPECT_EQ(inviteAdmitted(b, kPhoneIp, "2002", "911", 10, "rl2-to911-"), 0u)
+		<< "To: 911 is a header anyone can write; only the Request-URI earns the budget";
+}
+
+TEST(TrunkInbound, ANonEmergencyFloodFromARegisteredIpIsStillLimited)
+{
+	Bench b;
+	floodOptions(b, kPhoneIp, 100, "rl2-flood-");
+	EXPECT_GE(b.handler.getDropProbe().rateCount(), 50u);
+	EXPECT_EQ(inviteAdmitted(b, kPhoneIp, "2002", "2002", 10, "rl2-ordinv-"), 0u);
+	// The emergency budget is for INVITEs only: a non-INVITE aimed at 911 buys nothing.
+	const uint32_t before = b.handler.getDropProbe().rateCount();
+	floodOptions(b, kPhoneIp, 5, "rl2-opt-");
+	EXPECT_EQ(b.handler.getDropProbe().rateCount(), before + 5u);
+}
