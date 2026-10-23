@@ -638,6 +638,13 @@ public:
 	// #463: tick() runs at most once a second; this lets a test drive two passes
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
+	// #1092: the shared unregistered emergency INVITE budget as it stands, untouched by any
+	// packet. It must start FULL: a bucket stamped at the clock epoch refills from boot on ESP.
+	double unregisteredEmergencyTokensForTest()
+	{
+		std::lock_guard<std::mutex> rlock(_rateMutex);
+		return _unregisteredEmergency.tokens;
+	}
 	// #1092: forget one source's bucket-table entry (network-order s_addr), as tick()'s idle
 	// sweep does after 60 s, so a test can hold the table full with that source absent.
 	void eraseRateBucketForTest(uint32_t netIp)

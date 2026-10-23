@@ -1232,7 +1232,8 @@ namespace
 
 	// `n` OPTIONS from `ip`, each its own Call-ID. A valid message that no
 	// handler answers with anything but a 200, so only the limiter can stop it.
-	void floodOptions(Bench& b, const std::string& ip, size_t n, const std::string& tag)
+	void floodOptions(Bench& b, const std::string& ip, size_t n, const std::string& tag,
+		const std::string& target = "server")
 	{
 		for (size_t i = 0; i < n; ++i)
 		{
@@ -1248,6 +1249,19 @@ namespace
 			b.handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(ip)));
 			b.sent.clear();   // `sent` holds pool messages; a long flood must not run the pool dry
 		}
+	}
+
+	// `n` INVITEs to `ruriUser` from `ip`; returns how many the limiter let through.
+	uint32_t inviteAdmitted(Bench& b, const std::string& ip, const std::string& ruriUser,
+		const std::string& toUser, size_t n, const std::string& tag)
+	{
+		const uint32_t before = b.handler.getDropProbe().rateCount();
+		for (size_t i = 0; i < n; ++i)
+		{
+			b.handler.handle(makeInvite(ruriUser, toUser, tag + std::to_string(i), ip, true, kExt));
+			b.sent.clear();
+		}
+		return static_cast<uint32_t>(n) - (b.handler.getDropProbe().rateCount() - before);
 	}
 
 	// 2001 dials 911 and the anchor places it, then a callback window is open on
@@ -1337,7 +1351,7 @@ TEST(TrunkInbound, AByeOnALive911DialogSurvivesTheHandsetsDrainedBucket)
 	EXPECT_EQ(b.handler.getDropProbe().rateCount(), before + 1u) << "an ended call's Call-ID is limited again";
 }
 
-TEST(TrunkInbound, AFloodingNonTrunkIpIsStillRateLimitedAndSpoofedHeadersBuyNothing)
+TEST(TrunkInbound, AFloodingNonTrunkIpIsStillRateLimitedAndAForgedTo911IsBoundedByTheTinyBudget)
 {
 	Bench b;
 	const std::string ok = live911(b, "rl-911-d");
@@ -1345,15 +1359,17 @@ TEST(TrunkInbound, AFloodingNonTrunkIpIsStillRateLimitedAndSpoofedHeadersBuyNoth
 	const uint32_t afterFlood = b.handler.getDropProbe().rateCount();
 	EXPECT_GE(afterFlood, 50u) << "100 packets against a burst of 40: most must be refused";
 
-	// To: 911 and an unknown Call-ID is a header anyone can write; it is not an exemption
-	// (the Request-URI is what earns the emergency INVITE budget; see the #1092 follow-up tests).
-	b.handler.handle(makeInvite("2002", "911", "rl-forged-911", kForgerIp, true, "+12025550177"));
-	EXPECT_EQ(b.handler.getDropProbe().rateCount(), afterFlood + 1u);
+	// onInvite routes on To, so a forged To: 911 spends the emergency INVITE budget like a
+	// Request-URI 911 (the same shared burst of 4, so a forger gains nothing extra). It is not
+	// an exemption: the 10 INVITEs get exactly the budget, no more.
+	EXPECT_EQ(inviteAdmitted(b, kForgerIp, "2002", "911", 10, "rl-forged-911"), 4u);
+	const uint32_t afterInvites = b.handler.getDropProbe().rateCount();
+	EXPECT_EQ(afterInvites, afterFlood + 6u);
 
 	// A BYE on a Call-ID that is not a live emergency session is limited like any other.
 	b.handler.handle(RequestsHandler::getMessageFromPool(
 		phoneBye("rl-not-live", field(ok, "To: "), "rlforged"), addrFor(kForgerIp)));
-	EXPECT_EQ(b.handler.getDropProbe().rateCount(), afterFlood + 2u);
+	EXPECT_EQ(b.handler.getDropProbe().rateCount(), afterInvites + 1u);
 }
 
 // #1092 review: the trunk dialog's own Call-ID (what the carrier speaks on) must be in the
@@ -1431,19 +1447,6 @@ namespace
 		floodOptions(b, "10.89.0.1", 1, "rl2-refill-");   // the freed slot goes to a spoofer
 		b.sent.clear();
 	}
-
-	// `n` INVITEs to `ruriUser` from `ip`; returns how many the limiter let through.
-	uint32_t inviteAdmitted(Bench& b, const std::string& ip, const std::string& ruriUser,
-		const std::string& toUser, size_t n, const std::string& tag)
-	{
-		const uint32_t before = b.handler.getDropProbe().rateCount();
-		for (size_t i = 0; i < n; ++i)
-		{
-			b.handler.handle(makeInvite(ruriUser, toUser, tag + std::to_string(i), ip, true, kExt));
-			b.sent.clear();
-		}
-		return static_cast<uint32_t>(n) - (b.handler.getDropProbe().rateCount() - before);
-	}
 }
 
 TEST(TrunkInbound, AHandsetsFirst911InviteIsAdmittedAfterItsOwnBucketDrained)
@@ -1477,7 +1480,7 @@ TEST(TrunkInbound, ARegisteredHandsetsOrdinaryInviteGetsItsOwnBucketWhenTheTable
 	EXPECT_EQ(inviteAdmitted(b, kPhoneIp, "2002", "2002", 1, "rl2-fullord-"), 1u)
 		<< "a registered handset was refused for lack of a table slot";
 	// It is still limited like any source: its own bucket, burst 40, not a free pass.
-	EXPECT_LT(inviteAdmitted(b, kPhoneIp, "2002", "2002", 100, "rl2-fullflood-"), 60u);
+	EXPECT_EQ(inviteAdmitted(b, kPhoneIp, "2002", "2002", 100, "rl2-fullflood-"), 39u);   // burst 40 in all, one spent above
 }
 
 TEST(TrunkInbound, AnUnregisteredSourceFlooding911GetsExactlyTheTinyBudget)
@@ -1488,12 +1491,20 @@ TEST(TrunkInbound, AnUnregisteredSourceFlooding911GetsExactlyTheTinyBudget)
 		<< "burst 4 emergency INVITEs, then dropped";
 }
 
-TEST(TrunkInbound, AForgedTo911WithANonEmergencyRequestUriIsStillLimited)
+TEST(TrunkInbound, ATo911WithANonEmergencyRequestUriSpendsTheSameTinyBudget)
 {
 	Bench b;
 	floodOptions(b, kPhoneIp, 100, "rl2-drainT-");
-	EXPECT_EQ(inviteAdmitted(b, kPhoneIp, "2002", "911", 10, "rl2-to911-"), 0u)
-		<< "To: 911 is a header anyone can write; only the Request-URI earns the budget";
+	EXPECT_EQ(inviteAdmitted(b, kPhoneIp, "2002", "911", 10, "rl2-to911-"), 4u)
+		<< "onInvite routes on To, so a real To: 911 call must get the budget; no more than it";
+	EXPECT_EQ(inviteAdmitted(b, kPhoneIp, "2002", "2002", 10, "rl2-to2002-"), 0u)
+		<< "neither header is an emergency number: limited";
+}
+
+TEST(TrunkInbound, TheUnregisteredEmergencyBudgetStartsFullNotAtTheClockEpoch)
+{
+	Bench b;
+	EXPECT_EQ(b.handler.unregisteredEmergencyTokensForTest(), 4.0);
 }
 
 TEST(TrunkInbound, ANonEmergencyFloodFromARegisteredIpIsStillLimited)
@@ -1504,7 +1515,7 @@ TEST(TrunkInbound, ANonEmergencyFloodFromARegisteredIpIsStillLimited)
 	EXPECT_EQ(inviteAdmitted(b, kPhoneIp, "2002", "2002", 10, "rl2-ordinv-"), 0u);
 	// The emergency budget is for INVITEs only: a non-INVITE aimed at 911 buys nothing.
 	const uint32_t before = b.handler.getDropProbe().rateCount();
-	floodOptions(b, kPhoneIp, 5, "rl2-opt-");
+	floodOptions(b, kPhoneIp, 5, "rl2-opt-", std::string("911@") + kServerIp);
 	EXPECT_EQ(b.handler.getDropProbe().rateCount(), before + 5u);
 }
 
