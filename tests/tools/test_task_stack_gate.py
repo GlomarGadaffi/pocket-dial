@@ -1067,6 +1067,49 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("FAIL frame: library callee with no frame data", out)
 
+    # A target pattern of the form `X::(?:a|b)\(` names several functions: each alternative is checked on
+    # its own, so one that is not in the image fails the gate instead of riding on its siblings.
+    def test_every_alternative_of_a_target_pattern_must_match_a_function(self):
+        self.indirect_fixture()
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {
+            "targets": [r"SlowSink::(?:write|gone)\("], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("alternative 'gone'", out)
+        self.assertNotIn("alternative 'write'", out)
+        self.add_ci(node("gone", "void SlowSink::gone()", 10))
+        self.assertEqual(self.run_gate()[0], 0)
+
+    # A row whose targets matched nothing bounds nothing, so its caller is not counted as bounded.
+    def test_a_row_that_resolved_no_target_does_not_count_its_caller_as_bounded(self):
+        self.indirect_fixture()
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {
+            "targets": [r"NoSuchSink::write\("], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("1 function(s) reachable make one, 0 bounded", out)
+        self.assertIn("1 reachable indirect call site(s) have no indirect_allowlist row", out)
+        self.table["indirect_allowlist"][r"void mid\(\)"]["targets"] = []
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 function(s) reachable make one, 1 bounded", out)
+
+    def test_the_report_counts_the_block_operations_a_task_reaches(self):
+        self.add_ci(node("ind", "Indirect Call Placeholder", 0) + node("memcpy", "memcpy", 10)
+                    + edge("mid", "ind") + edge("helper", "ind"))
+        self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("block operations (unlabelled placeholder edges, charged as memcpy): 2 function(s) reachable", out.split("big:")[1])
+        self.assertIn("block operations (unlabelled placeholder edges, charged as memcpy): 0 function(s) reachable", out.split("small:")[1].split("big:")[0])
+
+    def test_a_cycle_member_with_no_name_is_shown_by_its_title(self):
+        self.add_ci(node("_ZL3foov", ")", 8) + node("other", "void other()", 8)
+                    + edge("mid", "_ZL3foov") + edge("_ZL3foov", "other") + edge("other", "_ZL3foov"))
+        self.table["recursion_allowlist"] = {"void other()": {"depth": 1, "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertIn("nameless member: title _ZL3foov", out)
+
     def test_a_failing_cycle_lists_every_member(self):
         names = [f"void Ring{i}()" for i in range(7)]
         self.add_ci("".join(node(f"r{i}", n, 8) for i, n in enumerate(names))

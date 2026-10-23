@@ -128,6 +128,19 @@ ALIAS_NODE_RE = re.compile(r'node:\s*\{\s*title:\s*"([^"]+)"\s*label:\s*"[^"]*"\
 EDGE_LABEL_RE = re.compile(r'edge:\s*\{\s*sourcename:\s*"([^"]+)"\s*targetname:\s*"([^"]+)"(?:\s*label:\s*"([^"]*)")?')
 
 
+ALT_GROUP_RE = re.compile(r"\(\?:([\w:~<>]+(?:\|[\w:~<>]+)+)\)")
+
+
+def alternatives(pat):
+    """[(alternative, pattern with only that alternative)] for the first `(?:a|b|c)` group of plain names in
+    `pat`, or [(None, pat)] when it has none. A row names several functions this way; the gate checks each
+    one, so a name that is not in the image cannot hide behind its siblings."""
+    m = ALT_GROUP_RE.search(pat)
+    if not m:
+        return [(None, pat)]
+    return [(a, pat[:m.start()] + "(?:" + a + ")" + pat[m.end():]) for a in m.group(1).split("|")]
+
+
 def short_site(label):
     """A call position without the build machine's prefix: from the last components/, managed_components/,
     src/ or main/ directory on, else the last three path elements."""
@@ -374,13 +387,23 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             rc_rows = 1
             print(f"FAIL indirect_allowlist row '{k}': matches no function that makes an indirect call")
         hit = []
+        resolved = False
         for pat in tg:
             rx = re.compile(pat)
             # The "[with ...]" note is searched only by a pattern that spells it out.
             note = "[with " in pat
-            found = sorted(x for x in nodes if x not in ind
-                           and rx.search(pretty(nodes[x]) if note else head(pretty(nodes[x]))))
-            if not found:
+
+            def find(r, note=note):
+                return sorted(x for x in nodes if x not in ind
+                              and r.search(pretty(nodes[x]) if note else head(pretty(nodes[x]))))
+            found = find(rx)
+            alts = alternatives(pat)
+            if len(alts) > 1:
+                for a, ap in alts:
+                    if not find(re.compile(ap)):
+                        rc_rows = 1
+                        print(f"FAIL indirect_allowlist row '{k}': target alternative '{a}' (of '{pat}') matches no function, so it bounds nothing")
+            elif not found:
                 rc_rows = 1
                 print(f"FAIL indirect_allowlist row '{k}': target '{pat}' matches no function, so it bounds nothing")
                 # Show what the graph calls the nearest names, so the pattern can be fixed from the log.
@@ -391,10 +414,13 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                     for n in near[:8]:
                         print(f"        near '{tok}': {n}")
             hit += found
+            resolved = resolved or bool(found)
         for v in callers:
             if v in bound_of:
                 rc_rows = 1
                 print(f"FAIL indirect_allowlist: '{pretty(nodes[v])[:100]}' matches rows '{bound_of[v]}' and '{k}' (ambiguous)")
+            if tg and not resolved:
+                continue        # a row whose targets matched nothing bounds nothing
             bound_of[v] = k
             bounded_edges.setdefault(v, set()).update(hit)
             for h in hit:
@@ -509,6 +535,9 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                 trip = sum(size[m] for m in c)      # too many cycles to list: charge every member
             cycle_cost[rep] = depth * trip
             cycle_label[rep] = f"recursion x{depth} of {trip} B, {len(c)} function(s): {names[0][:50]}"
+            for m in c:
+                if len(pretty(nodes.get(m, m)).strip()) <= 2:     # GCC lost the name: the title is all there is
+                    print(f"        nameless member: title {m}")
             if len(matched) == 1 and matched[0] not in bad:
                 print(f"ok   recursion: {len(c)} function(s), depth {depth} x {trip} B a level "
                       f"= {cycle_cost[rep]} B charged ({by}): {shown}")
@@ -563,11 +592,13 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             reached = reachable(hits, edges)
             # GCC names every indirect site by one shared placeholder node, so a site is its caller.
             callers = sorted(v for v in reached if v in real)
+            blockops = sum(1 for v in reached if v in block)
             unbounded = [v for v in callers if v not in bound_of] if strict else []
             rc |= 1 if unbounded else 0
             label = "FAIL" if unbounded else "ok  " if ok else "KNOWN" if known_hit else "FAIL"
             print(f"{label} {t['name']}: {total} B + {margin} margin "
                   f"{'<=' if ok else '>'} {t['bytes']} B ({t['file']}:{t['line']})")
+            print(f"        block operations (unlabelled placeholder edges, charged as memcpy): {blockops} function(s) reachable")
             chain = {m for x in path for m in members.get(x, (x,))}
             on_chain = [v for v in callers if v in chain]
             if strict:
