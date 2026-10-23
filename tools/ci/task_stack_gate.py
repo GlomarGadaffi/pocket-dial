@@ -37,7 +37,10 @@ can't see indirect calls, except where indirect_allowlist names the targets of a
 (see below). The runtime stackHwm_* (#451) stays ground truth.
 
 Indirect calls: GCC names every indirect site by one placeholder node, so a site is the
-function that calls it. A task row marked "indirect": "bounded" must have every such
+function that calls it, and it puts the call's file:line:col on the edge. An edge without one is
+no call through a pointer: it is the memset/memcpy libcall that zero-filling or copying an
+aggregate expands to (`char b[64] = {0}`), which GCC cannot name. That is charged as a call of
+memcpy and needs no row. A task row marked "indirect": "bounded" must have every such
 function it reaches matched by an indirect_allowlist row {"targets": [regex over a
 function name, ...], "reason": "who installs the pointer, file:line"} ([] = no
 target exists in the image, the reason says why); the key is a
@@ -122,6 +125,16 @@ CREATE_RE = re.compile(r"\b(?:xTaskCreate\w*|pd::createTaskPreferPsram)\s*\("
 
 INDIRECT_RE = re.compile(r"^Indirect Call Placeholder$")
 EDGE_LABEL_RE = re.compile(r'edge:\s*\{\s*sourcename:\s*"([^"]+)"\s*targetname:\s*"([^"]+)"(?:\s*label:\s*"([^"]*)")?')
+
+
+def short_site(label):
+    """A call position without the build machine's prefix: from the last components/, managed_components/,
+    src/ or main/ directory on, else the last three path elements."""
+    p = label.replace("\\", "/")
+    m = re.search(r"(?:^|/)((?:managed_)?components|src|main)/(?!.*/(?:managed_)?components/)(.*)$", p)
+    if m:
+        return m.group(1) + "/" + m.group(2)
+    return "/".join(p.split("/")[-3:])
 
 
 def placeholder_edges(ci_dir, ind):
@@ -577,7 +590,7 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                         print(f"            library entered from project code: +{len(enter) - 80} more")
                     for v in unbounded:
                         print(f"            {pretty(nodes.get(v, v))}")
-                        where = sorted(re.sub(r"^.*[\/]", "", w) for w in sites[v])
+                        where = sorted(short_site(w) for w in sites[v])
                         print(f"                at: {', '.join(where[:4])}{f', +{len(where) - 4} more' if len(where) > 4 else ''}")
                         if parent.get(v) is not None:
                             print(f"                <- {pretty(nodes.get(parent[v], parent[v]))[:160]}"

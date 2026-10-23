@@ -994,6 +994,15 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertRegex(out, r"void mid\(\)\n\s+at: X\.cpp:10:5")
 
+    def test_call_positions_are_shown_without_the_build_machines_prefix(self):
+        for label, want in (
+                ("/opt/esp/idf/components/tcp_transport/transport_ws.c:341:13", "components/tcp_transport/transport_ws.c:341:13"),
+                ("/__w/p/p/src/SIP/RequestsHandler.cpp:5:5", "src/SIP/RequestsHandler.cpp:5:5"),
+                ("/__w/p/p/build/managed_components/espressif__x/x.c:1:1", "managed_components/espressif__x/x.c:1:1"),
+                ("/tc/include/c++/15.2.0/bits/std_function.h:591:9", "15.2.0/bits/std_function.h:591:9"),
+                ("X.cpp:10:5", "X.cpp:10:5")):
+            self.assertEqual(g.short_site(label), want)
+
     def test_a_failing_cycle_lists_every_member(self):
         names = [f"void Ring{i}()" for i in range(7)]
         self.add_ci("".join(node(f"r{i}", n, 8) for i, n in enumerate(names))
