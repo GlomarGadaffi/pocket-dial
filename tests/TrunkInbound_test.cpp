@@ -1239,10 +1239,10 @@ namespace
 		{
 			const std::string id = tag + std::to_string(i);
 			const std::string raw =
-				"OPTIONS sip:server SIP/2.0\r\n"
+				"OPTIONS sip:" + target + " SIP/2.0\r\n"
 				"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKo" + id + "\r\n"
 				"From: <sip:probe@" + ip + ">;tag=o" + id + "\r\n"
-				"To: <sip:server>\r\n"
+				"To: <sip:" + target + ">\r\n"
 				"Call-ID: " + id + "\r\n"
 				"CSeq: 1 OPTIONS\r\n"
 				"Content-Length: 0\r\n\r\n";
