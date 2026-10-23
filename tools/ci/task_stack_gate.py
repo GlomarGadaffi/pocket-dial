@@ -124,6 +124,7 @@ CREATE_RE = re.compile(r"\b(?:xTaskCreate\w*|pd::createTaskPreferPsram)\s*\("
 
 
 INDIRECT_RE = re.compile(r"^Indirect Call Placeholder$")
+ALIAS_NODE_RE = re.compile(r'node:\s*\{\s*title:\s*"([^"]+)"\s*label:\s*"[^"]*"\s*shape\s*:\s*triangle')
 EDGE_LABEL_RE = re.compile(r'edge:\s*\{\s*sourcename:\s*"([^"]+)"\s*targetname:\s*"([^"]+)"(?:\s*label:\s*"([^"]*)")?')
 
 
@@ -138,22 +139,24 @@ def short_site(label):
 
 
 def placeholder_edges(ci_dir, ind):
-    """({function: {file:line:col, ...}}, {function, ...}) for the edges into the indirect-call
-    placeholder. GCC writes one edge per call and puts the call's position in its label. An edge
+    """({function: {file:line:col, ...}}, {function, ...}, {alias title, ...}) for the edges into the
+    indirect-call placeholder, and the nodes GCC marked `shape : triangle`: an `__attribute__((alias))`
+    function (a declaration is an ellipse), which has no frame of its own and one edge to its target. GCC writes one edge per call and puts the call's position in its label. An edge
     without one is not a call through a pointer: it is the memset/memcpy libcall a block operation
     (`char b[64] = {0}`, `struct S s{}`) expands to, which GCC cannot name. The second set holds
     the functions with such an edge."""
-    sites, block = collections.defaultdict(set), set()
+    sites, block, aliases = collections.defaultdict(set), set(), set()
     for ci in sorted(glob.glob(os.path.join(ci_dir, "**", "*.ci"), recursive=True)):
         with open(ci, encoding="utf-8", errors="ignore") as f:
             txt = f.read()
+        aliases.update(m.group(1) for m in ALIAS_NODE_RE.finditer(txt))
         for m in EDGE_LABEL_RE.finditer(txt):
             if m.group(2) in ind:
                 if m.group(3):
                     sites[m.group(1)].add(m.group(3))
                 else:
                     block.add(m.group(1))
-    return sites, block
+    return sites, block, aliases
 
 
 def head(label):
@@ -228,6 +231,17 @@ def alias_body(title, edges, frames):
         if body in frames and body in edges.get(title, ()):
             return body
     return None
+
+
+def alias_of_framed(v, aliases, edges, frames, seen=()):
+    """True for an `__attribute__((alias))` node (GCC's `shape : triangle`) whose one edge goes to a
+    function with a frame, or to another such alias: the target is charged, the alias is its name. Any
+    other frameless node is still unknown."""
+    out = edges.get(v, ())
+    if v not in aliases or len(out) != 1 or v in seen:
+        return False
+    (w,) = tuple(out)
+    return w in frames or alias_of_framed(w, aliases, edges, frames, seen + (v,))
 
 
 def reachable(starts, edges):
@@ -330,7 +344,7 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
     ind = {v for v in nodes if INDIRECT_RE.search(pretty(nodes.get(v, v)))}
     # Only an edge with a call position is a call through a pointer. One without is a block operation
     # (see placeholder_edges), a call of the libc mem* leaf: charged as memcpy, needing no row.
-    sites, block = placeholder_edges(ci_dir, ind)
+    sites, block, aliases = placeholder_edges(ci_dir, ind)
     if block:
         nodes.setdefault("memcpy", "memcpy")
         for v in block:
@@ -397,7 +411,7 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             size[v] = frames[v][0]
             if frames[v][1] != "static" and not allowed(v):
                 problem[v] = f"{frames[v][1]} frame, no allowlist entry"
-        elif alias_body(v, edges, frames):
+        elif alias_body(v, edges, frames) or alias_of_framed(v, aliases, edges, frames):
             size[v] = 0     # a pass-through: the walk goes on into the body, which has the frame
         else:
             # A callee GCC never saw defined carries the location of a use, which may be a

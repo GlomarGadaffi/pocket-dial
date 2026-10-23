@@ -31,6 +31,12 @@ def bare(title, name, loc="@ROOT@/src/SIP/X.cpp:7:1"):
     return f'node: {{ title: "{title}" label: "{name}\\n{loc}" }}\n'
 
 
+def alias_node(title, name, loc="/idf/components/vfs/vfs_calls.c:927:5"):
+    """What GCC writes for `int f(void) __attribute__((alias("g")))`: a node with no stack line and
+    `shape : triangle` (a declaration is an ellipse), whose one edge goes to the aliased function."""
+    return f'node: {{ title: "{title}" label: "{name}\\n{loc}" shape : triangle }}\n'
+
+
 def edge(a, b, label=None):
     """A call edge. GCC puts the call's file:line:col in `label`, and leaves it off the
     placeholder edge of a block operation it expands to a memset/memcpy libcall."""
@@ -1011,6 +1017,33 @@ class Gate(unittest.TestCase):
                 ("/tc/include/c++/15.2.0/bits/std_function.h:591:9", "15.2.0/bits/std_function.h:591:9"),
                 ("X.cpp:10:5", "X.cpp:10:5")):
             self.assertEqual(g.short_site(label), want)
+
+    # __attribute__((alias)): vfs_calls.c makes _close_r, closedir, select and the rest aliases of esp_vfs_*.
+    # GCC marks such a node `shape : triangle`, gives it no frame and one edge to the aliased function, whose
+    # own frame is charged. Charging the alias a library default as well counts the same call twice.
+    def test_an_alias_node_is_a_pass_through_to_the_function_it_aliases(self):
+        self.add_ci(alias_node("_close_r", "_close_r") + node("esp_vfs_close", "esp_vfs_close", 32)
+                    + edge("leaf", "_close_r") + edge("_close_r", "esp_vfs_close", "/idf/vfs_calls.c:927:5"))
+        self.table["library_defaults"] = {"^_close_r$": 1536}      # the estimate that used to be charged for it
+        self.table["tasks"][0]["bytes"] = 4096
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok   small: 532 B", out)                    # 200 + 300 + alias 0 + esp_vfs_close 32
+        self.assertIn("32  esp_vfs_close", out)
+
+    def test_an_alias_of_a_function_with_no_frame_is_still_unknown(self):
+        self.add_ci(alias_node("_close_r", "_close_r") + bare("esp_vfs_close", "esp_vfs_close", loc="/idf/vfs_calls.c:1:1")
+                    + edge("leaf", "_close_r") + edge("_close_r", "esp_vfs_close"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL frame: library callee with no frame data", out)
+
+    def test_an_alias_with_two_edges_is_not_taken_for_a_pass_through(self):
+        self.add_ci(alias_node("_close_r", "_close_r") + node("a", "void a()", 32) + node("b", "void b()", 32)
+                    + edge("leaf", "_close_r") + edge("_close_r", "a") + edge("_close_r", "b"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL frame: library callee with no frame data", out)
 
     def test_a_failing_cycle_lists_every_member(self):
         names = [f"void Ring{i}()" for i in range(7)]
