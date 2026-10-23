@@ -12280,8 +12280,11 @@ RequestsHandler::RateSource* RequestsHandler::findRateSource(uint32_t ip)
 bool RequestsHandler::allowEmergencyInvite(const SipMessage& m, const sockaddr_in& src)
 {
 	if (m.getType() != SipMessageTypes::INVITE) return false;
-	// The Request-URI, not To: it is what the PBX routes on, and the header is free to forge.
-	if (!pbx::classifyEmergencyDial(m.getRequestUriUser()).isEmergency) return false;
+	// Either header: onInvite routes on To, a proxy-style client may route on the Request-URI, and
+	// both are free to forge. The budget is the same tiny cap either way (heap-free, no _mutex).
+	if (!pbx::classifyEmergencyDial(m.getRequestUriUser()).isEmergency &&
+		!pbx::classifyEmergencyDial(m.getToNumber()).isEmergency)
+		return false;
 	RateSource* r = findRateSource(src.sin_addr.s_addr);
 	return takeToken(r ? r->emergency : _unregisteredEmergency, std::chrono::steady_clock::now(),
 		kEmergencyInviteBurst, kEmergencyInvitePerSec);

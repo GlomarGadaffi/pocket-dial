@@ -3307,11 +3307,12 @@ private:
 	//       client): it keeps a normal burst-40 bucket but is never refused for lack of a slot in
 	//       the 256-entry table, so spoofed sources filling the table cannot lock a real handset
 	//       out. Buckets carry over each rebuild; they are never reset to full by it.
-	//   (d) an INVITE whose REQUEST-URI user part is 911/933 (classifyEmergencyDial) may spend a
+	//   (d) an INVITE whose REQUEST-URI user part or its To number is 911/933 (classifyEmergencyDial) may spend a
 	//       tiny separate budget when the ordinary bucket would drop it: burst 4, 1 per 10 s. A
 	//       registered source has its own; every unregistered source shares ONE, so a spoofer
-	//       gains kEmergencyInviteBurst packets in total however many addresses it forges. The To
-	//       header is not consulted (spoofable, #1108).
+	//       gains kEmergencyInviteBurst packets in total however many addresses it forges. Either
+	//       header qualifies (onInvite routes on To; both are forgeable) and the cap is the same, so
+	//       a forger gains nothing extra. A dial-rule 911 (#834) gets none: the rules are _mutex's.
 	static constexpr size_t kMaxRateRegisteredSources = POCKETDIAL_MAX_CLIENTS;
 	static_assert(kMaxRateRegisteredSources > 0 && kMaxRateRegisteredSources <= 255,
 		"one reserved limiter slot per client");
@@ -3321,7 +3322,7 @@ private:
 	{
 		uint32_t ip = 0;   // network-order s_addr; 0 = unused
 		RateBucket ordinary{ 0.0, {} };
-		RateBucket emergency{ 0.0, {} };
+		RateBucket emergency{ kEmergencyInviteBurst, {} };
 	};
 	// Caller holds _rateMutex. Null when `ip` is not a registered extension's source.
 	RateSource* findRateSource(uint32_t ip);
@@ -3336,7 +3337,7 @@ private:
 	EmergencyCallIds _emergencyIdsScratch;   // publishRateExemptions() build area; guarded by _mutex
 	std::array<RateSource, kMaxRateRegisteredSources> _rateSources{};          // guarded by _rateMutex
 	std::array<RateSource, kMaxRateRegisteredSources> _rateSourcesScratch{};   // build area; guarded by _mutex
-	RateBucket _unregisteredEmergency{ 0.0, {} };   // guarded by _rateMutex
+	RateBucket _unregisteredEmergency{ kEmergencyInviteBurst, {} };   // guarded by _rateMutex
 	// Optional CIDR allowlist (host order). _allowMask == 0 means "no allowlist".
 	uint32_t _allowNet  = 0;
 	uint32_t _allowMask = 0;
