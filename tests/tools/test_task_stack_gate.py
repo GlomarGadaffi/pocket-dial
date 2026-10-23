@@ -31,8 +31,11 @@ def bare(title, name, loc="@ROOT@/src/SIP/X.cpp:7:1"):
     return f'node: {{ title: "{title}" label: "{name}\\n{loc}" }}\n'
 
 
-def edge(a, b):
-    return f'edge: {{ sourcename: "{a}" targetname: "{b}" }}\n'
+def edge(a, b, label=None):
+    """A call edge. GCC puts the call's file:line:col in `label`, and leaves it off the
+    placeholder edge of a block operation it expands to a memset/memcpy libcall."""
+    where = f' label: "{label}"' if label else ""
+    return f'edge: {{ sourcename: "{a}" targetname: "{b}"{where} }}\n'
 
 
 # Labels start with the return type, as GCC writes them ("void f(void*)", #457).
@@ -146,6 +149,7 @@ class Gate(unittest.TestCase):
         rc, out = self.run_gate()
         self.assertEqual(rc, 1)
         self.assertIn("FAIL frame: library callee with no frame data", out)
+        self.assertIn("reached from: void leaf()", out)            # the caller on the shortest path
         self.table["library_defaults"] = {r"^v?(s|sn|f|as)?printf\b": 2048}
         rc, out = self.run_gate()
         self.assertEqual(rc, 1)                          # 500 + 2048 + 512 > 1024
@@ -819,7 +823,7 @@ class Gate(unittest.TestCase):
     def test_indirect_call_sites_are_reported_per_task_not_silently_zero(self):
         # An indirect site is charged 0 B (the walk cannot follow it), so the task line must say
         # how many the task reaches and who makes them: a fit is a fit for direct calls only.
-        self.add_ci(node("ind", "Indirect Call Placeholder", 0, kind="static") + edge("mid", "ind"))
+        self.add_ci(node("ind", "Indirect Call Placeholder", 0, kind="static") + edge("mid", "ind", "X.cpp:10:5"))
         self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
         rc, out = self.run_gate()
         self.assertIn("indirect call sites: 1 function(s) reachable", out)
@@ -834,7 +838,7 @@ class Gate(unittest.TestCase):
     # possible targets, and the walk charges the heaviest of them.
     def indirect_fixture(self, flag=True):
         self.add_ci(node("ind", "Indirect Call Placeholder", 0)
-                    + node("slow", "void SlowSink::write()", 1000) + edge("mid", "ind"))
+                    + node("slow", "void SlowSink::write()", 1000) + edge("mid", "ind", "X.cpp:10:5"))
         self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
         if flag:
             for t in self.table["tasks"]:
@@ -917,11 +921,11 @@ class Gate(unittest.TestCase):
     def test_an_unbounded_site_names_the_function_that_reaches_it(self):
         self.indirect_fixture()
         self.add_ci(node("deep", "void Deep::call()", 10) + node("ind2", "Indirect Call Placeholder", 0)
-                    + edge("mid", "deep") + edge("deep", "ind2"))
+                    + edge("mid", "deep") + edge("deep", "ind2", "X.cpp:20:7"))
         self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture"}}
         rc, out = self.run_gate()
         self.assertEqual(rc, 1, out)
-        self.assertRegex(out, r"void Deep::call\(\)\s+<- void mid\(\)")
+        self.assertRegex(out, r"void Deep::call\(\)\s+at: X\.cpp:20:7\s+<- void mid\(\)")
 
     def test_an_unbounded_task_lists_where_project_code_enters_a_library(self):
         # 146 library sites are no use as a list; the few calls from our code into the library
@@ -929,7 +933,7 @@ class Gate(unittest.TestCase):
         self.indirect_fixture()
         self.add_ci(node("lib", "void lib_entry()", 10, loc="/idf/components/x/x.c:1:1")
                     + node("ind2", "Indirect Call Placeholder", 0)
-                    + edge("mid", "lib") + edge("lib", "ind2"))
+                    + edge("mid", "lib") + edge("lib", "ind2", "X.cpp:30:9"))
         self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture"}}
         rc, out = self.run_gate()
         self.assertEqual(rc, 1, out)
@@ -941,13 +945,54 @@ class Gate(unittest.TestCase):
         # for the pointer: a site that calls only memcpy and a logger has its pointer in one of them.
         self.indirect_fixture()
         self.add_ci(node("deep", "void Deep::call()", 10) + node("ind2", "Indirect Call Placeholder", 0)
-                    + node("cp", "void* memcpy_like(void*)", 5) + edge("mid", "deep") + edge("deep", "ind2")
+                    + node("cp", "void* memcpy_like(void*)", 5) + edge("mid", "deep") + edge("deep", "ind2", "X.cpp:20:7")
                     + edge("deep", "cp"))
         self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture"}}
         rc, out = self.run_gate()
         self.assertEqual(rc, 1, out)
-        self.assertRegex(out, r"void Deep::call\(\)\n\s+<- void mid\(\)\n\s+calls: .*void\* memcpy_like\(void\*\)")
+        self.assertRegex(out, r"void Deep::call\(\)\n\s+at: [^\n]+\n\s+<- void mid\(\)\n\s+calls: .*void\* memcpy_like\(void\*\)")
         self.assertNotRegex(out, r"calls: .*Indirect Call Placeholder")
+
+    # GCC puts a call's file:line:col on its placeholder edge. A function that zero-fills or copies an
+    # aggregate (`char b[64] = {0}`, `struct S s{}`) gets a placeholder edge with NO label, for the
+    # memset/memcpy libcall the expansion makes: that is a block operation, not a call through a
+    # pointer, so it needs no indirect_allowlist row, and it is charged as the libc mem* leaf.
+    def test_an_unlabelled_placeholder_is_a_block_operation_not_an_indirect_site(self):
+        self.add_ci(node("ind", "Indirect Call Placeholder", 0) + node("memcpy", "memcpy", 1000)
+                    + edge("mid", "ind"))
+        self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["indirect"] = "bounded"
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("indirect call sites: 0 function(s) reachable make one", out.split("big:")[1])
+        self.assertIn("big: 2000 B", out)         # 400 + 600 + the 1000 B memcpy leaf the block operation calls
+        self.assertIn("memcpy", out.split("big:")[1])
+
+    def test_a_block_operation_is_charged_even_when_no_memcpy_node_exists(self):
+        self.add_ci(node("ind", "Indirect Call Placeholder", 0) + edge("mid", "ind"))
+        self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0, "^memcpy$": 950}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("big: 1950 B", out)         # 400 + 600 + 950
+
+    def test_a_labelled_and_an_unlabelled_placeholder_on_one_function_still_needs_a_row(self):
+        self.add_ci(node("ind", "Indirect Call Placeholder", 0) + node("memcpy", "memcpy", 10)
+                    + edge("mid", "ind") + edge("mid", "ind", "X.cpp:10:5"))
+        self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["indirect"] = "bounded"
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("1 reachable indirect call site(s) have no indirect_allowlist row", out)
+
+    def test_an_unbounded_site_names_where_in_the_source_it_calls(self):
+        self.indirect_fixture()
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"void mid\(\)\n\s+at: X\.cpp:10:5")
 
     def test_a_failing_cycle_lists_every_member(self):
         names = [f"void Ring{i}()" for i in range(7)]

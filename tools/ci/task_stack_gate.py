@@ -105,6 +105,7 @@ reason, and stackHwm_* stays the ground truth.
 import argparse
 import collections
 import functools
+import glob
 import json
 import os
 import posixpath
@@ -120,6 +121,26 @@ CREATE_RE = re.compile(r"\b(?:xTaskCreate\w*|pd::createTaskPreferPsram)\s*\("
 
 
 INDIRECT_RE = re.compile(r"^Indirect Call Placeholder$")
+EDGE_LABEL_RE = re.compile(r'edge:\s*\{\s*sourcename:\s*"([^"]+)"\s*targetname:\s*"([^"]+)"(?:\s*label:\s*"([^"]*)")?')
+
+
+def placeholder_edges(ci_dir, ind):
+    """({function: {file:line:col, ...}}, {function, ...}) for the edges into the indirect-call
+    placeholder. GCC writes one edge per call and puts the call's position in its label. An edge
+    without one is not a call through a pointer: it is the memset/memcpy libcall a block operation
+    (`char b[64] = {0}`, `struct S s{}`) expands to, which GCC cannot name. The second set holds
+    the functions with such an edge."""
+    sites, block = collections.defaultdict(set), set()
+    for ci in sorted(glob.glob(os.path.join(ci_dir, "**", "*.ci"), recursive=True)):
+        with open(ci, encoding="utf-8", errors="ignore") as f:
+            txt = f.read()
+        for m in EDGE_LABEL_RE.finditer(txt):
+            if m.group(2) in ind:
+                if m.group(3):
+                    sites[m.group(1)].add(m.group(3))
+                else:
+                    block.add(m.group(1))
+    return sites, block
 
 
 def head(label):
@@ -294,7 +315,15 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
     # walk of those tasks gets an edge from the caller to each, so the heaviest target chain is
     # charged. Other tasks keep the base graph and report the sites, charging 0 B.
     ind = {v for v in nodes if INDIRECT_RE.search(pretty(nodes.get(v, v)))}
-    makers = sorted(v for v in nodes if ind & set(edges.get(v, ())))
+    # Only an edge with a call position is a call through a pointer. One without is a block operation
+    # (see placeholder_edges), a call of the libc mem* leaf: charged as memcpy, needing no row.
+    sites, block = placeholder_edges(ci_dir, ind)
+    if block:
+        nodes.setdefault("memcpy", "memcpy")
+        for v in block:
+            edges[v].add("memcpy")
+    real = {v for v in sites if v in nodes}
+    makers = sorted(real)
     bounded_edges = {v: set(ws) for v, ws in edges.items()}
     base_edges = edges      # analyse() shadows `edges` with the walk's own
     bound_of, edge_row, rc_rows = {}, {}, 0
@@ -388,6 +417,7 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             print(f"FAIL table: {f} has {have.get(f, 0)} task-creation site(s), "
                   f"task_stacks.json lists {want[f]}")
 
+    reached_from = {}
     walked = []     # (task row, its entry nodes) for the tasks this image walks
     for t in sorted(tasks, key=lambda t: (t["name"], t["file"], t["line"])):
         # One image links one esp_main variant; the others' tasks aren't in it.
@@ -472,6 +502,17 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             direct = any(t in base_edges.get(s, ()) for s in members.get(u, (u,)) for t in members.get(w, (w,)))
             return "" if direct or not rows else f"  (via indirect_allowlist row '{sorted(rows)[0]}')"
 
+        # Who reaches each function on a shortest path from a walked task's entry, for the frame failures.
+        queue = collections.deque(sorted({h for _, hits in batch for h in hits}))
+        seen = set(queue)
+        while queue:
+            a = queue.popleft()
+            for b in sorted(edges.get(a, ())):
+                if b not in seen:
+                    seen.add(b)
+                    reached_from.setdefault(b, f"{pretty(nodes.get(a, a))[:140]}{via(a, b)}")
+                    queue.append(b)
+
         def succ(u):
             out = {unit.get(w, w) for s in members.get(u, (u,)) for w in edges.get(s, ())}
             return sorted(out - {u})
@@ -494,7 +535,7 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             # functions make one, never a silent 0.
             reached = reachable(hits, edges)
             # GCC names every indirect site by one shared placeholder node, so a site is its caller.
-            callers = sorted(v for v in reached if ind & set(edges.get(v, ())))
+            callers = sorted(v for v in reached if v in real)
             unbounded = [v for v in callers if v not in bound_of] if strict else []
             rc |= 1 if unbounded else 0
             label = "FAIL" if unbounded else "ok  " if ok else "KNOWN" if known_hit else "FAIL"
@@ -536,6 +577,8 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                         print(f"            library entered from project code: +{len(enter) - 80} more")
                     for v in unbounded:
                         print(f"            {pretty(nodes.get(v, v))}")
+                        where = sorted(re.sub(r"^.*[\/]", "", w) for w in sites[v])
+                        print(f"                at: {', '.join(where[:4])}{f', +{len(where) - 4} more' if len(where) > 4 else ''}")
                         if parent.get(v) is not None:
                             print(f"                <- {pretty(nodes.get(parent[v], parent[v]))[:160]}"
                                   f"{via(parent[v], v)}")
@@ -572,6 +615,8 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
     for x in sorted(reach & set(problem)):
         rc = 1
         print(f"FAIL frame: {problem[x]}: {pretty(nodes[x])[:100]}")
+        if x in reached_from:
+            print(f"        reached from: {reached_from[x]}")
 
     for x in sorted(frames):
         b = frames[x][0]
