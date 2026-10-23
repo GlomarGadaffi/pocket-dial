@@ -2663,7 +2663,8 @@ namespace
 {
 	// An Opus-only offer: no PCMU, PCMA or G.722, so the relay codec gate refuses it.
 	std::shared_ptr<SipMessage> makeOpusInvite(const std::string& dialed, const std::string& callId,
-		const std::string& ext = "101", const std::string& ip = kHandsetIp)
+		const std::string& ext = "101", const std::string& ip = kHandsetIp,
+		const std::string& pt = "111", const std::string& rtpmap = "opus/48000/2")
 	{
 		const std::string body =
 			"v=0\r\n"
@@ -2671,8 +2672,8 @@ namespace
 			"s=-\r\n"
 			"c=IN IP4 " + ip + "\r\n"
 			"t=0 0\r\n"
-			"m=audio 40000 RTP/AVP 111\r\n"
-			"a=rtpmap:111 opus/48000/2\r\n";
+			"m=audio 40000 RTP/AVP " + pt + "\r\n"
+			"a=rtpmap:" + pt + " " + rtpmap + "\r\n";
 		const std::string raw =
 			"INVITE sip:" + dialed + "@server SIP/2.0\r\n"
 			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKei" + callId + "\r\n"
@@ -2780,4 +2781,55 @@ TEST(EmergencyCodecGate, ANonEmergencyCallFromAnUnknownCallerIsStill403AndSilent
 	EXPECT_EQ(b.count("SIP/2.0 403 Forbidden"), 1u) << b.dump();
 	EXPECT_EQ(countOf(log, "EMERGENCY"), 0u) << log;
 	EXPECT_EQ(b.count("MESSAGE sip:200@"), 0u) << b.dump();
+}
+
+// #1107 review: the same refusals when a dial-plan Trunk rule makes the 911, and the
+// G.722-only offer that passes the relay gate and is refused by the anchor's G.711 gate.
+
+TEST(EmergencyCodecGate, ARuleProduced911WithAnOpusOnlyOfferGetsTheEmergency503AndTheRuleLogLine)
+{
+	Bench b;
+	b.handler->setAnchorPlacesRealCallsForTest(true);
+	b.handler->setDialRule("0", "trunk", "911", 1);
+	const std::string log = inviteAndCaptureLog(b, makeOpusInvite("0", "er-1107-rule-opus"));
+
+	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 488"), 0u) << b.dump();
+	EXPECT_TRUE(b.saw("no G.711 codec offered")) << b.dump();
+	EXPECT_EQ(countOf(log, "EMERGENCY: a dial-plan rule turned 0 into 911; routing it as an emergency call"), 1u)
+		<< log;
+	EXPECT_EQ(countOf(log, "EMERGENCY: 911 dialed by 101"), 1u) << log;
+	ASSERT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+	EXPECT_TRUE(b.saw("NOT ROUTED")) << b.dump();
+}
+
+TEST(EmergencyCodecGate, ARuleProduced911FromAnUnknownCallerIs403AndNotifiesTheNumberTheRuleMade)
+{
+	// "0" -> "9911": the notification names what the rule produced ("as 9911"), as the
+	// emergency intercept and the codec path do, never the raw "0".
+	Bench b;
+	b.handler->setDialRule("0", "trunk", "9911", 1);
+	const std::string log = inviteAndCaptureLog(b, makeInvite("0", "er-1107-rule-unknown", 0, "999"));
+
+	EXPECT_EQ(b.count("SIP/2.0 403 Forbidden"), 1u) << b.dump();
+	EXPECT_EQ(countOf(log, "EMERGENCY: 911 dialed by 999"), 1u) << log;
+	ASSERT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+	EXPECT_TRUE(b.saw("(as 9911)")) << b.dump();
+	EXPECT_FALSE(b.saw("(as 0)")) << b.dump();
+}
+
+TEST(EmergencyCodecGate, A911WithAG722OnlyOfferIsRefusedByTheAnchorsG711GateWithTheEmergency503)
+{
+	// Pins today's behaviour: G.722 passes the relay gate, then the anchor leg refuses it.
+	Bench b;
+	b.handler->setAnchorPlacesRealCallsForTest(true);
+	const std::string log = inviteAndCaptureLog(b, makeOpusInvite("911", "er-1107-g722", "101",
+		kHandsetIp, "9", "G722/8000"));
+
+	EXPECT_EQ(b.count("SIP/2.0 503 Emergency Call Not Routable"), 1u) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 488"), 0u) << b.dump();
+	EXPECT_TRUE(b.saw("no G.711 codec offered")) << b.dump();
+	EXPECT_EQ(countOf(log, "EMERGENCY: 911 dialed by 101"), 1u) << log;
+	ASSERT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+	EXPECT_TRUE(b.saw("NOT ROUTED")) << b.dump();
 }
