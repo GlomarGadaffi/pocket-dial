@@ -65,10 +65,11 @@ The firmware has a modular physical layer. Pick a transport at compile time by p
 
 ```mermaid
 flowchart TD
-    build["Build with -D SIP_TRANSPORT"] --> wifi["wifi: Wi-Fi SoftAP<br/>main/esp_main.cpp"]
-    build --> eth["eth (default): W5500 PoE Ethernet<br/>main/esp_main_eth.cpp"]
-    build --> lan["lan8720: LAN8720 RMII PHY, classic ESP32 only<br/>main/esp_main_eth_lan8720.cpp"]
-    build --> display["display: Guition AXS15231B touch display<br/>main/esp_main_display.cpp"]
+    build["idf.py -D SIP_TRANSPORT=... (main/CMakeLists.txt:6-7, unset means eth)"] --> sel{"SIP_TRANSPORT"}
+    sel -->|"eth (default)"| eth["W5500 PoE Ethernet. main/esp_main_eth.cpp. Tasks: sip_server (priority 5, core 1), http_dashboard (priority 4, core 0)"]
+    sel -->|"lan8720"| lan["LAN8720 RMII PHY, classic ESP32 only. main/esp_main_eth_lan8720.cpp. Same task names as eth"]
+    sel -->|"display"| disp["Guition AXS15231B touch display. main/esp_main_display.cpp. Tasks: sip_server_task and http_server_task, both core 0"]
+    sel -->|"anything else, including wifi"| wifi["Wi-Fi SoftAP. main/esp_main.cpp. Tasks: sip_server_task (priority 5, core 1), http_server_task (priority 4, core 0)"]
 ```
 
 | Transport Parameter | Target Board Description | Primary Entrypoint File |

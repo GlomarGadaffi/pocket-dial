@@ -21,36 +21,61 @@ overridden to 0 for the display build in `main/CMakeLists.txt:257`), so no build
 them. The HTTP accept loop is a separate, unpinned thread (§4), not `http_server_task` itself.
 
 ```mermaid
-graph TD
-    subgraph Core 1 [Core 1: LVGL - display build; also tel_media_rx]
-        A[lvgl_task 16ms] -->|Drives| B["AXS15231B LCD (QSPI)"]
-        A -->|Reads| C["AXS15231B Touch (I2C)"]
+flowchart TD
+    subgraph Core1["Core 1, display build"]
+        LV["lvgl_task, prio 5, 8192 B, every 16 ms"] -->|"drives"| LCD["AXS15231B LCD, QSPI"]
+        LV -->|"reads"| TP["AXS15231B touch, I2C"]
+        MRX["tel_media_rx, prio 6, 6144 B, one per anchor call slot"]
     end
 
-    subgraph Core 0 [Core 0: SIP, UDP and status tasks]
-        D[sip_server_task] -->|Runs| E[RequestsHandler::tick]
-        J[status_task 500ms] -->|Updates| K[Wallboard: clients & calls]
-        L[udp_receiver_task] -->|Reads| M[UDP Port 5060]
+    subgraph Core0["Core 0, display build"]
+        UDP["udp_receiver_task, prio 5, 16384 B"] -->|"runs inline"| HDL["RequestsHandler::handle()"]
+        SIP["sip_server_task, prio 5, 8192 B, 30 ms loop"] -->|"calls"| TICK["RequestsHandler::tick(), at most 1 Hz"]
+        ST["status_task, prio 3, 4096 B, every 500 ms"] -->|"updates"| WB["Wallboard: clients and calls"]
+        HTS["http_server_task, prio 4, 8192 B"]
     end
 
-    subgraph Unpinned [No core affinity]
-        F["HTTP accept thread"] -->|Listens| G[TCP Port 80]
-        G -->|Select Activity| H["Detached http_conn threads"]
-        H -->|Reads under _snapshotMutex| I["Registrar Snapshot (Clients/Sessions)"]
+    subgraph Unpinned["No core affinity"]
+        ACC["HTTP accept thread, select() every 250 ms"] -->|"at most 3 at once"| CONN["http_conn threads, 4096 B"]
     end
 
-    subgraph Hardware [Physical Hardware Layer]
-        B
-        C
-        N["W5500 / LAN8720 Ethernet"] <-->|LwIP Stack| L
-        N <-->|LwIP Stack| G
-    end
-
-    E -->|Pre-allocated Pool| O[SipClient / Session Memory]
-    M -->|Dispatches Packet| E
-    E -->|Write-Buffer| P[Local Outbox Vector]
-    P -->|Send Outside Lock| N
+    HTS -->|"HttpServer::start()"| ACC
+    NET["Wi-Fi radio, lwIP"] -->|"UDP port 5060"| UDP
+    NET -->|"TCP port 80"| ACC
+    HDL -->|"under _mutex"| POOL["SipClient and Session pools, preallocated"]
+    TICK -->|"under _mutex"| POOL
+    TICK -->|"refills scratch, swaps under _snapshotMutex"| SNAP["RegistrarSnapshot"]
+    CONN -->|"reads under _snapshotMutex"| SNAP
+    HDL -->|"_outbox drained to a local vector"| OUT["SipServer::onHandled, UdpServer::send, after _mutex is released"]
+    TICK -->|"same drain"| OUT
+    OUT --> NET
 ```
+
+The 3CX anchor adds its own tasks, created only for a real (non-Loopback) anchor. The SIP engine never makes an HTTPS call itself: it posts a job to one of three bounded queues and returns, and the WebSocket's events come back through the `tel_wsw` workers:
+
+```mermaid
+flowchart TD
+    RH["RequestsHandler, _mutex"] -->|"postTelCtl(), never blocks"| QS["sos queue, depth kTelSosDepth = 8"]
+    RH -->|"postTelCtl()"| QC["ctl queue, depth kTelCtlDepth = 4"]
+    RH -->|"asyncDropCall()"| QD["drop queue, depth kTelDropDepth, 23 at default pool sizes"]
+    QS --> SOS["tel_sos: 911/933 makeCall"]
+    QC --> CTL["tel_ctl0, tel_ctl1: makeCall, answerCall"]
+    QD --> DROP["tel_drop: dropCall"]
+    SOS --> TA["TelephonyAnchorClient, its own _mutex"]
+    CTL --> TA
+    DROP --> TA
+    TA -->|"HTTPS: makecall POST, answer and drop under _ctrlMutex"| PBX["3CX Call Control"]
+    PBX -->|"wss /callcontrol/ws"| WST["esp_websocket_client task, 6144 B: handleWsEvent()"]
+    WST -->|"WsWorkItem"| WQ["_wsWorkQueue, depth 16"]
+    WQ --> WSW["tel_wsw x4, prio 4, 12288 B: processWsWork()"]
+    WSW -->|"CallEvent callback, takes _mutex"| RH
+    PBX -->|"GET .../participants/{id}/stream"| MRX["tel_media_rx, Core 1"]
+    TA --- MAINT["tel_maint, prio 5, 6144 B: restart, token refresh"]
+    TA --- SWEEP["tel_sweep, prio 4, 6144 B: 911/933 orphan sweep"]
+    TA --- PRE["tel_prewarm, prio 4, 6144 B: one-shot TLS pre-warm"]
+```
+
+The lane workers `tel_ctl0`, `tel_ctl1`, `tel_drop` and `tel_sos` are 12288 B, priority 5, with a PSRAM stack where one is free. They are created in the order sos, drop, ctl, so when boot memory runs short a 911/933 and a drop get their workers before ordinary call setup does. A lane with no worker posts its jobs to `tel_ctl` instead.
 
 ### 1.1 Protocol Role: Back-to-Back Call Broker, Not a Proxy
 
@@ -190,8 +215,10 @@ sequenceDiagram
     participant HTTP as HTTP connection thread
     SIP->>SIP: handle() mutates state under _mutex
     Note over SIP: tick() runs at most once a second
-    SIP->>Snap: tick() refills scratch under _mutex, then swaps into _snapshot under _snapshotMutex
-    HTTP->>Snap: GET /api/status reads under _snapshotMutex
+    SIP->>Snap: tick() refills _snapshotScratch under _mutex, then swaps it into _snapshot under _snapshotMutex
+    HTTP->>Snap: getActiveClients() and getActiveSessions() copy under _snapshotMutex
+    HTTP->>Snap: /api/status formats in place through withSnapshot(), holding _snapshotMutex throughout
+    Note over HTTP: neither read takes _mutex
 ```
 
 ### B. Out-of-Lock Socket Syscalls (Issue #51)
@@ -223,15 +250,20 @@ flowchart TD
     A[select on the listen socket, 250 ms timeout] --> B{Activity?}
     B -- No --> A
     B -- Yes --> C[accept the client socket]
-    C --> D{Fewer than 3 connections live?}
-    D -- No --> E[Send 503 and close]
+    C --> D{"Fewer than kMaxConcurrentConnections = 3 live?"}
+    D -- No --> E["503 Service Unavailable, close"]
     E --> A
-    D -- Yes --> F[Spawn detached http_conn thread]
+    D -- Yes --> PS{"This source holds fewer than kMaxConnectionsPerSource = 2?"}
+    PS -- No --> E
+    PS -- Yes --> F["Spawn a detached http_conn thread on a connection slot"]
     F --> A
-    F --> G[Set SO_RCVTIMEO to 5 s and read the request, body capped at 16 KB]
-    G --> H[requireAdmin on gated routes]
+    F --> G["Read the request: each recv() waits at most 5 s, all of it within kReadDeadlineMs = 10 s"]
+    G --> BL{"Body over 16 KB?"}
+    BL -- Yes --> R413["413 Payload Too Large"]
+    BL -- No --> H[requireAdmin on gated routes]
     H --> I[Send the response with security headers]
     I --> J[Close the socket]
+    R413 --> J
 ```
 
 ### Accept Loop Implementation

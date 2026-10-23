@@ -963,7 +963,11 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	// touch only the rate state, which _rateMutex now guards.
 	{
 		std::lock_guard<std::mutex> rlock(_rateMutex);
-		if (!ipAllowed(request->getSource()) || !allowPacket(request->getSource()))
+		// #1092, Rule 5: a live emergency Call-ID skips the bucket; the trunk peer has its own
+		// high-ceiling bucket outside the 256-entry cap (allowPacket). The allowlist still
+		// applies. No _mutex.
+		if (!ipAllowed(request->getSource()) ||
+			(!rateExemptByCallId(*request) && !allowPacket(request->getSource())))
 		{
 			const sockaddr_in src = request->getSource();
 			_dropProbe.note(DropProbe::Reason::Rate, src.sin_addr.s_addr, src.sin_port, rawBytes);
@@ -1332,6 +1336,9 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// registration appear/disappear, session create/transition/teardown.
 		// NOTIFYs land in _outbox and ride out with this pass (after unlock).
 		_blf.refresh();
+
+		// #1092: a session this packet created or ended changes the emergency Call-ID set.
+		publishRateExemptions();
 
 		// #462 (#284 rank 5): into the receive path's own persistent scratch.
 		// Safe without a lock of their own: handle() has exactly one production
@@ -5755,6 +5762,22 @@ void RequestsHandler::asyncDropCall(const std::string& participantId)
 	}
 }
 
+void RequestsHandler::asyncReleaseRemovedLeg(const std::string& participantId)
+{
+	if (!_anchorClient) return;
+	if (anchorIsSynchronous())
+	{
+		_anchorClient->releaseRemovedLeg(participantId);
+		return;
+	}
+	// tel_drop, as the drop it replaces (kTelDropDepth budgets one per makeCall in
+	// flight): stopMediaStreams() may join the leg's rx task, so not tel_sos or tel_ctl.
+	if (!postTelCtl(new TelCtlJob{ TelCtlJob::Release, {}, {}, {}, participantId }, kLaneDrop))
+	{
+		queueLog("[Telephony] asyncReleaseRemovedLeg: tel_drop queue full — leg " + participantId + " NOT released", true);
+	}
+}
+
 void RequestsHandler::releaseFarLeg(Session& s, bool dropLeg)
 {
 	if (dropLeg) asyncDropCall(s.getAnchorParticipantId());
@@ -5921,6 +5944,11 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 		_anchorClient->dropCall(job.partId);
 		return;
 	}
+	if (job.kind == TelCtlJob::Release)
+	{
+		_anchorClient->releaseRemovedLeg(job.partId);   // #1103: no request, no _ctrlMutex
+		return;
+	}
 	if (job.kind == TelCtlJob::Answer)
 	{
 		if (!_anchorClient->answerCall(job.partId))
@@ -5966,10 +5994,12 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 		// What the missed Dropped would have done (#880: a final 503 to the ringing caller,
 		// NOT ROUTED for a 911/933). It matches only this leg's session, and only once: a
 		// Dropped already handled, or one still to come, finds no session. 3CX has ended
-		// the leg; the drop only frees the slot makeCall() keyed for it (tel_drop).
+		// the leg, so it is freed locally (#1103): tombstoned and its media stopped on
+		// tel_drop, with no drop POST, which would draw 403 and hold the anchor's control
+		// connection a PSAP callback's answer waits on.
 		queueLog("[Telephony] 3CX removed leg " + ownLeg + " before the call was bound -- failing it (#1095)", true);
 		anchorDroppedLocked(ownLeg);
-		asyncDropCall(ownLeg);
+		asyncReleaseRemovedLeg(ownLeg);
 	}
 	else if (!bound && !ownLeg.empty())
 	{
@@ -11160,6 +11190,11 @@ void RequestsHandler::tick()
 			}
 		}
 
+		// #1092: re-publish the limiter's exemptions every pass (a trunk name resolving,
+		// a session ending without a packet).
+		publishTrunkPeer(/*retire=*/false);
+		publishRateExemptions();
+
 		// Belt-and-suspenders (Fix #4): drop DTMF accumulators whose dialog is gone,
 		// in case a teardown path bypassed endCall(). Bounded by the small session pool.
 		_dtmf.sweepStale();
@@ -12121,10 +12156,106 @@ bool RequestsHandler::ipAllowed(const sockaddr_in& src) const
 	return (ip & _allowMask) == _allowNet;
 }
 
+uint32_t RequestsHandler::nextTrunkPeerIp(uint32_t current, TrunkResolver::Status st, uint32_t found)
+{
+	return (st == TrunkResolver::Status::Hit && found != 0) ? found : current;
+}
+
+bool RequestsHandler::emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId)
+{
+	callId = siphdr::stripHeaderNameView(callId);   // bare value, whatever form the caller holds
+	// A Call-ID that does not fit is not stored truncated: a prefix would exempt other dialogs.
+	if (callId.empty() || callId.size() >= kRateExemptCallIdBytes || set.count >= kMaxRateExemptCallIds)
+		return false;
+	if (emergencyIdsHas(set, callId)) return true;
+	std::memcpy(set.id[set.count].data(), callId.data(), callId.size());
+	set.len[set.count] = static_cast<uint8_t>(callId.size());
+	++set.count;
+	return true;
+}
+
+bool RequestsHandler::emergencyIdsHas(const EmergencyCallIds& set, std::string_view callId)
+{
+	callId = siphdr::stripHeaderNameView(callId);
+	for (size_t i = 0; i < set.count && i < kMaxRateExemptCallIds; ++i)
+	{
+		if (set.len[i] == callId.size() && std::memcmp(set.id[i].data(), callId.data(), callId.size()) == 0)
+			return true;
+	}
+	return false;
+}
+
+bool RequestsHandler::emergencyIdsEqual(const EmergencyCallIds& a, const EmergencyCallIds& b)
+{
+	if (a.count != b.count) return false;
+	for (size_t i = 0; i < a.count && i < kMaxRateExemptCallIds; ++i)
+	{
+		if (a.len[i] != b.len[i] || std::memcmp(a.id[i].data(), b.id[i].data(), a.len[i]) != 0)
+			return false;
+	}
+	return true;
+}
+
+void RequestsHandler::publishRateExemptions()
+{
+	// Member scratch (guarded by _mutex), not a stack local: it is ~2 KB and this runs from the SIP task.
+	EmergencyCallIds& fresh = _emergencyIdsScratch;
+	fresh.count = 0;   // entries past count are never read
+	for (const auto& [callID, s] : _sessions)
+	{
+		if (!s || !s->isEmergency()) continue;
+		(void)emergencyIdsAdd(fresh, callID);
+		// #818: the carrier speaks on the trunk dialog's own Call-ID, not the handset leg's.
+		if (const SipTrunk::Dialog* d = _sipTrunk.findByCallID(callID); d)
+			(void)emergencyIdsAdd(fresh, d->callID);
+	}
+	std::lock_guard<std::mutex> rlock(_rateMutex);
+	if (!emergencyIdsEqual(fresh, _emergencyCallIds)) _emergencyCallIds = fresh;
+}
+
+void RequestsHandler::publishTrunkPeer(bool retire)
+{
+	const auto now = std::chrono::steady_clock::now();
+	const bool valid = _sipTrunk.config().valid();
+	sockaddr_in sbc{};
+	// Cache-only lookup: tick() is what resolves. It stops answering Hit once its entry ages
+	// out (300 s) and while a failure is cached (30 s), so the last Hit is latched below.
+	const TrunkResolver::Status st = valid
+		? _trunkResolver.lookup(_sipTrunk.config().transportHost(), _sipTrunk.config().transportPort(), sbc, now)
+		: TrunkResolver::Status::Refused;
+	std::lock_guard<std::mutex> rlock(_rateMutex);
+	const uint32_t next = valid ? nextTrunkPeerIp(retire ? 0 : _trunkPeerIp, st, sbc.sin_addr.s_addr) : 0;
+	if (next != _trunkPeerIp)
+	{
+		_trunkPeerIp = next;
+		_trunkBucket = { kTrunkBucketBurst, now };
+	}
+}
+
+bool RequestsHandler::rateExemptByCallId(const SipMessage& m) const
+{
+	return emergencyIdsHas(_emergencyCallIds, m.getCallID());
+}
+
+bool RequestsHandler::takeToken(RateBucket& bucket, std::chrono::steady_clock::time_point now,
+	double burst, double perSec)
+{
+	const double elapsedSec = std::chrono::duration<double>(now - bucket.last).count();
+	bucket.last = now;
+	bucket.tokens = (std::min)(burst, bucket.tokens + elapsedSec * perSec);
+	if (bucket.tokens < 1.0) return false;
+	bucket.tokens -= 1.0;
+	return true;
+}
+
 bool RequestsHandler::allowPacket(const sockaddr_in& src)
 {
 	auto now = std::chrono::steady_clock::now();
 	uint32_t ip = src.sin_addr.s_addr; // Key by raw network-byte-order IP
+
+	// #1092: the carrier has its own bucket, outside the table and its cap.
+	if (_trunkPeerIp != 0 && ip == _trunkPeerIp)
+		return takeToken(_trunkBucket, now, kTrunkBucketBurst, kTrunkBucketRate);
 
 	auto it = _rateBuckets.find(ip);
 	if (it == _rateBuckets.end())
@@ -12139,20 +12270,8 @@ bool RequestsHandler::allowPacket(const sockaddr_in& src)
 		return true;
 	}
 
-	auto& bucket = it->second;
-	double elapsedSec = std::chrono::duration<double>(now - bucket.last).count();
-	bucket.last = now;
-
-	// Replenish tokens (sustained rate = 20 tokens/sec)
-	bucket.tokens = (std::min)(40.0, bucket.tokens + elapsedSec * 20.0);
-
-	if (bucket.tokens >= 1.0)
-	{
-		bucket.tokens -= 1.0;
-		return true;
-	}
-
-	return false; // Denied (Rate limit exceeded)
+	// Replenish tokens (burst 40, sustained rate = 20 tokens/sec); false = rate limit exceeded
+	return takeToken(it->second, now, 40.0, 20.0);
 }
 
 bool RequestsHandler::isValidAor(std::string_view s) const
@@ -13691,6 +13810,7 @@ void RequestsHandler::setTrunkConfig(const SipTrunk::Config& cfg)
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
+	publishTrunkPeer(/*retire=*/true);   // #1092: the old carrier IP loses its bucket now
 }
 
 SipTrunk::Config RequestsHandler::getTrunkConfig()
@@ -13751,6 +13871,7 @@ void RequestsHandler::applyStoredTrunkConfig()
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
+	publishTrunkPeer(/*retire=*/true);   // #1092: the old carrier IP loses its bucket now
 
 	// Checked, not discarded. The HTTP route caps the password well below
 	// kMaxSecret, but this path reads raw NVS, which an older or different

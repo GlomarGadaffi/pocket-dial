@@ -40,15 +40,26 @@ RAY BAUM'S Act requires all 911 calls from MLTS and interconnected VoIP systems 
 - **Pre-dialplan priority bypass:** Emergency classification runs strictly before operator-configured dial plans (`DialPlan.hpp`), ring groups, speed dials, and policy locks. An operator rule such as `9*` (strip 1 digit) cannot intercept or rewrite `911` into `11`.
 - **Policy gate bypass:** The call bypasses Do-Not-Disturb (DND), call forwarding (CFNA/CFU), and administrative PIN authentication.
 
-The decision path for an incoming INVITE is:
+The decision path for a new INVITE in `RequestsHandler::onInvite()` is below. Inside `onInvite()`, only the dialog, syntax, registration and codec gates come before the emergency check, and every policy gate comes after it. Two gates run earlier, before `onInvite()` is reached, and can drop a 911/933: the per-source rate limiter and `ipAllowed()` allowlist (`RequestsHandler.cpp:962-971`), which discard the packet without any response, and the SDP admission gate (`:1097-1110`), which yields to emergency traffic only for a `TooManyAudioStreams` verdict. The rate-limit exemption for emergency traffic is open as #1092. The diagram starts at `onInvite()`:
 
 ```mermaid
 flowchart TD
-    A["Incoming INVITE"] --> B["Capability gate (codec/registration)"]
-    B --> C["classifyEmergencyDial()"]
-    C -- "emergency" --> D["routeEmergencyCall()"]
-    C -- "not emergency" --> E["Normal call flow"]
-    E --> F["DialPlan / RingGroups / DND"]
+    A["INVITE reaches onInvite()"] --> S{"Session already holds this Call-ID?"}
+    S -- "Connected or Held, To has a tag" --> RI["onReinvite()"]
+    S -- "Invited, Connected or Held" --> SD["Silent drop: a retransmission"]
+    S -- "no" --> T{"To has a tag for an unknown dialog?"}
+    T -- "yes" --> R481["481 Call/Transaction Does Not Exist"]
+    T -- "no" --> V{"From and To are valid AORs?"}
+    V -- "no" --> R400["400 Bad Request"]
+    V -- "yes" --> REG{"Caller registered?"}
+    REG -- "no" --> R403["403 Forbidden"]
+    REG -- "yes" --> COD{"SDP offers PCMU, PCMA or G722?"}
+    COD -- "no" --> R488["488 Not Acceptable Here"]
+    COD -- "yes" --> EM{"classifyEmergencyDial(To): 911, 933, 9911 or 9933?"}
+    EM -- "yes" --> RE["routeEmergencyCall()"]
+    EM -- "no" --> DR{"dialRuleMakesEmergency(): a Trunk dial rule turns it into 911 or 933?"}
+    DR -- "yes" --> RE
+    DR -- "no" --> N["Policy and routing: secure-mode challenge, reserved extensions, ring groups, forwards, DND, dial plan"]
 ```
 
 ### 2.2 On-site notification (compliant)
@@ -78,10 +89,55 @@ On a traditional SIP trunk, the local PBX would have to attach location itself, 
   - Any incoming call delivering to that extension during the next 30 minutes is automatically promoted to an emergency session (`Session::isEmergency() = true`).
   - This prevents an incoming 911 callback from being deflected to voicemail, rejected by DND, or preempted by call waiting.
 
+How the window is opened and what a flagged callback changes:
+
+```mermaid
+flowchart TD
+    A["Extension X dials 911 or 933 and the anchor takes the call"] --> B["markEmergency(): _emergencyCallbacks.note(X)"]
+    B --> C{"A call to X arrives within kEmergencyCallbackWindow, 30 min?"}
+    C -- "no" --> D["Ordinary call"]
+    C -- "yes" --> E["Session flagged isEmergency()"]
+    E --> F{"Arrives on the 3CX anchor while every bridge is busy or another inbound is live?"}
+    F -- "yes" --> G["preemptAnchorCallForPsapCallback(): end one non-emergency anchor call"]
+    G -- "no single call clears the way" --> H["Callback dropped, logged as PSAP callback NOT routed"]
+    G -- "room made" --> I["Handsets ring"]
+    F -- "no" --> I
+    I --> J["A REGISTER with Expires 0 from X only lapses its lease, the call is not ended"]
+```
+
 ### 2.5 Outage and failover
 
 - **Provider readiness check (`telephonyProviderPlacesRealCalls()`):** Evaluated in `src/SIP/TelephonyProvider.hpp`. Simulated providers (such as `LoopbackAnchorClient`) explicitly report `false` and are barred from receiving 911 routing.
 - **Network outage signalling:** If the cloud media anchor is disconnected or the WAN is down, the PBX immediately returns SIP `503 Emergency Call Not Routable` with a Warning header and raises the on-site notification. The PBX has no fallback route for 911 or 933 (see `DEMARCATION.md`); any cellular fallback is the handset's own.
+
+What `routeEmergencyCall()` does with a 911/933, and the two different 503s a caller can receive, before and after the call is handed to the anchor:
+
+```mermaid
+flowchart TD
+    RE["routeEmergencyCall()"] --> RT{"emergencyRouteLocked(): provider places real calls?"}
+    RT -- "no: EmergencyRoute::None" --> W1["Warning detail: no emergency route configured"]
+    RT -- "yes: EmergencyRoute::Anchor" --> CN{"originateAnchorCall(): anchor isConnected()?"}
+    CN -- "no, nothing sent" --> W3["Warning detail: the 3CX anchor could not place the call"]
+    CN -- "yes" --> CD{"Offer carries PCMU?"}
+    CD -- "no" --> W2["Warning detail: no G.711 codec offered"]
+    CD -- "yes" --> RTP{"Usable RTP address in the SDP?"}
+    RTP -- "no" --> R400["400 Bad Request, notifyEmergency routed=false"]
+    R400 -. "the anchor answered, so the call counts as owned" .-> MK2["markEmergency(): the callback window opens although the call was never placed"]
+    MK2 --> NF
+    RTP -- "yes" --> PRE["preemptAnchorCallForEmergency(): when full, end one non-emergency anchor call"]
+    PRE --> CAP{"Bridge, session and virtual peer free, and the tel_sos queue takes the makeCall job?"}
+    CAP -- "no, nothing sent" --> W3
+    CAP -- "yes" --> RING["Session Invited, 180 Ringing to the handset"]
+    RING --> MK["markEmergency(): setEmergency, open the PSAP callback window"]
+    MK --> NT["notifyEmergency routed=true, on the same outbox pass as the 180"]
+    W1 --> R503["503 Emergency Call Not Routable, Warning 399, no Retry-After"]
+    W2 --> R503
+    W3 --> R503
+    R503 --> NF["notifyEmergency routed=false"]
+    NT --> MC["tel_sos worker: makeCall() to 3CX"]
+    MC -- "fails, or 3CX removes the leg before it connects" --> F503["503 Service Unavailable, notifyEmergency routed=false"]
+    MC -- "leg bound" --> UP["Answered event: 200 OK, call Connected"]
+```
 
 ## 3. Compliance summary and operator checklist
 

@@ -41,6 +41,10 @@ bool TelephonyAnchorClient::ownLegRemovedSinceNamed(const std::string&)
 	return false;
 }
 
+void TelephonyAnchorClient::releaseRemovedLeg(const std::string&)
+{
+}
+
 bool TelephonyAnchorClient::answerCall(const std::string&)
 {
 	return false;
@@ -767,6 +771,25 @@ bool TelephonyAnchorClient::ownLegRemovedSinceNamed(const std::string& ownLeg)
 {
 	std::lock_guard<std::mutex> lock(_mutex);
 	return _ownLegs.removedSinceNamed(ownLeg);
+}
+
+// #1103: the #1095 backstop's release of a leg 3CX has already removed. dropCall() without its POST: 3CX
+// no longer has the leg (a drop draws 403), and performCtrl() would hold _ctrlMutex across that round trip
+// (5-7 s on a stall) while a PSAP callback's answerCall() waits on the same mutex. Tombstone first (#554 (b):
+// an upsert racing the teardown cannot re-prime the slot), then free the slot makeCall() may have keyed.
+// Fixed-storage rings, no I/O, never _ctrlMutex. Runs on tel_drop: stopMediaStreams() may join the rx task.
+void TelephonyAnchorClient::releaseRemovedLeg(const std::string& ownLeg)
+{
+	if (ownLeg.empty()) return;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_droppedLegs.add(ownLeg);
+		// #379: false means the leg is not held (never ours, or past its grace); there is
+		// nothing to refresh then, and the tombstone above already stands.
+		(void)_ownLegs.refresh(ownLeg, esp_timer_get_time());
+	}
+	stopMediaStreams(ownLeg);
+	ESP_LOGI(TAG, "released removed leg %s locally, no drop request (#1103)", ownLeg.c_str());
 }
 
 bool TelephonyAnchorClient::dropCall(const std::string& participantId)

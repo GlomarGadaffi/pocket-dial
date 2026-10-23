@@ -108,14 +108,16 @@ as the board is up:
 
 ```mermaid
 flowchart TD
-    boot[Board boots] --> http[HTTP dashboard starts in every state]
-    http --> build{Build}
-    build -->|display| sip[SIP registrar starts]
-    build -->|wifi, eth or lan8720| committed{Credential committed?}
-    committed -->|yes| sip
-    committed -->|no, under 30 minutes| poll[Wait 2 s and check again]
-    poll --> committed
-    committed -->|no, 30 minutes passed| reboot[Board reboots and waits again]
+    boot["Board boots, NVS key provisioned read (esp_main.cpp:506-515)"] --> http["HTTP dashboard task created in every state: http_server_task on wifi and display, http_dashboard on eth and lan8720, prio 4, 8 KB, Core 0"]
+    http --> build{"Build"}
+    build -->|display| sipd["sip_server_task created with no gate (esp_main_display.cpp:923 and :968)"]
+    build -->|"wifi, eth or lan8720"| flag{"provisioned flag non-zero?"}
+    flag -->|yes| sip["SIP task created: prio 5, 8 KB, Core 1 (esp_main.cpp:560, esp_main_eth.cpp:845, esp_main_eth_lan8720.cpp:602)"]
+    flag -->|no| dark["Log: device unprovisioned, SIP stack held dark"]
+    dark --> committed{"AdminAuth::credentialIsSet()? polled every 2 s"}
+    committed -->|yes| save["NVS provisioned = 1, then SIP task created"]
+    save --> sip
+    committed -->|"no, 1800 s elapsed"| reboot["esp_restart, then the wait starts again"]
     reboot --> boot
 ```
 
@@ -227,12 +229,29 @@ confirms it automatically a few seconds after the SIP and HTTP servers come up (
 the previous slot, so the board is not bricked.
 
 ```mermaid
-flowchart LR
-    login[Log in: pd_session cookie and X-CSRF token] --> upload[Upload image to inactive slot]
-    upload --> reboot[Reboot into the new image]
-    reboot --> pending[Pending-verify state]
-    pending -->|SIP and HTTP servers up| confirm[Firmware confirms the image a few seconds later]
-    pending -->|Crashes on boot| rollback[Bootloader rolls back to the previous slot]
+sequenceDiagram
+    participant C as curl
+    participant H as http_conn thread
+    participant O as OtaUpdater
+    participant R as ota_reboot task
+    participant BL as Bootloader
+    participant N as New image http_server_task
+    C->>H: POST /api/admin/login, receive pd_session cookie and csrf
+    C->>H: POST /api/ota/upload with Content-Length
+    Note over H: requireAdmin with CSRF and Owner role, then 411 if length is 0, then 409 if any call is up or ringing
+    H->>O: begin, write per chunk, end, activate
+    H-->>C: 200 status ok, rebootRequired true
+    C->>H: POST /api/ota/reboot
+    H-->>C: 200 staged true
+    H->>R: xTaskCreate ota_reboot, waits 1 s
+    Note over R: holds the restart while a 911 or 933 call is live
+    R->>BL: esp_restart
+    BL->>N: boots the new slot as PENDING_VERIFY
+    alt 5 s of uptime reached
+        N->>N: isPendingVerify then markValid, slot VALID
+    else crash or boot loop before that
+        BL->>BL: next reset rolls back to the previous slot
+    end
 ```
 
 **Warning:** The dual-slot layout, the pending-verify confirmation and the rollback
