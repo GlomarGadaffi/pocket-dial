@@ -5223,6 +5223,11 @@ bool RequestsHandler::routeCodecRefusedEmergency(const std::shared_ptr<SipMessag
 	pbx::EmergencyDial emergency;
 	std::string asDialed;
 	if (!emergencyDialOf(dialed, emergency, asDialed)) return false;
+	if (asDialed != dialed)   // same line the intercept writes for a rule-made 911
+	{
+		queueLog("EMERGENCY: a dial-plan rule turned " + dialed + " into " + asDialed +
+			"; routing it as an emergency call", true);
+	}
 	routeEmergencyCall(data, caller, emergency, asDialed, /*noRelayableCodec=*/true);
 	return true;
 }
@@ -5236,7 +5241,7 @@ void RequestsHandler::noteUnregisteredEmergencyDial(const std::shared_ptr<SipMes
 	const std::string from(data->getFromNumber());
 	queueLog("EMERGENCY: " + std::string(emergency.isTest ? "TEST 933" : "911") + " dialed by " + from +
 		" - caller is not a registered extension, refused (403)", true);
-	notifyEmergency(emergency, from, dialed, /*routed=*/false, "caller is not a registered extension");
+	notifyEmergency(emergency, from, asDialed, /*routed=*/false, "caller is not a registered extension");
 }
 
 // Issue #166 part 2. Kept to this one small function so the compliance-relevant
