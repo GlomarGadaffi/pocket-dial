@@ -481,6 +481,28 @@ class Gate(unittest.TestCase):
                     "^void __cxa_guard_(release|abort)\\(long long int\\*\\)$"):
             self.assertTrue(table["_library_defaults_reasons"].get(row, "").strip(), row + " states no reason")
 
+    def test_the_wifi_blob_row_claims_only_its_own_name(self):
+        # esp_wifi_internal_tx lives in Espressif's prebuilt Wi-Fi library, so no .ci has a frame for it.
+        # wifi_transmit (esp_wifi/src/wifi_netif.c) calls it, and the indirect_allowlist row for
+        # esp_netif_transmit makes that call reachable. Like the other prebuilt callees it takes a stated
+        # estimate, and the row must not catch a function of ours.
+        table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
+        self.table["library_defaults"] = table["library_defaults"]
+        self.table["tasks"][0]["bytes"] = 4096
+        self.add_ci(bare("esp_wifi_internal_tx", "esp_err_t esp_wifi_internal_tx(wifi_interface_t, void*, uint16_t)",
+                         "/idf/components/esp_wifi/include/esp_private/wifi.h:210:5") + edge("leaf", "esp_wifi_internal_tx"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("FAIL frame", out)
+        self.assertIn("ok   small: 1524 B", out)         # 200 + 300 + the 1024 B estimate
+        self.add_ci(bare("esp_wifi_internal_tx_shim", "void esp_wifi_internal_tx_shim()", "@ROOT@/src/SIP/X.cpp:14:3")
+                    + edge("leaf", "esp_wifi_internal_tx_shim"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("project function with no frame data (partial --ci-dir?): void esp_wifi_internal_tx_shim", out)
+        self.assertTrue(table["_library_defaults_reasons"].get(
+            r"(?:^|[ *&])esp_wifi_internal_tx(?:\(|$)", "").startswith("1024 B"))
+
     def test_a_graph_compiled_elsewhere_fails_closed_until_given_its_project_root(self):
         # .ci files built in another checkout: nothing in them is under --src-root. Reading
         # that as "no project code, so nothing to cap" would pass any frame.
@@ -1063,6 +1085,14 @@ class Gate(unittest.TestCase):
             return dict(pairs)
         with open(os.path.join(os.path.dirname(GATE), "task_stacks.json"), encoding="utf-8") as f:
             json.load(f, object_pairs_hook=no_dups)
+
+    def test_checked_in_indirect_rows_cite_a_source_position(self):
+        # A row is a claim about who installs a pointer; a reader checks it against the source, so each
+        # reason carries a file:line (a header of the toolchain's libstdc++ counts).
+        with open(os.path.join(os.path.dirname(GATE), "task_stacks.json"), encoding="utf-8") as f:
+            rows = json.load(f)["indirect_allowlist"]
+        bare = sorted(k for k, v in rows.items() if not re.search(r"\.\w{1,4}:\d+", v["reason"]))
+        self.assertEqual(bare, [], "indirect_allowlist reasons with no file:line")
 
     def test_a_task_not_marked_bounded_stays_report_only(self):
         self.indirect_fixture(flag=False)
