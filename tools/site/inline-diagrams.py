@@ -13,7 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 S = os.path.join(HERE, 'svg')
 PAGE = os.path.join(HERE, '..', '..', 'docs', 'index.html')
 # Sequence and wide flowcharts keep a minimum width; the column scrolls instead.
-MINW = {'callflow': 560, 'callfail': 560, 'media': 720, 'emergency': 560}
+MINW = {'callflow': 720, 'callfail': 640, 'media': 720, 'emergency': 720, 'learn': 650}
 
 
 def svg(n, minw=None):
