@@ -1507,3 +1507,17 @@ TEST(TrunkInbound, ANonEmergencyFloodFromARegisteredIpIsStillLimited)
 	floodOptions(b, kPhoneIp, 5, "rl2-opt-");
 	EXPECT_EQ(b.handler.getDropProbe().rateCount(), before + 5u);
 }
+
+// The unregistered emergency budget is one shared bucket, not one per forged address.
+TEST(TrunkInbound, ManyForgedSources911FloodsShareOneTinyBudget)
+{
+	Bench b;
+	uint32_t total = 0;
+	for (int i = 0; i < 8; ++i)   // each source's ordinary bucket is drained first
+	{
+		const std::string ip = "198.51.100." + std::to_string(100 + i);
+		floodOptions(b, ip, 100, "rl2-multi-drain" + std::to_string(i) + "-");
+		total += inviteAdmitted(b, ip, "911", "911", 10, "rl2-multi" + std::to_string(i) + "-");
+	}
+	EXPECT_EQ(total, 4u) << "eight forged sources must not get eight budgets";
+}
