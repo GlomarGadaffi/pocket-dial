@@ -897,6 +897,12 @@ class Gate(unittest.TestCase):
         rc, out = self.run_gate()
         self.assertEqual(rc, 1, out)              # nothing is named like that before the "[with"
         self.assertIn("matches no function", out)
+        # A pattern that spells out "[with " asks for the note on purpose (one instantiation of
+        # a std::function manager, say), and is matched against the whole label.
+        self.table["indirect_allowlist"][r"void mid\(\)"]["targets"] = [r"_M_run\(\) \[with _C = Thing::run"]
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("big: 2000 B", out)         # 400 + 600 + the 1000 B _M_run
 
     def test_the_chain_says_which_edge_an_allowlist_row_added(self):
         self.indirect_fixture()
@@ -916,6 +922,19 @@ class Gate(unittest.TestCase):
         rc, out = self.run_gate()
         self.assertEqual(rc, 1, out)
         self.assertRegex(out, r"void Deep::call\(\)\s+<- void mid\(\)")
+
+    def test_an_unbounded_task_lists_where_project_code_enters_a_library(self):
+        # 146 library sites are no use as a list; the few calls from our code into the library
+        # that reach them are what one reads to decide whether the walk is right.
+        self.indirect_fixture()
+        self.add_ci(node("lib", "void lib_entry()", 10, loc="/idf/components/x/x.c:1:1")
+                    + node("ind2", "Indirect Call Placeholder", 0)
+                    + edge("mid", "lib") + edge("lib", "ind2"))
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"library entered from project code: void mid\(\) -> void lib_entry\(\)")
+        self.assertNotIn("void lib_entry() -> ", out)
 
     def test_a_failing_cycle_lists_every_member(self):
         names = [f"void Ring{i}()" for i in range(7)]

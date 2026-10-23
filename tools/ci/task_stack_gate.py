@@ -125,7 +125,8 @@ INDIRECT_RE = re.compile(r"^Indirect Call Placeholder$")
 def head(label):
     """A function's name without GCC's trailing " [with T = ...]" template-argument note.
     That note names the arguments an instantiation was made with, not the function: the
-    _M_run of a thread whose lambda sits in X::f carries "X::f(" in it, and is not X::f."""
+    _M_run of a thread whose lambda sits in X::f carries "X::f(" in it, and is not X::f.
+    A target pattern is matched against this, unless it contains "[with " itself."""
     return label.split(" [with ", 1)[0]
 
 
@@ -319,7 +320,10 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
         hit = []
         for pat in tg:
             rx = re.compile(pat)
-            found = sorted(x for x in nodes if x not in ind and rx.search(head(pretty(nodes[x]))))
+            # The "[with ...]" note is searched only by a pattern that spells it out.
+            note = "[with " in pat
+            found = sorted(x for x in nodes if x not in ind
+                           and rx.search(pretty(nodes[x]) if note else head(pretty(nodes[x]))))
             if not found:
                 rc_rows = 1
                 print(f"FAIL indirect_allowlist row '{k}': target '{pat}' matches no function, so it bounds nothing")
@@ -512,6 +516,14 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                             if b not in parent:
                                 parent[b] = a
                                 queue.append(b)
+                    enter = sorted({(parent[v], v) for v in parent if parent[v] is not None
+                                    and ours(nodes.get(parent[v], "")) and not ours(nodes.get(v, ""))},
+                                   key=lambda e: (pretty(nodes.get(e[0], e[0])), pretty(nodes.get(e[1], e[1]))))
+                    for a, b in enter[:80]:
+                        print(f"            library entered from project code: {pretty(nodes.get(a, a))[:110]} -> "
+                              f"{pretty(nodes.get(b, b))[:90]}{via(a, b)}")
+                    if len(enter) > 80:
+                        print(f"            library entered from project code: +{len(enter) - 80} more")
                     for v in unbounded:
                         print(f"            {pretty(nodes.get(v, v))}")
                         if parent.get(v) is not None:
