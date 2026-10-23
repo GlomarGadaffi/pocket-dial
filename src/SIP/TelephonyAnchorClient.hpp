@@ -355,6 +355,22 @@ private:
 	std::atomic<int>  _leakedGetClients{0};
 	std::atomic<bool> _restartRequested{false};
 	std::atomic<bool> _restartInFlight{false};
+	// #336: a restart whose start() failed re-arms itself (_restartRequested) with a capped backoff.
+	// _startFailures counts the failures in a row (success resets it); tick() holds the restart back
+	// until _restartNotBeforeUs (esp_timer microseconds; 0: no hold). See telephony::startRetryDelayUs.
+	std::atomic<uint32_t> _startFailures{0};
+	std::atomic<int64_t>  _restartNotBeforeUs{0};
+	// #336: which token each side holds, as a count of installs. fetchToken() bumps _tokenGen under
+	// _mutex when a token is installed. _wsHeaderGen is the generation of the Authorization header the
+	// control WebSocket will send on its next handshake: connectWs() sets it from the same _mutex
+	// section that copies the bearer it bakes, and fetchToken() sets it only when
+	// esp_websocket_client_set_headers() returned ESP_OK and the socket is up. A WS drop with the two unequal restarts the
+	// anchor (telephony::wsRestartDecision). Not the obtained-at stamp: token_age rewrites that.
+	// _lastWsRestartRequestUs is the last time a WS event asked for a restart (0: never); it is read
+	// and written on the WS client's task only.
+	std::atomic<uint32_t> _tokenGen{0};
+	std::atomic<uint32_t> _wsHeaderGen{0};
+	std::atomic<int64_t>  _lastWsRestartRequestUs{0};
 	// How many leaked GET sockets we tolerate before forcing a reclaiming restart. The
 	// pool is 16 and the anchor itself needs 3 persistent sockets + SIP/dashboard/SSH,
 	// so a handful of leaks is the safe ceiling before sockets start starving.
@@ -412,8 +428,10 @@ private:
 	bool wakeSweep();   // false: no tel_sweep task
 	static void sweepTaskTrampoline(void* arg);
 	// Issue #336: same _restartRequested mechanism as the leak-count path above,
-	// triggered instead by a disconnected/errored WS with an expiring/expired
-	// token -- see its own definition for why reconnect-in-place can't fix this.
+	// triggered instead by a disconnected/errored WS whose token is expiring or
+	// whose Authorization header is not the held token (telephony::wsRestartDecision,
+	// rate limited) -- see its own definition for why reconnect-in-place can't fix
+	// this. A restart whose start() fails re-arms itself with a capped backoff.
 	void requestRestartIfTokenStale();
 
 	static void wsEventTrampoline(void* handlerArgs, esp_event_base_t base, int32_t eventId, void* eventData);
