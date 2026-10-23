@@ -2416,14 +2416,21 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	}
 #endif
 
+	const std::string destNumber(data->getToNumber());
+
 	if (!caller.has_value())
 	{
 		auto response = getMessageFromPool(*data);
-		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		if (!response)
+		{
+			noteUnregisteredEmergencyDial(data, destNumber);   // #1107: the 911 is still on the record
+			return;   // pool exhausted: drop, peer retransmits (#101A)
+		}
 		response->setHeader("SIP/2.0 403 Forbidden");
 		response->clearBody();
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
+		noteUnregisteredEmergencyDial(data, destNumber);   // #1107: after the 403, as routeEmergencyCall orders it
 		return;
 	}
 
@@ -2434,6 +2441,9 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// PHONE_COMPATIBILITY.md used to document as a phone-side setting.
 	if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/true))
 	{
+		// #1107 (Rule 5): the refusal stands, but a 911/933 gets the emergency lane's own
+		// (log, 503 naming the codec, routed=false notification), not this plain 488.
+		if (routeCodecRefusedEmergency(data, caller.value(), destNumber)) return;
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader("SIP/2.0 488 Not Acceptable Here");
@@ -2443,8 +2453,6 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
-
-	std::string destNumber(data->getToNumber());
 
 	// ── Emergency dialing, before anything an operator can configure (#166) ──
 	//
@@ -5056,7 +5064,7 @@ namespace
 // does. Caller holds _mutex.
 void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	const std::shared_ptr<SipClient>& caller,
-	const pbx::EmergencyDial& emergency, const std::string& dialed)
+	const pbx::EmergencyDial& emergency, const std::string& dialed, bool noRelayableCodec)
 {
 	const std::string kind(emergency.isTest ? "TEST 933" : "911");
 	const std::string from(data->getFromNumber());
@@ -5093,8 +5101,8 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		_emergencyCallbacks.note(caller->getNumber(), std::chrono::steady_clock::now());
 	};
 	bool placed = false;
-	bool codecRejected = false;
-	if (route == EmergencyRoute::Anchor)
+	bool codecRejected = noRelayableCodec;   // #1107: nothing to route; the 503 below names the codec
+	if (route == EmergencyRoute::Anchor && !codecRejected)
 	{
 		// respondIfDisconnected=false: when the anchor is not connected,
 		// originateAnchorCall returns false having sent NOTHING, so this
@@ -5193,6 +5201,42 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 
 	// 503 is enqueued; notify after it, same ordering rule as the routed path.
 	notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted);
+}
+
+bool RequestsHandler::emergencyDialOf(const std::string& dialed, pbx::EmergencyDial& emergencyOut,
+	std::string& asDialedOut) const
+{
+	emergencyOut = pbx::classifyEmergencyDial(dialed);
+	if (emergencyOut.isEmergency)
+	{
+		asDialedOut = dialed;
+		return true;
+	}
+	if (!dialRuleMakesEmergency(dialed, &asDialedOut)) return false;
+	emergencyOut = pbx::classifyEmergencyDial(asDialedOut);
+	return emergencyOut.isEmergency;
+}
+
+bool RequestsHandler::routeCodecRefusedEmergency(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<SipClient>& caller, const std::string& dialed)
+{
+	pbx::EmergencyDial emergency;
+	std::string asDialed;
+	if (!emergencyDialOf(dialed, emergency, asDialed)) return false;
+	routeEmergencyCall(data, caller, emergency, asDialed, /*noRelayableCodec=*/true);
+	return true;
+}
+
+void RequestsHandler::noteUnregisteredEmergencyDial(const std::shared_ptr<SipMessage>& data,
+	const std::string& dialed)
+{
+	pbx::EmergencyDial emergency;
+	std::string asDialed;
+	if (!emergencyDialOf(dialed, emergency, asDialed)) return;
+	const std::string from(data->getFromNumber());
+	queueLog("EMERGENCY: " + std::string(emergency.isTest ? "TEST 933" : "911") + " dialed by " + from +
+		" - caller is not a registered extension, refused (403)", true);
+	notifyEmergency(emergency, from, dialed, /*routed=*/false, "caller is not a registered extension");
 }
 
 // Issue #166 part 2. Kept to this one small function so the compliance-relevant
