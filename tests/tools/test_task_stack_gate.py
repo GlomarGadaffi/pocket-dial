@@ -994,6 +994,15 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertRegex(out, r"void mid\(\)\n\s+at: X\.cpp:10:5")
 
+    def test_an_unbounded_site_shows_the_whole_path_from_the_entry(self):
+        self.indirect_fixture()
+        self.add_ci(node("deep", "void Deep::call(int)", 10) + node("ind2", "Indirect Call Placeholder", 0)
+                    + edge("mid", "deep") + edge("deep", "ind2", "X.cpp:20:7"))
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("path: void big_task > void mid > void Deep::call", out)
+
     def test_call_positions_are_shown_without_the_build_machines_prefix(self):
         for label, want in (
                 ("/opt/esp/idf/components/tcp_transport/transport_ws.c:341:13", "components/tcp_transport/transport_ws.c:341:13"),

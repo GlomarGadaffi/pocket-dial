@@ -590,8 +590,12 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                         print(f"            library entered from project code: +{len(enter) - 80} more")
                     for v in unbounded:
                         print(f"            {pretty(nodes.get(v, v))}")
+                        steps = [v]
+                        while parent.get(steps[-1]) is not None:
+                            steps.append(parent[steps[-1]])
+                        steps.reverse()
                         where = sorted(short_site(w) for w in sites[v])
-                        print(f"                at: {', '.join(where[:4])}{f', +{len(where) - 4} more' if len(where) > 4 else ''}")
+                        print(f"                at: {', '.join(where[:12])}{f', +{len(where) - 12} more' if len(where) > 12 else ''}")
                         if parent.get(v) is not None:
                             print(f"                <- {pretty(nodes.get(parent[v], parent[v]))[:160]}"
                                   f"{via(parent[v], v)}")
@@ -601,6 +605,8 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                         if also:
                             print(f"                calls: {'; '.join(also[:14])}"
                                   f"{f'; +{len(also) - 14} more' if len(also) > 14 else ''}")
+                        print("                path: " + " > ".join(
+                            pretty(nodes.get(x, x)).split("(")[0][-44:] for x in steps))
             else:
                 print(f"        indirect call sites: {len(callers)} function(s) reachable make one, "
                       f"{len(on_chain)} of them on the worst chain; callee frames are not charged (0 B)"
