@@ -1128,6 +1128,44 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("matches no function that makes an indirect call", out)
 
+    def test_every_alternation_group_of_a_target_is_checked_not_only_the_first(self):
+        self.indirect_fixture()
+        self.add_ci(node("zed", "void Other::write()", 5))
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {
+            "targets": [r"(?:SlowSink|Other)::(?:write|gone)\("], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("alternative 'gone'", out)
+        self.assertNotIn("alternative 'SlowSink'", out)
+        self.assertNotIn("alternative 'Other'", out)
+        self.table["indirect_allowlist"][r"void mid\(\)"]["targets"] = [r"(?:SlowSink|Missing)::(?:write)\("]
+        self.table["indirect_allowlist"][r"void mid\(\)"]["targets"] = [r"(?:SlowSink|Missing)::write\("]
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("alternative 'Missing'", out)
+
+    # A row can rest on a build setting (which log implementation is linked). The gate reads the CI build's
+    # build/config/sdkconfig.h and fails when the setting is not what the row assumed, or the file is missing.
+    def test_a_row_that_rests_on_a_build_setting_fails_when_the_build_differs(self):
+        self.table["sdkconfig_asserts"] = [{"present": ["CONFIG_LOG_VERSION_1"], "absent": ["CONFIG_LOG_VERSION_2"],
+                                            "reason": "the esp_log row reads the version 1 path"}]
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("sdkconfig_asserts: build/config/sdkconfig.h is missing", out)
+        cfg = os.path.join(self.tmp.name, "build", "config")
+        os.makedirs(cfg)
+        h = os.path.join(cfg, "sdkconfig.h")
+        with open(h, "w") as f:
+            f.write("#define CONFIG_LOG_VERSION_1 1\n")
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        with open(h, "w") as f:
+            f.write("#define CONFIG_LOG_VERSION_2 1\n")
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("CONFIG_LOG_VERSION_1 is not defined", out)
+        self.assertIn("CONFIG_LOG_VERSION_2 is defined", out)
+
     def test_a_failing_cycle_lists_every_member(self):
         names = [f"void Ring{i}()" for i in range(7)]
         self.add_ci("".join(node(f"r{i}", n, 8) for i, n in enumerate(names))

@@ -132,13 +132,13 @@ ALT_GROUP_RE = re.compile(r"\(\?:([\w:~<>]+(?:\|[\w:~<>]+)+)\)")
 
 
 def alternatives(pat):
-    """[(alternative, pattern with only that alternative)] for the first `(?:a|b|c)` group of plain names in
-    `pat`, or [(None, pat)] when it has none. A row names several functions this way; the gate checks each
-    one, so a name that is not in the image cannot hide behind its siblings."""
-    m = ALT_GROUP_RE.search(pat)
-    if not m:
+    """[(alternative, pattern with that group cut down to the alternative)] for every `(?:a|b|c)` group of
+    plain names in `pat`, or [(None, pat)] when it has none. A row names several functions this way; the
+    gate checks each one, so a name that is not in the image cannot hide behind its siblings."""
+    groups = list(ALT_GROUP_RE.finditer(pat))
+    if not groups:
         return [(None, pat)]
-    return [(a, pat[:m.start()] + "(?:" + a + ")" + pat[m.end():]) for a in m.group(1).split("|")]
+    return [(a, pat[:m.start()] + "(?:" + a + ")" + pat[m.end():]) for m in groups for a in m.group(1).split("|")]
 
 
 def short_site(label):
@@ -331,6 +331,23 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
     margin = table["margin_bytes"]
     ceiling = table["frame_ceiling_bytes"]
     allow = table.get("frame_allowlist", {})
+    cfg_rc = 0
+    for a in table.get("sdkconfig_asserts", []):
+        h = os.path.join(project_root or src_root, "build", "config", "sdkconfig.h")
+        if not os.path.isfile(h):
+            print(f"FAIL sdkconfig_asserts: build/config/sdkconfig.h is missing under {os.path.dirname(os.path.dirname(h))}, so '{a['reason']}' cannot be checked")
+            cfg_rc = 1
+            continue
+        with open(h, encoding="utf-8", errors="ignore") as f:
+            defined = set(re.findall(r"^#define\s+(\w+)\s+1\s*$", f.read(), re.M))
+        for d in a.get("present", []):
+            if d not in defined:
+                print(f"FAIL sdkconfig_asserts: {d} is not defined in the build, but {a['reason']}")
+                cfg_rc = 1
+        for d in a.get("absent", []):
+            if d in defined:
+                print(f"FAIL sdkconfig_asserts: {d} is defined in the build, but {a['reason']}")
+                cfg_rc = 1
     tasks = table["tasks"]
     known = table.get("known_findings", {})
     for k, row in sorted(known.items()):
@@ -452,7 +469,7 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                     problem[v] = "library callee with no frame data, no library_defaults match"
     print(f"call graph: {len(nodes)} functions, {len(frames)} frames with stack data; "
           f"margin {margin} B, frame ceiling {ceiling} B")
-    rc = rc_rows
+    rc = rc_rows | cfg_rc
 
     # .ci files compiled in another checkout have none of our paths in them, and
     # "nothing of ours to cap" would then pass any frame: fail closed.
