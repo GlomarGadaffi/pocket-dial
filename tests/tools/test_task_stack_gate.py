@@ -879,6 +879,53 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("big: 1900 B", out)
 
+    # A thread body is not on the caller's stack, and a label's "[with ...]" tail names template
+    # arguments, not the function: a target pattern is matched against the name before it, so
+    # the _M_run of a thread whose lambda sits in Thing::run is not a target of Thing::run.
+    def test_a_target_pattern_does_not_match_a_template_argument_annotation(self):
+        self.indirect_fixture()
+        self.add_ci(node("run", "void Thing::run(int)", 950)
+                    + node("mrun", "void std::thread::_State_impl<_C>::_M_run() "
+                           "[with _C = Thing::run(int)::<lambda()>]", 1000))
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {
+            "targets": [r"Thing::run\("], "reason": "fixture: the one sink"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("big: 1950 B", out)         # 400 + 600 + 950; the 1000 B _M_run would make it 2000
+        self.assertNotIn("_M_run", out)
+        self.table["indirect_allowlist"][r"void mid\(\)"]["targets"] = [r"_C = Thing::run"]
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)              # nothing is named like that before the "[with"
+        self.assertIn("matches no function", out)
+
+    def test_the_chain_says_which_edge_an_allowlist_row_added(self):
+        self.indirect_fixture()
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {
+            "targets": [r"SlowSink::write\("], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        line = [ln for ln in out.splitlines() if "void SlowSink::write()" in ln][0]
+        self.assertIn(r"via indirect_allowlist row 'void mid\(\)'", line)
+        self.assertNotIn("via indirect_allowlist", [ln for ln in out.splitlines() if "void mid()" in ln][0])
+
+    def test_an_unbounded_site_names_the_function_that_reaches_it(self):
+        self.indirect_fixture()
+        self.add_ci(node("deep", "void Deep::call()", 10) + node("ind2", "Indirect Call Placeholder", 0)
+                    + edge("mid", "deep") + edge("deep", "ind2"))
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"void Deep::call\(\)\s+<- void mid\(\)")
+
+    def test_a_failing_cycle_lists_every_member(self):
+        names = [f"void Ring{i}()" for i in range(7)]
+        self.add_ci("".join(node(f"r{i}", n, 8) for i, n in enumerate(names))
+                    + "".join(edge(f"r{i}", f"r{(i + 1) % 7}") for i in range(7)) + edge("mid", "r0"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        for n in names:
+            self.assertIn("        member " + n, out)
+
     def test_checked_in_table_has_no_duplicate_keys(self):
         # json.load keeps the last of two equal keys, so a second, empty indirect_allowlist once
         # silently replaced the filled one.

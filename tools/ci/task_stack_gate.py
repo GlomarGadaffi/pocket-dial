@@ -122,6 +122,13 @@ CREATE_RE = re.compile(r"\b(?:xTaskCreate\w*|pd::createTaskPreferPsram)\s*\("
 INDIRECT_RE = re.compile(r"^Indirect Call Placeholder$")
 
 
+def head(label):
+    """A function's name without GCC's trailing " [with T = ...]" template-argument note.
+    That note names the arguments an instantiation was made with, not the function: the
+    _M_run of a thread whose lambda sits in X::f carries "X::f(" in it, and is not X::f."""
+    return label.split(" [with ", 1)[0]
+
+
 def count_sites(src_root):
     """{relpath: number of task-creation call sites} over src/ and main/."""
     out = {}
@@ -288,7 +295,8 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
     ind = {v for v in nodes if INDIRECT_RE.search(pretty(nodes.get(v, v)))}
     makers = sorted(v for v in nodes if ind & set(edges.get(v, ())))
     bounded_edges = {v: set(ws) for v, ws in edges.items()}
-    bound_of, rc_rows = {}, 0
+    base_edges = edges      # analyse() shadows `edges` with the walk's own
+    bound_of, edge_row, rc_rows = {}, {}, 0
     irows = table.get("indirect_allowlist", {})
     for k in sorted(irows):
         row = irows[k]
@@ -311,7 +319,7 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
         hit = []
         for pat in tg:
             rx = re.compile(pat)
-            found = sorted(x for x in nodes if x not in ind and rx.search(pretty(nodes[x])))
+            found = sorted(x for x in nodes if x not in ind and rx.search(head(pretty(nodes[x]))))
             if not found:
                 rc_rows = 1
                 print(f"FAIL indirect_allowlist row '{k}': target '{pat}' matches no function, so it bounds nothing")
@@ -329,6 +337,9 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                 print(f"FAIL indirect_allowlist: '{pretty(nodes[v])[:100]}' matches rows '{bound_of[v]}' and '{k}' (ambiguous)")
             bound_of[v] = k
             bounded_edges.setdefault(v, set()).update(hit)
+            for h in hit:
+                if h not in edges.get(v, ()):
+                    edge_row.setdefault((v, h), k)
 
     def allowed(x):
         return any(k in pretty(nodes.get(x, x)) for k in allow)
@@ -422,10 +433,14 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                 rc = 1
                 print(f"FAIL recursion: cycle of {len(c)} function(s) reachable from {by} has no "
                       f"recursion_allowlist row (a depth bound and a reason): {shown}")
+                for n in names:
+                    print(f"        member {n}")
             elif len(matched) > 1:
                 rc = 1
                 print(f"FAIL recursion: cycle of {len(c)} function(s) reachable from {by} matches "
                       f"{len(matched)} recursion_allowlist rows (ambiguous): {', '.join(repr(k) for k in matched)}")
+                for n in names:
+                    print(f"        member {n}")
             elif matched[0] not in bad:
                 depth = rows[matched[0]]["depth"]
             trip = heaviest_round(c, edges, size)
@@ -443,6 +458,15 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                       f"a row names one cycle")
 
         cost = collections.ChainMap(cycle_cost, size)
+
+        def via(u, w, members=None):
+            members = members or {}
+            """' (via indirect_allowlist row ...)' when the walk reached w from u only by a row's
+            edge, '' for a direct call: it says which row drags a function into a chain."""
+            rows = {edge_row[(s, t)] for s in members.get(u, (u,)) for t in members.get(w, (w,))
+                    if t in edges.get(s, ()) and (s, t) in edge_row}
+            direct = any(t in base_edges.get(s, ()) for s in members.get(u, (u,)) for t in members.get(w, (w,)))
+            return "" if direct or not rows else f"  (via indirect_allowlist row '{sorted(rows)[0]}')"
 
         def succ(u):
             out = {unit.get(w, w) for s in members.get(u, (u,)) for w in edges.get(s, ())}
@@ -480,8 +504,19 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                 if unbounded:
                     print(f"        FAIL {t['name']}: {len(unbounded)} reachable indirect call site(s) have no "
                           f"indirect_allowlist row, so the chain above is not an upper bound (a 911 task):")
+                    parent = {h: None for h in hits}
+                    queue = collections.deque(sorted(hits))
+                    while queue:
+                        a = queue.popleft()
+                        for b in sorted(edges.get(a, ())):
+                            if b not in parent:
+                                parent[b] = a
+                                queue.append(b)
                     for v in unbounded:
                         print(f"            {pretty(nodes.get(v, v))}")
+                        if parent.get(v) is not None:
+                            print(f"                <- {pretty(nodes.get(parent[v], parent[v]))[:160]}"
+                                  f"{via(parent[v], v)}")
             else:
                 print(f"        indirect call sites: {len(callers)} function(s) reachable make one, "
                       f"{len(on_chain)} of them on the worst chain; callee frames are not charged (0 B)"
@@ -492,8 +527,9 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                 print(f"        note: known finding for {t['name']} no longer applies; remove it from task_stacks.json")
             elif kf:
                 print(f"        FAIL: deeper than the known finding's {kf['max_total']} B: a new finding")
-            for x in path:
-                print(f"        {cost[x]:6d}  {cycle_label.get(x) or pretty(nodes.get(x, x))[:100]}")
+            for i, x in enumerate(path):
+                print(f"        {cost[x]:6d}  {cycle_label.get(x) or pretty(nodes.get(x, x))[:100]}"
+                      f"{via(path[i - 1], x, members) if i else ''}")
         return rc, reach
 
     plain = [w for w in walked if w[0].get("indirect") != "bounded"]
