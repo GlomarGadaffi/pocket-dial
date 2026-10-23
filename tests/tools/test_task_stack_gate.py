@@ -936,6 +936,19 @@ class Gate(unittest.TestCase):
         self.assertRegex(out, r"library entered from project code: void mid\(\) -> void lib_entry\(\)")
         self.assertNotIn("void lib_entry() -> ", out)
 
+    def test_an_unbounded_site_lists_what_else_it_calls(self):
+        # What a function with an indirect call also calls is the evidence for reading its source
+        # for the pointer: a site that calls only memcpy and a logger has its pointer in one of them.
+        self.indirect_fixture()
+        self.add_ci(node("deep", "void Deep::call()", 10) + node("ind2", "Indirect Call Placeholder", 0)
+                    + node("cp", "void* memcpy_like(void*)", 5) + edge("mid", "deep") + edge("deep", "ind2")
+                    + edge("deep", "cp"))
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"void Deep::call\(\)\n\s+<- void mid\(\)\n\s+calls: .*void\* memcpy_like\(void\*\)")
+        self.assertNotRegex(out, r"calls: .*Indirect Call Placeholder")
+
     def test_a_failing_cycle_lists_every_member(self):
         names = [f"void Ring{i}()" for i in range(7)]
         self.add_ci("".join(node(f"r{i}", n, 8) for i, n in enumerate(names))

@@ -516,9 +516,19 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                             if b not in parent:
                                 parent[b] = a
                                 queue.append(b)
-                    enter = sorted({(parent[v], v) for v in parent if parent[v] is not None
-                                    and ours(nodes.get(parent[v], "")) and not ours(nodes.get(v, ""))},
-                                   key=lambda e: (pretty(nodes.get(e[0], e[0])), pretty(nodes.get(e[1], e[1]))))
+                    # Only the entries that lead to a site with no row: for each such site, the first
+                    # call on its shortest path from the entry that goes from our code into a library.
+                    enter = set()
+                    for v in unbounded:
+                        chain = [v]
+                        while parent.get(chain[-1]) is not None:
+                            chain.append(parent[chain[-1]])
+                        chain.reverse()
+                        for a, b in zip(chain, chain[1:]):
+                            if ours(nodes.get(a, "")) and not ours(nodes.get(b, "")):
+                                enter.add((a, b))
+                                break
+                    enter = sorted(enter, key=lambda e: (pretty(nodes.get(e[0], e[0])), pretty(nodes.get(e[1], e[1]))))
                     for a, b in enter[:80]:
                         print(f"            library entered from project code: {pretty(nodes.get(a, a))[:110]} -> "
                               f"{pretty(nodes.get(b, b))[:90]}{via(a, b)}")
@@ -529,6 +539,12 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                         if parent.get(v) is not None:
                             print(f"                <- {pretty(nodes.get(parent[v], parent[v]))[:160]}"
                                   f"{via(parent[v], v)}")
+                        # What else it calls: the evidence for finding its pointer in the source.
+                        also = sorted({pretty(nodes.get(w, w))[:80] for w in edges.get(v, ())
+                                       if w not in ind})
+                        if also:
+                            print(f"                calls: {'; '.join(also[:14])}"
+                                  f"{f'; +{len(also) - 14} more' if len(also) > 14 else ''}")
             else:
                 print(f"        indirect call sites: {len(callers)} function(s) reachable make one, "
                       f"{len(on_chain)} of them on the worst chain; callee frames are not charged (0 B)"
