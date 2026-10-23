@@ -377,12 +377,13 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             print(f"FAIL indirect_allowlist row '{k}': needs a list of target patterns (empty only when the reason shows nothing can be installed) and a reason")
             continue
         try:
-            krx = re.compile(k)
+            by_title = k.startswith("title:")      # `title:REGEX` is searched in the .ci title, for a node whose name GCC lost
+            krx = re.compile(k[6:] if by_title else k)
         except re.error as e:
             rc_rows = 1
             print(f"FAIL indirect_allowlist row '{k}': key is not a regex ({e})")
             continue
-        callers = [v for v in makers if krx.search(pretty(nodes[v]))]
+        callers = [v for v in makers if krx.search(v if by_title else pretty(nodes[v]))]
         if not callers:
             rc_rows = 1
             print(f"FAIL indirect_allowlist row '{k}': matches no function that makes an indirect call")

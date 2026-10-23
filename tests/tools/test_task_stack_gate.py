@@ -1110,6 +1110,24 @@ class Gate(unittest.TestCase):
         rc, out = self.run_gate()
         self.assertIn("nameless member: title _ZL3foov", out)
 
+    # GCC can lose a function's name (a node whose whole label is ")"); the .ci title survives. A key
+    # written `title:REGEX` is searched in the title, so such a function can still carry a row.
+    def test_a_row_can_be_keyed_on_the_title_of_a_nameless_function(self):
+        self.add_ci(node("esp_log", ")", 40) + node("ind", "Indirect Call Placeholder", 0)
+                    + node("sink", "void Sink::emit()", 1000) + edge("mid", "esp_log") + edge("esp_log", "ind", "log.c:9:3"))
+        self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["indirect"] = "bounded"
+        self.table["indirect_allowlist"] = {r"title:^esp_log$": {"targets": [r"Sink::emit\("], "reason": "fixture log.c:9"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("big: 2040 B", out)         # 400 + 600 + esp_log 40 + Sink::emit 1000
+        self.table["indirect_allowlist"] = {r"title:^nothing$": {"targets": [], "reason": "fixture log.c:9"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("matches no function that makes an indirect call", out)
+
     def test_a_failing_cycle_lists_every_member(self):
         names = [f"void Ring{i}()" for i in range(7)]
         self.add_ci("".join(node(f"r{i}", n, 8) for i, n in enumerate(names))
