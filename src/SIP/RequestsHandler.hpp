@@ -2117,7 +2117,9 @@ private:
 	// stands, the EMERGENCY log line and the routed=false notification are added.
 	void noteUnregisteredEmergencyDial(const std::shared_ptr<SipMessage>& data,
 		const std::string& dialed, std::chrono::steady_clock::time_point now);
-	// #1115: announce each unknown-caller tally whose window ended. Caller holds _mutex.
+	// #1115: announce ONE held unknown-caller tally per call (tick() calls it at 1 Hz) whose
+	// window ended with no further dial. Notices are coalesced per (source, number), so this
+	// is the "N more since" summary, not a repeat alert. Caller holds _mutex.
 	void flushUnknownEmergencyTallies(std::chrono::steady_clock::time_point now);
 
 	// #659: a call to `ext` is a PSAP callback (ext dialed 911/933 within
