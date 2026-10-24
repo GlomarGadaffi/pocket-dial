@@ -7675,8 +7675,8 @@ void RequestsHandler::logDroppedOk(const SipMessage& data, const std::string& ex
 		sipwire::addrToIpPort(data.getSource()) + ", expected " + expected + ".", true);
 }
 
-// #1120, Rule 5: an emergency leg's answer is accepted on the callee's IP alone, as the
-// #1030 exemption and isDialogSourceAuthorized() do. A differing port is logged, not refused.
+// #1120, Rule 5: an emergency leg's answer is accepted on the callee's IP alone, as
+// isDialogSourceAuthorized() does (#1030 exempts emergency traffic only from the line-length refusal). A differing port is logged, not refused.
 bool RequestsHandler::okSourceAccepted(const SipMessage& data, const sockaddr_in& registered)
 {
 	const sockaddr_in src = data.getSource();
