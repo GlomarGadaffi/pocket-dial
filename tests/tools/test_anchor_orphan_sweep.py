@@ -140,7 +140,7 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         self.assertIn(
             '_sweepMem.alloc("tel_sweep", kSweepStackBytes, PD_TASK_STACK_CAPS, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);', ctor,
             "allocated once at construction, so start() allocates nothing")
-        self.assertIn("kSweepStackBytes = 6144", self.hpp)
+        self.assertIn("kSweepStackBytes = 13376", self.hpp)
         start = body_of(self.cpp, "bool TelephonyAnchorClient::start(")
         self.assertRegex(start, r'xTaskCreateStatic\(&TelephonyAnchorClient::sweepTaskTrampoline, "tel_sweep",\s*'
                                 r'_sweepMem\.bytes, this, 4, _sweepMem\.stack, _sweepMem\.tcb\)')
