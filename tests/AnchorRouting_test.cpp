@@ -1181,12 +1181,16 @@ TEST(AnchorRouting, ADegradedConnected911OnARecycledSlotIsReportedAgain)
 	rig.bridge = rig.handler.anchorBridgeForCallIdForTest("Call-ID: anchor-1122-b");
 	ASSERT_NE(rig.bridge, nullptr);
 	ASSERT_TRUE(rig.degrade());
+	const int byesBefore = rig.countContaining("192.168.9.51", "BYE ");
 	rig.handler.forceNextTickForTest();
 	rig.handler.tick();
 
 	EXPECT_EQ(rig.countContaining("192.168.9.20", "AUDIO DEGRADED"), 2) << "one report per call";
-	EXPECT_TRUE(rig.handler.getSession("Call-ID: anchor-1122-b").has_value())
-		<< "the second 911 was torn down by the degraded sweep";
+	auto live = rig.handler.getSession("Call-ID: anchor-1122-b");
+	ASSERT_TRUE(live.has_value()) << "the second 911 was torn down by the degraded sweep";
+	EXPECT_EQ(live.value()->getState(), Session::State::Connected) << "the second 911 must stay Connected";
+	EXPECT_EQ(rig.countContaining("192.168.9.51", "BYE "), byesBefore) << "no BYE to the caller";
+	EXPECT_EQ(rig.countContaining("192.168.9.20", "BYE "), 0) << "no BYE to the other leg";
 }
 
 // #986: this notify runs inside tick(), not handle(): its pbx-911 Alert must leave
