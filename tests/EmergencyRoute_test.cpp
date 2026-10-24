@@ -2851,6 +2851,14 @@ namespace
 		b.handler->handle(makeInvite(dialed, callId, 0, ext, ip));
 	}
 
+	// Sent messages, of any kind, whose text contains `needle`.
+	size_t sentContaining(const Bench& b, const std::string& needle)
+	{
+		size_t n = 0;
+		for (const auto& p : b.sent) if (p.second.find(needle) != std::string::npos) ++n;
+		return n;
+	}
+
 	// Front desk 200 on the notify list, as inviteAndCaptureLog arranges.
 	void armNotifyList(Bench& b)
 	{
@@ -2914,7 +2922,8 @@ TEST(EmergencyUnknownCoalesce, AfterTheWindowTheNextDialNotifiesAgainWithAnExact
 	unknownDial(b, "911", "uc-w-later", unknownIp(1));
 
 	ASSERT_EQ(b.count("MESSAGE sip:200@"), 2u) << b.dump();
-	EXPECT_TRUE(b.saw("3 more since")) << b.dump();
+	EXPECT_EQ(sentContaining(b, "3 more since"), 1u) << b.dump();
+	EXPECT_EQ(sentContaining(b, "more since"), 1u) << b.dump();
 	EXPECT_EQ(b.count("SIP/2.0 403 Forbidden"), 5u) << b.dump();
 }
 
@@ -2932,7 +2941,8 @@ TEST(EmergencyUnknownCoalesce, AFullTableNotifiesAndCountsTheOverflow)
 	EXPECT_EQ(b.handler->getE911UnknownAlertOverflow(), 1u);
 }
 
-TEST(EmergencyUnknownCoalesce, ExpiredEntriesAreRecycledSoOneOffSourcesDoNotPinTheTable)
+
+TEST(EmergencyUnknownCoalesce, ExpiredTalliesAreAnnouncedByTickBeforeTheirSlotsAreRecycled)
 {
 	Bench b;
 	armNotifyList(b);
@@ -2943,8 +2953,62 @@ TEST(EmergencyUnknownCoalesce, ExpiredEntriesAreRecycledSoOneOffSourcesDoNotPinT
 	}
 	b.handler->ageUnknownEmergencyAlertsForTest(pbx::kUnknownAlertWindow + std::chrono::seconds(1));
 	b.sent.clear();
+	b.handler->tick();
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), pbx::kUnknownAlertMax) << b.dump();
+	EXPECT_EQ(sentContaining(b, "1 more since"), pbx::kUnknownAlertMax) << b.dump();
+
+	b.sent.clear();
 	for (int i = 0; i < 3; ++i) unknownDial(b, "911", "uc-r-n" + std::to_string(i), unknownIp(50));
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+	EXPECT_EQ(b.handler->getE911UnknownAlertOverflow(), 0u);
+}
+
+TEST(EmergencyUnknownCoalesce, ABurstThenSilenceIsSummarisedExactlyOnceByTick)
+{
+	Bench b;
+	armNotifyList(b);
+	for (int i = 0; i < 5; ++i) unknownDial(b, "911", "uc-t-" + std::to_string(i), unknownIp(1));
+	ASSERT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+	b.handler->ageUnknownEmergencyAlertsForTest(pbx::kUnknownAlertWindow + std::chrono::seconds(1));
+	b.sent.clear();
+	b.handler->tick();
 
 	EXPECT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+	EXPECT_EQ(sentContaining(b, "4 more since"), 1u) << b.dump();
+	EXPECT_TRUE(b.saw("999")) << "the summary names the caller:\n" << b.dump();
+}
+
+TEST(EmergencyUnknownCoalesce, ManyDistinctSourcesShareOneOverflowNoticeThenOneSummary)
+{
+	Bench b;
+	armNotifyList(b);
+	for (size_t i = 0; i < 40; ++i) unknownDial(b, "911", "uc-o-" + std::to_string(i), unknownIp(i));
+
+	EXPECT_EQ(b.count("SIP/2.0 403 Forbidden"), 40u) << b.dump();
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), pbx::kUnknownAlertMax + 1) << b.dump();
+	EXPECT_EQ(sentContaining(b, "from many sources"), 1u) << b.dump();
+	EXPECT_EQ(b.handler->getE911UnknownAlertOverflow(), 40u - pbx::kUnknownAlertMax);
+
+	b.handler->ageUnknownEmergencyAlertsForTest(pbx::kUnknownAlertWindow + std::chrono::seconds(1));
+	b.sent.clear();
+	b.handler->tick();
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+	EXPECT_EQ(sentContaining(b, "23 more since"), 1u) << b.dump();
+	EXPECT_EQ(sentContaining(b, "from many sources"), 1u) << b.dump();
+}
+
+TEST(EmergencyUnknownCoalesce, ARegisteredFromSentFromAForeignAddressIsNeverCoalesced)
+{
+	// findClient(From) decides "registered" before the unknown-caller path; pin it so a
+	// source-address check added later cannot silently move such a dial into the table.
+	Bench b;
+	b.handler->setAnchorPlacesRealCallsForTest(true);
+	armNotifyList(b);
+	for (int i = 0; i < 3; ++i)
+		b.handler->handle(makeOpusInvite("911", "uc-fx-" + std::to_string(i), "101", "192.168.79.77"));
+
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 3u) << b.dump();
+	EXPECT_EQ(sentContaining(b, "more since"), 0u) << b.dump();
+	EXPECT_EQ(b.handler->getE911UnknownAlertSuppressed(), 0u);
 	EXPECT_EQ(b.handler->getE911UnknownAlertOverflow(), 0u);
 }

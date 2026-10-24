@@ -2116,7 +2116,9 @@ private:
 	// #1107: onInvite's 403 for an unknown caller, for an emergency dial: the status
 	// stands, the EMERGENCY log line and the routed=false notification are added.
 	void noteUnregisteredEmergencyDial(const std::shared_ptr<SipMessage>& data,
-		const std::string& dialed);
+		const std::string& dialed, std::chrono::steady_clock::time_point now);
+	// #1115: announce each unknown-caller tally whose window ended. Caller holds _mutex.
+	void flushUnknownEmergencyTallies(std::chrono::steady_clock::time_point now);
 
 	// #659: a call to `ext` is a PSAP callback (ext dialed 911/933 within
 	// pbx::kEmergencyCallbackWindow). Every path that creates a session for an
