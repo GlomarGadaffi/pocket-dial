@@ -71,7 +71,7 @@ flowchart TD
     WSW -->|"CallEvent callback, takes _mutex"| RH
     PBX -->|"GET .../participants/{id}/stream"| MRX["tel_media_rx, Core 1"]
     TA --- MAINT["tel_maint, prio 5, 6144 B: restart, token refresh"]
-    TA --- SWEEP["tel_sweep, prio 4, 6144 B: 911/933 orphan sweep"]
+    TA --- SWEEP["tel_sweep, prio 4, 13376 B (gate estimate, pending #1116 bench): 911/933 orphan sweep"]
     TA --- PRE["tel_prewarm, prio 4, 6144 B: one-shot TLS pre-warm"]
 ```
 
