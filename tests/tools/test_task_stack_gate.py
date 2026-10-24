@@ -1182,7 +1182,7 @@ class Gate(unittest.TestCase):
         for t in self.table["tasks"]:
             if t["name"] == "big":
                 t["bytes"] = 2000                         # 1900 + 512 > 2000
-        self.table["known_findings"] = {"big": {"max_total": 1900, "reason": "#1116"}}
+        self.table["known_findings"] = {"big": {"max_total": 1900, "bytes": 2000, "reason": "#1116"}}
         rc, out = self.run_gate()
         self.assertEqual(rc, 0, out)
         self.assertIn("KNOWN big: 1900 B", out)
@@ -1197,11 +1197,46 @@ class Gate(unittest.TestCase):
         self.assertIn("FAIL big: 1900 B", out)
         self.assertIn("have no indirect_allowlist row", out)
 
-    def test_a_known_row_for_a_task_that_fits_again_is_reported_stale(self):
+    # A known row is a ratchet: it fails when the task fits again (remove it) and when the total has come
+    # down but the cap has not (lower it), and it holds only for the budget and the site it was written for.
+    def test_a_known_row_for_a_task_that_fits_again_fails_and_asks_for_its_removal(self):
+        self.table["known_findings"] = {"big": {"max_total": 1900, "bytes": 4096, "reason": "#1116"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL big: known finding is stale, the task fits its 4096 B again: remove the row", out)
+
+    def test_a_known_cap_above_the_current_total_fails_and_asks_for_it_to_come_down(self):
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["bytes"] = 2000
+        self.table["known_findings"] = {"big": {"max_total": 2500, "bytes": 2000, "reason": "#1116"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL big: known finding cap 2500 B is above the total 1900 B: lower max_total to 1900", out)
+
+    def test_a_smaller_budget_than_the_known_row_recorded_fails(self):
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["bytes"] = 1500                         # shrunk from the 2000 the row was written for
+        self.table["known_findings"] = {"big": {"max_total": 1900, "bytes": 2000, "reason": "#1116"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL big: known finding was written for a 2000 B stack, the site now has 1500 B", out)
+
+    def test_a_known_row_for_another_source_file_does_not_cover_the_task(self):
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["bytes"] = 2000
+        self.table["known_findings"] = {"big": {"max_total": 1900, "bytes": 2000, "file": "main/esp_main_eth.cpp", "reason": "#1116"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)                     # the task is at src/SIP/X.cpp: not covered
+        self.assertIn("FAIL big: 1900 B", out)
+
+    def test_a_known_row_without_a_recorded_budget_is_refused(self):
         self.table["known_findings"] = {"big": {"max_total": 1900, "reason": "#1116"}}
         rc, out = self.run_gate()
-        self.assertEqual(rc, 0, out)
-        self.assertIn("note: known finding for big no longer applies; remove it", out)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("known_findings row 'big': needs", out)
 
     def test_a_failing_cycle_lists_every_member(self):
         names = [f"void Ring{i}()" for i in range(7)]
@@ -1242,7 +1277,7 @@ class Gate(unittest.TestCase):
                 t["bytes"] = 2000                        # 1900 + 512 margin > 2000: over budget
         rc, out = self.run_gate()
         self.assertEqual(rc, 1, out)                      # control: red without a known_findings row
-        self.table["known_findings"] = {"big": {"max_total": 1900, "reason": "pending measurement"}}
+        self.table["known_findings"] = {"big": {"max_total": 1900, "reason": "pending measurement", "bytes": 2000}}
         rc, out = self.run_gate()
         self.assertEqual(rc, 0, out)
         self.assertIn("KNOWN big: 1900 B", out)

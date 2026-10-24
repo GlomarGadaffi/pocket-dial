@@ -351,8 +351,9 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
     tasks = table["tasks"]
     known = table.get("known_findings", {})
     for k, row in sorted(known.items()):
-        if not (isinstance(row.get("max_total"), int) and row["max_total"] >= 1 and row.get("reason")):
-            print(f"FAIL known_findings row '{k}': needs a whole-number max_total >= 1 and a reason")
+        if not (isinstance(row.get("max_total"), int) and row["max_total"] >= 1 and row.get("reason")
+                and isinstance(row.get("bytes"), int) and row["bytes"] >= 1):
+            print(f"FAIL known_findings row '{k}': needs a whole-number max_total >= 1, the stack `bytes` it was written for, and a reason")
             return 1
     nodes, edges, frames = load_graph(ci_dir)
     roots = project_roots(project_root or src_root)
@@ -600,8 +601,18 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             # something new. It holds only while the chain is no deeper than the recorded max_total; a
             # deeper chain is a new finding and fails. A known task that fits again is called out.
             kf = known.get(t["name"])
-            known_hit = bool(kf) and not ok and total <= kf["max_total"]
-            rc |= 0 if (ok or known_hit) else 1
+            if kf and kf.get("file") not in (None, t["file"]):
+                kf = None       # written for another site (another esp_main variant): it covers nothing here
+            stale = []          # a known row is a ratchet: these make the job fail, whatever the total
+            if kf and kf["bytes"] != t["bytes"]:
+                stale.append(f"known finding was written for a {kf['bytes']} B stack, the site now has {t['bytes']} B: "
+                             f"re-derive the row for the new budget")
+            elif kf and ok:
+                stale.append(f"known finding is stale, the task fits its {t['bytes']} B again: remove the row")
+            elif kf and total < kf["max_total"]:
+                stale.append(f"known finding cap {kf['max_total']} B is above the total {total} B: lower max_total to {total}")
+            known_hit = bool(kf) and not ok and total <= kf["max_total"] and not stale
+            rc |= 0 if ((ok and not stale) or known_hit) else 1
             # The walk cannot follow an indirect call (a vtable, std::function, a callback pointer), and
             # the placeholder is charged 0 B. A task marked "indirect": "bounded" gets the edges of its
             # indirect_allowlist rows instead and fails on a site with no row. Any other task passes
@@ -613,7 +624,7 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             blockops = sum(1 for v in reached if v in block)
             unbounded = [v for v in callers if v not in bound_of] if strict else []
             rc |= 1 if unbounded else 0
-            label = "FAIL" if unbounded else "ok  " if ok else "KNOWN" if known_hit else "FAIL"
+            label = "FAIL" if (unbounded or stale) else "ok  " if ok else "KNOWN" if known_hit else "FAIL"
             print(f"{label} {t['name']}: {total} B + {margin} margin "
                   f"{'<=' if ok else '>'} {t['bytes']} B ({t['file']}:{t['line']})")
             print(f"        block operations (unlabelled placeholder edges, charged as memcpy): {blockops} function(s) reachable")
@@ -676,9 +687,9 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                       + ("" if not on_chain else ": " + "; ".join(pretty(nodes.get(v, v)).split("(")[0][-50:] for v in on_chain[:8])))
             if known_hit:
                 print(f"        known finding (<= {kf['max_total']} B, not failing the job): {kf['reason']}")
-            elif kf and ok:
-                print(f"        note: known finding for {t['name']} no longer applies; remove it from task_stacks.json")
-            elif kf:
+            for msg in stale:
+                print(f"        FAIL {t['name']}: {msg}")
+            if kf and not stale and not ok and not known_hit:
                 print(f"        FAIL: deeper than the known finding's {kf['max_total']} B: a new finding")
             for i, x in enumerate(path):
                 print(f"        {cost[x]:6d}  {cycle_label.get(x) or pretty(nodes.get(x, x))[:100]}"
