@@ -1166,6 +1166,43 @@ class Gate(unittest.TestCase):
         self.assertIn("CONFIG_LOG_VERSION_1 is not defined", out)
         self.assertIn("CONFIG_LOG_VERSION_2 is defined", out)
 
+    # Known findings for the 911 tasks (#1116 tracks the bench measurement). The cap is the exact current
+    # total: the gate passes at it and fails one byte over, and a known row hides nothing else.
+    def test_checked_in_known_findings_cap_the_three_911_tasks_at_their_totals(self):
+        table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
+        kf = table["known_findings"]
+        for name, cap in (("sip_server", 9616), ("tel_ctl", 12944), ("tel_sweep", 12864)):
+            with self.subTest(name):
+                self.assertEqual(kf.get(name, {}).get("max_total"), cap)
+                self.assertIn("#1116", kf[name]["reason"])
+
+    def test_a_known_cap_passes_at_its_total_fails_one_byte_over_and_hides_no_unbounded_site(self):
+        self.indirect_fixture()
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture"}}
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["bytes"] = 2000                         # 1900 + 512 > 2000
+        self.table["known_findings"] = {"big": {"max_total": 1900, "reason": "#1116"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("KNOWN big: 1900 B", out)
+        self.table["known_findings"]["big"]["max_total"] = 1899
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("a new finding", out)
+        self.table["known_findings"]["big"]["max_total"] = 1900
+        del self.table["indirect_allowlist"]                 # an unbounded site is a different failure
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL big: 1900 B", out)
+        self.assertIn("have no indirect_allowlist row", out)
+
+    def test_a_known_row_for_a_task_that_fits_again_is_reported_stale(self):
+        self.table["known_findings"] = {"big": {"max_total": 1900, "reason": "#1116"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("note: known finding for big no longer applies; remove it", out)
+
     def test_a_failing_cycle_lists_every_member(self):
         names = [f"void Ring{i}()" for i in range(7)]
         self.add_ci("".join(node(f"r{i}", n, 8) for i, n in enumerate(names))
