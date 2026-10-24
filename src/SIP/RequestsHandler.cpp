@@ -963,7 +963,9 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	// touch only the rate state, which _rateMutex now guards.
 	{
 		std::lock_guard<std::mutex> rlock(_rateMutex);
-		if (!ipAllowed(request->getSource()) || !allowPacket(request->getSource()))
+		// #1092, Rule 5: admitPacket() = allowlist, then live emergency Call-ID, then the bucket
+		// (trunk peer, registered source, or table), then the emergency INVITE budget. No _mutex.
+		if (!admitPacket(*request))
 		{
 			const sockaddr_in src = request->getSource();
 			_dropProbe.note(DropProbe::Reason::Rate, src.sin_addr.s_addr, src.sin_port, rawBytes);
@@ -1332,6 +1334,10 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// registration appear/disappear, session create/transition/teardown.
 		// NOTIFYs land in _outbox and ride out with this pass (after unlock).
 		_blf.refresh();
+
+		// #1092: a session this packet created or ended changes the emergency Call-ID set.
+		publishRateExemptions();
+		publishRegisteredSources();
 
 		// #462 (#284 rank 5): into the receive path's own persistent scratch.
 		// Safe without a lock of their own: handle() has exactly one production
@@ -2409,14 +2415,21 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	}
 #endif
 
+	const std::string destNumber(data->getToNumber());
+
 	if (!caller.has_value())
 	{
 		auto response = getMessageFromPool(*data);
-		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		if (!response)
+		{
+			noteUnregisteredEmergencyDial(data, destNumber);   // #1107: the 911 is still on the record
+			return;   // pool exhausted: drop, peer retransmits (#101A)
+		}
 		response->setHeader("SIP/2.0 403 Forbidden");
 		response->clearBody();
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
+		noteUnregisteredEmergencyDial(data, destNumber);   // #1107: after the 403, as routeEmergencyCall orders it
 		return;
 	}
 
@@ -2427,6 +2440,9 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// PHONE_COMPATIBILITY.md used to document as a phone-side setting.
 	if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/true))
 	{
+		// #1107 (Rule 5): the refusal stands, but a 911/933 gets the emergency lane's own
+		// (log, 503 naming the codec, routed=false notification), not this plain 488.
+		if (routeCodecRefusedEmergency(data, caller.value(), destNumber)) return;
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader("SIP/2.0 488 Not Acceptable Here");
@@ -2436,8 +2452,6 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
-
-	std::string destNumber(data->getToNumber());
 
 	// ── Emergency dialing, before anything an operator can configure (#166) ──
 	//
@@ -5049,7 +5063,7 @@ namespace
 // does. Caller holds _mutex.
 void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	const std::shared_ptr<SipClient>& caller,
-	const pbx::EmergencyDial& emergency, const std::string& dialed)
+	const pbx::EmergencyDial& emergency, const std::string& dialed, bool noRelayableCodec)
 {
 	const std::string kind(emergency.isTest ? "TEST 933" : "911");
 	const std::string from(data->getFromNumber());
@@ -5086,8 +5100,8 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		_emergencyCallbacks.note(caller->getNumber(), std::chrono::steady_clock::now());
 	};
 	bool placed = false;
-	bool codecRejected = false;
-	if (route == EmergencyRoute::Anchor)
+	bool codecRejected = noRelayableCodec;   // #1107: nothing to route; the 503 below names the codec
+	if (route == EmergencyRoute::Anchor && !codecRejected)
 	{
 		// respondIfDisconnected=false: when the anchor is not connected,
 		// originateAnchorCall returns false having sent NOTHING, so this
@@ -5186,6 +5200,47 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 
 	// 503 is enqueued; notify after it, same ordering rule as the routed path.
 	notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted);
+}
+
+bool RequestsHandler::emergencyDialOf(const std::string& dialed, pbx::EmergencyDial& emergencyOut,
+	std::string& asDialedOut) const
+{
+	emergencyOut = pbx::classifyEmergencyDial(dialed);
+	if (emergencyOut.isEmergency)
+	{
+		asDialedOut = dialed;
+		return true;
+	}
+	if (!dialRuleMakesEmergency(dialed, &asDialedOut)) return false;
+	emergencyOut = pbx::classifyEmergencyDial(asDialedOut);
+	return emergencyOut.isEmergency;
+}
+
+bool RequestsHandler::routeCodecRefusedEmergency(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<SipClient>& caller, const std::string& dialed)
+{
+	pbx::EmergencyDial emergency;
+	std::string asDialed;
+	if (!emergencyDialOf(dialed, emergency, asDialed)) return false;
+	if (asDialed != dialed)   // same line the intercept writes for a rule-made 911
+	{
+		queueLog("EMERGENCY: a dial-plan rule turned " + dialed + " into " + asDialed +
+			"; routing it as an emergency call", true);
+	}
+	routeEmergencyCall(data, caller, emergency, asDialed, /*noRelayableCodec=*/true);
+	return true;
+}
+
+void RequestsHandler::noteUnregisteredEmergencyDial(const std::shared_ptr<SipMessage>& data,
+	const std::string& dialed)
+{
+	pbx::EmergencyDial emergency;
+	std::string asDialed;
+	if (!emergencyDialOf(dialed, emergency, asDialed)) return;
+	const std::string from(data->getFromNumber());
+	queueLog("EMERGENCY: " + std::string(emergency.isTest ? "TEST 933" : "911") + " dialed by " + from +
+		" - caller is not a registered extension, refused (403)", true);
+	notifyEmergency(emergency, from, asDialed, /*routed=*/false, "caller is not a registered extension");
 }
 
 // Issue #166 part 2. Kept to this one small function so the compliance-relevant
@@ -11183,6 +11238,12 @@ void RequestsHandler::tick()
 			}
 		}
 
+		// #1092: re-publish the limiter's exemptions every pass (a trunk name resolving,
+		// a session ending without a packet).
+		publishTrunkPeer(/*retire=*/false);
+		publishRateExemptions();
+		publishRegisteredSources();
+
 		// Belt-and-suspenders (Fix #4): drop DTMF accumulators whose dialog is gone,
 		// in case a teardown path bypassed endCall(). Bounded by the small session pool.
 		_dtmf.sweepStale();
@@ -12144,10 +12205,176 @@ bool RequestsHandler::ipAllowed(const sockaddr_in& src) const
 	return (ip & _allowMask) == _allowNet;
 }
 
+uint32_t RequestsHandler::nextTrunkPeerIp(uint32_t current, TrunkResolver::Status st, uint32_t found)
+{
+	return (st == TrunkResolver::Status::Hit && found != 0) ? found : current;
+}
+
+bool RequestsHandler::emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId)
+{
+	callId = siphdr::stripHeaderNameView(callId);   // bare value, whatever form the caller holds
+	// A Call-ID that does not fit is not stored truncated: a prefix would exempt other dialogs.
+	if (callId.empty() || callId.size() >= kRateExemptCallIdBytes || set.count >= kMaxRateExemptCallIds)
+		return false;
+	if (emergencyIdsHas(set, callId)) return true;
+	std::memcpy(set.id[set.count].data(), callId.data(), callId.size());
+	set.len[set.count] = static_cast<uint8_t>(callId.size());
+	++set.count;
+	return true;
+}
+
+bool RequestsHandler::emergencyIdsHas(const EmergencyCallIds& set, std::string_view callId)
+{
+	callId = siphdr::stripHeaderNameView(callId);
+	for (size_t i = 0; i < set.count && i < kMaxRateExemptCallIds; ++i)
+	{
+		if (set.len[i] == callId.size() && std::memcmp(set.id[i].data(), callId.data(), callId.size()) == 0)
+			return true;
+	}
+	return false;
+}
+
+bool RequestsHandler::emergencyIdsEqual(const EmergencyCallIds& a, const EmergencyCallIds& b)
+{
+	if (a.count != b.count) return false;
+	for (size_t i = 0; i < a.count && i < kMaxRateExemptCallIds; ++i)
+	{
+		if (a.len[i] != b.len[i] || std::memcmp(a.id[i].data(), b.id[i].data(), a.len[i]) != 0)
+			return false;
+	}
+	return true;
+}
+
+void RequestsHandler::publishRateExemptions()
+{
+	// Member scratch (guarded by _mutex), not a stack local: it is ~2 KB and this runs from the SIP task.
+	EmergencyCallIds& fresh = _emergencyIdsScratch;
+	fresh.count = 0;   // entries past count are never read
+	for (const auto& [callID, s] : _sessions)
+	{
+		if (!s || !s->isEmergency()) continue;
+		(void)emergencyIdsAdd(fresh, callID);
+		// #818: the carrier speaks on the trunk dialog's own Call-ID, not the handset leg's.
+		if (const SipTrunk::Dialog* d = _sipTrunk.findByCallID(callID); d)
+			(void)emergencyIdsAdd(fresh, d->callID);
+	}
+	std::lock_guard<std::mutex> rlock(_rateMutex);
+	if (!emergencyIdsEqual(fresh, _emergencyCallIds)) _emergencyCallIds = fresh;
+}
+
+void RequestsHandler::publishTrunkPeer(bool retire)
+{
+	const auto now = std::chrono::steady_clock::now();
+	const bool valid = _sipTrunk.config().valid();
+	sockaddr_in sbc{};
+	// Cache-only lookup: tick() is what resolves. It stops answering Hit once its entry ages
+	// out (300 s) and while a failure is cached (30 s), so the last Hit is latched below.
+	const TrunkResolver::Status st = valid
+		? _trunkResolver.lookup(_sipTrunk.config().transportHost(), _sipTrunk.config().transportPort(), sbc, now)
+		: TrunkResolver::Status::Refused;
+	std::lock_guard<std::mutex> rlock(_rateMutex);
+	const uint32_t next = valid ? nextTrunkPeerIp(retire ? 0 : _trunkPeerIp, st, sbc.sin_addr.s_addr) : 0;
+	if (next != _trunkPeerIp)
+	{
+		_trunkPeerIp = next;
+		_trunkBucket = { kTrunkBucketBurst, now };
+	}
+}
+
+void RequestsHandler::publishRegisteredSources()
+{
+	// Member scratch (guarded by _mutex): ~1 KB, and this runs from the SIP task.
+	std::array<RateSource, kMaxRateRegisteredSources>& fresh = _rateSourcesScratch;
+	size_t n = 0;
+	const auto now = std::chrono::steady_clock::now();
+	for (const auto& client : _clientPool)
+	{
+		if (!client || client->getNumber().empty() || client->isExpired(now)) continue;
+		const uint32_t ip = client->getAddress().sin_addr.s_addr;
+		bool dup = (ip == 0);
+		for (size_t i = 0; i < n && !dup; ++i) dup = (fresh[i].ip == ip);
+		if (dup) continue;
+		if (n >= kMaxRateRegisteredSources) break;   // the pool is the same size; belt and braces
+		fresh[n].ip = ip;
+		++n;
+	}
+	std::lock_guard<std::mutex> rlock(_rateMutex);
+	for (size_t i = 0; i < n; ++i)
+	{
+		// Carry the live buckets over, or seed from the table entry the source already had; a
+		// rebuild must never refill a drained bucket. A new source's emergency budget starts full.
+		const RateSource* old = findRateSource(fresh[i].ip);
+		const auto it = _rateBuckets.find(fresh[i].ip);
+		fresh[i].ordinary  = old ? old->ordinary : (it != _rateBuckets.end() ? it->second : RateBucket{ 40.0, now });
+		fresh[i].emergency = old ? old->emergency : RateBucket{ kEmergencyInviteBurst, now };
+		if (it != _rateBuckets.end()) _rateBuckets.erase(it);   // its state moved to the reserved slot
+	}
+	for (size_t i = 0; i < kMaxRateRegisteredSources; ++i)
+	{
+		if (i < n) _rateSources[i] = fresh[i];
+		else _rateSources[i].ip = 0;
+	}
+}
+
+RequestsHandler::RateSource* RequestsHandler::findRateSource(uint32_t ip)
+{
+	if (ip == 0) return nullptr;
+	for (RateSource& r : _rateSources)
+	{
+		if (r.ip == ip) return &r;
+	}
+	return nullptr;
+}
+
+bool RequestsHandler::allowEmergencyInvite(const SipMessage& m, const sockaddr_in& src)
+{
+	if (m.getType() != SipMessageTypes::INVITE) return false;
+	// Either header: onInvite routes on To, a proxy-style client may route on the Request-URI, and
+	// both are free to forge. The budget is the same tiny cap either way (heap-free, no _mutex).
+	if (!pbx::classifyEmergencyDial(m.getRequestUriUser()).isEmergency &&
+		!pbx::classifyEmergencyDial(m.getToNumber()).isEmergency)
+		return false;
+	RateSource* r = findRateSource(src.sin_addr.s_addr);
+	return takeToken(r ? r->emergency : _unregisteredEmergency, std::chrono::steady_clock::now(),
+		kEmergencyInviteBurst, kEmergencyInvitePerSec);
+}
+
+bool RequestsHandler::admitPacket(const SipMessage& m)
+{
+	const sockaddr_in src = m.getSource();
+	if (!ipAllowed(src)) return false;
+	if (rateExemptByCallId(m)) return true;
+	return allowPacket(src) || allowEmergencyInvite(m, src);
+}
+
+bool RequestsHandler::rateExemptByCallId(const SipMessage& m) const
+{
+	return emergencyIdsHas(_emergencyCallIds, m.getCallID());
+}
+
+bool RequestsHandler::takeToken(RateBucket& bucket, std::chrono::steady_clock::time_point now,
+	double burst, double perSec)
+{
+	const double elapsedSec = std::chrono::duration<double>(now - bucket.last).count();
+	bucket.last = now;
+	bucket.tokens = (std::min)(burst, bucket.tokens + elapsedSec * perSec);
+	if (bucket.tokens < 1.0) return false;
+	bucket.tokens -= 1.0;
+	return true;
+}
+
 bool RequestsHandler::allowPacket(const sockaddr_in& src)
 {
 	auto now = std::chrono::steady_clock::now();
 	uint32_t ip = src.sin_addr.s_addr; // Key by raw network-byte-order IP
+
+	// #1092: the carrier has its own bucket, outside the table and its cap.
+	if (_trunkPeerIp != 0 && ip == _trunkPeerIp)
+		return takeToken(_trunkBucket, now, kTrunkBucketBurst, kTrunkBucketRate);
+
+	// #1092 follow-up: a registered extension's source has a reserved slot, never the table's cap.
+	if (RateSource* r = findRateSource(ip); r != nullptr)
+		return takeToken(r->ordinary, now, 40.0, 20.0);
 
 	auto it = _rateBuckets.find(ip);
 	if (it == _rateBuckets.end())
@@ -12162,20 +12389,8 @@ bool RequestsHandler::allowPacket(const sockaddr_in& src)
 		return true;
 	}
 
-	auto& bucket = it->second;
-	double elapsedSec = std::chrono::duration<double>(now - bucket.last).count();
-	bucket.last = now;
-
-	// Replenish tokens (sustained rate = 20 tokens/sec)
-	bucket.tokens = (std::min)(40.0, bucket.tokens + elapsedSec * 20.0);
-
-	if (bucket.tokens >= 1.0)
-	{
-		bucket.tokens -= 1.0;
-		return true;
-	}
-
-	return false; // Denied (Rate limit exceeded)
+	// Replenish tokens (burst 40, sustained rate = 20 tokens/sec); false = rate limit exceeded
+	return takeToken(it->second, now, 40.0, 20.0);
 }
 
 bool RequestsHandler::isValidAor(std::string_view s) const
@@ -13714,6 +13929,7 @@ void RequestsHandler::setTrunkConfig(const SipTrunk::Config& cfg)
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
+	publishTrunkPeer(/*retire=*/true);   // #1092: the old carrier IP loses its bucket now
 }
 
 SipTrunk::Config RequestsHandler::getTrunkConfig()
@@ -13774,6 +13990,7 @@ void RequestsHandler::applyStoredTrunkConfig()
 	// The operator has pointed the trunk somewhere else, so any cached address
 	// is not merely stale, it is wrong -- see TrunkResolver::clear().
 	_trunkResolver.clear();
+	publishTrunkPeer(/*retire=*/true);   // #1092: the old carrier IP loses its bucket now
 
 	// Checked, not discarded. The HTTP route caps the password well below
 	// kMaxSecret, but this path reads raw NVS, which an older or different

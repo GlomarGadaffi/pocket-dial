@@ -69,13 +69,15 @@ The same decision as a flow:
 
 ```mermaid
 flowchart TD
-    A["INVITE with SDP offer"] --> B{"Offer has PCMU, PCMA or G.722?"}
-    B -- "no" --> R1["488 Not Acceptable Here"]
-    B -- "yes" --> C{"Relayed peer-to-peer or server-terminated?"}
-    C -- "relayed" --> D["Relay the offer, dropping only unsupported payloads"]
-    C -- "server-terminated" --> E{"Offer has PCMU?"}
+    A["INVITE reaches onInvite(), caller registered"] --> B{"SDP has an m=audio line that offers none of PCMU 0, PCMA 8, G.722 9?<br/>(offersSupportedAudio allowWideband=true, RequestsHandler.cpp:2428)"}
+    B -- "yes" --> R1["488 Not Acceptable Here + Warning 304 No compatible audio codec"]
+    B -- "no, or no SDP" --> C{"Destination"}
+    C -- "911 or 933" --> EM["Emergency lane: routeEmergencyCall(), dispatched after the codec gate"]
+    C -- "extension, ring group, hunt group, pickup" --> D["Relayed peer to peer: filterAudioCodecs(allowWideband=true) drops every payload except 0, 8, 9 and telephone-event"]
+    C -- "777 echo" --> G["Offer needs PCMU (:2603), answer echoes the offer through filterAudioCodecs(false, false)"]
+    C -- "440, 555, 888, 997, 796" --> E{"Offer has PCMU?<br/>(offersSupportedAudio false, false)"}
     E -- "no" --> R2["488 Not Acceptable Here"]
-    E -- "yes" --> F["Answer with PCMU"]
+    E -- "yes" --> F["Answer m=audio with PCMU only (buildMediaSdp)"]
 ```
 
 Keep G.711 (PCMU at minimum) enabled on every client. G.722 is a bonus that works
@@ -238,15 +240,16 @@ decision for one registered client is:
 
 ```mermaid
 flowchart TD
-    A["Client registered"] --> B{"Lease expired?"}
-    B -- "yes" --> E{"On an emergency call?"}
-    B -- "no" --> C{"Silent for more than 15 s?"}
-    C -- "no" --> A
-    C -- "yes" --> D{"In a call?"}
+    P["tick() sends OPTIONS to each registered client every 5 s"] --> A
+    A["sweepExpired(), run at most once per second, visits each registered client"] --> B{"Lease expired? (isExpired)"}
+    B -- "yes" --> E{"Live emergency session on this extension? (isEmergency, #712)"}
+    B -- "no" --> C{"Last SIP packet more than 15 s ago?"}
+    C -- "no" --> N["Nothing to do"]
+    C -- "yes" --> D{"In any session? (RTP does not count as activity, #533)"}
     D -- "yes" --> K["Kept"]
     D -- "no" --> E
     E -- "yes" --> K
-    E -- "no" --> P["Pruned, calls ended"]
+    E -- "no" --> P2["endClientCalls(), then client->release(): pruned"]
 ```
 
 - A registered extension appears in the `clients` array of

@@ -1,0 +1,5 @@
+# #457 stack-depth gate in CI: 8 new Python unittest cases in
+# tests/tools/test_task_stack_gate_wiring.py (host job, test_*.py discover). The 7 frames added to
+# test_checked_in_allowlist_covers_the_measured_frames are rows in an existing case, not new cases.
+# No gtest cases.
+0

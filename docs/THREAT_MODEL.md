@@ -202,21 +202,21 @@ The checks run in the order below, so the status codes are not interchangeable.
 
 ```mermaid
 flowchart TD
-    A["Admin-gated request"] --> B{"Origin absent, or its host matches Host?"}
-    B -- "no" --> R1["403 cross-origin request rejected"]
-    B -- "yes" --> C{"Valid pd_session cookie?"}
-    C -- "no" --> R2["401 authentication required"]
-    C -- "yes" --> D{"Mutating route?"}
-    D -- "yes" --> G{"Matching X-CSRF token?"}
-    G -- "no" --> R3["403 missing or invalid CSRF token"]
+    A["Admin-gated request: HttpServer::requireAdmin() (HttpServer.cpp:4734)"] --> B{"1. isSameOrigin(): Origin absent, or its host matches an allowed Host?"}
+    B -- "no" --> R1["403 Forbidden: cross-origin request rejected"]
+    B -- "yes" --> C{"2. AdminAuth::validateSession(pd_session cookie)?"}
+    C -- "no" --> R2["401 Unauthorized: authentication required"]
+    C -- "yes" --> D{"needCsrf: mutating route?"}
+    D -- "yes" --> G{"3. AdminAuth::validateCsrf(token, X-CSRF)?"}
+    G -- "no" --> R3["403 Forbidden: missing or invalid CSRF token"]
     G -- "yes" --> E
-    D -- "no" --> E{"Default credential still in place, and not set-credential?"}
-    E -- "yes" --> R4["403 setup_required"]
-    E -- "no" --> F{"Owner-only route?"}
+    D -- "no" --> E{"4. needsInitialSetup() and path is not /api/admin/set-credential?"}
+    E -- "yes" --> R4["403 Forbidden: setup_required"]
+    E -- "no" --> F{"5. minRole is Owner?"}
     F -- "no" --> RUN["Handler runs"]
-    F -- "yes, owner session" --> RUN
-    F -- "yes, sysop session, no owner credential yet" --> RUN
-    F -- "yes, sysop session, owner credential set" --> R5["403 owner privilege required"]
+    F -- "yes" --> H{"sessionSatisfiesRole(token, Owner)?<br/>true for an owner session, and for a sysop session while no owner credential exists"}
+    H -- "yes" --> RUN
+    H -- "no" --> R5["403 Forbidden: owner privilege required"]
 ```
 
 | What the caller has | Result |
@@ -240,12 +240,15 @@ On the `wifi`, `eth` and `lan8720` builds the SIP stack is held down until a cre
 
 ```mermaid
 flowchart TD
-    A["Boot on a wifi, eth or lan8720 build"] --> B{"NVS provisioned flag set?"}
-    B -- "yes" --> S["Start the SIP task"]
-    B -- "no" --> C{"credentialIsSet() returns true?"}
-    C -- "no: poll again after 2 s" --> C
-    C -- "yes" --> S
-    C -- "30-minute cap reached" --> R["Reboot"]
+    A["app_main() on a wifi, eth or lan8720 build"] --> W["Start the HTTP task: http_server_task (wifi) or http_dashboard (eth, lan8720), priority 4, core 0, 8192 B stack"]
+    W --> B{"NVS namespace storage, key provisioned (u8) non-zero?"}
+    B -- "yes" --> S
+    B -- "no" --> L["vTaskDelay 2 s, waited += 2"]
+    L --> C{"AdminAuth::credentialIsSet()?"}
+    C -- "no, waited under 1800 s" --> L
+    C -- "no, waited reaches 1800 s" --> R["esp_restart()"]
+    C -- "yes" --> P["nvs_set_u8 provisioned = 1, nvs_commit"]
+    P --> S["Start the SIP task: sip_server_task (wifi) or sip_server (eth, lan8720), priority 5, core 1, 8192 B stack"]
 ```
 
 The gate is skipped whenever the NVS `provisioned` flag (namespace `storage`) is set. That flag is written once, on the first successful claim. Neither `AdminAuth::clearCredential()` nor `DeviceConfig::clearAll()` touches it. Both reset doors (`POST /api/factory-reset` and the DTMF `999` code) end with `nvs_flash_erase()` of the whole NVS partition (#456). That erase takes the flag with everything else, and so does reflashing. If the erase fails, the reset journal says so on the next boot (`resetIncomplete` in `/api/status`), and what survives depends on the door. On the HTTP door the per-key erases already ran, so the board comes back on `admin`/`admin` with the SIP stack running. That is the `display` build's posture. The keypad door has no per-key erases, so after a failed erase nothing in NVS was erased at all. The old credential, PIN, trunk password and every other store are intact. On either door, run the reset again.

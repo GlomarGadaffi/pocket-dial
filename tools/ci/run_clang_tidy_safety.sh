@@ -33,7 +33,7 @@ declare -A BASELINE=(
   [misc-no-recursion]=4
   [bugprone-unused-return-value]=0
   [cert-err33-c]=33
-  [cppcoreguidelines-pro-type-member-init]=28
+  [cppcoreguidelines-pro-type-member-init]=23
   [cppcoreguidelines-init-variables]=22
 )
 

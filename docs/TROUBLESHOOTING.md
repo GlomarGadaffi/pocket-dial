@@ -98,12 +98,12 @@ The provisioning gate on `wifi`, `eth` and `lan8720` builds works like this. Boo
 
 ```mermaid
 flowchart TD
-    A["Boot: app_main starts the HTTP dashboard"] --> B{"provisioned flag set in NVS?"}
-    B -->|yes| C["SIP task starts"]
-    B -->|no| D["SIP held dark until a credential is committed"]
-    D -->|"credential committed"| E["Set the provisioned flag"]
+    A["app_main(): HTTP task starts first (http_server_task, or http_dashboard on eth and lan8720)"] --> B{"NVS storage/provisioned flag non-zero?"}
+    B -->|yes| C["SIP task starts (sip_server_task, or sip_server on eth and lan8720)"]
+    B -->|no| D["SIP held dark. Log: boot device unprovisioned. Poll AdminAuth::credentialIsSet() every 2 s"]
+    D -->|"credential committed"| E["nvs_set_u8 provisioned = 1, then nvs_commit"]
     E --> C
-    D -->|"no credential after 30 minutes"| F["Reboot and retry"]
+    D -->|"1800 s with no credential"| F["esp_restart() and retry"]
     F --> A
 ```
 
@@ -325,22 +325,24 @@ the `/api/telephony-config` and `/api/did-mapping` writes, and the OTA endpoints
 
 There is no "unprovisioned device needs no headers" exemption. The session gate applies from the first boot, and the shipped default credential exists for that reason (`HttpServer::requireAdmin()`).
 
-Four rejections, four different problems. The JSON body is what tells them apart:
+Five rejections, five different problems. The JSON body is what tells them apart:
 
 * `401 {"error":"authentication required"}`: no or expired session. Log in.
 * `403 {"error":"cross-origin request rejected"}`: the `Origin` host differs from the `Host`.
 * `403 {"error":"setup_required"}`: still on `admin`/`admin`. Replace the credential.
 * `403 {"error":"missing or invalid CSRF token"}`: session valid, token missing. Send the `X-CSRF` token.
+* `403 {"error":"owner privilege required"}`: a sysop session on an owner-only route, once an owner credential exists. Log in as the owner.
 
-Asserting on the status code alone cannot distinguish the three `403`s.
+Asserting on the status code alone cannot distinguish the four `403`s.
 
 ```mermaid
 flowchart TD
-    A["Request rejected"] --> B{"Which status and JSON body?"}
-    B -->|"401 authentication required"| C["No or expired session: log in"]
-    B -->|"403 cross-origin request rejected"| D["Origin host differs from Host"]
-    B -->|"403 setup_required"| E["Still on admin/admin: replace the credential"]
-    B -->|"403 missing or invalid CSRF token"| F["Session valid, token missing: send X-CSRF"]
+    A["Admin request rejected (HttpServer::requireAdmin)"] --> B{"Which status and JSON body?"}
+    B -->|"403 cross-origin request rejected (check 1)"| D["Origin host differs from Host, or Host is not a local name"]
+    B -->|"401 authentication required (check 2)"| C["No or expired pd_session: log in"]
+    B -->|"403 missing or invalid CSRF token (check 3)"| F["Session valid, token missing: send X-CSRF"]
+    B -->|"403 setup_required (check 4)"| E["Still on admin/admin: replace the credential"]
+    B -->|"403 owner privilege required (check 5)"| G["Sysop session on an owner-only route, owner credential exists: log in as owner"]
 ```
 
 ## `429` on login
