@@ -130,6 +130,15 @@ class AnchorOrphanSweepTest(unittest.TestCase):
                     encoding="utf-8").read()
         self.assertIn('"name": "tel_sweep", "entry": "sweepTaskTrampoline\\\\("', gate, "the stack gate knows the new task")
 
+    def test_the_no_psram_internal_budget_counts_tel_sweep(self):
+        # #1116: with no PSRAM the sweep's stack falls back to internal DRAM, allocated before the receiver slots, so
+        # the 72 KB static_assert in RtpTaskSlots.hpp must count it, from the one constant the class uses.
+        slots = read("RtpTaskSlots.hpp")
+        budget = slots[slots.index("#if !defined(CONFIG_SPIRAM)"):]
+        self.assertIn("kSweepStackBytes", budget, "the no-PSRAM assert leaves out tel_sweep's stack")
+        self.assertRegex(slots, r"kSweepStackBytes\s*=\s*13376")
+        self.assertRegex(self.hpp, r"kSweepStackBytes\s*=\s*pd::rtpslots::kSweepStackBytes")
+
     def test_tel_sweep_is_a_static_task_on_a_boot_allocated_psram_stack(self):
         # Round 9: a dynamic internal 6 KB stack cost ~6.7 KB of internal heap for good (BigDog's bench). The sweep's
         # call graph (resolveOutboundLeg, httpPostBody, cJSON, the in-memory tables, esp_log witnesses) does no flash
