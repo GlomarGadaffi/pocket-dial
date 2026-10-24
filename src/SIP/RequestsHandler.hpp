@@ -3298,12 +3298,7 @@ private:
 	// Issue #38: token bucket keyed by source IPv4 (network-order s_addr).
 	struct RateBucket
 	{
-		// cppcheck flags this as uninitMemberVarNoCtor. False positive: every
-		// RateBucket is created via `_rateBuckets[ip] = { 40.0, now }` (below),
-		// so `tokens` is overwritten immediately and is never read from the
-		// briefly-default-constructed instance operator[] creates first.
-		// cppcheck-suppress uninitMemberVarNoCtor
-		double tokens;
+		double tokens = 0.0;
 		std::chrono::steady_clock::time_point last;
 	};
 	std::unordered_map<uint32_t, RateBucket> _rateBuckets;
