@@ -638,6 +638,20 @@ public:
 	// #463: tick() runs at most once a second; this lets a test drive two passes
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
+	// #1092: the shared unregistered emergency INVITE budget as it stands, untouched by any
+	// packet. It must start FULL: a bucket stamped at the clock epoch refills from boot on ESP.
+	double unregisteredEmergencyTokensForTest()
+	{
+		std::lock_guard<std::mutex> rlock(_rateMutex);
+		return _unregisteredEmergency.tokens;
+	}
+	// #1092: forget one source's bucket-table entry (network-order s_addr), as tick()'s idle
+	// sweep does after 60 s, so a test can hold the table full with that source absent.
+	void eraseRateBucketForTest(uint32_t netIp)
+	{
+		std::lock_guard<std::mutex> rlock(_rateMutex);
+		_rateBuckets.erase(netIp);
+	}
 	// #986: hold _mutex for `d`, as a slow NVS commit or PIN hash would. Host builds
 	// only. Defined in the .cpp so every call is one site however the caller is inlined.
 	void holdMutexForTest(std::chrono::milliseconds d);
@@ -3284,12 +3298,7 @@ private:
 	// Issue #38: token bucket keyed by source IPv4 (network-order s_addr).
 	struct RateBucket
 	{
-		// cppcheck flags this as uninitMemberVarNoCtor. False positive: every
-		// RateBucket is created via `_rateBuckets[ip] = { 40.0, now }` (below),
-		// so `tokens` is overwritten immediately and is never read from the
-		// briefly-default-constructed instance operator[] creates first.
-		// cppcheck-suppress uninitMemberVarNoCtor
-		double tokens;
+		double tokens = 0.0;
 		std::chrono::steady_clock::time_point last;
 	};
 	std::unordered_map<uint32_t, RateBucket> _rateBuckets;
@@ -3304,10 +3313,44 @@ private:
 	RateBucket _trunkBucket{ 0.0, {} };   // guarded by _rateMutex; reset when _trunkPeerIp changes
 	static bool takeToken(RateBucket& bucket, std::chrono::steady_clock::time_point now,
 		double burst, double perSec);
+
+	// #1092 follow-up: a handset's FIRST 911 INVITE has no session yet, and the handset is not
+	// the trunk peer, so neither exemption above can admit it. Two more, same locking.
+	//   (c) every registered extension's source IPv4 gets a RESERVED slot (fixed array, one per
+	//       client): it keeps a normal burst-40 bucket but is never refused for lack of a slot in
+	//       the 256-entry table, so spoofed sources filling the table cannot lock a real handset
+	//       out. Buckets carry over each rebuild; they are never reset to full by it.
+	//   (d) an INVITE whose REQUEST-URI user part or its To number is 911/933 (classifyEmergencyDial) may spend a
+	//       tiny separate budget when the ordinary bucket would drop it: burst 4, 1 per 10 s. A
+	//       registered source has its own; every unregistered source shares ONE, so a spoofer
+	//       gains kEmergencyInviteBurst packets in total however many addresses it forges. Either
+	//       header qualifies (onInvite routes on To; both are forgeable) and the cap is the same, so
+	//       a forger gains nothing extra. A dial-rule 911 (#834) gets none: the rules are _mutex's.
+	static constexpr size_t kMaxRateRegisteredSources = POCKETDIAL_MAX_CLIENTS;
+	static_assert(kMaxRateRegisteredSources > 0 && kMaxRateRegisteredSources <= 255,
+		"one reserved limiter slot per client");
+	static constexpr double kEmergencyInviteBurst  = 4.0;
+	static constexpr double kEmergencyInvitePerSec = 0.1;
+	struct RateSource
+	{
+		uint32_t ip = 0;   // network-order s_addr; 0 = unused
+		RateBucket ordinary{ 0.0, {} };
+		RateBucket emergency{ kEmergencyInviteBurst, {} };
+	};
+	// Caller holds _rateMutex. Null when `ip` is not a registered extension's source.
+	RateSource* findRateSource(uint32_t ip);
+	// Caller holds _rateMutex. The whole admission decision for one inbound packet.
+	bool admitPacket(const SipMessage& m);
+	bool allowEmergencyInvite(const SipMessage& m, const sockaddr_in& src);
+	// Caller holds _mutex.
+	void publishRegisteredSources();
 	// #1092: both guarded by _rateMutex. 0 = no trunk peer known (never matches).
 	uint32_t _trunkPeerIp = 0;   // network-order s_addr
 	EmergencyCallIds _emergencyCallIds;
 	EmergencyCallIds _emergencyIdsScratch;   // publishRateExemptions() build area; guarded by _mutex
+	std::array<RateSource, kMaxRateRegisteredSources> _rateSources{};          // guarded by _rateMutex
+	std::array<RateSource, kMaxRateRegisteredSources> _rateSourcesScratch{};   // build area; guarded by _mutex
+	RateBucket _unregisteredEmergency{ kEmergencyInviteBurst, {} };   // guarded by _rateMutex
 	// Optional CIDR allowlist (host order). _allowMask == 0 means "no allowlist".
 	uint32_t _allowNet  = 0;
 	uint32_t _allowMask = 0;

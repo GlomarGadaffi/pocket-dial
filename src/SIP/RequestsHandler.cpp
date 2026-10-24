@@ -963,11 +963,9 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	// touch only the rate state, which _rateMutex now guards.
 	{
 		std::lock_guard<std::mutex> rlock(_rateMutex);
-		// #1092, Rule 5: a live emergency Call-ID skips the bucket; the trunk peer has its own
-		// high-ceiling bucket outside the 256-entry cap (allowPacket). The allowlist still
-		// applies. No _mutex.
-		if (!ipAllowed(request->getSource()) ||
-			(!rateExemptByCallId(*request) && !allowPacket(request->getSource())))
+		// #1092, Rule 5: admitPacket() = allowlist, then live emergency Call-ID, then the bucket
+		// (trunk peer, registered source, or table), then the emergency INVITE budget. No _mutex.
+		if (!admitPacket(*request))
 		{
 			const sockaddr_in src = request->getSource();
 			_dropProbe.note(DropProbe::Reason::Rate, src.sin_addr.s_addr, src.sin_port, rawBytes);
@@ -1339,6 +1337,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 
 		// #1092: a session this packet created or ended changes the emergency Call-ID set.
 		publishRateExemptions();
+		publishRegisteredSources();
 
 		// #462 (#284 rank 5): into the receive path's own persistent scratch.
 		// Safe without a lock of their own: handle() has exactly one production
@@ -11243,6 +11242,7 @@ void RequestsHandler::tick()
 		// a session ending without a packet).
 		publishTrunkPeer(/*retire=*/false);
 		publishRateExemptions();
+		publishRegisteredSources();
 
 		// Belt-and-suspenders (Fix #4): drop DTMF accumulators whose dialog is gone,
 		// in case a teardown path bypassed endCall(). Bounded by the small session pool.
@@ -12281,6 +12281,72 @@ void RequestsHandler::publishTrunkPeer(bool retire)
 	}
 }
 
+void RequestsHandler::publishRegisteredSources()
+{
+	// Member scratch (guarded by _mutex): ~1 KB, and this runs from the SIP task.
+	std::array<RateSource, kMaxRateRegisteredSources>& fresh = _rateSourcesScratch;
+	size_t n = 0;
+	const auto now = std::chrono::steady_clock::now();
+	for (const auto& client : _clientPool)
+	{
+		if (!client || client->getNumber().empty() || client->isExpired(now)) continue;
+		const uint32_t ip = client->getAddress().sin_addr.s_addr;
+		bool dup = (ip == 0);
+		for (size_t i = 0; i < n && !dup; ++i) dup = (fresh[i].ip == ip);
+		if (dup) continue;
+		if (n >= kMaxRateRegisteredSources) break;   // the pool is the same size; belt and braces
+		fresh[n].ip = ip;
+		++n;
+	}
+	std::lock_guard<std::mutex> rlock(_rateMutex);
+	for (size_t i = 0; i < n; ++i)
+	{
+		// Carry the live buckets over, or seed from the table entry the source already had; a
+		// rebuild must never refill a drained bucket. A new source's emergency budget starts full.
+		const RateSource* old = findRateSource(fresh[i].ip);
+		const auto it = _rateBuckets.find(fresh[i].ip);
+		fresh[i].ordinary  = old ? old->ordinary : (it != _rateBuckets.end() ? it->second : RateBucket{ 40.0, now });
+		fresh[i].emergency = old ? old->emergency : RateBucket{ kEmergencyInviteBurst, now };
+		if (it != _rateBuckets.end()) _rateBuckets.erase(it);   // its state moved to the reserved slot
+	}
+	for (size_t i = 0; i < kMaxRateRegisteredSources; ++i)
+	{
+		if (i < n) _rateSources[i] = fresh[i];
+		else _rateSources[i].ip = 0;
+	}
+}
+
+RequestsHandler::RateSource* RequestsHandler::findRateSource(uint32_t ip)
+{
+	if (ip == 0) return nullptr;
+	for (RateSource& r : _rateSources)
+	{
+		if (r.ip == ip) return &r;
+	}
+	return nullptr;
+}
+
+bool RequestsHandler::allowEmergencyInvite(const SipMessage& m, const sockaddr_in& src)
+{
+	if (m.getType() != SipMessageTypes::INVITE) return false;
+	// Either header: onInvite routes on To, a proxy-style client may route on the Request-URI, and
+	// both are free to forge. The budget is the same tiny cap either way (heap-free, no _mutex).
+	if (!pbx::classifyEmergencyDial(m.getRequestUriUser()).isEmergency &&
+		!pbx::classifyEmergencyDial(m.getToNumber()).isEmergency)
+		return false;
+	RateSource* r = findRateSource(src.sin_addr.s_addr);
+	return takeToken(r ? r->emergency : _unregisteredEmergency, std::chrono::steady_clock::now(),
+		kEmergencyInviteBurst, kEmergencyInvitePerSec);
+}
+
+bool RequestsHandler::admitPacket(const SipMessage& m)
+{
+	const sockaddr_in src = m.getSource();
+	if (!ipAllowed(src)) return false;
+	if (rateExemptByCallId(m)) return true;
+	return allowPacket(src) || allowEmergencyInvite(m, src);
+}
+
 bool RequestsHandler::rateExemptByCallId(const SipMessage& m) const
 {
 	return emergencyIdsHas(_emergencyCallIds, m.getCallID());
@@ -12305,6 +12371,10 @@ bool RequestsHandler::allowPacket(const sockaddr_in& src)
 	// #1092: the carrier has its own bucket, outside the table and its cap.
 	if (_trunkPeerIp != 0 && ip == _trunkPeerIp)
 		return takeToken(_trunkBucket, now, kTrunkBucketBurst, kTrunkBucketRate);
+
+	// #1092 follow-up: a registered extension's source has a reserved slot, never the table's cap.
+	if (RateSource* r = findRateSource(ip); r != nullptr)
+		return takeToken(r->ordinary, now, 40.0, 20.0);
 
 	auto it = _rateBuckets.find(ip);
 	if (it == _rateBuckets.end())
