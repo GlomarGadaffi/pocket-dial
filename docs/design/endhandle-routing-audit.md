@@ -200,10 +200,10 @@ ended, the survivor actually got its BYE/CANCEL) is asserted next to every green
 - **Row 12.** 401 and 402 connected; 401 blind-REFERs to 403. 403 answers the
   PBX's INVITE with `100 Trying` (CSeq INVITE, the leg's Call-ID). onTrying has no
   blind-leg claim, so it is relayed `endHandle(From)` to the transferee 402.
-  **On main:** red: the 100 is relayed to 402 (1 message, expected 0). STILL BROKEN.
+  **On main:** red: the 100 is relayed to 402 (1 message, expected 0). OPEN as #1124.
 - **Row 23.** 401 calls 402; 402's 200 OK carries no SDP. Predicted: 401 gets
   nothing, 402 receives a 400 it discards, the session is ended.
-  **On main:** red, as predicted: 0 finals to 401, 1 `400 Bad Request` to 402, session ended. STILL BROKEN.
+  **On main:** red, as predicted: 0 finals to 401, 1 `400 Bad Request` to 402, session ended. OPEN as #1125.
 - **Fork-loser 200 (section 7).** Ring-all 600 = 402,403. 402 answers 200; before
   the CANCEL lands, 403's 200 arrives. Predicted: no ACK and no BYE to 403.
   Not re-run (not one of the findings re-checked on 2026-10-24); still inferred.
