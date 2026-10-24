@@ -1,8 +1,8 @@
 #!/bin/sh
 # Reject a commit outright if its message carries a Claude-Session: trailer
-# -- pocket-dial's convention forbids it (see CONTRIBUTING_FIRMWARE.md and
-# issue #326). Commits end with the single line --superlite and no other
-# attribution trailer; this hook only blocks the session-URL trailer.
+# or the noreply attribution address -- pocket-dial's convention forbids both
+# (see CONTRIBUTING_FIRMWARE.md, issues #326 and #1106). Commits end with the
+# single line --superlite and no other attribution trailer.
 #
 # Not installed by default -- git only runs hooks from .git/hooks, so this
 # has no effect until each clone opts in once with:
@@ -26,17 +26,19 @@
 # sub-commit. A check that only looked at the first line would have missed
 # exactly that shape.
 
+# Both patterns (Claude-Session trailer, noreply attribution address) live in
+# tools/ci/commit_hygiene.sh, the same script CI calls, so the two can never
+# disagree (issues #341, #1106).
+LIB="$(dirname "$0")/../tools/ci/commit_hygiene.sh"
+if [ ! -f "$LIB" ]; then
+    # Fail closed: a missing pattern file must not turn into "nothing to check".
+    echo "commit-msg: $LIB missing; refusing to pass unchecked" >&2
+    exit 1
+fi
+
+# check_message TEXT KIND: succeeds (0) if TEXT carries KIND (trailer|address).
 check_message() {
-    # $1: text to check. The SAME pattern as the CI job (commit-hygiene.yml,
-    # TRAILER_RE), so the two can never disagree (issue #341):
-    #   ^claude-session:                     the trailer, any case (gap 3)
-    #   claude-session:[[:space:]]*https?://  the trailer anywhere in a line,
-    #                                        followed by its URL (gap 4: a
-    #                                        72-column reflow joins it onto the
-    #                                        Co-authored-by line)
-    # Prose that merely names the trailer, and a bare session URL on its own
-    # line, do not match.
-    printf '%s\n' "$1" | grep -Eiq '(^claude-session:)|(claude-session:[[:space:]]*https?://)'
+    printf '%s\n' "$1" | sh "$LIB" match "$2"
 }
 
 if [ "$1" = "--selftest" ]; then
@@ -57,7 +59,7 @@ Co-authored-by: Claude Sonnet 5 <bot@example.invalid>"
 
     for name in bad bad_lower bad_reflowed; do
         eval "msg=\$$name"
-        if check_message "$msg"; then
+        if check_message "$msg" trailer; then
             echo "selftest: correctly detects a trailer ($name)"
         else
             echo "FAIL: did not detect a known-bad message ($name)"
@@ -67,13 +69,46 @@ Co-authored-by: Claude Sonnet 5 <bot@example.invalid>"
 
     for name in good good_prose; do
         eval "msg=\$$name"
-        if check_message "$msg"; then
+        if check_message "$msg" trailer; then
             echo "FAIL: false positive on a known-good message ($name)"
             exit 1
         else
             echo "selftest: correctly passes a clean message ($name)"
         fi
     done
+
+    # The attribution address, built from pieces so this file never holds it.
+    au="noreply"; ah="anthropic"
+    addr="${au}@${ah}.com"
+    addr_up="$(printf '%s' "$addr" | tr 'a-z' 'A-Z')"
+    addr_trailer="fix: something
+
+Co-Authored-By: Bot <${addr}>"
+    addr_upper="fix: something
+
+Co-Authored-By: Bot <${addr_up}>"
+    addr_body="fix: something
+
+prose naming ${addr} in the body"
+    addr_ok="fix: something
+
+Co-authored-by: Someone <12345+someone@users.${au}.github.com>"
+
+    for name in addr_trailer addr_upper addr_body; do
+        eval "msg=\$$name"
+        if check_message "$msg" address; then
+            echo "selftest: correctly detects the address ($name)"
+        else
+            echo "FAIL: did not detect the address ($name)"
+            exit 1
+        fi
+    done
+
+    if check_message "$addr_ok" address; then
+        echo "FAIL: false positive on a users.noreply.github.com address"
+        exit 1
+    fi
+    echo "selftest: correctly passes a users.noreply.github.com address"
 
     exit 0
 fi
@@ -94,19 +129,26 @@ fi
 
 MSG_BODY="$(cat "$MSG_FILE")"
 
-if check_message "$MSG_BODY"; then
+reject() {
     echo "" >&2
     echo "############################################################" >&2
-    echo "#  REJECTED: this commit message carries a Claude-Session:  " >&2
-    echo "#  trailer. pocket-dial's convention forbids it (see         " >&2
-    echo "#  CONTRIBUTING_FIRMWARE.md, issue #326).                    " >&2
+    echo "#  REJECTED: this commit message carries $1" >&2
+    echo "#  pocket-dial's convention forbids it (see                  " >&2
+    echo "#  CONTRIBUTING_FIRMWARE.md, issues #326 and #1106).         " >&2
     echo "#                                                            " >&2
-    echo "#  Remove that line. Commits end with --superlite only.      " >&2
-    echo "#  fine. If your harness auto-appends the trailer, strip it  " >&2
-    echo "#  before committing rather than after.                      " >&2
+    echo "#  Remove it. Commits end with --superlite only. If your     " >&2
+    echo "#  harness auto-appends it, strip it before committing       " >&2
+    echo "#  rather than after.                                        " >&2
     echo "############################################################" >&2
     echo "" >&2
     exit 1
+}
+
+if check_message "$MSG_BODY" trailer; then
+    reject "a Claude-Session: trailer."
+fi
+if check_message "$MSG_BODY" address; then
+    reject "the noreply attribution address."
 fi
 
 exit 0

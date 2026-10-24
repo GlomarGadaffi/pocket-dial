@@ -89,6 +89,16 @@ mechanically, two ways:
   `core.hooksPath` is repo-level config, one opt-in in the shared clone
   protects every linked worktree under it.
 
+Both the `Claude-Session` trailer and the Anthropic noreply attribution
+address (#1106) are rejected, in any case, anywhere in the message. A
+`users.noreply.github.com` address is fine. Both checks read one pattern file,
+`tools/ci/commit_hygiene.sh`, and `tools/ci/test_commit_hygiene.sh` proves the
+checks fail rather than pass when a range is bad or empty.
+
+If a branch carries older offending commits, do not rewrite its history. It
+lands through a clean squash message, written without the trailer or the
+address. The push run on `main` checks that squash commit.
+
 Both hooks support `--selftest` (`.githooks/post-checkout --selftest`,
 `.githooks/commit-msg --selftest`) to print what each one would decide
 without acting on it -- worth running once after opting in, rather than

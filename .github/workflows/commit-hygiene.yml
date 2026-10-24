@@ -70,130 +70,76 @@ jobs:
           # negligible -- verified locally before this ever ran in CI.
           fetch-depth: 0
 
-      - name: Self-test the shared trailer pattern (.githooks/commit-msg)
-        # #341: the hook and the check below share one pattern; run the hook's
-        # own self-test so a regex edit that stops catching a known-bad message,
-        # or starts flagging prose, fails here instead of silently passing.
-        run: sh .githooks/commit-msg --selftest
+      - name: Self-test the hygiene gate (hook + shared patterns + range scan)
+        # #341, #1106: the hook and the checks below share one pattern file,
+        # tools/ci/commit_hygiene.sh. These self-tests prove it rejects the
+        # trailer and the address (any case), allows users.noreply.github.com,
+        # and that a bad or empty range FAILS instead of passing unchecked.
+        run: |
+          set -euo pipefail
+          sh .githooks/commit-msg --selftest
+          sh tools/ci/test_commit_hygiene.sh
 
-      - name: No Claude-Session trailers in this PR's commits or description
+      - name: Compute the range to check
+        id: range
         env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-          # Passed via env, not interpolated directly into the shell script,
-          # so a hostile PR title/branch name/body can't inject shell -- the
-          # same reason BASE_REF and HEAD_SHA below are also read from env
-          # rather than spliced into the run: block as ${{ }} literals.
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           EVENT_NAME: ${{ github.event_name }}
           PUSH_BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
-
-          # Issue #341 gaps 3 + 4. One pattern, shared with .githooks/commit-msg:
-          #   ^claude-session:                   the trailer, ANY case (gap 3: a
-          #                                      hand-typed "claude-session:" passed)
-          #   claude-session:[[:space:]]*https?://  the trailer anywhere in a line,
-          #                                      followed by its URL (gap 4: a
-          #                                      72-column reflow joins it onto
-          #                                      the Co-authored-by line)
-          # Prose that merely names the trailer ("the Claude-Session trailer")
-          # and a bare session URL on its own line do not match.
-          TRAILER_RE='(^claude-session:)|(claude-session:[[:space:]]*https?://)'
-
+          # PASSED VIA ENV, not spliced into the script, so a hostile branch
+          # name or body cannot inject shell.
           if [ "$EVENT_NAME" = "push" ]; then
-            # Gap 6: check exactly what landed. A new-branch push has an all-zero
-            # "before"; main always exists, so fall back to the pushed commit alone.
+            # Gap 6 (#341): check exactly what landed. A new-branch push has an
+            # all-zero "before"; main always exists, so check the pushed commit
+            # alone. Any other "before" MUST be in the fetched history
+            # (fetch-depth 0 above): a force-push whose old tip is gone makes
+            # rev-list fail, and the scan step then fails loudly -- it never
+            # prints "Clean".
             if [ -z "$PUSH_BEFORE" ] || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
-              RANGE_ARGS="-1 ${HEAD_SHA}"
+              RANGE="-1 ${HEAD_SHA}"
             else
-              RANGE_ARGS="${PUSH_BEFORE}..${HEAD_SHA}"
+              RANGE="${PUSH_BEFORE}..${HEAD_SHA}"
             fi
-            echo "Checking pushed commits ${RANGE_ARGS}"
-            FOUND=0
-            for sha in $(git rev-list ${RANGE_ARGS}); do
-              if git log -1 --format=%B "$sha" | grep -Eic "$TRAILER_RE" >/dev/null; then
-                echo "::error::Commit ${sha} (\"$(git log -1 --format=%s "$sha")\") landed on main with a Claude-Session: trailer."
-                FOUND=1
-              fi
-            done
-            if [ "$FOUND" -ne 0 ]; then
-              echo "A merge-time message edit or a direct push slipped a trailer past the PR check (#326, #341)."
-              exit 1
-            fi
-            echo "Clean: no Claude-Session trailer in the pushed commits."
-            exit 0
+          else
+            # BASE_REF, not a hardcoded "main": stacked PRs (#242) must not
+            # pull their parent branch's unmerged commits into the range.
+            # merge-base is computed from the checked-out repo, not trusted
+            # from the payload's base.sha, which can be stale. Under set -e a
+            # failing merge-base fails this step.
+            BASE="$(git merge-base "origin/${BASE_REF}" HEAD)"
+            RANGE="${BASE}..${HEAD_SHA}"
           fi
+          echo "Checking commit range ${RANGE}"
+          echo "range=${RANGE}" >> "$GITHUB_OUTPUT"
 
-          # BASE_REF, not a hardcoded "main". This repo has stacked PRs --
-          # a feat/** branch based on another unmerged feat/** branch -- and
-          # this workflow's own header comment cites #242, where CI on a
-          # stacked PR silently ran against the wrong base once already.
-          # Hardcoding origin/main here would walk a stacked child PR's
-          # merge-base all the way back to main, pulling the PARENT
-          # branch's own unmerged commits into the range being checked --
-          # and failing the CHILD PR for a trailer its author can't touch.
-          #
-          # Computed from the checked-out repo, not trusted from the event
-          # payload's base.sha field -- that field reflects the base
-          # branch's tip AT THE TIME OF THE LAST SYNCHRONIZE EVENT, which
-          # can be stale if the base has moved since. merge-base against
-          # the freshly fetched origin/$BASE_REF is the actual answer,
-          # verified against the artifact rather than the metadata
-          # describing it.
-          BASE="$(git merge-base "origin/${BASE_REF}" HEAD)"
-
-          echo "Checking commit range ${BASE}..${HEAD_SHA}"
-
-          FOUND=0
-
-          # One commit at a time (not one grep over the whole range) so a
-          # hit can be reported against the specific commit that carries
-          # it -- including a squash-merge commit whose OWN first line
-          # looks clean but whose full body (every squashed sub-commit's
-          # message, which GitHub concatenates into the squash body) still
-          # carries a trailer from history further back. A check that only
-          # looked at the first line or the last few lines of a message
-          # would miss exactly that shape; this repo has already shipped a
-          # squash commit where the trailer was buried past line 50 of a
-          # 71-line body, and a manual review that used `tail -15` on that
-          # same commit missed it for exactly that reason.
-          # `grep -q` exits the instant it finds a match and closes its end
-          # of the pipe -- fine for a short producer, but `git log`'s output
-          # here can be arbitrarily large (a squash-merge body, exactly the
-          # shape #326 exists to catch). If `git log` is still writing when
-          # `-q` closes the pipe early, its next write() gets SIGPIPE and it
-          # dies; under `pipefail` the PIPELINE's reported status becomes
-          # git log's (128+SIGPIPE=141), not grep's real match result -- so
-          # a commit that DOES carry the trailer silently reports "clean"
-          # once its message is big enough. Reproduced deterministically
-          # (5/5) with a ~550 KB message, trailer near the top -- twice,
-          # independently, by two different sessions -- before this fix.
-          #
-          # Fix: never use `-q` against a producer that might still be
-          # writing. `grep -c` (no `-q`) always reads to EOF regardless of
-          # where the match is, so it never closes the pipe early and the
-          # producer never gets SIGPIPE'd -- same exit-code semantics
-          # (0 = found, 1 = not found), just without the early-exit race.
-          for sha in $(git rev-list "${BASE}..${HEAD_SHA}"); do
-            if git log -1 --format=%B "$sha" | grep -Eic "$TRAILER_RE" >/dev/null; then
-              subject="$(git log -1 --format=%s "$sha")"
-              echo "::error::Commit ${sha} (\"${subject}\") carries a Claude-Session: trailer."
-              FOUND=1
-            fi
-          done
-
-          if printf '%s\n' "$PR_BODY" | grep -Eic "$TRAILER_RE" >/dev/null; then
-            echo "::error::The PR description carries a Claude-Session: trailer."
-            FOUND=1
-          fi
-
-          if [ "$FOUND" -ne 0 ]; then
+      - name: No Claude-Session trailers in this PR's commits or description
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          RANGE: ${{ steps.range.outputs.range }}
+        run: |
+          set -euo pipefail
+          # One pattern, shared with .githooks/commit-msg, lives in
+          # tools/ci/commit_hygiene.sh (issue #341 gaps 3 + 4). The script
+          # scans one commit at a time (a squash body can hide the trailer past
+          # line 50, #326), uses grep -c not -q (SIGPIPE under pipefail, #339),
+          # and fails -- never passes -- when rev-list or git log fails or the
+          # range is empty (#1106). $RANGE is intentionally unquoted: it may be
+          # "-1 <sha>".
+          rc=0
+          # shellcheck disable=SC2086
+          sh tools/ci/commit_hygiene.sh range trailer $RANGE || rc=$?
+          printf '%s\n' "$PR_BODY" | sh tools/ci/commit_hygiene.sh text trailer "The PR description" || rc=$?
+          if [ "$rc" -ne 0 ]; then
             echo ""
             echo "pocket-dial's convention: no Claude-Session URL in commit"
             echo "messages or PR bodies. Commits end with --superlite only."
             echo ""
-            echo "Fix a commit: amend it and force-push the branch."
+            echo "A branch with older offending commits lands through a clean"
+            echo "squash message: write the squash message without the trailer."
+            echo "The push run on main checks that squash commit."
             echo "Fix the PR body: edit the description directly."
             echo ""
             echo "If you have .githooks/commit-msg installed"
@@ -201,75 +147,29 @@ jobs:
             echo "at the commit stage going forward."
             exit 1
           fi
-
-          echo "Clean: no Claude-Session trailer in this PR's commits or description."
+          echo "Clean: no Claude-Session trailer in the checked commits or description."
 
       - name: No noreply attribution address in this PR's commits or description
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          EVENT_NAME: ${{ github.event_name }}
-          PUSH_BEFORE: ${{ github.event.before }}
+          RANGE: ${{ steps.range.outputs.range }}
         run: |
           set -euo pipefail
-
-          # Project convention. Pattern built from two pieces so this file
-          # never holds the address itself.
-          ADDR_USER="noreply"
-          ADDR_HOST="anthropic\.com"
-          ADDR_RE="${ADDR_USER}@${ADDR_HOST}"
-
-          if [ "$EVENT_NAME" = "push" ]; then
-            if [ -z "$PUSH_BEFORE" ] || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
-              RANGE_ARGS="-1 ${HEAD_SHA}"
-            else
-              RANGE_ARGS="${PUSH_BEFORE}..${HEAD_SHA}"
-            fi
-            echo "Checking pushed commits ${RANGE_ARGS}"
-            FOUND=0
-            for sha in $(git rev-list ${RANGE_ARGS}); do
-              if git log -1 --format=%B "$sha" | grep -Eic "$ADDR_RE" >/dev/null; then
-                echo "::error::Commit ${sha} (\"$(git log -1 --format=%s "$sha")\") landed on main with the noreply attribution address."
-                FOUND=1
-              fi
-            done
-            if [ "$FOUND" -ne 0 ]; then
-              echo "A merge-time message edit or a direct push slipped the address past the PR check."
-              exit 1
-            fi
-            echo "Clean: no noreply attribution address in the pushed commits."
-            exit 0
-          fi
-
-          BASE="$(git merge-base "origin/${BASE_REF}" HEAD)"
-
-          echo "Checking commit range ${BASE}..${HEAD_SHA}"
-
-          FOUND=0
-
-          # grep -c, not -q: see the SIGPIPE note in the step above.
-          for sha in $(git rev-list "${BASE}..${HEAD_SHA}"); do
-            if git log -1 --format=%B "$sha" | grep -Eic "$ADDR_RE" >/dev/null; then
-              subject="$(git log -1 --format=%s "$sha")"
-              echo "::error::Commit ${sha} (\"${subject}\") carries the noreply attribution address."
-              FOUND=1
-            fi
-          done
-
-          if printf '%s\n' "$PR_BODY" | grep -Eic "$ADDR_RE" >/dev/null; then
-            echo "::error::The PR description carries the noreply attribution address."
-            FOUND=1
-          fi
-
-          if [ "$FOUND" -ne 0 ]; then
+          # Project convention. The pattern is built from pieces inside
+          # tools/ci/commit_hygiene.sh so no file here holds the address.
+          rc=0
+          # shellcheck disable=SC2086
+          sh tools/ci/commit_hygiene.sh range address $RANGE || rc=$?
+          printf '%s\n' "$PR_BODY" | sh tools/ci/commit_hygiene.sh text address "The PR description" || rc=$?
+          if [ "$rc" -ne 0 ]; then
             echo ""
             echo "pocket-dial's convention: no noreply attribution address in"
             echo "commit messages or PR bodies."
             echo ""
-            echo "Fix a commit: amend it and force-push the branch."
+            echo "A branch with older offending commits lands through a clean"
+            echo "squash message: write the squash message without the address."
+            echo "The push run on main checks that squash commit."
             echo "Fix the PR body: edit the description directly."
             exit 1
           fi
-
-          echo "Clean: no noreply attribution address in this PR's commits or description."
+          echo "Clean: no noreply attribution address in the checked commits or description."
