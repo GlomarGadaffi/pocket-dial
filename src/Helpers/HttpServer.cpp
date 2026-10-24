@@ -4189,10 +4189,11 @@ void HttpServer::sendApiTelephonyConfigSet(int sock, size_t slotIdx, const std::
 	// Params: enabled ("1"/"true"/"on", same convention as sendApiDnd's "on"),
 	// baseUrl, clientId, secret, routeDn. An empty secret means "keep existing"
 	// (TelephonyApiConfig::setSlot's keepSecret param). `type` is deliberately
-	// NOT a parameter here: this endpoint only ever configures
+	// NOT a parameter here: a save that carries any provider field configures
 	// TelephonyProviderType::Telephony credentials -- the one real,
 	// vendor-neutral provider this class exists for (see TelephonyProvider.hpp).
-	// Loopback is the internal default and is never set through this API. Like
+	// A disabled save with no provider field keeps the stored type (#1086), so a
+	// Loopback slot stays Loopback until credentials are saved to it. Like
 	// sendApiForward/sendApiGroup above, this is a full-replace PUT (except for
 	// the secret carve-out): omitting `enabled` leaves the slot disabled.
 	std::string enabledParam = getFormParam(body, "enabled");
@@ -4204,6 +4205,20 @@ void HttpServer::sendApiTelephonyConfigSet(int sock, size_t slotIdx, const std::
 	TelephonyApiConfig::Slot s;
 	s.type     = TelephonyProviderType::Telephony;
 	s.enabled  = (enabledParam == "1" || enabledParam == "true" || enabledParam == "on");
+	// #1086: a save that carries no provider field and does not enable is not a request to
+	// configure the real provider, so it keeps the stored type (a Loopback slot is exempt from
+	// the #1073 acceptance gate; flipping it to TELEPHONY-API would silently drop that exemption).
+	if (!s.enabled && baseUrl.empty() && clientId.empty() && secret.empty() && routeDn.empty())
+	{
+		if (RequestsHandler* h = _handler.load(std::memory_order_acquire))
+		{
+			TelephonyProviderType stored = TelephonyProviderType::Telephony;
+			if (h->getTelephonyConfigSlotType(slotIdx, stored))
+			{
+				s.type = stored;
+			}
+		}
+	}
 	s.baseUrl  = baseUrl;
 	s.clientId = clientId;
 	s.secret   = secret;
