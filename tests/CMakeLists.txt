@@ -289,6 +289,8 @@ add_executable(sip_parser_tests
     # never answered by the loopback simulator -- plus the route report,
     # the boot WARN, /api/status's emergencyRoute and the dashboard banner.
     EmergencyRoute_test.cpp
+    # #1120 and #1125: who may answer a ringing call, and the final a bodiless 200 owes the caller.
+    OnOk_test.cpp
     # Dashboard review #5: logged-out roster count and call-log prompt.
     DashboardRosterText_test.cpp
     # Dashboard review #6: the Factory Reset confirm lists what it erases.
@@ -515,6 +517,8 @@ add_executable(sip_parser_tests
     # Issue #690 (slice 1): Session::Disposition is written once by the four outcome
     # writers (486, 480, CANCEL, BYE) and cleared by reset().
     SessionDisposition_test.cpp
+    # Issue #1122 / #1121 item 1: reset() clears _degradedReported, _cancelledLegExt and the forward pair.
+    SessionReset_test.cpp
     # Wire-level coverage for the decomposed SIP state machines, driven through a
     # FakePbxEnv that records what each machine enqueues. The park/beep/BLF paths
     # build their requests by hand, so only a byte-level assertion catches header

@@ -2859,7 +2859,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	pdAppendHwmField(json, "stackHwm_tel_ctl1", pdStackHwmBytes("tel_ctl1"));
 	pdAppendHwmField(json, "stackHwm_tel_drop", pdStackHwmBytes("tel_drop"));
 	pdAppendHwmField(json, "stackHwm_tel_sos", pdStackHwmBytes("tel_sos"));
-	// #977: the 911 orphan sweep's task (PSRAM stack, 6144 B unmeasured); null until it exists.
+	// #977: the 911 orphan sweep's task (13376 B static stack, PSRAM or internal; sized from the stack gate estimate, pending the #1116 bench); null until it exists.
 	pdAppendHwmField(json, "stackHwm_tel_sweep", pdStackHwmBytes("tel_sweep"));
 	// #991: the one NVS-writing task (CDR ring + device table, forwards, DIDs);
 	// 6144 B kept from the two it replaced, this reading is what sizes it.
