@@ -355,6 +355,11 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                 and isinstance(row.get("bytes"), int) and row["bytes"] >= 1):
             print(f"FAIL known_findings row '{k}': needs a whole-number max_total >= 1, the stack `bytes` it was written for, and a reason")
             return 1
+    names = {t["name"] for t in tasks}
+    for k in sorted(known):
+        if k not in names:
+            print(f"FAIL known_findings row '{k}': no task of that name in the table (renamed or removed?)")
+            return 1
     nodes, edges, frames = load_graph(ci_dir)
     roots = project_roots(project_root or src_root)
 
@@ -599,7 +604,8 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             ok = total + margin <= t["bytes"]
             # known_findings: a reported over-budget task that does not fail the job, so a red job means
             # something new. It holds only while the chain is no deeper than the recorded max_total; a
-            # deeper chain is a new finding and fails. A known task that fits again is called out.
+            # deeper chain is a new finding and fails. A ratchet: a stale row (the task fits again, the total
+            # is below the cap, or the stack size differs from the row's) fails too and says what to change.
             kf = known.get(t["name"])
             if kf and kf.get("file") not in (None, t["file"]):
                 kf = None       # written for another site (another esp_main variant): it covers nothing here

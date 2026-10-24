@@ -1238,6 +1238,12 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("known_findings row 'big': needs", out)
 
+    def test_a_known_row_for_a_task_that_is_not_in_the_table_fails(self):
+        self.table["known_findings"] = {"renamed": {"max_total": 1900, "bytes": 4096, "reason": "#1116"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL known_findings row 'renamed': no task of that name in the table", out)
+
     def test_a_failing_cycle_lists_every_member(self):
         names = [f"void Ring{i}()" for i in range(7)]
         self.add_ci("".join(node(f"r{i}", n, 8) for i, n in enumerate(names))
