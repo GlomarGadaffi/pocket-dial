@@ -4,23 +4,24 @@ End-to-end check that a wired (`SIP_TRANSPORT=eth`) board is alive and on the ne
 
 ## Boot gate
 
-On a freshly flashed board, the HTTP step comes before the SIP step, and it is not optional. `app_main()` holds the SIP task down until an admin credential has been committed. The gate is at `main/esp_main_eth.cpp:800-824`. It logs `[boot] device unprovisioned — SIP stack held dark until credential committed`, then polls `AdminAuth::credentialIsSet()`. The HTTP dashboard task starts before the gate and unconditionally (`main/esp_main_eth.cpp:798`), so you can commit the credential. A board whose NVS `provisioned` flag is already set passes the gate at once.
+On a freshly flashed board, the HTTP step comes before the SIP step, and it is not optional. `app_main()` holds the SIP task down until an admin credential has been committed. The gate is at `main/esp_main_eth.cpp:817-842`. It logs `[boot] device unprovisioned — SIP stack held dark until credential committed`, then polls `AdminAuth::credentialIsSet()`. The HTTP dashboard task starts before the gate and unconditionally (`main/esp_main_eth.cpp:814`), so you can commit the credential. A board whose NVS `provisioned` flag is already set passes the gate at once.
 
 On a virgin board:
 
 * Port 80 answers immediately. The listener always accepts, and there is no socket-level dark or open gate. [API.md §0](API.md) describes this, and `tests/AdminHttpGate_test.cpp` pins it as a regression.
 * Port 5060 does not answer. That is the gate working, not a fault.
-* After 30 minutes with no credential, the board reboots and waits again (`kMaxCredentialWaitSec` at `main/esp_main_eth.cpp:805`, reboot at line 813).
+* After 30 minutes with no credential, the board reboots and waits again (`kMaxCredentialWaitSec` at `main/esp_main_eth.cpp:822`, reboot at line 830).
 
 ```mermaid
 flowchart TD
-    A["Boot"] --> B["HTTP dashboard starts on port 80"]
-    B --> C{"provisioned flag set?"}
-    C -- yes --> F["SIP stack starts"]
-    C -- no --> D["SIP held dark, port 5060 silent"]
-    D --> E{"Credential committed within 30 minutes?"}
-    E -- yes --> F
-    E -- no --> G["Board reboots and waits again"]
+    A["app_main: nvs_flash_init, read storage/provisioned (esp_main_eth.cpp:632, 790-801)"] --> B["SmtpClient init, then http_dashboard task starts, priority 4, core 0, always (esp_main_eth.cpp:814)"]
+    B --> C{"provisioned flag set? (esp_main_eth.cpp:817)"}
+    C -- yes --> F["sip_server task starts, priority 5, core 1, UDP 5060 (esp_main_eth.cpp:845)"]
+    C -- no --> D["Logs unprovisioned, SIP held dark, port 5060 silent. Polls AdminAuth credentialIsSet every 2 s (esp_main_eth.cpp:818-826)"]
+    D --> E{"Credential committed within kMaxCredentialWaitSec, 1800 s? (esp_main_eth.cpp:822-827)"}
+    E -- yes --> P["Stores provisioned=1, logs credential set, unblocking SIP stack (esp_main_eth.cpp:835-841)"]
+    P --> F
+    E -- no --> G["esp_restart() and the board waits again (esp_main_eth.cpp:830)"]
     G --> A
 ```
 
@@ -229,9 +230,9 @@ Check the mode with `curl -s -b "$JAR" http://<BOARD_IP>/api/registrar`. It is a
 |---|---|
 | No `Ethernet link UP` at all | Cable/switch dead, or wrong SPI pin map; recheck the `W5500 board:` line matches your hardware. On a breadboard, keep SPI leads <5 cm (the W5500 bus runs at **40 MHz**, `main/esp_main_eth.cpp:150`, and the boot line above prints it); see [HARDWARE.md §9B](HARDWARE.md). |
 | Link UP but no `IP:` | No DHCP server on that LAN segment, or the lease is slow. Set `USE_STATIC_IP 1` (+ the `STATIC_IP/GATEWAY/NETMASK` defines) at the top of `main/esp_main_eth.cpp` and reflash to bypass DHCP. |
-| `sip_probe.py` → `NO RESPONSE`, but HTTP answers | Almost always the boot provisioning gate: the board has no admin credential yet and the SIP task has not been started (`main/esp_main_eth.cpp:800-828`). Do §5, watch for `[boot] credential set — unblocking SIP stack`, re-probe. |
+| `sip_probe.py` → `NO RESPONSE`, but HTTP answers | Almost always the boot provisioning gate: the board has no admin credential yet and the SIP task has not been started (`main/esp_main_eth.cpp:817-842`). Do §5, watch for `[boot] credential set — unblocking SIP stack`, re-probe. |
 | `sip_probe.py` → `NO RESPONSE` and HTTP is also dead | Wrong IP, a firewall on the dev machine, or you're not on the same subnet. Ping `<BOARD_IP>` first. |
-| The board reboots every ~30 minutes and nothing is configured | The provisioning wait is bounded: no credential within `kMaxCredentialWaitSec` (1800 s) and it restarts to retry (`main/esp_main_eth.cpp:805-813`). Complete §5. |
+| The board reboots every ~30 minutes and nothing is configured | The provisioning wait is bounded: no credential within `kMaxCredentialWaitSec` (1800 s) and it restarts to retry (`main/esp_main_eth.cpp:822-830`). Complete §5. |
 | Board never enumerates for flashing | OTG-switch position / native-USB; BOOT-hold + RST tap to enter download mode. |
 | Wrong board's pins compiled | You passed (or defaulted) the wrong `PD_ETH_BOARD`. Rebuild; the `W5500 board:` boot line is the ground truth. |
 | `curl` says **connection refused** on port 80 | A real fault. The HTTP listener accepts unconditionally on every build and every provisioning state; there is no dark/open gate to reopen (`tests/AdminHttpGate_test.cpp`, `AdminHttpGate.Boot_Provisioned_StillListensImmediately`). Check the board is at the IP you think it is and that nothing on the dev machine is filtering port 80. (`http_dashboard` is the FreeRTOS **task name** on this transport, not a log line, and it is never printed.) |

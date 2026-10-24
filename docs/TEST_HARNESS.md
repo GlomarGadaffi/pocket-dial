@@ -109,6 +109,7 @@ each UA to its own `127.0.0.x`. For `--target board=<ip>`:
   page zones 980–989 and the literal service extensions.
 - `heap_telemetry` already discriminates host vs device via `resetReason == "n/a"`; on a
   board it asserts a real reason and non-zero heap fields.
+- `BARESIP_MODULES=<dir>` (optional, interop only): searched before the system baresip module directories, so a user-side install such as `$HOME/baresip-root/usr/lib/baresip/modules` works without patching `interop.py`. The directory must contain `ctrl_tcp.so`; otherwise baresip scenarios SKIP as before.
 - pjsua/baresip assertions never depended on the PBX being local; they are unchanged.
 
 ## 5. Board tier (HIL)

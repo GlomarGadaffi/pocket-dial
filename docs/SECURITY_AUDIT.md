@@ -36,15 +36,17 @@ The pocket-dial PBX exposes multiple UDP and TCP listening services and interact
 
 ```mermaid
 flowchart TD
-    AV["Attack vectors"] --> DNS["Port 53/UDP: DnsServer<br/>(DNS redirection)"]
-    AV --> SIP["Port 5060/UDP: UdpServer (SIP)<br/>(signaling parser)"]
-    AV --> HTTP["Port 80/TCP: HttpServer<br/>(CGA admin dashboard)"]
-    DNS --> CP["Captive portal<br/>(host redirection)"]
-    SIP --> RH["RequestsHandler<br/>(pre-allocated)"]
-    HTTP --> HC["Detached HTTP client threads"]
-    CP --> NVS[("NVS storage<br/>SSID and password, cleartext flash")]
-    RH --> NVS
-    HC --> NVS
+    AV["Attack vectors"] --> DNS["Port 53/UDP: DnsServer, task dns_task (4096 B, priority 5, core 0)<br/>display build captive portal only"]
+    AV --> SIP["Port 5060/UDP: UdpServer, task udp_receiver_task (16384 B, priority 5)"]
+    AV --> HTTP["Port 80/TCP: HttpServer accept loop<br/>listen backlog 8, 3 concurrent connections"]
+    DNS --> CP["Every query answered with 192.168.4.1<br/>(captive portal redirection)"]
+    SIP --> MP["SipMessageFactory::createMessage<br/>fixed message pool, no heap fallback"]
+    MP --> RH["RequestsHandler::handle, inline on udp_receiver_task"]
+    HTTP --> HC["One detached thread per connection: http_conn (4096 B stack)"]
+    HC --> RA["requireAdmin() gate on /api routes (THREAT_MODEL 5.1)"]
+    CP --> HTTP
+    RA --> NVS[("NVS storage<br/>WiFi SSID and password in cleartext flash")]
+    RH --> SS[("SipSecretStore<br/>stored digest HA1 per extension, plus registrar mode")]
 ```
 
 1. HttpServer (Port 80/TCP): Exposes the admin dashboard, network scanning endpoints, and session teardown controls. Dispatches connections to detached thread contexts.
@@ -179,11 +181,31 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) §5 and §9.
 
 An INVITE is digest-checked when the registrar is in Secure mode, or when the calling extension is Secured. The check answers with a `401` challenge, rejects with `403`, or admits a request that carries a valid digest. Otherwise, in Learn mode with an unsecured extension, the INVITE is admitted on trust on first use.
 
+The digest check is not the first gate and not the last. The order below is the order in `RequestsHandler::onInvite()`. An emergency call (911, 933, urn:service:sos, or a dial-plan rule that produces one) is routed before the source-address binding, the digest challenge and the Session-Expires floor, so call-setup policy cannot refuse it. It still follows the registration and codec checks, which are capability gates rather than policy.
+
 ```mermaid
 flowchart TD
-    A["INVITE received"] --> B{"Secure mode, or calling extension Secured?"}
-    B -->|Yes| C["Digest check: 401 challenge, 403 reject, or admit on valid digest"]
-    B -->|No| D["Learn mode, unsecured extension: admitted on trust on first use"]
+    A["INVITE reaches onInvite() (RequestsHandler.cpp:2332)"] --> B{"From or To not a valid AOR?"}
+    B -->|Yes| X1["400 Bad Request"]
+    B -->|No| C{"Caller registered? (findClient)"}
+    C -->|No| X2["403 Forbidden"]
+    C -->|Yes| D{"SDP offers no relayable audio codec?"}
+    D -->|Yes| X3["488 Not Acceptable Here"]
+    D -->|No| E{"To is 911 or 933, or a dial-plan rule makes one?"}
+    E -->|Yes| EM["routeEmergencyCall(): no source-binding, digest or 422 gate"]
+    E -->|No| F{"Initial INVITE, From or To line over kMaxDialogLineBytes?"}
+    F -->|Yes| X4["400 From/To Line Too Long"]
+    F -->|No| G{"Source IP differs from the IP the caller registered from?"}
+    G -->|Yes| X5["403 Caller Not Registered From This Address"]
+    G -->|No| H{"Secure mode, or calling extension Secured?"}
+    H -->|No| T["Learn mode, unsecured extension: admitted on trust on first use"]
+    H -->|Yes| I["Registrar::admitSecure()"]
+    I -->|"no or stale digest"| X6["401 Unauthorized + WWW-Authenticate"]
+    I -->|"no secret, bad digest, wrong URI"| X7["403 Forbidden (reason text)"]
+    I -->|"valid digest"| J{"Request-URI user equals To user?"}
+    J -->|No| X8["403 Request-URI And To Disagree"]
+    J -->|Yes| K["Authorization headers removed, then the 422 floor and routing"]
+    T --> K
 ```
 
 #### Original remediation guidance

@@ -241,13 +241,16 @@ The REGISTER path through `allocateClient()`, in order:
 
 ```mermaid
 flowchart TD
-    A[REGISTER arrives] --> B{Existing binding for this number?}
-    B -->|yes| C[Reuse the existing binding]
-    B -->|no| D{Free slot?}
-    D -->|yes| E[Take the free slot]
-    D -->|no| F{Expired client in pool?}
-    F -->|yes| G[Evict the first expired client]
-    F -->|no| H[503 Service Unavailable]
+    A["REGISTER, onRegister (RequestsHandler.cpp:1462)"] --> X{"Expires 0?"}
+    X -->|yes| U["unregisterClient (RequestsHandler.cpp:1587)"]
+    X -->|no| Q["allocateClient (RequestsHandler.cpp:12077)"]
+    Q --> B{"Pool entry with this number?"}
+    B -->|yes| C["Re-REGISTER: reset that entry in place (12057-12064)"]
+    B -->|no| D{"Pool entry with an empty number?"}
+    D -->|yes| E["New Client: take the first free entry (12068-12075)"]
+    D -->|no| F{"Expired entry not on a live session? (issue 1089)"}
+    F -->|yes| G["Reset the first such entry for this number (12080-12097)"]
+    F -->|no| H["Return nullptr: 503 Service Unavailable (RequestsHandler.cpp:1620-1628)"]
 ```
 
 All three counters surface on the dashboard (`getClientCount()`,

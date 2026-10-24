@@ -46,12 +46,28 @@
 // factory reset's erase) is neither staged nor split: it writes every key,
 // synchronously, because a staged write is refused once the reset has begun.
 //
+// ── Acceptance of the limitations (#1073) ─────────────────────────────────────
+// Enabling a slot, or activating one, is refused unless the caller carries an
+// explicit acceptance of the warning text (the dashboard's "Accept and enable"
+// dialog): the Acceptance struct below, whose `version` must equal
+// kAcceptanceVersion. The acceptance is stored WITH the slot: the version, the
+// role of the admin session that gave it (AdminAuth::Role as a byte; the session
+// carries no user name) and when (timesync::epochSeconds(); the boards have no
+// RTC, so 0 means the clock had not synced yet). Disabling a slot clears it, so
+// each enable asks again. Bump kAcceptanceVersion whenever the warning text
+// changes: every stored acceptance is then stale and the slot reports
+// acceptanceMissing until it is accepted again. A slot that was enabled before
+// this existed has no acceptance: it is NOT disabled and keeps working
+// (acceptanceMissing is how the dashboard says so). Nothing here is on the
+// emergency path: 911/933 routing never reads an acceptance.
+//
 // Thread-safety: this class is NOT internally locked. RequestsHandler owns the
 // instance and serializes access under its _mutex (same pattern as TrunkConfig),
 // which is also what makes the staging slot single-producer.
 
 #include "FunctionRef.hpp"
 #include "TelephonyProvider.hpp"
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -73,6 +89,19 @@ public:
 	static constexpr size_t kMaxFieldLen = 64;     // clientId / secret / routeDn
 	static constexpr size_t kNoActiveSlot = kSlots; // activeSlot() when none
 
+	// The version of the warning text the dashboard shows (web/index.html #accept-dlg).
+	static constexpr uint8_t kAcceptanceVersion = 1;
+	// setSlot()/activateSlot() answer an acceptance refusal with this text and the
+	// current version appended; HttpServer maps the prefix to 409.
+	static constexpr const char* kAcceptanceRequiredPrefix = "Acceptance required: ";
+
+	struct Acceptance
+	{
+		uint8_t  version = 0;   // 0 = none; else the warning-text version accepted
+		uint8_t  role = 0;      // AdminAuth::Role of the accepting session (1 sysop, 2 owner)
+		uint64_t epoch = 0;     // seconds since 1970 when accepted, 0 if the clock had not synced
+	};
+
 	// The staged snapshot (everything but the secrets): for each slot its type byte,
 	// its enabled byte, then the base URL, the client id and the route DN, each in one
 	// cell of kCellLen bytes (the value, then NULs; a cell's last byte is always NUL);
@@ -80,8 +109,11 @@ public:
 	// read back (it reads into kMaxUrlLen + 1 bytes), so a table that load() or
 	// setSlot() produced always fits and a stale long value cannot jam the stage.
 	// kSnapshotCap adds the NUL every staging slot keeps after its payload.
+	// #1073: each slot ends with one more, smaller cell: its acceptance as
+	// "version,role,epoch" ("" for none), at most 6 + 20 characters plus the NUL.
 	static constexpr size_t kCellLen = kMaxUrlLen + 1;
-	static constexpr size_t kSlotSnapshotLen = 2 + 3 * kCellLen;
+	static constexpr size_t kAcceptCellLen = 28;
+	static constexpr size_t kSlotSnapshotLen = 2 + 3 * kCellLen + kAcceptCellLen;
 	static constexpr size_t kSnapshotLen = kSlots * kSlotSnapshotLen + 1;
 	static constexpr size_t kSnapshotCap = kSnapshotLen + 1;
 
@@ -94,6 +126,7 @@ public:
 		std::string clientId;
 		std::string secret;     // never log, never echo
 		std::string routeDn;
+		Acceptance accepted;    // #1073: set by setSlot()/activateSlot(), never by the caller's edit
 	};
 
 	// Display-safe projection: the secret is reduced to set-or-not.
@@ -107,6 +140,11 @@ public:
 		std::string clientId;
 		std::string routeDn;
 		bool secretSet = false;
+		bool accepted = false;           // #1073: an acceptance of the CURRENT warning text is stored
+		bool acceptanceMissing = false;  // enabled, but accepted == false (a legacy or stale slot; still enabled)
+		uint8_t  acceptedVersion = 0;
+		uint8_t  acceptedRole = 0;
+		uint64_t acceptedAt = 0;
 	};
 
 	// Load the table from the backing store (NVS "tapicfg" on ESP, the config
@@ -119,7 +157,23 @@ public:
 	// table is accepted and staged for the NVS writer (not yet on flash) and, if
 	// the secret changed, written; see "Staged persistence" above. An error from
 	// persisting ("Telephony config not persisted: ...") leaves the edit live in RAM.
-	std::string setSlot(size_t idx, const Slot& s, bool keepSecret);
+	//
+	// #1073: an ENABLED slot needs an acceptance: `accept` with the current
+	// version (stored with the slot), or the slot already enabled and accepted
+	// (the stored one is kept). Otherwise "Acceptance required: ..." and nothing
+	// is changed. Checked after the field validation above, before any write.
+	// A disabled edit clears the stored acceptance.
+	std::string setSlot(size_t idx, const Slot& s, bool keepSecret, const Acceptance* accept = nullptr);
+
+	// Make a slot the active one, as setActiveSlot() does, but only with an
+	// acceptance (#1073): `accept` with the current version, which is stored, or one
+	// already stored for the slot. Index kNoActiveSlot (deactivate) needs none.
+	std::string activateSlot(size_t idx, const Acceptance* accept);
+
+	// Bit i set: slot i is enabled and has no acceptance of the current warning text.
+	// Readable from any thread without the owner's lock (it is a mirror, refreshed by
+	// every mutator and by load()); /api/status polls it.
+	uint8_t acceptanceMissingMask() const { return _missingMask.load(std::memory_order_relaxed); }
 
 	// Wipe a slot (zeroize + persist). Returns "" on success. Same staging contract
 	// as setSlot(); the slot's secret, if it had one, is erased synchronously.
@@ -136,6 +190,7 @@ public:
 
 	// Mark a slot as the boot-time provider source (idx == kNoActiveSlot clears
 	// the selection → legacy/loopback behavior). Persisted (staged). "" on success.
+	// No acceptance check: the engine's own SBC route uses this (see activateSlot()).
 	std::string setActiveSlot(size_t idx);
 	size_t activeSlot() const { return _active; }
 
@@ -181,6 +236,7 @@ private:
 	void fillSnapshot(nvswriter::BlobWriter& w) const;   // the staged form, built in the writer's slot
 	bool anySecretPending() const;
 	void wipeSlot(size_t idx);          // zeroize one slot in RAM; its secret becomes pending if it had one
+	void refreshMissingMask();          // recompute _missingMask from the slots
 	static void scrub(std::string& s);  // best-effort zeroize-then-clear
 
 	Slot _slots[kSlots];
@@ -188,6 +244,7 @@ private:
 	std::string _storePath = "pocketdial_tapi.cfg";
 	bool _secretPending[kSlots] = {};   // secret changed since it was last written to the store
 	uint32_t _secretWrites = 0;
+	std::atomic<uint8_t> _missingMask{0};   // see acceptanceMissingMask()
 };
 
 #endif // TELEPHONY_API_CONFIG_HPP

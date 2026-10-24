@@ -31,8 +31,17 @@ def bare(title, name, loc="@ROOT@/src/SIP/X.cpp:7:1"):
     return f'node: {{ title: "{title}" label: "{name}\\n{loc}" }}\n'
 
 
-def edge(a, b):
-    return f'edge: {{ sourcename: "{a}" targetname: "{b}" }}\n'
+def alias_node(title, name, loc="/idf/components/vfs/vfs_calls.c:927:5"):
+    """What GCC writes for `int f(void) __attribute__((alias("g")))`: a node with no stack line and
+    `shape : triangle` (a declaration is an ellipse), whose one edge goes to the aliased function."""
+    return f'node: {{ title: "{title}" label: "{name}\\n{loc}" shape : triangle }}\n'
+
+
+def edge(a, b, label=None):
+    """A call edge. GCC puts the call's file:line:col in `label`, and leaves it off the
+    placeholder edge of a block operation it expands to a memset/memcpy libcall."""
+    where = f' label: "{label}"' if label else ""
+    return f'edge: {{ sourcename: "{a}" targetname: "{b}"{where} }}\n'
 
 
 # Labels start with the return type, as GCC writes them ("void f(void*)", #457).
@@ -146,6 +155,7 @@ class Gate(unittest.TestCase):
         rc, out = self.run_gate()
         self.assertEqual(rc, 1)
         self.assertIn("FAIL frame: library callee with no frame data", out)
+        self.assertIn("reached from: void leaf()", out)            # the caller on the shortest path
         self.table["library_defaults"] = {r"^v?(s|sn|f|as)?printf\b": 2048}
         rc, out = self.run_gate()
         self.assertEqual(rc, 1)                          # 500 + 2048 + 512 > 1024
@@ -248,7 +258,10 @@ class Gate(unittest.TestCase):
         self.assertEqual([t["entry"] for t in table["tasks"] if (t["entry"] or "").startswith("^")], [])
 
     def test_checked_in_allowlist_covers_the_measured_frames(self):
-        # Project frames over the ceiling on the Xtensa eth image (#457, #685 @ ebdc919).
+        # Project frames over the ceiling on the Xtensa eth image (#457): the first 11 from the
+        # run on #685 @ ebdc919 (2026-09-29), the last 7 from the combined-tree run of 2026-10-04
+        # (issue comment 5976074325). No .ci was at hand for the 7: their labels are written from
+        # the source signatures, which is all the allowlist's `Class::name(` keys match on.
         table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
         big = [("sdp::Verdict sdp::parse(std::string_view, Session&)", 3488),
                ("SmtpDialogue::SendResult SmtpDialogue::run(Transport&, const Config&, const Message&)", 3408),
@@ -262,7 +275,18 @@ class Gate(unittest.TestCase):
                ("bool SipTrunk::handleBye(const std::shared_ptr<SipMessage>&)", 1184),
                ("virtual bool TelephonyAnchorClient::writeAudio(std::string_view, const int16_t*, size_t)", 1120),
                ("bool HoldMusic::loadClip(const std::string&)", 1088),
-               ("void RequestsHandler::onRefer(std::shared_ptr<SipMessage>)", 1056)]
+               ("void RequestsHandler::onRefer(std::shared_ptr<SipMessage>)", 1056),
+               # tick() was 1024 B, the ceiling itself, until #1028 (2993c0dc) added a std::string for the
+               # 480's To tag; BigDog's run on that tree measured 1056 B.
+               ("void RequestsHandler::tick()", 1056),
+               ("void RequestsHandler::relayIntoPeerDialog(const std::shared_ptr<SipMessage>&, "
+                "const std::shared_ptr<Session>&)", 1648),
+               ("void HttpServer::sendApiConfigExport(int, bool, const std::string&)", 1392),
+               ("bool SipTrunk::handleCancel(const std::shared_ptr<SipMessage>&)", 1248),
+               ("void SipTrunk::releaseAsTimeout(SipTrunk::Dialog&)", 1152),
+               ("void RequestsHandler::onBye(std::shared_ptr<SipMessage>)", 1120),
+               ("bool RequestsHandler::handleSpliceResponse(const std::shared_ptr<SipMessage>&)", 1072),
+               ("void HttpServer::sendApiConfigImport(int, const std::string&)", 1040)]
         self.put(os.path.join(self.ci, "x.ci"), "".join(node(f"f{i}", n, b) for i, (n, b) in enumerate(big)))
         open(os.path.join(self.tmp.name, "src", "SIP", "X.cpp"), "w").write("")
         self.table = {"margin_bytes": 512, "frame_ceiling_bytes": table["frame_ceiling_bytes"],
@@ -329,6 +353,69 @@ class Gate(unittest.TestCase):
                 self.assertIn("FAIL frame: project function with no frame data (partial --ci-dir?): Foo::", out)
                 self.assertNotIn("FAIL small", out)    # the chain is within budget; only the frame is unknown
 
+    # --- template constructors (#457) -----------------------------------------------------
+    # A constructor template mangles as C1I<template args>E<params>, not C1E<params>, so the
+    # alias rule above did not see it. On the first real CI run that left
+    # telephony::SosStatusClaim (SosStatusGet.hpp, a project type) as "project function with no
+    # frame data", and the std::pair, std::function, std::thread and shared_ptr constructor
+    # templates as library callees with none.
+
+    def test_alias_body_reads_template_ctor_titles(self):
+        frames = {"_ZN3FooC2IiEEOT_": (600, "static")}
+        edges = {"_ZN3FooC1IiEEOT_": {"_ZN3FooC2IiEEOT_"}, "_ZN3FooC1Ev": {"_ZN3FooC2Ev"}}
+        self.assertEqual(g.alias_body("_ZN3FooC1IiEEOT_", edges, frames), "_ZN3FooC2IiEEOT_")
+        # not a constructor: "C1I" inside a length-prefixed name derives a body that is not there
+        self.assertIsNone(g.alias_body("_ZN5AC1Id3fooEv", {"_ZN5AC1Id3fooEv": {"_ZN3barEv"}}, {"_ZN3barEv": (64, "static")}))
+        # and the plain rule is unchanged: no body in frames, or no edge to it, is no alias
+        self.assertIsNone(g.alias_body("_ZN3FooC1Ev", edges, frames))
+        self.assertIsNone(g.alias_body("_ZN3FooC1IiEEOT_", {}, frames))
+
+    def test_ctor_template_alias_is_a_pass_through_to_its_body(self):
+        local = "@ROOT@/src/SIP/X.cpp:"
+        pair = "_ZNSt4pairIiiEC"
+        cases = {
+            "a project constructor template": (
+                bare("_ZN3FooC1IiEEOT_", "Foo::Foo(T&&) [with T = int]")
+                + node("_ZN3FooC2IiEEOT_", "Foo::Foo(T&&) [with T = int]", 600)
+                + edge("leaf", "_ZN3FooC1IiEEOT_") + edge("_ZN3FooC1IiEEOT_", "_ZN3FooC2IiEEOT_"), "1100 B", "600  Foo::Foo"),
+            "a library constructor template under a file-local title": (
+                bare(local + pair + "1IRiS2_Lb1EEEOT_OT0_", "std::pair<int, int>::pair(U1&&, U2&&)", STL_VECTOR_H)
+                + node(local + pair + "2IRiS2_Lb1EEEOT_OT0_", "std::pair<int, int>::pair(U1&&, U2&&)", 80, STL_VECTOR_H)
+                + edge("leaf", local + pair + "1IRiS2_Lb1EEEOT_OT0_")
+                + edge(local + pair + "1IRiS2_Lb1EEEOT_OT0_", local + pair + "2IRiS2_Lb1EEEOT_OT0_"), "580 B", "80  std::pair"),
+        }
+        for why, (text, total, shown) in cases.items():
+            with self.subTest(why):
+                self.put(os.path.join(self.ci, "x.ci"), CI)
+                self.add_ci(text)
+                self.table["tasks"][0]["bytes"] = 4096
+                rc, out = self.run_gate()
+                self.assertEqual(rc, 0, out)
+                self.assertNotIn("FAIL frame", out)
+                self.assertIn("ok   small: " + total, out)       # 200 + 300 + the body, counted once
+                self.assertIn(shown, out)
+
+    def test_a_frameless_ctor_template_still_fails_unless_it_calls_its_own_body(self):
+        body = node("_ZN3FooC2IiEEOT_", "Foo::Foo(T&&) [with T = int]", 600)
+        cases = {
+            "no edge to the C2 body": bare("_ZN3FooC1IiEEOT_", "Foo::Foo(T&&) [with T = int]") + body
+            + edge("leaf", "_ZN3FooC1IiEEOT_"),
+            "body without a frame": bare("_ZN3FooC1IiEEOT_", "Foo::Foo(T&&) [with T = int]")
+            + bare("_ZN3FooC2IiEEOT_", "Foo::Foo(T&&) [with T = int]")
+            + edge("leaf", "_ZN3FooC1IiEEOT_") + edge("_ZN3FooC1IiEEOT_", "_ZN3FooC2IiEEOT_"),
+            "the body is another instantiation's": bare("_ZN3FooC1IiEEOT_", "Foo::Foo(T&&) [with T = int]")
+            + node("_ZN3FooC2IlEEOT_", "Foo::Foo(T&&) [with T = long]", 600)
+            + edge("leaf", "_ZN3FooC1IiEEOT_") + edge("_ZN3FooC1IiEEOT_", "_ZN3FooC2IlEEOT_"),
+        }
+        for why, text in cases.items():
+            with self.subTest(why):
+                self.put(os.path.join(self.ci, "x.ci"), CI)
+                self.add_ci(text)
+                self.table["tasks"][0]["bytes"] = 4096
+                rc, out = self.run_gate()
+                self.assertEqual(rc, 1, out)
+                self.assertIn("FAIL frame: project function with no frame data (partial --ci-dir?): Foo::Foo(T&&)", out)
+
     # --- which functions are this repo's (#457) -----------------------------------------
     # The ceiling and "no frame data" checks are for src/ and main/. The gate used to take
     # any "/src/" in a label's path for ours, which also matches IDF's lwip/src.
@@ -393,6 +480,28 @@ class Gate(unittest.TestCase):
         for row in ("^void _ZTH5errno\\(\\)$", "^int __cxa_guard_acquire\\(long long int\\*\\)$",
                     "^void __cxa_guard_(release|abort)\\(long long int\\*\\)$"):
             self.assertTrue(table["_library_defaults_reasons"].get(row, "").strip(), row + " states no reason")
+
+    def test_the_wifi_blob_row_claims_only_its_own_name(self):
+        # esp_wifi_internal_tx lives in Espressif's prebuilt Wi-Fi library, so no .ci has a frame for it.
+        # wifi_transmit (esp_wifi/src/wifi_netif.c) calls it, and the indirect_allowlist row for
+        # esp_netif_transmit makes that call reachable. Like the other prebuilt callees it takes a stated
+        # estimate, and the row must not catch a function of ours.
+        table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
+        self.table["library_defaults"] = table["library_defaults"]
+        self.table["tasks"][0]["bytes"] = 4096
+        self.add_ci(bare("esp_wifi_internal_tx", "esp_err_t esp_wifi_internal_tx(wifi_interface_t, void*, uint16_t)",
+                         "/idf/components/esp_wifi/include/esp_private/wifi.h:210:5") + edge("leaf", "esp_wifi_internal_tx"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("FAIL frame", out)
+        self.assertIn("ok   small: 1524 B", out)         # 200 + 300 + the 1024 B estimate
+        self.add_ci(bare("esp_wifi_internal_tx_shim", "void esp_wifi_internal_tx_shim()", "@ROOT@/src/SIP/X.cpp:14:3")
+                    + edge("leaf", "esp_wifi_internal_tx_shim"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("project function with no frame data (partial --ci-dir?): void esp_wifi_internal_tx_shim", out)
+        self.assertTrue(table["_library_defaults_reasons"].get(
+            r"(?:^|[ *&])esp_wifi_internal_tx(?:\(|$)", "").startswith("1024 B"))
 
     def test_a_graph_compiled_elsewhere_fails_closed_until_given_its_project_root(self):
         # .ci files built in another checkout: nothing in them is under --src-root. Reading
@@ -610,6 +719,579 @@ class Gate(unittest.TestCase):
         self.assertGreaterEqual(row("std::shared_ptr<Session>"), rb(sessions))
         self.assertGreaterEqual(row("basic_string<char>, std::__cxx11::basic_string<char> >"),
                                 rb(nvs_bytes // 32))     # one 32 B NVS entry at least per cached HA1
+
+    # --- what the first real CI run printed (#457) ----------------------------------------
+    # tests/tools/fixtures/task_stack_gate_run_39346846761.json holds the names the gate printed
+    # in the stack-depth-gate job (PR #1031): 195 library callees with no frame data, 8 cycles
+    # with no recursion row, 2 dynamic frames. A red job is meant to mean a project problem, so
+    # each of those needs a row that says why it is modelled the way it is.
+
+    def first_run(self):
+        path = os.path.join(os.path.dirname(__file__), "fixtures", "task_stack_gate_run_39346846761.json")
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def checked_in(self):
+        with open(os.path.join(os.path.dirname(GATE), "task_stacks.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_checked_in_library_defaults_cover_the_first_ci_run(self):
+        run, table = self.first_run(), self.checked_in()
+        self.assertEqual(len(run["library_callees"]), 195)
+        # Each name as a frameless callee of a library file, walked by the gate itself with the
+        # checked-in rows: no "library callee with no frame data" is left.
+        lib = "/tc/include/c++/15.2.0/bits/stl_vector.h:1:1"
+        text = "".join(bare(f"lib{i}", name, lib) + edge("leaf", f"lib{i}")
+                       for i, name in enumerate(run["library_callees"]))
+        self.add_ci(text)
+        self.table["library_defaults"] = table["library_defaults"]
+        self.table["tasks"][0]["bytes"] = 1 << 20          # the budget is not what is under test
+        rc, out = self.run_gate()
+        left = [ln for ln in out.splitlines() if "library callee with no frame data" in ln]
+        self.assertEqual(left, [], "\n".join(left[:10]))
+        self.assertEqual(rc, 0, out[:600])
+
+    def test_each_first_run_callee_matches_exactly_one_library_default(self):
+        # The gate takes the first match in sorted key order; one match per name keeps the table
+        # free of an order nobody can see.
+        run, table = self.first_run(), self.checked_in()
+        rows = list(table["library_defaults"])
+        for name in run["library_callees"]:
+            hits = [k for k in rows if re.search(k, name)]
+            self.assertEqual(len(hits), 1, f"{name[:90]!r} matches {hits}")
+
+    def test_every_library_default_states_its_figure_and_reason(self):
+        table = self.checked_in()
+        reasons = table["_library_defaults_reasons"]
+        for rx, b in table["library_defaults"].items():
+            with self.subTest(rx):
+                why = reasons.get(rx, "")
+                self.assertTrue(why.startswith(f"{b} B"), f"reason must open with its figure, '{b} B': {why[:60]!r}")
+                self.assertGreater(len(why), 60, "a figure needs its provenance")
+        self.assertEqual(sorted(set(reasons) - set(table["library_defaults"])), [], "a reason for a row that is gone")
+
+    def test_library_defaults_still_fail_closed_on_an_unclassified_name(self):
+        # A table of rows is not a blanket: a library function nobody looked at is still a FAIL.
+        table = self.checked_in()
+        for name in ("qsort_r", "void vendor::mystery(int)", "int pvPortMallocCaps(unsigned int)",
+                     "esp_http_client_perform", "mbedtls_ssl_handshake", "std::string std::to_string(long)"):
+            with self.subTest(name):
+                self.assertEqual([k for k in table["library_defaults"] if re.search(k, name)], [])
+
+    def test_checked_in_recursion_rows_cover_the_first_ci_run_cycles(self):
+        run, rows = self.first_run(), self.checked_in()["recursion_allowlist"]
+        self.assertEqual(len(run["cycles"]), 8)
+        claimed = {}
+        for cycle in run["cycles"]:
+            hits = [k for k in rows if any(k in name for name in cycle["shown_members"])]
+            self.assertEqual(len(hits), 1, f"{cycle['shown_members']}: rows {hits}")
+            self.assertNotIn(hits[0], claimed, f"'{hits[0]}' names two cycles")
+            claimed[hits[0]] = cycle["size"]
+
+    def cjson_nesting_limit(self):
+        """CJSON_NESTING_LIMIT as the firmware build gives it to the cjson component (top-level
+        CMakeLists.txt, after project()), or None when nothing does."""
+        with open(os.path.join(g.REPO, "CMakeLists.txt"), encoding="utf-8") as f:
+            text = f.read()
+        lib = re.search(r"idf_component_get_property\(\s*(\w+)\s+espressif__cjson\s+COMPONENT_LIB\s*\)", text)
+        m = lib and re.search(r"set_property\(\s*TARGET\s+\$\{" + lib.group(1) +
+                              r"\}\s+PROPERTY\s+COMPILE_DEFINITIONS\s+\$\{\w+\}\s+\"CJSON_NESTING_LIMIT=(\d+)\"\s*\)", text)
+        # The component defines CJSON_NESTING_LIMIT=1000 itself: a second -D is a -Werror redefinition,
+        # so the build must drop the component's value first (run 39355912998 failed on exactly this).
+        self.assertFalse(m and "EXCLUDE REGEX \"^CJSON_NESTING_LIMIT=\"" not in text,
+                         "appending a second CJSON_NESTING_LIMIT -D fails -Werror; replace the component's")
+        if m:
+            self.assertLess(text.index('project("SipServer")'), m.start(), "the cjson target exists only after project()")
+        return int(m.group(1)) if m else None
+
+    def test_cjson_nesting_limit_is_a_compile_definition_of_the_cjson_component(self):
+        # cJSON parses and deletes recursively and refuses nesting only past CJSON_NESTING_LIMIT,
+        # 1000 by default: no task stack here holds that. desmo's decision (#457): 16, as a
+        # compile definition of the cjson component (only cJSON.c reads it).
+        self.assertEqual(self.cjson_nesting_limit(), 16)
+
+    def test_cjson_recursion_rows_are_the_nesting_limit_not_a_guess(self):
+        # Every tree in this firmware comes from cJSON_Parse*, and cJSON checks its depth counter on
+        # entry to parse_array and parse_object, so at most `limit` containers are open at once. The
+        # gate's depth counts live activations of one member: parse_value is live once per open
+        # container plus once for the innermost value, and cJSON_Delete once per tree level likewise.
+        # That is limit + 1, as the JsonReader rows are kMaxDepth + 1. The rows follow the define.
+        rows = self.checked_in()["recursion_allowlist"]
+        limit = self.cjson_nesting_limit()
+        self.assertIsNotNone(limit, "no CJSON_NESTING_LIMIT define: cJSON would accept 1000 levels")
+        for key in ("parse_value", "cJSON_Delete("):
+            with self.subTest(key):
+                self.assertEqual(rows[key]["depth"], limit + 1)
+                self.assertIn("CJSON_NESTING_LIMIT", rows[key]["reason"])
+                self.assertIn("CMakeLists.txt", rows[key]["reason"])
+
+    def test_checked_in_dynamic_frames_of_the_first_run_are_allowlisted(self):
+        run, table = self.first_run(), self.checked_in()
+        self.assertEqual(len(run["dynamic_frames"]), 2)
+        ext = "/managed_components/espressif__mdns/mdns.c:1:1"
+        self.add_ci("".join(node(f"dyn{i}", name, 96, ext, "dynamic") + edge("leaf", f"dyn{i}")
+                            for i, name in enumerate(run["dynamic_frames"])))
+        self.table["tasks"][0]["bytes"] = 4096
+        rc, out = self.run_gate()
+        self.assertEqual(out.count("dynamic frame, no allowlist entry"), 2, out)      # positive control
+        self.table["frame_allowlist"] = table["frame_allowlist"]
+        rc, out = self.run_gate()
+        self.assertNotIn("dynamic frame", out)
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(all(table["frame_allowlist"][k].strip() for k in table["frame_allowlist"]))
+
+    def test_http_conn_keeps_its_budget(self):
+        # http_conn is the one real red the stack-depth-gate job reports until its stack is fixed
+        # (4768 B + 512 > 4096 B in the first run). Nothing in the table loosens it away.
+        table = self.checked_in()
+        row = [t for t in table["tasks"] if t["name"] == "http_conn"]
+        self.assertEqual([(t["bytes"], t["file"]) for t in row], [(4096, "src/Helpers/HttpServer.cpp")])
+        self.assertEqual((table["margin_bytes"], table["frame_ceiling_bytes"]), (512, 1024))
+
+    def test_indirect_call_sites_are_reported_per_task_not_silently_zero(self):
+        # An indirect site is charged 0 B (the walk cannot follow it), so the task line must say
+        # how many the task reaches and who makes them: a fit is a fit for direct calls only.
+        self.add_ci(node("ind", "Indirect Call Placeholder", 0, kind="static") + edge("mid", "ind", "X.cpp:10:5"))
+        self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
+        rc, out = self.run_gate()
+        self.assertIn("indirect call sites: 1 function(s) reachable", out)
+        small = out.split("small:")[1].split("big:")[0]
+        self.assertIn("indirect call sites: 0 function(s) reachable", small)
+        self.assertIn("big:", out)
+        self.assertRegex(out.split("big:")[1], r"indirect call sites: 1 function\(s\) reachable make one, 1 of them on the worst chain.*mid")
+
+    # #1031 review: an indirect call is charged 0 B, so a task that carries a 911 path must not
+    # pass on that. Such a task is marked "indirect": "bounded" in the table; every function it
+    # reaches that makes an indirect call then needs an indirect_allowlist row naming the
+    # possible targets, and the walk charges the heaviest of them.
+    def indirect_fixture(self, flag=True):
+        self.add_ci(node("ind", "Indirect Call Placeholder", 0)
+                    + node("slow", "void SlowSink::write()", 1000) + edge("mid", "ind", "X.cpp:10:5"))
+        self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
+        if flag:
+            for t in self.table["tasks"]:
+                if t["name"] == "big":
+                    t["indirect"] = "bounded"
+
+    def test_an_unbounded_indirect_site_on_a_911_task_fails_the_gate(self):
+        self.indirect_fixture()
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"(?s)FAIL big: .*FAIL big: .*indirect_allowlist.*void mid\(\)")
+
+    def test_a_bounded_indirect_site_passes_and_the_heaviest_target_is_charged(self):
+        self.indirect_fixture()
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {
+            "targets": [r"SlowSink::write\("], "reason": "fixture: the one sink installed at boot"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("big: 2000 B", out)         # 400 + 600 (mid) + 1000 (SlowSink::write) beats helper and buildOptionsPing
+        self.assertIn("SlowSink::write", out)
+
+    def test_a_target_that_matches_no_function_bounds_nothing_and_fails(self):
+        self.indirect_fixture()
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {
+            "targets": [r"NoSuchSink::write\("], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("matches no function", out)
+
+    def test_a_row_must_name_targets_and_a_reason(self):
+        self.indirect_fixture()
+        for row in ({"reason": "x"}, {"targets": "SlowSink", "reason": "x"}, {"targets": ["SlowSink"], "reason": " "}):
+            self.table["indirect_allowlist"] = {r"void mid()": row}
+            rc, out = self.run_gate()
+            self.assertEqual(rc, 1, out)
+            self.assertIn("indirect_allowlist row 'void mid", out)
+
+    def test_a_row_with_no_targets_bounds_a_site_that_can_call_nothing(self):
+        self.indirect_fixture()
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture: pointer never installed"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("big: 1900 B", out)
+
+    # A thread body is not on the caller's stack, and a label's "[with ...]" tail names template
+    # arguments, not the function: a target pattern is matched against the name before it, so
+    # the _M_run of a thread whose lambda sits in Thing::run is not a target of Thing::run.
+    def test_a_target_pattern_does_not_match_a_template_argument_annotation(self):
+        self.indirect_fixture()
+        self.add_ci(node("run", "void Thing::run(int)", 950)
+                    + node("mrun", "void std::thread::_State_impl<_C>::_M_run() "
+                           "[with _C = Thing::run(int)::<lambda()>]", 1000))
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {
+            "targets": [r"Thing::run\("], "reason": "fixture: the one sink"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("big: 1950 B", out)         # 400 + 600 + 950; the 1000 B _M_run would make it 2000
+        self.assertNotIn("_M_run", out)
+        self.table["indirect_allowlist"][r"void mid\(\)"]["targets"] = [r"_C = Thing::run"]
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)              # nothing is named like that before the "[with"
+        self.assertIn("matches no function", out)
+        # A pattern that spells out "[with " asks for the note on purpose (one instantiation of
+        # a std::function manager, say), and is matched against the whole label.
+        self.table["indirect_allowlist"][r"void mid\(\)"]["targets"] = [r"_M_run\(\) \[with _C = Thing::run"]
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("big: 2000 B", out)         # 400 + 600 + the 1000 B _M_run
+
+    def test_the_chain_says_which_edge_an_allowlist_row_added(self):
+        self.indirect_fixture()
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {
+            "targets": [r"SlowSink::write\("], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        line = [ln for ln in out.splitlines() if "void SlowSink::write()" in ln][0]
+        self.assertIn(r"via indirect_allowlist row 'void mid\(\)'", line)
+        self.assertNotIn("via indirect_allowlist", [ln for ln in out.splitlines() if "void mid()" in ln][0])
+
+    def test_an_unbounded_site_names_the_function_that_reaches_it(self):
+        self.indirect_fixture()
+        self.add_ci(node("deep", "void Deep::call()", 10) + node("ind2", "Indirect Call Placeholder", 0)
+                    + edge("mid", "deep") + edge("deep", "ind2", "X.cpp:20:7"))
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"void Deep::call\(\)\s+at: X\.cpp:20:7\s+<- void mid\(\)")
+
+    def test_an_unbounded_task_lists_where_project_code_enters_a_library(self):
+        # 146 library sites are no use as a list; the few calls from our code into the library
+        # that reach them are what one reads to decide whether the walk is right.
+        self.indirect_fixture()
+        self.add_ci(node("lib", "void lib_entry()", 10, loc="/idf/components/x/x.c:1:1")
+                    + node("ind2", "Indirect Call Placeholder", 0)
+                    + edge("mid", "lib") + edge("lib", "ind2", "X.cpp:30:9"))
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"library entered from project code: void mid\(\) -> void lib_entry\(\)")
+        self.assertNotIn("void lib_entry() -> ", out)
+
+    def test_an_unbounded_site_lists_what_else_it_calls(self):
+        # What a function with an indirect call also calls is the evidence for reading its source
+        # for the pointer: a site that calls only memcpy and a logger has its pointer in one of them.
+        self.indirect_fixture()
+        self.add_ci(node("deep", "void Deep::call()", 10) + node("ind2", "Indirect Call Placeholder", 0)
+                    + node("cp", "void* memcpy_like(void*)", 5) + edge("mid", "deep") + edge("deep", "ind2", "X.cpp:20:7")
+                    + edge("deep", "cp"))
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"void Deep::call\(\)\n\s+at: [^\n]+\n\s+<- void mid\(\)\n\s+calls: .*void\* memcpy_like\(void\*\)")
+        self.assertNotRegex(out, r"calls: .*Indirect Call Placeholder")
+
+    # GCC puts a call's file:line:col on its placeholder edge. A function that zero-fills or copies an
+    # aggregate (`char b[64] = {0}`, `struct S s{}`) gets a placeholder edge with NO label, for the
+    # memset/memcpy libcall the expansion makes: that is a block operation, not a call through a
+    # pointer, so it needs no indirect_allowlist row, and it is charged as the libc mem* leaf.
+    def test_an_unlabelled_placeholder_is_a_block_operation_not_an_indirect_site(self):
+        self.add_ci(node("ind", "Indirect Call Placeholder", 0) + node("memcpy", "memcpy", 1000)
+                    + edge("mid", "ind"))
+        self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["indirect"] = "bounded"
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("indirect call sites: 0 function(s) reachable make one", out.split("big:")[1])
+        self.assertIn("big: 2000 B", out)         # 400 + 600 + the 1000 B memcpy leaf the block operation calls
+        self.assertIn("memcpy", out.split("big:")[1])
+
+    def test_a_block_operation_is_charged_even_when_no_memcpy_node_exists(self):
+        self.add_ci(node("ind", "Indirect Call Placeholder", 0) + edge("mid", "ind"))
+        self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0, "^memcpy$": 950}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("big: 1950 B", out)         # 400 + 600 + 950
+
+    def test_a_labelled_and_an_unlabelled_placeholder_on_one_function_still_needs_a_row(self):
+        self.add_ci(node("ind", "Indirect Call Placeholder", 0) + node("memcpy", "memcpy", 10)
+                    + edge("mid", "ind") + edge("mid", "ind", "X.cpp:10:5"))
+        self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["indirect"] = "bounded"
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("1 reachable indirect call site(s) have no indirect_allowlist row", out)
+
+    def test_an_unbounded_site_names_where_in_the_source_it_calls(self):
+        self.indirect_fixture()
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"void mid\(\)\n\s+at: X\.cpp:10:5")
+
+    def test_an_unbounded_site_shows_the_whole_path_from_the_entry(self):
+        self.indirect_fixture()
+        self.add_ci(node("deep", "void Deep::call(int)", 10) + node("ind2", "Indirect Call Placeholder", 0)
+                    + edge("mid", "deep") + edge("deep", "ind2", "X.cpp:20:7"))
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("path: void big_task > void mid > void Deep::call", out)
+
+    def test_call_positions_are_shown_without_the_build_machines_prefix(self):
+        for label, want in (
+                ("/opt/esp/idf/components/tcp_transport/transport_ws.c:341:13", "components/tcp_transport/transport_ws.c:341:13"),
+                ("/__w/p/p/src/SIP/RequestsHandler.cpp:5:5", "src/SIP/RequestsHandler.cpp:5:5"),
+                ("/__w/p/p/build/managed_components/espressif__x/x.c:1:1", "managed_components/espressif__x/x.c:1:1"),
+                ("/tc/include/c++/15.2.0/bits/std_function.h:591:9", "15.2.0/bits/std_function.h:591:9"),
+                ("X.cpp:10:5", "X.cpp:10:5")):
+            self.assertEqual(g.short_site(label), want)
+
+    # __attribute__((alias)): vfs_calls.c makes _close_r, closedir, select and the rest aliases of esp_vfs_*.
+    # GCC marks such a node `shape : triangle`, gives it no frame and one edge to the aliased function, whose
+    # own frame is charged. Charging the alias a library default as well counts the same call twice.
+    def test_an_alias_node_is_a_pass_through_to_the_function_it_aliases(self):
+        self.add_ci(alias_node("_close_r", "_close_r") + node("esp_vfs_close", "esp_vfs_close", 32)
+                    + edge("leaf", "_close_r") + edge("_close_r", "esp_vfs_close", "/idf/vfs_calls.c:927:5"))
+        self.table["library_defaults"] = {"^_close_r$": 1536}      # the estimate that used to be charged for it
+        self.table["tasks"][0]["bytes"] = 4096
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok   small: 532 B", out)                    # 200 + 300 + alias 0 + esp_vfs_close 32
+        self.assertIn("32  esp_vfs_close", out)
+
+    def test_an_alias_of_a_function_with_no_frame_is_still_unknown(self):
+        self.add_ci(alias_node("_close_r", "_close_r") + bare("esp_vfs_close", "esp_vfs_close", loc="/idf/vfs_calls.c:1:1")
+                    + edge("leaf", "_close_r") + edge("_close_r", "esp_vfs_close"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL frame: library callee with no frame data", out)
+
+    def test_an_alias_with_two_edges_is_not_taken_for_a_pass_through(self):
+        self.add_ci(alias_node("_close_r", "_close_r") + node("a", "void a()", 32) + node("b", "void b()", 32)
+                    + edge("leaf", "_close_r") + edge("_close_r", "a") + edge("_close_r", "b"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL frame: library callee with no frame data", out)
+
+    # A target pattern of the form `X::(?:a|b)\(` names several functions: each alternative is checked on
+    # its own, so one that is not in the image fails the gate instead of riding on its siblings.
+    def test_every_alternative_of_a_target_pattern_must_match_a_function(self):
+        self.indirect_fixture()
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {
+            "targets": [r"SlowSink::(?:write|gone)\("], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("alternative 'gone'", out)
+        self.assertNotIn("alternative 'write'", out)
+        self.add_ci(node("gone", "void SlowSink::gone()", 10))
+        self.assertEqual(self.run_gate()[0], 0)
+
+    # A row whose targets matched nothing bounds nothing, so its caller is not counted as bounded.
+    def test_a_row_that_resolved_no_target_does_not_count_its_caller_as_bounded(self):
+        self.indirect_fixture()
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {
+            "targets": [r"NoSuchSink::write\("], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("1 function(s) reachable make one, 0 bounded", out)
+        self.assertIn("1 reachable indirect call site(s) have no indirect_allowlist row", out)
+        self.table["indirect_allowlist"][r"void mid\(\)"]["targets"] = []
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 function(s) reachable make one, 1 bounded", out)
+
+    def test_the_report_counts_the_block_operations_a_task_reaches(self):
+        self.add_ci(node("ind", "Indirect Call Placeholder", 0) + node("memcpy", "memcpy", 10)
+                    + edge("mid", "ind") + edge("helper", "ind"))
+        self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("block operations (unlabelled placeholder edges, charged as memcpy): 2 function(s) reachable", out.split("big:")[1])
+        self.assertIn("block operations (unlabelled placeholder edges, charged as memcpy): 0 function(s) reachable", out.split("small:")[1].split("big:")[0])
+
+    def test_a_cycle_member_with_no_name_is_shown_by_its_title(self):
+        self.add_ci(node("_ZL3foov", ")", 8) + node("other", "void other()", 8)
+                    + edge("mid", "_ZL3foov") + edge("_ZL3foov", "other") + edge("other", "_ZL3foov"))
+        self.table["recursion_allowlist"] = {"void other()": {"depth": 1, "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertIn("nameless member: title _ZL3foov", out)
+
+    # GCC can lose a function's name (a node whose whole label is ")"); the .ci title survives. A key
+    # written `title:REGEX` is searched in the title, so such a function can still carry a row.
+    def test_a_row_can_be_keyed_on_the_title_of_a_nameless_function(self):
+        self.add_ci(node("esp_log", ")", 40) + node("ind", "Indirect Call Placeholder", 0)
+                    + node("sink", "void Sink::emit()", 1000) + edge("mid", "esp_log") + edge("esp_log", "ind", "log.c:9:3"))
+        self.table["library_defaults"] = {"^Indirect Call Placeholder$": 0}
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["indirect"] = "bounded"
+        self.table["indirect_allowlist"] = {r"title:^esp_log$": {"targets": [r"Sink::emit\("], "reason": "fixture log.c:9"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("big: 2040 B", out)         # 400 + 600 + esp_log 40 + Sink::emit 1000
+        self.table["indirect_allowlist"] = {r"title:^nothing$": {"targets": [], "reason": "fixture log.c:9"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("matches no function that makes an indirect call", out)
+
+    def test_every_alternation_group_of_a_target_is_checked_not_only_the_first(self):
+        self.indirect_fixture()
+        self.add_ci(node("zed", "void Other::write()", 5))
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {
+            "targets": [r"(?:SlowSink|Other)::(?:write|gone)\("], "reason": "fixture"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("alternative 'gone'", out)
+        self.assertNotIn("alternative 'SlowSink'", out)
+        self.assertNotIn("alternative 'Other'", out)
+        self.table["indirect_allowlist"][r"void mid\(\)"]["targets"] = [r"(?:SlowSink|Missing)::(?:write)\("]
+        self.table["indirect_allowlist"][r"void mid\(\)"]["targets"] = [r"(?:SlowSink|Missing)::write\("]
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("alternative 'Missing'", out)
+
+    # A row can rest on a build setting (which log implementation is linked). The gate reads the CI build's
+    # build/config/sdkconfig.h and fails when the setting is not what the row assumed, or the file is missing.
+    def test_a_row_that_rests_on_a_build_setting_fails_when_the_build_differs(self):
+        self.table["sdkconfig_asserts"] = [{"present": ["CONFIG_LOG_VERSION_1"], "absent": ["CONFIG_LOG_VERSION_2"],
+                                            "reason": "the esp_log row reads the version 1 path"}]
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("sdkconfig_asserts: build/config/sdkconfig.h is missing", out)
+        cfg = os.path.join(self.tmp.name, "build", "config")
+        os.makedirs(cfg)
+        h = os.path.join(cfg, "sdkconfig.h")
+        with open(h, "w") as f:
+            f.write("#define CONFIG_LOG_VERSION_1 1\n")
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        with open(h, "w") as f:
+            f.write("#define CONFIG_LOG_VERSION_2 1\n")
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("CONFIG_LOG_VERSION_1 is not defined", out)
+        self.assertIn("CONFIG_LOG_VERSION_2 is defined", out)
+
+    # Known findings for the 911 tasks (#1116 tracks the bench measurement). The cap is the exact current
+    # total: the gate passes at it and fails one byte over, and a known row hides nothing else.
+    def test_checked_in_known_findings_cap_the_three_911_tasks_at_their_totals(self):
+        table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
+        kf = table["known_findings"]
+        for name, cap in (("sip_server", 9616), ("tel_ctl", 12944), ("tel_sweep", 12864)):
+            with self.subTest(name):
+                self.assertEqual(kf.get(name, {}).get("max_total"), cap)
+                self.assertIn("#1116", kf[name]["reason"])
+
+    def test_a_known_cap_passes_at_its_total_fails_one_byte_over_and_hides_no_unbounded_site(self):
+        self.indirect_fixture()
+        self.table["indirect_allowlist"] = {r"void mid\(\)": {"targets": [], "reason": "fixture"}}
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["bytes"] = 2000                         # 1900 + 512 > 2000
+        self.table["known_findings"] = {"big": {"max_total": 1900, "bytes": 2000, "reason": "#1116"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("KNOWN big: 1900 B", out)
+        self.table["known_findings"]["big"]["max_total"] = 1899
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("a new finding", out)
+        self.table["known_findings"]["big"]["max_total"] = 1900
+        del self.table["indirect_allowlist"]                 # an unbounded site is a different failure
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL big: 1900 B", out)
+        self.assertIn("have no indirect_allowlist row", out)
+
+    # A known row is a ratchet: it fails when the task fits again (remove it) and when the total has come
+    # down but the cap has not (lower it), and it holds only for the budget and the site it was written for.
+    def test_a_known_row_for_a_task_that_fits_again_fails_and_asks_for_its_removal(self):
+        self.table["known_findings"] = {"big": {"max_total": 1900, "bytes": 4096, "reason": "#1116"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL big: known finding is stale, the task fits its 4096 B again: remove the row", out)
+
+    def test_a_known_cap_above_the_current_total_fails_and_asks_for_it_to_come_down(self):
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["bytes"] = 2000
+        self.table["known_findings"] = {"big": {"max_total": 2500, "bytes": 2000, "reason": "#1116"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL big: known finding cap 2500 B is above the total 1900 B: lower max_total to 1900", out)
+
+    def test_a_smaller_budget_than_the_known_row_recorded_fails(self):
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["bytes"] = 1500                         # shrunk from the 2000 the row was written for
+        self.table["known_findings"] = {"big": {"max_total": 1900, "bytes": 2000, "reason": "#1116"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL big: known finding was written for a 2000 B stack, the site now has 1500 B", out)
+
+    def test_a_known_row_for_another_source_file_does_not_cover_the_task(self):
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["bytes"] = 2000
+        self.table["known_findings"] = {"big": {"max_total": 1900, "bytes": 2000, "file": "main/esp_main_eth.cpp", "reason": "#1116"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)                     # the task is at src/SIP/X.cpp: not covered
+        self.assertIn("FAIL big: 1900 B", out)
+
+    def test_a_known_row_without_a_recorded_budget_is_refused(self):
+        self.table["known_findings"] = {"big": {"max_total": 1900, "reason": "#1116"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("known_findings row 'big': needs", out)
+
+    def test_a_known_row_for_a_task_that_is_not_in_the_table_fails(self):
+        self.table["known_findings"] = {"renamed": {"max_total": 1900, "bytes": 4096, "reason": "#1116"}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL known_findings row 'renamed': no task of that name in the table", out)
+
+    def test_a_failing_cycle_lists_every_member(self):
+        names = [f"void Ring{i}()" for i in range(7)]
+        self.add_ci("".join(node(f"r{i}", n, 8) for i, n in enumerate(names))
+                    + "".join(edge(f"r{i}", f"r{(i + 1) % 7}") for i in range(7)) + edge("mid", "r0"))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        for n in names:
+            self.assertIn("        member " + n, out)
+
+    def test_checked_in_table_has_no_duplicate_keys(self):
+        # json.load keeps the last of two equal keys, so a second, empty indirect_allowlist once
+        # silently replaced the filled one.
+        def no_dups(pairs):
+            keys = [k for k, _ in pairs]
+            self.assertEqual(len(keys), len(set(keys)), sorted(k for k in keys if keys.count(k) > 1))
+            return dict(pairs)
+        with open(os.path.join(os.path.dirname(GATE), "task_stacks.json"), encoding="utf-8") as f:
+            json.load(f, object_pairs_hook=no_dups)
+
+    def test_checked_in_indirect_rows_cite_a_source_position(self):
+        # A row is a claim about who installs a pointer; a reader checks it against the source, so each
+        # reason carries a file:line (a header of the toolchain's libstdc++ counts).
+        with open(os.path.join(os.path.dirname(GATE), "task_stacks.json"), encoding="utf-8") as f:
+            rows = json.load(f)["indirect_allowlist"]
+        bare = sorted(k for k, v in rows.items() if not re.search(r"\.\w{1,4}:\d+", v["reason"]))
+        self.assertEqual(bare, [], "indirect_allowlist reasons with no file:line")
+
+    def test_a_task_not_marked_bounded_stays_report_only(self):
+        self.indirect_fixture(flag=False)
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("indirect call sites: 1 function(s) reachable", out)
+
+    def test_known_finding_is_reported_but_only_while_it_does_not_get_worse(self):
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["bytes"] = 2000                        # 1900 + 512 margin > 2000: over budget
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)                      # control: red without a known_findings row
+        self.table["known_findings"] = {"big": {"max_total": 1900, "reason": "pending measurement", "bytes": 2000}}
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("KNOWN big: 1900 B", out)
+        self.assertIn("pending measurement", out)
+        self.table["known_findings"]["big"]["max_total"] = 1800     # deeper than recorded: new
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("a new finding", out)
 
 
 if __name__ == "__main__":

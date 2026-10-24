@@ -1716,6 +1716,35 @@ TEST(AnchorRouting, AnAnchorCallWhoseHandsetGoesSilentIsEndedButNeverWhileHeld)
 	EXPECT_EQ(byes, 1u);
 }
 
+// #1089: the shared teardown helper hangs up a phone peer; an anchor leg is dropped
+// by endCall() through its bridge, so the helper must not BYE it as well.
+TEST(AnchorRouting, AnExpiredLeaseOnAnAnchoredCallSendsTheHandsetNoByeOfItsOwn)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.setAnchorPlacesRealCallsForTest(true);
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-1089"));
+	ASSERT_TRUE(handler.getSession("Call-ID: anchor-1089").has_value()) << "precondition: anchored call up";
+	MediaBridge* bridge = handler.anchorBridgeForCallIdForTest("Call-ID: anchor-1089");
+	ASSERT_NE(bridge, nullptr) << "precondition: a bridge backs the call";
+	ASSERT_TRUE(bridge->isActive()) << "precondition: and it is active";
+	sent.clear();
+
+	handler.expireLeaseAndSweepForTest("501");
+
+	EXPECT_FALSE(handler.getSession("Call-ID: anchor-1089").has_value());
+	EXPECT_FALSE(bridge->isActive()) << "endCall() dropped the anchor leg through its bridge";
+	for (const auto& [addr, msg] : sent)
+	{
+		(void)addr;
+		EXPECT_NE(msg ? msg->toString().rfind("BYE ", 0) : 1u, 0u) << "a BYE went out";
+	}
+}
+
 TEST(AnchorRouting, ARingingEmergencyAnchorCallIsNeverReapedForNoAnswer)
 {
 	// #712 (desmo): a 911/933 still ringing on the anchor gets no PBX-side

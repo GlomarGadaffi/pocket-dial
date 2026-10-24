@@ -47,13 +47,14 @@ On the `wifi`, `eth` and `lan8720` builds, the SIP registrar does not start unti
 
 ```mermaid
 flowchart TD
-    A["Boot"] --> B{"Provisioning flag set?"}
-    B -->|yes| S["SIP stack starts"]
-    B -->|no| C["SIP held dark, dashboard up"]
-    C --> D{"Admin credential committed within 30 minutes?"}
-    D -->|yes| E["Save provisioning flag"]
+    A["Boot (wifi, eth and lan8720 builds)"] --> H["HTTP dashboard task created first, prio 4, Core 0"]
+    H --> B{"NVS key provisioned non-zero? (esp_main.cpp:511)"}
+    B -->|yes| S["SIP task created: prio 5, Core 1 (esp_main.cpp:560)"]
+    B -->|no| C["SIP held dark, dashboard up (esp_main.cpp:529)"]
+    C --> D{"AdminAuth::credentialIsSet() true, polled every 2 s, 1800 s cap? (esp_main.cpp:536-548)"}
+    D -->|yes| E["Save NVS provisioned = 1 (esp_main.cpp:552)"]
     E --> S
-    D -->|no| R["Board reboots"]
+    D -->|"no, 1800 s elapsed"| R["esp_restart (esp_main.cpp:544)"]
     R --> A
 ```
 
@@ -65,7 +66,7 @@ It is off by default on purpose: switching it on forces every phone already
 associated with the access point to be re-paired, so it is never done to a live fleet
 by a firmware update. Enable it deliberately, in one of two ways:
 
-* From the dashboard: *Admin / Security & Firmware* → *Wi-Fi Access Point Security*.
+* From the dashboard: *Security* → *Wi-Fi access point security*.
   Tick the box and save. The change takes effect the next time the access point starts.
 * At flash time: the [browser flasher](https://glomargadaffi.github.io/pocket-dial/flasher/)
   can write the setting and the passphrase directly to the board. This is the easiest
@@ -126,7 +127,7 @@ or, where mDNS resolves:
 http://pocketdial.local
 ```
 
-You should see the retro CGA dashboard. It renders live data from
+You should see the operator console (Overview first). It renders live data from
 [`GET /api/status`](API.md#get-apistatus): the server IP/port, uptime, processed/dropped
 packet counters, the list of registered extensions, and any active call sessions.
 
@@ -164,7 +165,7 @@ While `admin`/`admin` is still in place, a request with a valid session gets `40
 
 ### Log in and complete setup from the dashboard
 
-Use the admin/security control on the dashboard. It opens on a login form;
+Use the login form on the dashboard. It opens on a login form;
 logging in with the default `admin`/`admin` credential immediately routes to
 a forced setup form (new username, new password, and an optional DTMF admin
 PIN) that nothing else on the dashboard is usable until you submit.

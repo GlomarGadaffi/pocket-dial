@@ -305,8 +305,9 @@ if(SIP_CONSTRAINED)
         # (full INVITE + REGISTER response) is compiled out here.
         POCKETDIAL_TRUNK_WIRE_LOG=0
         # #483/#689: the 4 MB app slot is full at -Og, so the config backup's
-        # trunk/SMTP/E911/admin_ext section is compiled out here; an import
-        # that carries it says so under "skipped".
+        # trunk/SMTP/E911/admin_ext section, and the MAC bindings in its
+        # secretsEnc block, are compiled out here; an import that carries
+        # them says so under "skipped".
         POCKETDIAL_BACKUP_SECTION_C=0
         # #398: no inbound carrier calls here; the slot is full. An INVITE from
         # the SBC is refused 403 as before.

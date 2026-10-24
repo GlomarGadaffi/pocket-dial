@@ -27,15 +27,16 @@ class AnchorSosStatusLaneTest(unittest.TestCase):
         # Positive control: every other caller still goes through the shared, mutex-guarded handle.
         self.assertIn("_statusMutex", self.get_body)
         self.assertIn("_statusClient", self.get_body)
-        for sig in ("std::string TelephonyAnchorClient::getLegStatus(",
-                    "std::string TelephonyAnchorClient::reconcileParticipantId(",
+        # getLegStatus took no lane before #949; it forwards one now (default: shared), see
+        # test_anchor_leg_status_sos_lane.py. The other two still pass none.
+        for sig in ("std::string TelephonyAnchorClient::reconcileParticipantId(",
                     "std::string TelephonyAnchorClient::getParticipantCaller("):
             self.assertIn("httpGetBody(url, body, &status)", body_of(self.src, sig), sig)
 
     def test_the_sos_lane_never_takes_the_status_mutex(self):
         self.assertIn("sosLane ? _sosStatusClient : _statusClient", self.get_body,
                       "the emergency lane must drive its own handle")
-        self.assertRegex(self.get_body, r"if \(!sosLane\)\s*statusLock\.lock\(\);",
+        self.assertRegex(self.get_body, r"if \(!sosLane( && !fresh)?\)\s*statusLock\.lock\(\);",
                          "_statusMutex may be taken only off the emergency lane")
         self.assertNotRegex(self.get_body, r"lock_guard<std::mutex>\s+\w+\(_statusMutex\)",
                             "an unconditional lock_guard on _statusMutex is the #941 wait")
@@ -55,7 +56,7 @@ class AnchorSosStatusLaneTest(unittest.TestCase):
                          "both the lazy resolve and the stale-device re-resolve")
         self.assertNotIn("resolveDevice()", self.make)
         self.assertIn("httpGetBody(url, body, &status, sosLane)", self.resolve_dev)
-        self.assertIn("httpGetBody(url, body, &status, pbx::classifyEmergencyDial(destination).isEmergency)",
+        self.assertIn("httpGetBody(url, body, &status, pbx::classifyEmergencyDial(destination).isEmergency, false, fresh, deadlineUs)",
                       self.resolve_leg, "the fallback list read is the 911's other status GET")
 
     def test_the_sos_handle_is_built_at_init_and_freed_at_teardown(self):

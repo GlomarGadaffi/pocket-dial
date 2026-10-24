@@ -645,6 +645,7 @@ never locks: Forget it so the right phone can lock.
 <button class="btn" onclick="tnLoad()">Refresh</button>
 </div>
 <div class="msg" id="tn-gate"></div>
+<div class="e911" id="tn-accept-banner" role="alert" style="display:none"><span class="lbl-s">Not accepted</span><span class="txt" id="tn-accept-text"></span></div>
 <div id="sbc-slot">
 )html2";
 
@@ -2691,6 +2692,7 @@ if(sig.nav.get()==="devices")devicesShown();
 var tnSlots=[];
 var tnSelected=0;
 var tnTest={};
+var tnAcceptVer=0;
 var tnSlotMsg="tn-tapi-msg";
 var tnFieldIds=["tn-tapi-baseurl","tn-tapi-clientid","tn-tapi-secret","tn-tapi-routedn"];
 var tnWriteIds=tnFieldIds.concat(["tn-tapi-enabled","tn-tapi-save","tn-tapi-activate","tn-tapi-clear"]);
@@ -2740,6 +2742,7 @@ return ok;
 function tnClearViews(){
 ["tn-tapi-body","tn-trunk-kv","tn-tapi-secret-state"].forEach(id=>$(id).textContent="");
 $("tn-tapi-active").textContent="—";
+$("tn-accept-banner").style.display="none";
 $("tn-tapi-edit-title").textContent="Configure slot";
 tnFieldIds.forEach(id=>$(id).value="");
 $("tn-tapi-enabled").checked=false;
@@ -2759,6 +2762,7 @@ tnFetchTrunk();
 function tnFetchSlots(keepForm){
 return tnGet("/api/telephony-config",tnSlotMsg,d=>{
 tnSlots=d.slots||[];
+tnAcceptVer=d.acceptanceVersion||0;
 tnRenderSlots();
 if(keepForm)tnUpdateEditMeta();
 else tnSelectSlot(tnSelected);
@@ -2767,6 +2771,7 @@ else tnSelectSlot(tnSelected);
 function tnChipEl(s){
 if(!(s.baseUrl||s.clientId||s.secretSet||s.routeDn||s.enabled))return tnStatusEl("standby","·","Not configured");
 if(!s.implemented)return tnStatusEl("warning","▲","Configured, not yet connected");
+if(s.active&&!s.enabled)return tnStatusEl("warning","▲","Selected, disabled");
 return s.active?tnStatusEl("ok","·","Active"):tnStatusEl("standby","·","Configured");
 }
 function tnBtn(cls,label,aria,enabled,fn){
@@ -2780,9 +2785,11 @@ return b;
 function tnRenderSlots(){
 var body=$("tn-tapi-body");
 var lbl="None (loopback default)";
+var miss=[];
 body.textContent="";
 tnSlots.forEach((s,i)=>{
-if(s.active)lbl="Slot "+(i+1)+(s.implemented?"":" (not yet connected)");
+if(s.active)lbl="Slot "+(i+1)+(!s.enabled?" (disabled, loopback runs)":s.implemented?"":" (not yet connected)");
+if(s.acceptanceMissing)miss.push(i+1);
 var acts=tnEl("div",0,"row-btns");
 acts.append(tnBtn("btn","Edit","Edit slot "+(i+1),canWrite(),()=>tnEditSlot(i)));
 if(!s.active)acts.append(tnBtn("btn","Activate","Activate slot "+(i+1),canWrite(),()=>tnActivate(i)));
@@ -2791,6 +2798,8 @@ tr.append(tnEl("td","Slot "+(i+1)),tnEl("td",tnChipEl(s)),tnEl("td",s.baseUrl||"
 body.append(tr);
 });
 $("tn-tapi-active").textContent=lbl;
+$("tn-accept-banner").style.display=miss.length?"":"none";
+$("tn-accept-text").textContent=miss.length?"Slot "+miss.join(", ")+(miss.length>1?" are":" is")+" enabled without a recorded acceptance of the limitations. It keeps working. Edit it and accept to record who accepted and when.":"";
 }
 function tnEditSlot(i){
 tnSelectSlot(i);
@@ -2823,36 +2832,39 @@ tnSetOff("tn-tapi-test",!(canWrite()&&s.active&&s.implemented));
 function tnSaveSlot(){
 if(!tnGuard()||!tnSlots.length)return;
 var i=tnSelected;
-var turningOn=$("tn-tapi-enabled").checked&&!(tnSlots[i]&&tnSlots[i].enabled);
+var turningOn=$("tn-tapi-enabled").checked&&!(tnSlots[i]&&tnSlots[i].enabled&&tnSlots[i].accepted);
 if(turningOn){
 ui.accept().then(ok=>{
-if(ok)tnSaveSlotNow(i);
+if(ok)tnSaveSlotNow(i,true);
 else{$("tn-tapi-enabled").checked=false;setMsg(tnSlotMsg,"Not enabled. The slot stays off until you accept the limitations.","");}
 });
 return;
 }
-tnSaveSlotNow(i);
+tnSaveSlotNow(i,false);
 }
-function tnSaveSlotNow(i){
-var q=new URLSearchParams({
+function tnSaveSlotNow(i,accepted){
+var f={
 enabled:$("tn-tapi-enabled").checked?"1":"0",
 baseUrl:$("tn-tapi-baseurl").value.trim(),
 clientId:$("tn-tapi-clientid").value.trim(),
 secret:$("tn-tapi-secret").value,
 routeDn:$("tn-tapi-routedn").value.trim()
-}).toString();
+};
+if(accepted)f.acceptLimitations=String(tnAcceptVer);
+var q=new URLSearchParams(f).toString();
 tnThen(put("/api/telephony-config/"+i,q),tnSlotMsg,"Slot "+(i+1)+" saved.",()=>tnFetchSlots(false));
 }
 function tnActivate(i){
 if(!tnGuard()||!tnSlots.length)return;
 if(tnSlots[i]&&tnSlots[i].active)return;
+if(tnSlots[i]&&tnSlots[i].accepted)return tnActivateNow(i,false);
 ui.accept().then(ok=>{
 if(!ok){setMsg(tnSlotMsg,"Not activated. The slot stays off until you accept the limitations.","");return;}
-tnActivateNow(i);
+tnActivateNow(i,true);
 });
 }
-function tnActivateNow(i){
-tnThen(post("/api/telephony-config/"+i+"/activate",""),tnSlotMsg,"Slot "+(i+1)+" is now active.",()=>tnFetchSlots(true));
+function tnActivateNow(i,accepted){
+tnThen(post("/api/telephony-config/"+i+"/activate",accepted?"acceptLimitations="+tnAcceptVer:""),tnSlotMsg,"Slot "+(i+1)+" is now active.",()=>tnFetchSlots(true));
 }
 function tnShowTest(i){
 if(i!==tnSelected)return;
@@ -2883,7 +2895,10 @@ var i=tnSelected;
 ui.arm($("tn-tapi-clear"),"Clear slot",()=>tnThen(del("/api/telephony-config/"+i,""),tnSlotMsg,"Slot "+(i+1)+" cleared.",()=>tnFetchSlots(false)));
 }
 function tnFetchTrunk(){
-return tnGet("/api/trunk","tn-trunk-msg",tnRenderTrunk);
+)html23";
+
+static const char PD_HTML_24[] =
+R"html24(return tnGet("/api/trunk","tn-trunk-msg",tnRenderTrunk);
 }
 function tnKvRow(dl,label,valueEl){
 var row=tnEl("div",0,"kvrow");
@@ -2901,11 +2916,11 @@ store.effect(()=>{
 sig.admin.get();
 if(sig.nav.get()==="trunks-numbers")tnLoad();
 });
-)html23";
+)html24";
 
 #if !defined(POCKETDIAL_PROFILE_SBC) || !defined(ESP_PLATFORM)
-static const char PD_HTML_24[] =
-R"html24(var tnDidMsg="tn-did-msg";
+static const char PD_HTML_25[] =
+R"html25(var tnDidMsg="tn-did-msg";
 var tnDidWriteIds=["tn-did-new","tn-did-ext","tn-did-add"];
 var tnReserved={"777":1,"999":1,"555":1,"888":1,"440":1,"796":1,"997":1,"pbx":1,"moh":1,"server":1};
 function tnDidLoad(){
@@ -2942,12 +2957,12 @@ function tnRemoveDid(did,btn){
 if(!tnGuard())return;
 ui.arm(btn,"Remove",()=>tnThen(del("/api/did-mapping",new URLSearchParams({did:did}).toString()),tnDidMsg,"Mapping removed.",tnFetchDids));
 }
-)html24";
+)html25";
 #endif
 
 #if !defined(POCKETDIAL_PROFILE_SBC) || !defined(ESP_PLATFORM)
-static const char PD_HTML_25[] =
-R"html25(var RT_ACTION_LABEL={trunk:"Trunk",group:"Ring group",page:"Page zone",park:"Park orbit"};
+static const char PD_HTML_26[] =
+R"html26(var RT_ACTION_LABEL={trunk:"Trunk",group:"Ring group",page:"Page zone",park:"Park orbit"};
 var RT_TARGET_LABEL={trunk:"Prepend after stripping (blank = prepend nothing)",group:"Ring group extension",page:"Paging zone (980–989)",park:"Park orbit (700–709)"};
 var rtLoaded=false;
 var rtSbcReady=false;
@@ -3123,10 +3138,19 @@ if(!rtSbcReady){setMsg("rt-sbc-msg","SBC mode has not loaded. Save is off until 
 var en=$("rt-sbc-enabled").checked;
 var route=$("rt-sbc-route").value||"0";
 setMsg("rt-sbc-msg","Saving…","");
-put("/api/sbc-mode","enabled="+(en?"1":"0")+"&route="+encodeURIComponent(route)).then(()=>{
+var ask=en?httpMethod("GET","/api/telephony-config").then(r=>{
+var d=typeof r==="string"?JSON.parse(r)||{}:r||{};
+var sl=(d.slots||[])[Number(route)]||{};
+if(sl.active||sl.accepted)return "";
+return ui.accept().then(ok=>ok?"&acceptLimitations="+(d.acceptanceVersion||0):null);
+}):Promise.resolve("");
+ask.then(acc=>{
+if(acc===null){setMsg("rt-sbc-msg","Not enabled. SBC mode stays as it was until you accept the limitations.","");return rtSbcLoad();}
+return put("/api/sbc-mode","enabled="+(en?"1":"0")+"&route="+encodeURIComponent(route)+acc).then(()=>{
 return rtSbcLoad();
 }).then(ok=>{
 if(ok)setMsg("rt-sbc-msg",en?"SBC mode enabled, slot "+(Number(route)+1)+".":"SBC mode disabled.","ok");
+});
 }).catch(e=>{
 setMsg("rt-sbc-msg",e.message,msgCls(e));
 });
@@ -3181,12 +3205,12 @@ rtActionChanged();
 rtGate();
 }
 try{rtBind();}catch(e){setMsg("rt-gate-msg","Routing failed to start: "+e.message,"err");}
-)html25";
+)html26";
 #endif
 
 #if !defined(POCKETDIAL_PROFILE_SBC) || !defined(ESP_PLATFORM)
-static const char PD_HTML_26[] =
-R"html26(var chPaint={groups:"",parked:""};
+static const char PD_HTML_27[] =
+R"html27(var chPaint={groups:"",parked:""};
 function chSecHidden(){
 var s=$("sec-call-handling");
 return !s||s.hidden;
@@ -3318,12 +3342,12 @@ sig.admin.get();
 var d=sig.status.get();
 if(sig.nav.get()==="call-handling")renderCallHandling(d);
 });
-)html26";
+)html27";
 #endif
 
 #if ((defined(POCKETDIAL_MULTICAST_PAGING) && (POCKETDIAL_MULTICAST_PAGING) != 0) && !defined(POCKETDIAL_PROFILE_SBC)) || !defined(ESP_PLATFORM)
-static const char PD_HTML_27[] =
-R"html27(var chMc={loaded:false,ok:false};
+static const char PD_HTML_28[] =
+R"html28(var chMc={loaded:false,ok:false};
 function chPagingTick(authed){
 if(!adminState.loggedIn)chMc.loaded=false;
 if(authed&&!chMc.loaded)chLoadMulticast();
@@ -3368,12 +3392,12 @@ chLoadMulticast();
 })
 .catch(fm("ch-mc-msg",""));
 }
-)html27";
+)html28";
 #endif
 
 #if !defined(POCKETDIAL_PROFILE_SBC) || !defined(ESP_PLATFORM)
-static const char PD_HTML_28[] =
-R"html28(var mohUploading=false;
+static const char PD_HTML_29[] =
+R"html29(var mohUploading=false;
 var MOH_MAX_BYTES=8*1024*1024;
 function audioOwner(){
 return canWrite()&&isOwner();
@@ -3500,11 +3524,11 @@ store.effect(()=>{
 sig.admin.get();
 audioRenderMoh(sig.moh.get());
 });
-)html28";
+)html29";
 #endif
 
-static const char PD_HTML_29[] =
-R"html29(var secApSecure=false;
+static const char PD_HTML_30[] =
+R"html30(var secApSecure=false;
 function secWriteGate(msgId){
 if(canWrite())return true;
 setMsg(msgId,adminState.needsSetup?"Finish the admin setup first.":"Log in before changing settings.","");
@@ -3906,10 +3930,10 @@ if(mntBlocked("mnt-sys-msg",false))return;
 post("/api/syslog",{host:$("mnt-sys-host").value.trim(),port:$("mnt-sys-port").value.trim()}).then(d=>{
 setMsg("mnt-sys-msg",d.message||"Saved.","ok");
 return mntLoadSyslog();
-)html29";
+)html30";
 
-static const char PD_HTML_30[] =
-R"html30(}).catch(mntCatch("mnt-sys-msg","Could not save"));
+static const char PD_HTML_31[] =
+R"html31(}).catch(mntCatch("mnt-sys-msg","Could not save"));
 }
 function mntLoadCoredump(){
 return getJson("/api/coredump/info").then(d=>{
@@ -3960,11 +3984,11 @@ mntLoadSyslog();
 mntLoadEmail();
 mntLoadCoredump();
 });
-)html30";
+)html31";
 
 #if defined(POCKETDIAL_HAS_WIFI) || !defined(ESP_PLATFORM)
-static const char PD_HTML_31[] =
-R"html31(var mntWifiSelected="";
+static const char PD_HTML_32[] =
+R"html32(var mntWifiSelected="";
 function mntBars(rssi){
 if(!isFinite(rssi))return "—";
 return rssi>-50?"▂▄▆█":rssi>-65?"▂▄▆ ":rssi>-75?"▂▄  ":"▂   ";
@@ -4044,11 +4068,11 @@ function mntWifiBind(){
 ].forEach(p=>{$("mnt-"+p[0]).addEventListener("click",p[1]);});
 }
 mntWifiBind();
-)html31";
+)html32";
 #endif
 
-static const char PD_HTML_32[] =
-R"html32(var CON_GLYPH={ok:"·",standby:"·",warning:"▲",critical:"■"};
+static const char PD_HTML_33[] =
+R"html33(var CON_GLYPH={ok:"·",standby:"·",warning:"▲",critical:"■"};
 var CON_TRACE_MAX=200;
 var CON_CDR_MAX=20;
 function conNode(tag,cls,txt){
@@ -4231,7 +4255,7 @@ store.effect(()=>{conRenderTrace(sig.trace.get(),sig.traceOn.get(),sig.traceErr.
 </script>
 </body>
 </html>
-)html32";
+)html33";
 
 // Issue #159 (SMTP client): the standalone /setup/email admin page.
 // Deliberately its OWN top-level document (own <html>/<head>/<body>), served
@@ -4680,27 +4704,28 @@ static const HtmlPart CGA_INDEX_HTML_PARTS[] = {
 #endif
 	{ PD_HTML_22, sizeof(PD_HTML_22) - 1 },
 	{ PD_HTML_23, sizeof(PD_HTML_23) - 1 },
-#if !defined(POCKETDIAL_PROFILE_SBC) || !defined(ESP_PLATFORM)
 	{ PD_HTML_24, sizeof(PD_HTML_24) - 1 },
-#endif
 #if !defined(POCKETDIAL_PROFILE_SBC) || !defined(ESP_PLATFORM)
 	{ PD_HTML_25, sizeof(PD_HTML_25) - 1 },
 #endif
 #if !defined(POCKETDIAL_PROFILE_SBC) || !defined(ESP_PLATFORM)
 	{ PD_HTML_26, sizeof(PD_HTML_26) - 1 },
 #endif
-#if ((defined(POCKETDIAL_MULTICAST_PAGING) && (POCKETDIAL_MULTICAST_PAGING) != 0) && !defined(POCKETDIAL_PROFILE_SBC)) || !defined(ESP_PLATFORM)
+#if !defined(POCKETDIAL_PROFILE_SBC) || !defined(ESP_PLATFORM)
 	{ PD_HTML_27, sizeof(PD_HTML_27) - 1 },
 #endif
-#if !defined(POCKETDIAL_PROFILE_SBC) || !defined(ESP_PLATFORM)
+#if ((defined(POCKETDIAL_MULTICAST_PAGING) && (POCKETDIAL_MULTICAST_PAGING) != 0) && !defined(POCKETDIAL_PROFILE_SBC)) || !defined(ESP_PLATFORM)
 	{ PD_HTML_28, sizeof(PD_HTML_28) - 1 },
 #endif
+#if !defined(POCKETDIAL_PROFILE_SBC) || !defined(ESP_PLATFORM)
 	{ PD_HTML_29, sizeof(PD_HTML_29) - 1 },
-	{ PD_HTML_30, sizeof(PD_HTML_30) - 1 },
-#if defined(POCKETDIAL_HAS_WIFI) || !defined(ESP_PLATFORM)
-	{ PD_HTML_31, sizeof(PD_HTML_31) - 1 },
 #endif
+	{ PD_HTML_30, sizeof(PD_HTML_30) - 1 },
+	{ PD_HTML_31, sizeof(PD_HTML_31) - 1 },
+#if defined(POCKETDIAL_HAS_WIFI) || !defined(ESP_PLATFORM)
 	{ PD_HTML_32, sizeof(PD_HTML_32) - 1 },
+#endif
+	{ PD_HTML_33, sizeof(PD_HTML_33) - 1 },
 };
 static constexpr size_t CGA_INDEX_HTML_PART_COUNT =
 	sizeof(CGA_INDEX_HTML_PARTS) / sizeof(CGA_INDEX_HTML_PARTS[0]);

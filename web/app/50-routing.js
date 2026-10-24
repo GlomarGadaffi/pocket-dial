@@ -186,10 +186,21 @@ function rtSbcSave(){
   var en=$("rt-sbc-enabled").checked;
   var route=$("rt-sbc-route").value||"0";
   setMsg("rt-sbc-msg","Saving…","");
-  put("/api/sbc-mode","enabled="+(en?"1":"0")+"&route="+encodeURIComponent(route)).then(()=>{
-    return rtSbcLoad();
-  }).then(ok=>{
-    if(ok)setMsg("rt-sbc-msg",en?"SBC mode enabled, slot "+(Number(route)+1)+".":"SBC mode disabled.","ok");
+  /* Selecting a slot that is not the active one activates it, which needs the same acceptance as Activate on
+     Trunks & numbers. Turning SBC off, or keeping the active slot, sends nothing extra. */
+  var ask=en?httpMethod("GET","/api/telephony-config").then(r=>{
+    var d=typeof r==="string"?JSON.parse(r)||{}:r||{};
+    var sl=(d.slots||[])[Number(route)]||{};
+    if(sl.active||sl.accepted)return "";
+    return ui.accept().then(ok=>ok?"&acceptLimitations="+(d.acceptanceVersion||0):null);
+  }):Promise.resolve("");
+  ask.then(acc=>{
+    if(acc===null){setMsg("rt-sbc-msg","Not enabled. SBC mode stays as it was until you accept the limitations.","");return rtSbcLoad();}
+    return put("/api/sbc-mode","enabled="+(en?"1":"0")+"&route="+encodeURIComponent(route)+acc).then(()=>{
+      return rtSbcLoad();
+    }).then(ok=>{
+      if(ok)setMsg("rt-sbc-msg",en?"SBC mode enabled, slot "+(Number(route)+1)+".":"SBC mode disabled.","ok");
+    });
   }).catch(e=>{
     setMsg("rt-sbc-msg",e.message,msgCls(e));
   });

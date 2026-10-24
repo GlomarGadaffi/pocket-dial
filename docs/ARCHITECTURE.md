@@ -10,7 +10,7 @@ The firmware architecture is divided into three core logical layers:
 
 1. Network Hardware & Driver Layer: controls physical media (Wi-Fi radio, W5500 SPI Ethernet MAC/PHY, LAN8720 RMII PHY) and registers low-level event handlers.
 2. Signaling & State Engine Layer (`RequestsHandler`): A lightweight SIP registrar and session controller managing client registration leases, active SIP sessions, and intercom broadcasting/paging features. It implements a deliberately partial subset of RFC 3261: no §16 proxy behaviour (§1.1), but all four §17 transaction machines; §1.2 states which messages they cover, which they deliberately leave out, and where timing and coverage fall short (1 Hz sweep, pool exhaustion).
-3. User Interface & Query Layer: consists of a custom select-based, thread-dispatching `HttpServer` serving a CGA-style web dashboard, an mDNS service responder, and a high-frequency LVGL-based GUI display task.
+3. User Interface & Query Layer: consists of a custom select-based, thread-dispatching `HttpServer` serving the web dashboard, an mDNS service responder, and a high-frequency LVGL-based GUI display task.
 
 The diagram below shows the **display (JC3248W535) build**, where LVGL runs on Core 1 and
 the SIP, UDP and status tasks run on Core 0. On the headless builds (`eth`, `lan8720` and
@@ -21,36 +21,61 @@ overridden to 0 for the display build in `main/CMakeLists.txt:257`), so no build
 them. The HTTP accept loop is a separate, unpinned thread (§4), not `http_server_task` itself.
 
 ```mermaid
-graph TD
-    subgraph Core 1 [Core 1: LVGL - display build; also tel_media_rx]
-        A[lvgl_task 16ms] -->|Drives| B["AXS15231B LCD (QSPI)"]
-        A -->|Reads| C["AXS15231B Touch (I2C)"]
+flowchart TD
+    subgraph Core1["Core 1, display build"]
+        LV["lvgl_task, prio 5, 8192 B, every 16 ms"] -->|"drives"| LCD["AXS15231B LCD, QSPI"]
+        LV -->|"reads"| TP["AXS15231B touch, I2C"]
+        MRX["tel_media_rx, prio 6, 6144 B, one per anchor call slot"]
     end
 
-    subgraph Core 0 [Core 0: SIP, UDP and status tasks]
-        D[sip_server_task] -->|Runs| E[RequestsHandler::tick]
-        J[status_task 500ms] -->|Updates| K[Wallboard: clients & calls]
-        L[udp_receiver_task] -->|Reads| M[UDP Port 5060]
+    subgraph Core0["Core 0, display build"]
+        UDP["udp_receiver_task, prio 5, 16384 B"] -->|"runs inline"| HDL["RequestsHandler::handle()"]
+        SIP["sip_server_task, prio 5, 8192 B, 30 ms loop"] -->|"calls"| TICK["RequestsHandler::tick(), at most 1 Hz"]
+        ST["status_task, prio 3, 4096 B, every 500 ms"] -->|"updates"| WB["Wallboard: clients and calls"]
+        HTS["http_server_task, prio 4, 8192 B"]
     end
 
-    subgraph Unpinned [No core affinity]
-        F["HTTP accept thread"] -->|Listens| G[TCP Port 80]
-        G -->|Select Activity| H["Detached http_conn threads"]
-        H -->|Reads under _snapshotMutex| I["Registrar Snapshot (Clients/Sessions)"]
+    subgraph Unpinned["No core affinity"]
+        ACC["HTTP accept thread, select() every 250 ms"] -->|"at most 3 at once"| CONN["http_conn threads, 4096 B"]
     end
 
-    subgraph Hardware [Physical Hardware Layer]
-        B
-        C
-        N["W5500 / LAN8720 Ethernet"] <-->|LwIP Stack| L
-        N <-->|LwIP Stack| G
-    end
-
-    E -->|Pre-allocated Pool| O[SipClient / Session Memory]
-    M -->|Dispatches Packet| E
-    E -->|Write-Buffer| P[Local Outbox Vector]
-    P -->|Send Outside Lock| N
+    HTS -->|"HttpServer::start()"| ACC
+    NET["Wi-Fi radio, lwIP"] -->|"UDP port 5060"| UDP
+    NET -->|"TCP port 80"| ACC
+    HDL -->|"under _mutex"| POOL["SipClient and Session pools, preallocated"]
+    TICK -->|"under _mutex"| POOL
+    TICK -->|"refills scratch, swaps under _snapshotMutex"| SNAP["RegistrarSnapshot"]
+    CONN -->|"reads under _snapshotMutex"| SNAP
+    HDL -->|"_outbox drained to a local vector"| OUT["SipServer::onHandled, UdpServer::send, after _mutex is released"]
+    TICK -->|"same drain"| OUT
+    OUT --> NET
 ```
+
+The 3CX anchor adds its own tasks, created only for a real (non-Loopback) anchor. The SIP engine never makes an HTTPS call itself: it posts a job to one of three bounded queues and returns, and the WebSocket's events come back through the `tel_wsw` workers:
+
+```mermaid
+flowchart TD
+    RH["RequestsHandler, _mutex"] -->|"postTelCtl(), never blocks"| QS["sos queue, depth kTelSosDepth = 8"]
+    RH -->|"postTelCtl()"| QC["ctl queue, depth kTelCtlDepth = 4"]
+    RH -->|"asyncDropCall()"| QD["drop queue, depth kTelDropDepth, 23 at default pool sizes"]
+    QS --> SOS["tel_sos: 911/933 makeCall"]
+    QC --> CTL["tel_ctl0, tel_ctl1: makeCall, answerCall"]
+    QD --> DROP["tel_drop: dropCall"]
+    SOS --> TA["TelephonyAnchorClient, its own _mutex"]
+    CTL --> TA
+    DROP --> TA
+    TA -->|"HTTPS: makecall POST, answer and drop under _ctrlMutex"| PBX["3CX Call Control"]
+    PBX -->|"wss /callcontrol/ws"| WST["esp_websocket_client task, 6144 B: handleWsEvent()"]
+    WST -->|"WsWorkItem"| WQ["_wsWorkQueue, depth 16"]
+    WQ --> WSW["tel_wsw x4, prio 4, 12288 B: processWsWork()"]
+    WSW -->|"CallEvent callback, takes _mutex"| RH
+    PBX -->|"GET .../participants/{id}/stream"| MRX["tel_media_rx, Core 1"]
+    TA --- MAINT["tel_maint, prio 5, 6144 B: restart, token refresh"]
+    TA --- SWEEP["tel_sweep, prio 4, 6144 B: 911/933 orphan sweep"]
+    TA --- PRE["tel_prewarm, prio 4, 6144 B: one-shot TLS pre-warm"]
+```
+
+The lane workers `tel_ctl0`, `tel_ctl1`, `tel_drop` and `tel_sos` are 12288 B, priority 5, with a PSRAM stack where one is free. They are created in the order sos, drop, ctl, so when boot memory runs short a 911/933 and a drop get their workers before ordinary call setup does. A lane with no worker posts its jobs to `tel_ctl` instead.
 
 ### 1.1 Protocol Role: Back-to-Back Call Broker, Not a Proxy
 
@@ -190,8 +215,10 @@ sequenceDiagram
     participant HTTP as HTTP connection thread
     SIP->>SIP: handle() mutates state under _mutex
     Note over SIP: tick() runs at most once a second
-    SIP->>Snap: tick() refills scratch under _mutex, then swaps into _snapshot under _snapshotMutex
-    HTTP->>Snap: GET /api/status reads under _snapshotMutex
+    SIP->>Snap: tick() refills _snapshotScratch under _mutex, then swaps it into _snapshot under _snapshotMutex
+    HTTP->>Snap: getActiveClients() and getActiveSessions() copy under _snapshotMutex
+    HTTP->>Snap: /api/status formats in place through withSnapshot(), holding _snapshotMutex throughout
+    Note over HTTP: neither read takes _mutex
 ```
 
 ### B. Out-of-Lock Socket Syscalls (Issue #51)
@@ -223,15 +250,20 @@ flowchart TD
     A[select on the listen socket, 250 ms timeout] --> B{Activity?}
     B -- No --> A
     B -- Yes --> C[accept the client socket]
-    C --> D{Fewer than 3 connections live?}
-    D -- No --> E[Send 503 and close]
+    C --> D{"Fewer than kMaxConcurrentConnections = 3 live?"}
+    D -- No --> E["503 Service Unavailable, close"]
     E --> A
-    D -- Yes --> F[Spawn detached http_conn thread]
+    D -- Yes --> PS{"This source holds fewer than kMaxConnectionsPerSource = 2?"}
+    PS -- No --> E
+    PS -- Yes --> F["Spawn a detached http_conn thread on a connection slot"]
     F --> A
-    F --> G[Set SO_RCVTIMEO to 5 s and read the request, body capped at 16 KB]
-    G --> H[requireAdmin on gated routes]
+    F --> G["Read the request: each recv() waits at most 5 s, all of it within kReadDeadlineMs = 10 s"]
+    G --> BL{"Body over 16 KB?"}
+    BL -- Yes --> R413["413 Payload Too Large"]
+    BL -- No --> H[requireAdmin on gated routes]
     H --> I[Send the response with security headers]
     I --> J[Close the socket]
+    R413 --> J
 ```
 
 ### Accept Loop Implementation
@@ -329,3 +361,25 @@ To protect the registrar from UDP flood denial-of-service (DoS) attacks, the `Re
 * Bounded table: at most **256** buckets; a new source IP arriving when the table is full is dropped outright (`RequestsHandler.cpp:11445-11448`).
 * Eviction cycle: To prevent memory leak accumulation from transient spoofed IPs, buckets idle for 60 s are evicted from `tick()` (`RequestsHandler.cpp:11134-11145`).
 * **Warning:** subnet (CIDR) filtering is not implemented, so do not plan a deployment around it. The macro `-DPOCKETDIAL_ALLOW_CIDR` does not exist anywhere in the tree. The matching runtime state exists but is inert: `_allowNet` and `_allowMask` (`src/SIP/RequestsHandler.hpp:3101-3102`) are initialised to `0` and no code path assigns them. There is no setter, no constructor argument, no HTTP route and no NVS key. `RequestsHandler::ipAllowed()` (`RequestsHandler.cpp:11430-11434`) therefore takes its `if (_allowMask == 0) return true;` early exit on every packet, so every source IP is allowed. The token bucket above is real and does run. The subnet filter is scaffolding that was never wired up, so segment isolation has to come from the network: a VLAN, a firewall, or simply not routing the board's link.
+
+## 6. Origins
+
+pocket-dial began as a fork of [BarGabriel/SipServer](https://github.com/BarGabriel/SipServer), an MIT-licensed SIP server. That credit is kept in [NOTICE](../NOTICE) and the original licence text in [LICENSE-MIT](../LICENSE-MIT) (Copyright (c) 2022 BarGabriel). Everything added or changed since the fork is Apache 2.0 ([LICENSE](../LICENSE)); [CHANGELOG.md](../CHANGELOG.md) records the relicensing of the project from MIT to Apache 2.0.
+
+What the upstream project was: at its default branch (`master`, last pushed 2024-05-31) it holds 25 files and 33 commits, all under `src/SIP`, `src/Helpers`, `main.cpp`, `CMakeLists.txt` and the usual README, LICENSE and `.gitignore`. The upstream names that matter here are `SipServer`, `RequestsHandler`, `Session`, `SipClient`, `SipMessage`, `SipMessageFactory`, `SipSdpMessage`, `UdpServer` and `IDGen`.
+
+What survives: 24 of those 25 upstream paths still exist in this tree; only `src/SIP/SipMessageHeaders.h` is gone. Comparing git blob hashes, exactly one of the 24 is byte-identical to upstream, the vendored `src/Helpers/cxxopts.hpp`. The other 23 have been rewritten. For scale, upstream `src/SIP/RequestsHandler.cpp` is 8,953 bytes and the current file is 663,338 bytes. The file names carry over; the contents mostly do not, so read this section as lineage, not as a claim about how many lines are upstream's.
+
+What was added since: the current tree has 215 C/C++ source and header files under `src/` and `main/`. Named subsystems with no counterpart in the upstream file list include the registrar (`Registrar`), the SIP transaction layer (`TransactionLayer`), call forking (`CallForker`), parking (`ParkOrbit`), conferencing (`ConferenceRoom`, `MixBus`), voicemail (`VoicemailLeg`, `VoicemailMenu`), SIP trunks (`SipTrunk`, `TrunkResolver`), the telephony anchor clients (`AnchorClient`, `TelephonyAnchorClient`, `ApidazeAnchorClient`), plug-and-play provisioning (`PnpResponder`), OTA update (`OtaUpdater`), admin authentication (`AdminAuth`), and the ESP32 firmware entry points under `main/` (`esp_main*.cpp`). Upstream has no `main/` directory, no `web/` directory and no `tests/` directory.
+
+How the history is recorded: this repository was created on 2026-04-12 and is not a GitHub-marked fork (the API reports `fork: false`). Upstream's 33 commits are not in this repository's history. Its oldest commit reachable in a shallow clone is `c96dc048` (2026-08-28), a merge whose tree already holds 202 files, so the days of work before it are one undifferentiated commit as far as `git log` here can tell. The first tag is `v1.0.0` (`53ea00c6`, 2026-05-29). As of 2026-10-20 GitHub reports 781 commits on `main` and 506 merged pull requests, 245 of those commits dated on or before 2026-08-28. Counts move; the commands below reproduce them.
+
+Reproduce:
+
+```
+git log --diff-filter=A --format='%h %ad %s' --date=short -- LICENSE-MIT NOTICE
+gh api 'repos/BarGabriel/SipServer/git/trees/HEAD?recursive=1' --jq '.tree[]|select(.type=="blob")|"\(.sha) \(.path)"'
+git hash-object <path>          # compare against the upstream blob sha
+gh api 'repos/GlomarGadaffi/pocket-dial/commits?per_page=1' -i       # Link rel="last" = commit count
+gh api 'search/issues?q=repo:GlomarGadaffi/pocket-dial+is:pr+is:merged&per_page=1' --jq .total_count
+```

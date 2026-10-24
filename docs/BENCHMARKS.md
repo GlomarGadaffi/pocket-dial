@@ -68,7 +68,7 @@ flowchart LR
     S1 --> S3
 ```
 
-| Target Board | State 1: Idle Baseline (No Clients Registered) | State 2: HTTP status Polling (CGA Dashboard Active) | State 3: Active SIP Call (2 Registered, 1 Call) | Heap Fragmentation Hazard Level |
+| Target Board | State 1: Idle Baseline (No Clients Registered) | State 2: HTTP status Polling (Dashboard Active) | State 3: Active SIP Call (2 Registered, 1 Call) | Heap Fragmentation Hazard Level |
 | :--- | :---: | :---: | :---: | :---: |
 | **Headless ESP32-WROOM** | 280 KB Free | 274 KB Free *(Transient)* | 279 KB Free | **Low** (Steady-state dynamic allocations eliminated via pooling) |
 | **ESP32-S3 Smart Display** | 120 KB Free *(Graphics RAM consumed)* | 114 KB Free *(Transient)* | 119 KB Free | **Medium** (LVGL UI rendering and SIP engine share internal DRAM) |

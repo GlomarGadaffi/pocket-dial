@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <memory>
 #include <regex>
 #include <string>
@@ -176,7 +177,7 @@ TEST(HttpStatusAlloc, TheTelCtlWorkerStackWatermarksAreOnStatus)
 	// smaller size needs. null on the host build, like every stackHwm_* field.
 	StatusBench b;
 	const std::string resp = b.serve(false);
-	for (const char* key : { "stackHwm_tel_ctl0", "stackHwm_tel_ctl1", "stackHwm_tel_drop", "stackHwm_tel_sos" })
+	for (const char* key : { "stackHwm_tel_ctl0", "stackHwm_tel_ctl1", "stackHwm_tel_drop", "stackHwm_tel_sos", "stackHwm_tel_sweep" })
 	{
 		EXPECT_NE(resp.find(std::string("\"") + key + "\":null"), std::string::npos) << key << " missing from /api/status";
 	}
@@ -337,7 +338,7 @@ TEST(HttpStatusAlloc, TheStatusKeyListIsPinnedAndTheDramAccountGuardAddsOnlyItsO
 		"freeHeapInternal", "largestFreeBlockInternal", "freeHeapDma", "largestFreeBlockDma", "resetReason",
 		"stackHwm_sip_server_task", "stackHwm_udp_receiver_task", "stackHwm_rtp_media_tx", "stackHwm_rtp_media_rx",
 		"stackHwm_conf_mix_tick", "stackHwm_tel_ctl0", "stackHwm_tel_ctl1", "stackHwm_tel_drop", "stackHwm_tel_sos",
-		"stackHwm_flash_writer", "stackHwm_http_conn", "httpConnWorstRoute", "coredump", "l2Tx", "memory", "mutexHold", "mediaTx",
+		"stackHwm_tel_sweep", "stackHwm_flash_writer", "stackHwm_http_conn", "httpConnWorstRoute", "coredump", "l2Tx", "memory", "mutexHold", "mediaTx",
 	};
 #if POCKETDIAL_HTTP_DRAM_ACCOUNT
 	want.push_back("httpDramAccount");
@@ -348,7 +349,13 @@ TEST(HttpStatusAlloc, TheStatusKeyListIsPinnedAndTheDramAccountGuardAddsOnlyItsO
 		const std::string resp = b.serve(authed);
 		ASSERT_EQ(resp.rfind("HTTP/1.1 200", 0), 0u) << resp.substr(0, 200);
 		const std::string body = resp.substr(resp.find("\r\n\r\n") + 4);
-		EXPECT_EQ(topLevelKeys(body), want);
+		std::vector<std::string> expected = want;
+		if (authed)
+		{
+			// #1073: the per-slot "enabled without an acceptance" flags, behind the session.
+			expected.insert(std::find(expected.begin(), expected.end(), "uptime"), "anchorAcceptanceMissing");
+		}
+		EXPECT_EQ(topLevelKeys(body), expected);
 #if !POCKETDIAL_HTTP_DRAM_ACCOUNT
 		EXPECT_EQ(body.find("httpDramAccount"), std::string::npos);
 #endif
