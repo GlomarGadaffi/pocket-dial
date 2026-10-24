@@ -40,8 +40,9 @@ ending (`HoldEnd`, TA.cpp:2500-2505), the sweep finding and noting the leg (TA.c
 the arm (`_pendingSeen.seenIn`, TA.cpp:3644). So it adds no id to the set #888 already ignores: it
 lengthens how long those ids' repeat upserts are ignored, by up to 4 s past the return, on this
 double failure only. Any other id, such as a PSAP callback that first appears after the return, is not
-held by #977 (TA.cpp:3644): it is classified on the real count. With no outbound in flight it
-rings; while an outbound rings it is absorbed, as section 2 describes. A held id is still not queued or replayed, and its `ignoredPending`
+held by #977 (TA.cpp:3644): it is classified on the real count (TA.cpp:3642-3644, :3820-3832).
+With no outbound keyed and no makeCall pending it rings (row 0, 0). With a makeCall pending it
+is ignored (row 0, >0). While an outbound rings it is absorbed, as section 2 describes. A held id is still not queued or replayed, and its `ignoredPending`
 witness line reports an age measured from the last real makeCall.
 
 After the window closes, only two things could still find the ignored participant, and neither does:
