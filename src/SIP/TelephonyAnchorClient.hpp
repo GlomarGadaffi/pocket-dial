@@ -4,6 +4,7 @@
 #include "AnchorClient.hpp"
 #include "RecentIdRing.hpp"   // Issue #554
 #include "ParkedTaskReap.hpp" // Issue #553: pd::ReapDecision
+#include "RtpTaskSlots.hpp"   // #1116: pd::rtpslots::kSweepStackBytes
 #include "AnchorWedge.hpp"    // Issue #667: pd::anchorSlotLooksWedged
 #include "TelephonyAnchorLogic.hpp"   // #951: telephony::BearerHeader (the ESP block below includes it again)
 #include <mutex>
@@ -412,7 +413,7 @@ private:
 	// resolveOutboundLeg -> httpGetBody -> esp_http_client_open -> cert verify -> ECP -> DRBG) plus its margin.
 	// Sized from that estimate, NOT measured safe: pending the bench in #1116 (stackHwm_tel_sweep after a fresh
 	// TLS connect), after which this is trimmed to the measured high-water mark plus margin.
-	static constexpr uint32_t kSweepStackBytes = 13376;
+	static constexpr uint32_t kSweepStackBytes = pd::rtpslots::kSweepStackBytes;   // 13376, see RtpTaskSlots.hpp
 	pd::StaticTaskSlot _sweepMem;
 	bool wakeSweep();   // false: no tel_sweep task
 	static void sweepTaskTrampoline(void* arg);
