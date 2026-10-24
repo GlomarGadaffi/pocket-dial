@@ -940,6 +940,13 @@ jobs:
                  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32_constrained" \
                  set-target esp32 build
 
+      # #1116: the profile has no PSRAM, so every task stack here is internal DRAM. Print the
+      # static DRAM figure (Memory Type Usage Summary) so a stack change can be checked against it.
+      - name: Memory report (DRAM, #1116)
+        run: |
+          . $IDF_PATH/export.sh > /dev/null
+          idf.py size
+
       - name: App slot margin (issue #489)
         run: |
           . $IDF_PATH/export.sh > /dev/null

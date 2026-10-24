@@ -1166,12 +1166,12 @@ class Gate(unittest.TestCase):
         self.assertIn("CONFIG_LOG_VERSION_1 is not defined", out)
         self.assertIn("CONFIG_LOG_VERSION_2 is defined", out)
 
-    # Known findings for the 911 tasks (#1116 tracks the bench measurement). The cap is the exact current
+    # Known findings for the 911 tasks (#1116 tracks the bench measurement); tel_sweep has none, its stack was raised to fit. The cap is the exact current
     # total: the gate passes at it and fails one byte over, and a known row hides nothing else.
-    def test_checked_in_known_findings_cap_the_three_911_tasks_at_their_totals(self):
+    def test_checked_in_known_findings_cap_the_two_911_tasks_at_their_totals(self):
         table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
         kf = table["known_findings"]
-        for name, cap in (("sip_server", 9616), ("tel_ctl", 12944), ("tel_sweep", 12864)):
+        for name, cap in (("sip_server", 9616), ("tel_ctl", 12944)):
             with self.subTest(name):
                 self.assertEqual(kf.get(name, {}).get("max_total"), cap)
                 self.assertIn("#1116", kf[name]["reason"])
