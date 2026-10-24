@@ -1155,6 +1155,40 @@ TEST(AnchorRouting, ADegradedConnected911Or933IsKeptUpAndReportedOnce)
 	}
 }
 
+// #1122: Session::reset() left _degradedReported set, so the next degraded 911 on the same
+// pooled slot was never reported. Rule 5: it is reported again, and still kept up.
+TEST(AnchorRouting, ADegradedConnected911OnARecycledSlotIsReportedAgain)
+{
+	DegradedRig rig("911", "anchor-1122-a");
+	ASSERT_NE(rig.bridge, nullptr);
+	auto first = rig.handler.getSession("Call-ID: anchor-1122-a");
+	ASSERT_TRUE(first.has_value());
+	Session* slot = first.value().get();
+	first.reset();
+	ASSERT_TRUE(rig.degrade());
+	rig.handler.forceNextTickForTest();
+	rig.handler.tick();
+	ASSERT_EQ(rig.countContaining("192.168.9.20", "AUDIO DEGRADED"), 1);
+	rig.handler.handle(makeBye("501", "911", "192.168.9.51", "anchor-1122-a"));
+	ASSERT_FALSE(rig.handler.getSession("Call-ID: anchor-1122-a").has_value());
+
+	ASSERT_TRUE(rig.handler.anchorClientForTest()->start());   // degrade() stopped it
+	rig.handler.handle(makeInvite("501", "911", "192.168.9.51", "anchor-1122-b"));
+	auto second = rig.handler.getSession("Call-ID: anchor-1122-b");
+	ASSERT_TRUE(second.has_value());
+	ASSERT_EQ(second.value().get(), slot) << "the second call must land on the recycled slot";
+	second.reset();
+	rig.bridge = rig.handler.anchorBridgeForCallIdForTest("Call-ID: anchor-1122-b");
+	ASSERT_NE(rig.bridge, nullptr);
+	ASSERT_TRUE(rig.degrade());
+	rig.handler.forceNextTickForTest();
+	rig.handler.tick();
+
+	EXPECT_EQ(rig.countContaining("192.168.9.20", "AUDIO DEGRADED"), 2) << "one report per call";
+	EXPECT_TRUE(rig.handler.getSession("Call-ID: anchor-1122-b").has_value())
+		<< "the second 911 was torn down by the degraded sweep";
+}
+
 // #986: this notify runs inside tick(), not handle(): its pbx-911 Alert must leave
 // on tick()'s own flushPass(), unlocked, and exactly once.
 TEST(AnchorRouting, ADegradedConnected911SendsItsPbx911AlertOnTheTickPassOnce)

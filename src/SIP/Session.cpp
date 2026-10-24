@@ -61,6 +61,11 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_fwdCSeq = 0;
 	_fwdRSeq = 0;
 	_rtpWatchArmed = false;   // #604
+	// #1122 / #1121: per-call state that survived a pool recycle.
+	_degradedReported = false;
+	_cancelledLegExt.clear();
+	_forwardInvite.reset();
+	_forwardTarget.clear();
 
 	// Issue #353. These survived reset() and nothing else ever cleared them --
 	// there is no setVoicemail(false) anywhere in the tree -- so a pool slot
