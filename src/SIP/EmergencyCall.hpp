@@ -52,6 +52,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 
 #include "PoolConfig.hpp"
@@ -177,6 +178,92 @@ private:
 		std::string_view view() const { return {ext.data(), len}; }
 	};
 	std::array<Mark, POCKETDIAL_MAX_CLIENTS> _marks{};
+};
+
+// ── Unknown-caller alert coalescing (#1115) ──────────────────────────────────
+//
+// An INVITE to 911/933 from a caller that is not a registered extension is
+// refused (403) and, since #1107, written to the EMERGENCY log and announced to
+// the E911 notify list. The log line is never coalesced. The announcement goes
+// out once per (source IP, emergency number) per window, so a flood of forged
+// 911s cannot teach the notify list to ignore the alert. A registered caller's
+// 911 does not pass through here at all.
+//
+// 60 s: long enough to absorb a burst, short enough that a real unknown device
+// dialling again a minute later is announced afresh.
+inline constexpr std::chrono::seconds kUnknownAlertWindow{60};
+// 16 pairs: 8 sources x {911, 933}. The ordinary rate limiter already bounds
+// distinct sources; a full table announces rather than drops (overflow counted).
+inline constexpr std::size_t kUnknownAlertMax = 16;
+
+class UnknownEmergencyAlerts
+{
+public:
+	struct Verdict
+	{
+		bool notify = true;
+		uint32_t summary = 0;   // refusals coalesced since the last announcement
+	};
+
+	// `ip` is the source address (network order), `isTest` selects 933 over 911.
+	Verdict check(uint32_t ip, bool isTest, std::chrono::steady_clock::time_point now)
+	{
+		Entry* free = nullptr;
+		for (Entry& e : _e)
+		{
+			if (!e.used) { if (!free) free = &e; continue; }
+			if (e.ip != ip || e.isTest != isTest) continue;
+			if (now - e.since < kUnknownAlertWindow)
+			{
+				if (e.held < UINT32_MAX) ++e.held;
+				++_suppressed;
+				return {false, 0};
+			}
+			const Verdict v{true, e.held};   // window over: announce again, with the tally
+			e.since = now;
+			e.held = 0;
+			return v;
+		}
+		if (!free) free = reclaimExpired(now);
+		if (!free)
+		{
+			if (_overflow < UINT32_MAX) ++_overflow;
+			return {true, 0};
+		}
+		*free = Entry{true, isTest, ip, now, 0};
+		return {true, 0};
+	}
+
+	uint32_t overflow() const { return _overflow; }
+	uint32_t suppressed() const { return _suppressed; }
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	void ageForTest(std::chrono::steady_clock::duration d) { for (Entry& e : _e) e.since -= d; }
+#endif
+
+private:
+	struct Entry
+	{
+		bool used = false;
+		bool isTest = false;
+		uint32_t ip = 0;
+		std::chrono::steady_clock::time_point since{};
+		uint32_t held = 0;
+	};
+
+	// The oldest expired entry. Its first alert already went out; a source that never
+	// dials again must not pin its slot, so any tally it still holds is dropped.
+	Entry* reclaimExpired(std::chrono::steady_clock::time_point now)
+	{
+		Entry* oldest = nullptr;
+		for (Entry& e : _e)
+			if (now - e.since >= kUnknownAlertWindow && (!oldest || e.since < oldest->since)) oldest = &e;
+		return oldest;
+	}
+
+	std::array<Entry, kUnknownAlertMax> _e{};
+	uint32_t _overflow = 0;
+	uint32_t _suppressed = 0;
 };
 
 } // namespace pbx

@@ -2833,3 +2833,118 @@ TEST(EmergencyCodecGate, A911WithAG722OnlyOfferIsRefusedByTheAnchorsG711GateWith
 	ASSERT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
 	EXPECT_TRUE(b.saw("NOT ROUTED")) << b.dump();
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// #1115. A 911/933 from an unknown caller is refused (403) and every refusal is
+// logged, but the E911 notification (MESSAGE + beep) goes out once per (source IP,
+// number) per window, then an "N more since" tally. A registered caller's 911 is
+// never coalesced. The window is aged by a test hook, so nothing sleeps.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace
+{
+	std::string unknownIp(size_t n) { return "192.168.79." + std::to_string(100 + n); }
+
+	void unknownDial(Bench& b, const std::string& dialed, const std::string& callId,
+		const std::string& ip, const std::string& ext = "999")
+	{
+		b.handler->handle(makeInvite(dialed, callId, 0, ext, ip));
+	}
+
+	// Front desk 200 on the notify list, as inviteAndCaptureLog arranges.
+	void armNotifyList(Bench& b)
+	{
+		b.handler->handle(makeRegister("200", "192.168.79.20"));
+		b.handler->setE911Config("200", "", "");
+		b.sent.clear();
+	}
+}
+
+TEST(EmergencyUnknownCoalesce, TenInvitesFromOneSourceGiveOneNotificationAndTenLogLines)
+{
+	Bench b;
+	armNotifyList(b);
+	testing::internal::CaptureStderr();
+	for (int i = 0; i < 10; ++i) unknownDial(b, "911", "uc-one-" + std::to_string(i), unknownIp(1));
+	const std::string log = testing::internal::GetCapturedStderr();
+
+	EXPECT_EQ(b.count("SIP/2.0 403 Forbidden"), 10u) << b.dump();
+	EXPECT_EQ(countOf(log, "EMERGENCY: 911 dialed by 999"), 10u) << log;
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+	EXPECT_EQ(b.count("INVITE sip:200@"), 1u) << "one beep too: " << b.dump();
+}
+
+TEST(EmergencyUnknownCoalesce, ASecondSourceGetsItsOwnNotification)
+{
+	Bench b;
+	armNotifyList(b);
+	for (int i = 0; i < 3; ++i) unknownDial(b, "911", "uc-a-" + std::to_string(i), unknownIp(1));
+	for (int i = 0; i < 3; ++i) unknownDial(b, "911", "uc-b-" + std::to_string(i), unknownIp(2));
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 2u) << b.dump();
+}
+
+TEST(EmergencyUnknownCoalesce, ADifferentNumberFromTheSameSourceGetsItsOwnNotification)
+{
+	Bench b;
+	armNotifyList(b);
+	unknownDial(b, "911", "uc-n-1", unknownIp(1));
+	unknownDial(b, "933", "uc-n-2", unknownIp(1));
+	unknownDial(b, "933", "uc-n-3", unknownIp(1));
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 2u) << b.dump();
+}
+
+TEST(EmergencyUnknownCoalesce, ARegisteredCallers911IsNeverSuppressed)
+{
+	Bench b;
+	b.handler->setAnchorPlacesRealCallsForTest(true);
+	armNotifyList(b);
+	for (int i = 0; i < 3; ++i) b.handler->handle(makeOpusInvite("911", "uc-reg-" + std::to_string(i)));
+	// Unknown-caller refusals in between must not touch the registered caller's count.
+	for (int i = 0; i < 3; ++i) unknownDial(b, "911", "uc-regu-" + std::to_string(i), unknownIp(1));
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 4u) << b.dump();
+}
+
+TEST(EmergencyUnknownCoalesce, AfterTheWindowTheNextDialNotifiesAgainWithAnExactTally)
+{
+	Bench b;
+	armNotifyList(b);
+	for (int i = 0; i < 4; ++i) unknownDial(b, "911", "uc-w-" + std::to_string(i), unknownIp(1));
+	ASSERT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();   // 3 held back
+	b.handler->ageUnknownEmergencyAlertsForTest(pbx::kUnknownAlertWindow + std::chrono::seconds(1));
+	unknownDial(b, "911", "uc-w-later", unknownIp(1));
+
+	ASSERT_EQ(b.count("MESSAGE sip:200@"), 2u) << b.dump();
+	EXPECT_TRUE(b.saw("3 more since")) << b.dump();
+	EXPECT_EQ(b.count("SIP/2.0 403 Forbidden"), 5u) << b.dump();
+}
+
+TEST(EmergencyUnknownCoalesce, AFullTableNotifiesAndCountsTheOverflow)
+{
+	Bench b;
+	armNotifyList(b);
+	for (size_t i = 0; i < pbx::kUnknownAlertMax; ++i)
+		unknownDial(b, "911", "uc-f-" + std::to_string(i), unknownIp(i));
+	ASSERT_EQ(b.count("MESSAGE sip:200@"), pbx::kUnknownAlertMax) << b.dump();
+	ASSERT_EQ(b.handler->getE911UnknownAlertOverflow(), 0u);
+
+	unknownDial(b, "911", "uc-f-over", unknownIp(pbx::kUnknownAlertMax));
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), pbx::kUnknownAlertMax + 1) << b.dump();
+	EXPECT_EQ(b.handler->getE911UnknownAlertOverflow(), 1u);
+}
+
+TEST(EmergencyUnknownCoalesce, ExpiredEntriesAreRecycledSoOneOffSourcesDoNotPinTheTable)
+{
+	Bench b;
+	armNotifyList(b);
+	for (size_t i = 0; i < pbx::kUnknownAlertMax; ++i)
+	{
+		unknownDial(b, "911", "uc-r-a" + std::to_string(i), unknownIp(i));
+		unknownDial(b, "911", "uc-r-b" + std::to_string(i), unknownIp(i));   // held, so a tally is pending
+	}
+	b.handler->ageUnknownEmergencyAlertsForTest(pbx::kUnknownAlertWindow + std::chrono::seconds(1));
+	b.sent.clear();
+	for (int i = 0; i < 3; ++i) unknownDial(b, "911", "uc-r-n" + std::to_string(i), unknownIp(50));
+
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 1u) << b.dump();
+	EXPECT_EQ(b.handler->getE911UnknownAlertOverflow(), 0u);
+}

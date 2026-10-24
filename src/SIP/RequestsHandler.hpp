@@ -226,6 +226,16 @@ public:
 	// Issue #424: responses drainOutbox() refused to send because they answered
 	// a response or an ACK. Any non-zero value is a handler bug the guard caught.
 	uint32_t getRepliesRefused() const;
+	// #1115: unknown-caller 911/933 announcements sent because the coalescing table was
+	// full (they notify rather than drop), and refusals folded into an earlier one.
+	uint32_t getE911UnknownAlertOverflow() const { return _unknownAlertOverflow.load(std::memory_order_relaxed); }
+	uint32_t getE911UnknownAlertSuppressed() const { return _unknownAlertSuppressed.load(std::memory_order_relaxed); }
+	// Test-only (#1115): move every coalescing window `d` into the past.
+	void ageUnknownEmergencyAlertsForTest(std::chrono::steady_clock::duration d)
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		_unknownAlerts.ageForTest(d);
+	}
 	// OPTIONS keep-alive pings refused because they would not fit their stack
 	// buffer (#463). Not reachable with a real AOR and IPv4 address; counted so
 	// a clipped request can never go out silently.
@@ -3179,6 +3189,9 @@ private:
 	std::array<TrunkInboundPair, POCKETDIAL_MAX_TRUNK_CALLS> _trunkInbound{};
 #endif
 	std::atomic<uint32_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped
+	pbx::UnknownEmergencyAlerts _unknownAlerts;   // #1115, under _mutex
+	std::atomic<uint32_t> _unknownAlertOverflow{0};     // #1115: mirrors _unknownAlerts for the HTTP thread
+	std::atomic<uint32_t> _unknownAlertSuppressed{0};   // #1115
 	std::atomic<uint32_t> _optionsPingTruncated{0};   // #463: see getOptionsPingTruncated()
 	std::atomic<uint32_t> _byeTruncated{0};           // #744: see getByeTruncated()
 	// Requests answered from a §17.2 server transaction's stored response rather

@@ -5240,7 +5240,20 @@ void RequestsHandler::noteUnregisteredEmergencyDial(const std::shared_ptr<SipMes
 	const std::string from(data->getFromNumber());
 	queueLog("EMERGENCY: " + std::string(emergency.isTest ? "TEST 933" : "911") + " dialed by " + from +
 		" - caller is not a registered extension, refused (403)", true);
-	notifyEmergency(emergency, from, asDialed, /*routed=*/false, "caller is not a registered extension");
+	// #1115: the log line above is every refusal's record; only the announcement is
+	// coalesced, once per (source, number) per window. The 403 is already queued.
+	const pbx::UnknownEmergencyAlerts::Verdict v =
+		_unknownAlerts.check(data->getSource().sin_addr.s_addr, emergency.isTest, std::chrono::steady_clock::now());
+	_unknownAlertOverflow.store(_unknownAlerts.overflow(), std::memory_order_relaxed);
+	_unknownAlertSuppressed.store(_unknownAlerts.suppressed(), std::memory_order_relaxed);
+	if (!v.notify) return;
+	char reason[96];
+	const int n = v.summary == 0
+		? std::snprintf(reason, sizeof reason, "caller is not a registered extension")
+		: std::snprintf(reason, sizeof reason, "caller is not a registered extension; %u more since the last notice",
+			static_cast<unsigned>(v.summary));
+	const std::size_t len = n < 0 ? 0 : std::min(static_cast<std::size_t>(n), sizeof reason - 1);
+	notifyEmergency(emergency, from, asDialed, /*routed=*/false, std::string_view(reason, len));
 }
 
 // Issue #166 part 2. Kept to this one small function so the compliance-relevant
