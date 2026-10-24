@@ -1,7 +1,7 @@
 # #888: an inbound or PSAP callback during a pending makeCall
 
 Status: design only. No fix is claimed. No source or test changed. Everything below was read on
-`origin/main` at 046e7277 (symbols, not line numbers, because lines drift).
+`origin/main` at fe447968 (symbols, with a few line numbers that drift).
 
 Rule 5 context: nothing may gate, delay, refuse or misreport a 911/933 or a PSAP callback. A PSAP
 callback after a 911 arrives as an ordinary route-point inbound on the anchor's source DN.
@@ -16,15 +16,32 @@ slots keyed and not yet answered) and reads `pending` (`_outboundPending`). The 
 | nin | pending | result |
 |---|---|---|
 | 0 | 0 | `controlLegs = {partId}`: a new INBOUND. Worker allocs a slot, `evCb(Incoming)`. |
-| 0 | >0 | **IGNORED** (`ignoredPending`). Nothing queued, nothing held. Logs the #888 witness. |
+| 0 | >0 | **IGNORED** (`ignoredPending`). Nothing queued, nothing replayed. Logs the #888 witness. `pending` is the real makeCall count, or 1 under the #977 orphan hold (below). |
 | 1 | 0 | absorbed: re-check the in-flight outbound leg, NOT `partId`. |
 | >=1 | >0, or >=2 | ambiguous: re-check every in-flight leg, NOT `partId`. |
 
 `_outboundPending` is incremented at the top of `makeCall` (before the POST, `PendingDec` RAII) and
-decremented when `makeCall` returns. So the window is the whole of `makeCall`: token work, the
+decremented when `makeCall` returns. So the window is the whole of `makeCall` (TA.cpp:359-364 to its return): token work, the
 POST (1.8-3.2 s measured on .244), `resolveOutboundLeg`, the list-read loop on an unread response
 (bounded by `kUnreadAdoptWindowUs` = 4 s), and for a 911/933 the `emergencySlotRetryContinues`
-wait for a slot.
+wait for a slot. For one 911/933 failure #977 extends it past the return, by up to 4 s.
+
+#977 adds a second source of `pending`. `countOutboundLocked` (TA.cpp:3622) computes it with
+`telephony::pendingWithOrphanHold` (SosStatusGet.hpp:422, called at TA.cpp:3642-3644). The hold
+exists on one path only: a 911/933 whose #349 list-read window ended with no read showing 3CX's
+list (`orphanSweepWanted`, SosStatusGet.hpp:394). `makeCall` then arms an orphan sweep before it
+returns false (TA.cpp:621-623; `armOrphanSweep`, TA.cpp:2443), because 3CX may hold a live call to
+the PSAP that the unit cannot see. `armOrphanSweep` sets `_orphanHoldUntilUs` to the arm time plus
+`kOrphanSweepWindowUs` (4 s, equal to `kUnreadAdoptWindowUs`; TA.cpp:2450, SosStatusGet.hpp:387).
+While that deadline has not passed and no makeCall is pending, `pendingWithOrphanHold` reports 1,
+so the (0, >0) row applies after `makeCall` has returned. The hold ends at the first of: the sweep
+ending (`HoldEnd`, TA.cpp:2500-2505), the sweep finding and noting the leg (TA.cpp:2553), or the
+4 s bound. It covers only an id first upserted while a makeCall was pending, between the POST and
+the arm (`_pendingSeen.seenIn`, TA.cpp:3644). So it adds no id to the set #888 already ignores: it
+lengthens how long those ids' repeat upserts are ignored, by up to 4 s past the return, on this
+double failure only. Any other id, such as a PSAP callback that first appears after the return, sees
+the real count and rings (Rule 5). A held id is still not queued or replayed, and its `ignoredPending`
+witness line reports an age measured from the last real makeCall.
 
 After the window closes, only two things could still find the ignored participant, and neither does:
 
