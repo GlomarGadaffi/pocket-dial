@@ -865,6 +865,7 @@ TELEMETRY_HWM_FIELDS = (
     "stackHwm_sip_server_task", "stackHwm_udp_receiver_task",
     "stackHwm_rtp_media_tx", "stackHwm_rtp_media_rx", "stackHwm_conf_mix_tick",
     "stackHwm_tel_ctl0", "stackHwm_tel_ctl1", "stackHwm_tel_drop", "stackHwm_tel_sos",
+    "stackHwm_tel_sweep",
 )
 
 

@@ -42,6 +42,8 @@ public:
 	bool isConnected() const override;
 	bool isStreaming() const;
 	bool makeCall(const std::string& destination, std::string* ownLegOut = nullptr) override;
+	bool ownLegRemovedSinceNamed(const std::string& ownLeg) override;   // #1095
+	void releaseRemovedLeg(const std::string& ownLeg) override;         // #1103
 	bool answerCall(const std::string& participantId) override;
 	bool dropCall(const std::string& participantId) override;
 	void setEventCallback(EventCallback cb) override;
@@ -282,7 +284,10 @@ private:
 	struct WitnessTick { WitnessStatus status = WitnessStatus::Skipped; uint16_t seen = 0; };
 	WitnessTick witnessSightingLocked(const std::string& partId);
 	static void noteWitnessCap(const WitnessTick& tick);
-	int         countOutboundLocked(std::string* inflight, size_t inflightCap, int& active, int& pending) const;
+	// partId (#977, Rule 5): the id of the upsert being classified. The sweep's hold counts in pending only for an
+	// id _pendingSeen first noted within the armed window (_orphanArm); nullptr (a caller that announces nothing): the hold counts.
+	int         countOutboundLocked(std::string* inflight, size_t inflightCap, int& active, int& pending,
+	                                const std::string* partId = nullptr) const;
 	// Issue #553: delete a slot's rx task only once it has parked (pd::reapDecision);
 	// clears rxTaskHandle on Reap. Caller holds _mutex.
 	pd::ReapDecision reapParkedRxLocked(CallSlot& slot);
@@ -369,10 +374,43 @@ private:
 	static constexpr uint32_t kMaintTokenRefresh = 1u << 3;
 	std::atomic<bool>    _maintRefreshInFlight{false};
 	std::atomic<int64_t> _lastMaintRefreshUs{0};
+	// #977: the orphan sweep. A 911/933 whose #349 window ended with every participant-list read errored is still
+	// refused (503), as on main. makeCall() then arms a sweep (telephony::orphanSweepWanted) with three atomic
+	// stores and a wake: no lock, no I/O, no wait, so the caller's 503 is not delayed. The sweep, on its own task tel_sweep,
+	// reads the list again on the ordinary status lane within telephony::kOrphanSweepWindowUs of the arm and
+	// DROPS the one leg that shows (never two: one may be a PSAP callback). Until it ends, or the bound passes,
+	// _orphanHoldUntilUs makes the WS classifier ignore an unmatched upsert as it does while a makeCall is
+	// pending, so the orphan's repeat upsert is not promoted to an inbound call before the drop.
+	// The arm: its time, POST seq, arm seq and the number the 911/933 dialed, written and taken as one snapshot under
+	// _mutex (no I/O inside), so a take never pairs one arm's window with another's number. The window is (post, arm].
+	telephony::OrphanArmSlot _orphanArm;
+	// Set when a 911/933 makeCall succeeded WITHOUT a resolved own leg: a live call with no slot, which looks like an
+	// orphan to any sweep. Once set, every sweep ends before a drop; sticky until reboot. A flag, not a POST seq:
+	// _wsSeq starts at 0, so a 911 as the first call after boot has a POST seq of 0.
+	telephony::UnslottedRecord _unslottedEmergency;
+	std::atomic<int64_t>  _orphanHoldUntilUs{0};   // esp_timer time the hold lasts to; 0: no hold
+	telephony::OrphanSweepWitness _orphanWitness;
+	// The ids first upserted, within the sweep's window (its POST to its arm), while a makeCall was pending (guarded by
+	// _mutex): the orphan is one, a PSAP callback is not.
+	// The hold covers only these, and the sweep drops only one of these (Rule 5 review of #1040).
+	telephony::PendingSeenIds<8, telephony::kParticipantIdBytes> _pendingSeen;
+	// The sweep's drop: a fresh-client POST, never performCtrl()'s _ctrlMutex, so answerCall() cannot queue behind it.
+	bool dropOrphanLeg(const std::string& leg);
+	void armOrphanSweep(uint64_t postSeq, uint64_t armSeq, const std::string& destination);
+	void orphanSweepBody();
 	std::atomic<TaskHandle_t> _maintHandle{nullptr};
 	static void maintTaskTrampoline(void* arg);
 	static void maintRefreshTaskTrampoline(void* arg);
 	bool wakeMaint(uint32_t job);   // false: no tel_maint task; the caller releases its gate
+	// #977: the orphan sweep has a task of its own. Its I/O (a list GET, a drop POST, a getaddrinfo with no timeout)
+	// cannot be stopped once started, and a restart runs on tel_maint, so tel_maint never runs, joins or waits for it.
+	std::atomic<TaskHandle_t> _sweepHandle{nullptr};
+	// Its stack and TCB, allocated once at construction (#479, like a call slot's rxMem) so start() allocates nothing
+	// and the 6 KB sit in PSRAM, not internal RAM. Safe: nothing on the sweep's path writes flash or runs in an ISR.
+	static constexpr uint32_t kSweepStackBytes = 6144;
+	pd::StaticTaskSlot _sweepMem;
+	bool wakeSweep();   // false: no tel_sweep task
+	static void sweepTaskTrampoline(void* arg);
 	// Issue #336: same _restartRequested mechanism as the leak-count path above,
 	// triggered instead by a disconnected/errored WS with an expiring/expired
 	// token -- see its own definition for why reconnect-in-place can't fix this.
@@ -494,8 +532,11 @@ private:
 	// sosLane (#941): an emergency makeCall()'s GET; uses _sosStatusClient, never _statusMutex.
 	// warm (#948): start()'s warm GET on the sos handle. Not a 911: if it loses the claim it records no
 	// fallback witness line.
+	// fresh (#977): the orphan sweep's read. A handle of its own, no _statusMutex, so it holds nothing an inbound
+	// leg's caller-name GET waits for.
 	bool httpGetBody(const std::string& url, std::string& bodyOut, int* statusOut = nullptr, bool sosLane = false,
-	                 bool warm = false);
+	                 bool warm = false, bool fresh = false,
+	                 int64_t deadlineUs = 0);   // #977: != 0, each step runs under this deadline (the sweep's read)
 	// First participant id currently on our DN (single-leg assumption), or "" if none / on error.
 	std::string reconcileParticipantId();
 	// POST + capture the response body (for makecall result.id). Fresh client (not the persistent
@@ -505,7 +546,8 @@ private:
 	// return with *requestSentOut == true is UNKNOWN state, not a declined call --
 	// 3CX may well have set the call up. Callers that can reconcile must not treat
 	// the two the same.
-	bool httpPostBody(const std::string& url, const char* contentType, const std::string& body, std::string& respBody, int* statusOut = nullptr, bool* requestSentOut = nullptr);
+	bool httpPostBody(const std::string& url, const char* contentType, const std::string& body, std::string& respBody, int* statusOut = nullptr, bool* requestSentOut = nullptr,
+	                  int64_t deadlineUs = 0);   // #977: != 0, each step runs under this deadline (the sweep's drop)
 	// The leg WE control for an outbound call: makecall result.id, else a destination digit-suffix
 	// match in the live participant list — the id Telephony authorizes us to stream/drop (issue #40).
 	// #349 follow-up: listStatusOut reports the HTTP status of the live-participant-list
@@ -518,7 +560,11 @@ private:
 	                               int* listStatusOut = nullptr,
 	                               telephony::OwnLegSource* sourceOut = nullptr,   // #379
 	                               telephony::ListLegCounts* countsOut = nullptr,   // #349: what the list held
-	                               bool skipOurs = false);   // #349: skip a leg an earlier call left listed
+	                               bool skipOurs = false,    // #349: skip a leg an earlier call left listed
+	                               bool fresh = false,       // #977: the sweep's read, see httpGetBody
+	                               std::string* partyDnOut = nullptr,    // #977: the pick's party_dn and
+	                               std::string* partyCidOut = nullptr,
+	                               int64_t deadlineUs = 0);   // #977: the sweep's read, see httpGetBody  // party_caller_id, as the record carried them
 	// Status of a specific leg read from the LIST (GET /participants -> find id). Replaces
 	// getParticipantStatus(id), which 403s for a leg this DN cannot directly control (issue #40).
 	// sosLane (#949): the tel_wsw worker's read for a 911/933 slot; uses _sosStatusClient, never _statusMutex.

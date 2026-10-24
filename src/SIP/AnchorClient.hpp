@@ -66,6 +66,19 @@ public:
 	// any Answered event arrives — keeping call correlation correct under concurrency.
 	virtual bool makeCall(const std::string& destination, std::string* ownLegOut = nullptr) = 0;
 
+	// #1095: has the external system removed this leg since makeCall() named it? Asked
+	// once, after the engine has bound the leg to its session: a removal that came in
+	// before the bind reached the engine as a Dropped with no session to match. Quick,
+	// non-blocking, no allocation. Default: no provider reports one.
+	virtual bool ownLegRemovedSinceNamed(const std::string& ownLeg) { (void)ownLeg; return false; }
+
+	// #1103: free a leg the external system has already removed (ownLegRemovedSinceNamed()
+	// said yes): tombstone it and stop its media streams, locally. Never a drop request:
+	// there is no leg left to drop (3CX answers 403), and the request would hold the
+	// control connection a PSAP callback's answer needs. May join the leg's rx task, so
+	// it is never called under the engine's lock. Default: nothing held locally.
+	virtual void releaseRemovedLeg(const std::string& ownLeg) { (void)ownLeg; }
+
 	// Accept an inbound call the external system is delivering (mirror of makeCall).
 	// Call this once the local extension has accepted; participantId is from CallEvent::Incoming.
 	virtual bool answerCall(const std::string& participantId) = 0;

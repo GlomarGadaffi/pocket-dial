@@ -20,9 +20,9 @@ choice), [SCALING.md](SCALING.md) §1 and §5 (why the cap exists, pool sizing),
 The SoftAP build configures the Wi-Fi driver for a fixed number of associated stations:
 
 ```c
-#define EXAMPLE_MAX_STA_CONN       10        // main/esp_main.cpp:38
+#define EXAMPLE_MAX_STA_CONN       10        // main/esp_main.cpp:39
 ...
-wifi_config.ap.max_connection = EXAMPLE_MAX_STA_CONN;   // main/esp_main.cpp:121
+wifi_config.ap.max_connection = EXAMPLE_MAX_STA_CONN;   // main/esp_main.cpp:136
 ```
 
 `10` is a **build-time constant**, not a config knob. There is no NVS key or dashboard field
@@ -143,11 +143,11 @@ Phones associate to the APs. The APs and the pocket-dial board all sit on one wi
 
 ```mermaid
 flowchart LR
-    P1[Phone] -- "Wi-Fi, one SSID" --> AP1[Consumer AP]
-    P2[Phone] -- "Wi-Fi, one SSID" --> AP2[Consumer AP]
-    AP1 --- LAN[Wired LAN segment]
+    P1["Phone"] -- "Wi-Fi, one SSID" --> AP1["Consumer AP"]
+    P2["Phone"] -- "Wi-Fi, one SSID" --> AP2["Consumer AP"]
+    AP1 --- LAN["Wired LAN segment"]
     AP2 --- LAN
-    LAN --- PD[pocket-dial registrar on one LAN IP]
+    LAN -- "SIP over UDP 5060 (SIP_PORT, esp_main_eth.cpp:178)" --- PD["pocket-dial registrar on one LAN IP (sip_server task)"]
 ```
 
 ### Why no firmware change is needed
@@ -158,7 +158,7 @@ pocket-dial's Wi-Fi role and its SIP-server role are already decoupled in the co
   `TOPOLOGY_INFRA` (its own SoftAP, which is what the cap in §1 applies to) and
   `TOPOLOGY_CLIENT` (join an existing network as an ordinary station via `wifi_init_sta()`).
   The flag is switched from the dashboard, or with the `101` DTMF admin code, which reboots the
-  device (`main/esp_main.cpp:44-45` and `:453`; `src/SIP/DtmfFeatureCodes.cpp:371`;
+  device (`main/esp_main.cpp:44-46` and `:469`; `src/SIP/DtmfFeatureCodes.cpp:375`;
   [THREAT_MODEL.md §5.5](THREAT_MODEL.md)).
 - Or skip Wi-Fi for the board entirely and use the `eth` build (W5500/LAN8720), which has
   **no station-association ceiling at all**. See [HARDWARE_SELECTION.md §2](HARDWARE_SELECTION.md),
@@ -180,21 +180,25 @@ One caveat applies if the board itself is the `wifi` build in `TOPOLOGY_CLIENT`,
 `eth` build. TB-1 does not disappear. It becomes a fallback.
 
 On boot in `TOPOLOGY_CLIENT`, the board needs a saved SSID. If none is saved, `wifi_init_sta()`
-gives up at `main/esp_main.cpp:204`. If one is saved, the board has 15 s to join the upstream
-network (`main/esp_main.cpp:222`), and `wifi_init_sta()` gives up if it does not. In either case
-the boot path falls straight back to `wifi_init_softap()` (`main/esp_main.cpp:461-482`), which
+gives up at `main/esp_main.cpp:218-221`. If one is saved, the board has 15 s to join the upstream
+network (`main/esp_main.cpp:233-237`), and `wifi_init_sta()` gives up if it does not. In either case
+the boot path falls straight back to `wifi_init_softap()` (`main/esp_main.cpp:477-498`), which
 silently re-creates the board's own SoftAP. That AP is open unless `ap_secure` is set.
 
 ```mermaid
 flowchart TD
-    A[Boot in TOPOLOGY_CLIENT] --> B{Saved SSID?}
-    B -- No --> F[wifi_init_softap]
-    B -- Yes --> C{Joined upstream within 15 s?}
-    C -- Yes --> D[Station on upstream network]
-    C -- No --> F
-    F --> G{ap_secure set?}
-    G -- Yes --> H[SoftAP with WPA2-PSK]
-    G -- No --> I[Open SoftAP]
+    A["app_main reads NVS wifi_mode, default TOPOLOGY_INFRA (main/esp_main.cpp:464-473)"] --> A2{"wifi_mode is TOPOLOGY_CLIENT?"}
+    A2 -- No --> F
+    A2 -- Yes --> B{"Saved wifi_ssid? (esp_main.cpp:213)"}
+    B -- No --> W["wifi_init_sta returns empty string"]
+    B -- Yes --> C{"STA_GOT_IP_BIT within 15 s? (esp_main.cpp:233-237)"}
+    C -- Yes --> D["Station on upstream network, SIP on that IP"]
+    C -- No --> W
+    W --> T["esp_wifi_stop, esp_wifi_deinit, delete STA event group, topology = INFRA (esp_main.cpp:477-493)"]
+    T --> F["wifi_init_softap (esp_main.cpp:496-498)"]
+    F --> G{"ap_secure set? (esp_main.cpp:144)"}
+    G -- Yes --> H["SoftAP with WIFI_AUTH_WPA2_PSK"]
+    G -- No --> I["WIFI_AUTH_OPEN SoftAP (esp_main.cpp:154)"]
 ```
 
 So an upstream Wi-Fi outage at boot time quietly reopens exactly the boundary this topology was

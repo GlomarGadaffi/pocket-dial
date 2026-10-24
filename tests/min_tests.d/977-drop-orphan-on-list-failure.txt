@@ -1,0 +1,2 @@
+# SosStatusGet_test.cpp: 28 (#977 orphan sweep: SosOrphanSweep 27 = the arm decision, the unchanged 503, the step table, drop after reads, give up within the bound, two candidates left alone, late start, stopping anchor, failed drop, own-leg hold vs a late upsert, the hold, the callback / concurrent-911 / party / unslotted-live-911 / redial scenarios, the seen-id table and the arm snapshot; SosOrphanSweepWitness 1). tests/tools/test_anchor_orphan_sweep.py (unittest) pins the ESP-only wiring: 0 to the gtest floor.
+28

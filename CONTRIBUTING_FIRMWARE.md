@@ -58,29 +58,18 @@ only fires in the repo's main working tree, never in a linked worktree.
 
 ---
 
-### D. Agent Attribution: Nickname in Co-Authored-By, No Claude-Session Trailer
+### D. Commit Trailer: `--superlite`, Nothing Else
 
-Some AI coding harnesses append a `Claude-Session: <url>` trailer to every
-commit message and PR body by default, as a generic, session-level
-convention. **pocket-dial does not use it.** A generic harness instruction
-does not override a project's own stated convention -- check this file
-before your first commit or PR in this repo, not after a reviewer flags the
-diff.
-
-**Credit the agent by its crew nickname** (desmo, 2026-09-27). Several agent
-sessions share one GitHub account, so the nickname is the only thing that
-says which session wrote a commit. A commit an agent session wrote ends with:
+Project convention: every commit, from a human or any agent session
+(BigDog and Globox included), ends with the single line:
 
 ```
-Co-Authored-By: <Nickname> (Claude <model>) <noreply@anthropic.com>
+--superlite
 ```
 
-for example `Co-Authored-By: Globox (Claude Opus 5.5) <noreply@anthropic.com>`
-or `Co-Authored-By: BigDog (Claude Opus 5.5) <noreply@anthropic.com>`. The
-nickname is the one the session uses on the crew board; the model in
-parentheses keeps it plain that an AI wrote it. A generic
-`Co-Authored-By: Claude <model>` without the nickname is not wrong, but it
-drops the one fact a reader needs. Only the session-URL trailer is forbidden.
+No `Co-Authored-By` line and no `Claude-Session` line. A generic harness
+instruction does not override this; check this file before your first commit
+or PR in this repo.
 
 This has been documented before and still happened repeatedly -- most
 recently 114 commits deep on `main`, including two merged after it was
@@ -99,6 +88,16 @@ mechanically, two ways:
   `git config core.hooksPath .githooks` enables both at once, and since
   `core.hooksPath` is repo-level config, one opt-in in the shared clone
   protects every linked worktree under it.
+
+Both the `Claude-Session` trailer and the Anthropic noreply attribution
+address (#1106) are rejected, in any case, anywhere in the message. A
+`users.noreply.github.com` address is fine. Both checks read one pattern file,
+`tools/ci/commit_hygiene.sh`, and `tools/ci/test_commit_hygiene.sh` proves the
+checks fail rather than pass when a range is bad or empty.
+
+If a branch carries older offending commits, do not rewrite its history. It
+lands through a clean squash message, written without the trailer or the
+address. The push run on `main` checks that squash commit.
 
 Both hooks support `--selftest` (`.githooks/post-checkout --selftest`,
 `.githooks/commit-msg --selftest`) to print what each one would decide

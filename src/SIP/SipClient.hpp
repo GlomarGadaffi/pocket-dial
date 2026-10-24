@@ -46,6 +46,8 @@ public:
 	bool isExpired(std::chrono::steady_clock::time_point now) const;
 	// Negotiated lease length echoed back to the client in the 200 OK.
 	int getExpiresSeconds() const;
+	// #1089: lapse the lease now; the next sweep prunes the binding (a de-register deferred past a live 911).
+	void expireLease() { _expiresAt = std::chrono::steady_clock::now() - std::chrono::seconds(1); }
 
 	// ── OPTIONS Keepalive tracking ───────────────────────────────────
 	void markActive();
