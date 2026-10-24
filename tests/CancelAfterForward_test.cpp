@@ -105,3 +105,41 @@ TEST(CancelAfterForward, CancelOfAnUnforwardedCallStillReachesTheDialledCallee)
 	EXPECT_EQ(countTo(t.sent, "192.168.50.21", "CANCEL sip:402"), 1);
 	EXPECT_EQ(countTo(t.sent, "192.168.50.23", "CANCEL"), 0);
 }
+
+// #1121 item 1 / #1122: Session::reset() must clear the forward pair. Call one is forwarded
+// 402 -> 403 and ended; call two (401 -> 404) lands on the recycled slot and is CANCELled.
+// The CANCEL goes to 404 only, never to call one's forward target.
+TEST(CancelAfterForward, ARecycledSlotDoesNotCancelTheEarlierCallsForwardTarget)
+{
+	H t;
+	t.h.handle(reg("401", "192.168.50.20", "r1")); t.h.handle(reg("402", "192.168.50.21", "r2"));
+	t.h.handle(reg("403", "192.168.50.23", "r3")); t.h.handle(reg("404", "192.168.50.24", "r4"));
+	t.h.setForward("402", "always", "403");
+	t.h.handle(inv("401", "402", "192.168.50.20", "rc1", "z9hG4bKrc1"));
+	auto first = t.h.getSession("Call-ID: rc1");
+	ASSERT_TRUE(first.has_value());
+	Session* slot = first.value().get();
+	first.reset();
+	ASSERT_EQ(countTo(t.sent, "192.168.50.23", "INVITE sip:403"), 1);
+	t.h.handle(mk("SIP/2.0 486 X\r\nVia: SIP/2.0/UDP 192.168.50.20:5060;branch=z9hG4bKrc1\r\n"
+		"From: <sip:401@server>;tag=ftrc1\r\nTo: <sip:403@server>;tag=btrc1\r\nCall-ID: rc1\r\n"
+		"CSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n", "192.168.50.23"));
+	t.h.handle(mk("ACK sip:402@server SIP/2.0\r\nVia: SIP/2.0/UDP 192.168.50.20:5060;branch=z9hG4bKrc1\r\n"
+		"From: <sip:401@server>;tag=ftrc1\r\nTo: <sip:402@server>;tag=btrc1\r\nCall-ID: rc1\r\n"
+		"CSeq: 1 ACK\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n", "192.168.50.20"));
+	ASSERT_FALSE(t.h.getSession("Call-ID: rc1").has_value()) << "call one must be over";
+
+	t.h.handle(inv("401", "404", "192.168.50.20", "rc2", "z9hG4bKrc2"));
+	auto second = t.h.getSession("Call-ID: rc2");
+	ASSERT_TRUE(second.has_value());
+	ASSERT_EQ(second.value().get(), slot) << "call two must land on the recycled slot";
+	second.reset();
+	ASSERT_EQ(countTo(t.sent, "192.168.50.24", "INVITE sip:404"), 1);
+	t.sent.clear();
+	t.h.handle(cancel("401", "404", "192.168.50.20", "rc2", "z9hG4bKrc2"));
+	int total = 0;
+	for (auto& p : t.sent) if (p.second && p.second->toString().rfind("CANCEL ", 0) == 0) ++total;
+	EXPECT_EQ(total, 1) << "exactly one CANCEL";
+	EXPECT_EQ(countTo(t.sent, "192.168.50.24", "CANCEL sip:404"), 1) << "to the second callee";
+	EXPECT_EQ(countTo(t.sent, "192.168.50.23", "CANCEL"), 0) << "never to call one's forward target";
+}
