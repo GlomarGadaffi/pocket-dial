@@ -39,8 +39,9 @@ ending (`HoldEnd`, TA.cpp:2500-2505), the sweep finding and noting the leg (TA.c
 4 s bound. It covers only an id first upserted while a makeCall was pending, between the POST and
 the arm (`_pendingSeen.seenIn`, TA.cpp:3644). So it adds no id to the set #888 already ignores: it
 lengthens how long those ids' repeat upserts are ignored, by up to 4 s past the return, on this
-double failure only. Any other id, such as a PSAP callback that first appears after the return, sees
-the real count and rings (Rule 5). A held id is still not queued or replayed, and its `ignoredPending`
+double failure only. Any other id, such as a PSAP callback that first appears after the return, is not
+held by #977 (TA.cpp:3644): it is classified on the real count. With no outbound in flight it
+rings; while an outbound rings it is absorbed, as section 2 describes. A held id is still not queued or replayed, and its `ignoredPending`
 witness line reports an age measured from the last real makeCall.
 
 After the window closes, only two things could still find the ignored participant, and neither does:
@@ -65,7 +66,7 @@ is up to ~120 s, not 1-3 s, whenever an outbound is ringing. The pending-only re
 
 ## 3. Can a callback be lost? Two separate questions
 
-**Proven by reading:** an unmatched upsert during the window is discarded without being held, and no
+**Proven by reading:** an unmatched upsert during the window is discarded without being replayed, and no
 later code path re-derives it from `/participants`. If 3CX sends exactly one such upsert, it is lost.
 
 **Depends on 3CX behaviour nobody here has verified:**
