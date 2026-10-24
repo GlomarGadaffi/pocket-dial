@@ -131,6 +131,16 @@ void TelephonyApiConfig::scrub(std::string& s)
 	s.clear();
 }
 
+bool TelephonyApiConfig::slotType(size_t idx, TelephonyProviderType& out) const
+{
+	if (idx >= kSlots)
+	{
+		return false;
+	}
+	out = _slots[idx].type;
+	return true;
+}
+
 TelephonyApiConfig::SlotView TelephonyApiConfig::view(size_t idx) const
 {
 	SlotView v;
