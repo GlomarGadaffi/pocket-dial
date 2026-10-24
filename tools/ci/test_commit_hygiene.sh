@@ -52,6 +52,23 @@ hook_case "plain message" "fix: x
 
 --superlite" accept
 
+# A checker that ERRORS (rc 2) must make the hook reject, never pass. Copy the
+# hook next to a stub checker that always exits 2.
+mkdir -p "$TMP/stub/.githooks" "$TMP/stub/tools/ci"
+cp "$HOOK" "$TMP/stub/.githooks/commit-msg"
+printf '#!/bin/sh\nexit 2\n' > "$TMP/stub/tools/ci/commit_hygiene.sh"
+printf 'fix: x\n\n--superlite\n' > "$TMP/msg"
+sh "$TMP/stub/.githooks/commit-msg" "$TMP/msg" >/dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 1 ]; then ok "hook rejects when the checker errors (rc 2)"
+else bad "hook must reject when the checker errors (rc=$rc)"; fi
+
+# The checker itself: an unknown kind is an error (2), not "clean".
+printf 'x\n' | sh "$LIB" match nonsense >/dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 2 ]; then ok "checker errors (rc 2) on an unknown kind"
+else bad "checker unknown kind should be rc 2 (rc=$rc)"; fi
+
 # Range cases need a throwaway repo.
 R="$TMP/repo"
 git init -q "$R" || { bad "git init"; exit 1; }

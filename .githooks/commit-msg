@@ -36,9 +36,17 @@ if [ ! -f "$LIB" ]; then
     exit 1
 fi
 
-# check_message TEXT KIND: succeeds (0) if TEXT carries KIND (trailer|address).
+# check_message TEXT KIND: returns 0 if TEXT carries KIND (trailer|address),
+# 1 if clean. Any other checker status (rc 2 = checker error) fails closed:
+# the commit is rejected, never passed.
 check_message() {
     printf '%s\n' "$1" | sh "$LIB" match "$2"
+    cmrc=$?
+    case "$cmrc" in
+        0|1) return "$cmrc" ;;
+    esac
+    echo "commit-msg: checker failed (rc ${cmrc}); rejecting rather than passing unchecked" >&2
+    exit 1
 }
 
 if [ "$1" = "--selftest" ]; then

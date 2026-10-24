@@ -37,17 +37,29 @@ pattern_for() {
 # is already in a variable, so this is belt and braces.
 hit() { printf '%s\n' "$2" | grep -Eic "$1" >/dev/null; }
 
+# verdict PAT TEXT: 0 = forbidden content found, 1 = clean. Any other grep
+# status is a checker error: exit 2, never "clean".
+verdict() {
+    hit "$1" "$2"
+    vrc=$?
+    case "$vrc" in
+        0|1) return "$vrc" ;;
+    esac
+    echo "::error::commit_hygiene: grep failed (rc ${vrc}); refusing to report clean." >&2
+    exit 2
+}
+
 cmd="${1:-}"
 kind="${2:-}"
 
 case "$cmd" in
 match)
     pattern_for "$kind"
-    hit "$PAT" "$(cat)"
+    verdict "$PAT" "$(cat)"
     ;;
 text)
     pattern_for "$kind"
-    if hit "$PAT" "$(cat)"; then
+    if verdict "$PAT" "$(cat)"; then
         echo "::error::${3:-The text} carries ${WHAT}."
         exit 1
     fi
@@ -73,7 +85,7 @@ range)
             exit 2
         fi
         n=$((n + 1))
-        if hit "$PAT" "$msg"; then
+        if verdict "$PAT" "$msg"; then
             subject="$(git log -1 --format=%s "$sha" 2>/dev/null)"
             echo "::error::Commit ${sha} (\"${subject}\") carries ${WHAT}."
             found=1
