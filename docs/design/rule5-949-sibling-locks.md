@@ -55,7 +55,7 @@ Fixed on main. #1088 gave `getLegStatus` a lane parameter and the `tel_wsw` work
 
 ## 3. Hold 2: the inbound PSAP callback's ring waits on a caller lookup under `_statusMutex`
 
-**Lock and holder.** Same `_statusMutex`, same holders as hold 1, through `getParticipantCaller` (TA.cpp:1934-1969), which calls the non-sos `httpGetBody` (TA.cpp:1946) [verified].
+**Lock and holder.** Same `_statusMutex`, same holders as hold 1, through `getParticipantCaller` (TA.cpp:1934-1969), which calls the non-sos `httpGetBody` (TA.cpp:1947) [verified].
 
 **Waiter.** The `tel_wsw` pass for an inbound leg, inbound branch: `if (caller.empty()) caller = getParticipantCaller(controlLeg);` at TA.cpp:3465, and only after it returns does `evCb(CallEvent::Incoming ...)` run (TA.cpp:3468-3472) [verified]. The comment at TA.cpp:3461-3463 says the WS event's `attached_data` is "often null on a route point", so the lookup is the common case, not the rare one. The handler's `Incoming` branch is `routeInboundAnchorCall` (RH.cpp:621-625), which rings the extensions; so a PSAP callback's ring starts only after this GET returns [verified].
 
@@ -123,7 +123,7 @@ Each lands as its own PR, red test first. They do not share code beyond holds 1 
 
 | Hold | First red test | Red today because | Positive control |
 |---|---|---|---|
-| 1 | Fixed by #1088: `tests/tools/test_anchor_leg_status_sos_lane.py` pins the wiring and `OutboundLegStatus_test.cpp` covers the Unknown step | Was red on `getLegStatus(const std::string&)` having no lane and the worker call passing none; now `getLegStatus(legId, bool sosLane)` is TA.cpp:1896 and the worker call at :3512 passes it | Ordinary callers (`reconcile`, `getParticipantCaller`, a non-emergency slot) still reach the `_statusMutex` path. Plus a gtest for the pure "what does a claim-held "" mean for an emergency slot" step once the operator rules |
+| 1 | Fixed by #1088: `tests/tools/test_anchor_leg_status_sos_lane.py` pins the wiring and `OutboundLegStatus_test.cpp` covers the Unknown step | Was red on `getLegStatus(const std::string&)` having no lane and the worker call passing none; now `getLegStatus(legId, bool sosLane)` is TA.cpp:1896 and the worker call at :3512 passes it | Ordinary callers (`reconcile`, `getParticipantCaller`, a non-emergency slot) still reach the `_statusMutex` path. Plus a gtest for the pure "what does a claim-held "" mean for an emergency slot" step, which the operator ruled on 2026-10-20 (Unknown) and #1088 shipped |
 | 2 | Same file: in the inbound branch `evCb(... Incoming ...)` precedes the caller lookup in source order and the lookup is still performed | Today `getParticipantCaller` (TA.cpp:3465) comes before `Incoming` (:3470) | The lookup still happens, and `routeInboundAnchorCall` still defaults to "PSTN" on an empty id |
 | 3 | `tests/tools/test_anchor_emergency_noslot_drop.py`: the `all %d call slots busy` emergency block contains no `dropCall(` / `performCtrl(` and does record the leg in fixed storage; a drain site exists and reaches `performCtrl`. Plus a gtest for the fixed table (add, drain, overflow) | The block calls `dropCall(ownLeg)` directly (TA.cpp:699) | The leg is still dropped (the drain calls `performCtrl` with the drop URL), and `return false` / `ownLegOut->clear()` are unchanged |
 | 4 | none | the item does not hold | n/a |
