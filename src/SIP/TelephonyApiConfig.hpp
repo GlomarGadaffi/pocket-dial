@@ -197,6 +197,10 @@ public:
 	// Display-safe snapshot of one slot (default SlotView when idx is out of range).
 	SlotView view(size_t idx) const;
 
+	// The stored provider type only: no string copy. False (out untouched) when idx is
+	// out of range.
+	bool slotType(size_t idx, TelephonyProviderType& out) const;
+
 	// Engine-only plaintext access for boot-time provider init. nullptr when idx
 	// is out of range. Callers must not log or forward the secret.
 	const Slot* bootSlot(size_t idx) const;

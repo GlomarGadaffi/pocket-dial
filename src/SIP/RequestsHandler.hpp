@@ -785,6 +785,8 @@ public:
 	// writes everything here and now (the reset has begun; a stage would be refused).
 	std::vector<TelephonyApiConfig::SlotView> getTelephonyConfigSlots();
 	TelephonyApiConfig::SlotView getTelephonyConfigSlot(size_t idx);
+	// Type only, no SlotView string copies (HTTP handlers allocate nothing). False when idx is out of range.
+	bool getTelephonyConfigSlotType(size_t idx, TelephonyProviderType& out);
 	// #1073: enabling a slot, and activating one, take the caller's acceptance of the
 	// limitations (TelephonyApiConfig.hpp); without one that the slot already holds,
 	// they answer "Acceptance required: ...". The SBC route does not go through here.

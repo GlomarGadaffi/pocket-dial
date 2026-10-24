@@ -10655,6 +10655,12 @@ TelephonyApiConfig::SlotView RequestsHandler::getTelephonyConfigSlot(size_t idx)
 	return _tapiConfig.view(idx);
 }
 
+bool RequestsHandler::getTelephonyConfigSlotType(size_t idx, TelephonyProviderType& out)
+{
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
+	return _tapiConfig.slotType(idx, out);
+}
+
 RequestsHandler::TestDialResult RequestsHandler::testDialSlot(size_t idx)
 {
 	AnchorClient* anchor = nullptr;

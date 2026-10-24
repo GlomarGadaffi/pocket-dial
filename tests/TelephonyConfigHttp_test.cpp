@@ -311,6 +311,39 @@ TEST_F(TelephonyConfigHttpTest, DisablingAnEmptyLoopbackSlotKeepsItLoopback)
 	EXPECT_EQ(_handler->getTelephonyConfigSlot(2).type, TelephonyProviderType::Telephony);
 }
 
+// #1086: the other half of the rule. A disabled slot that already holds real provider
+// credentials is Telephony; a save that asks for nothing must not turn it back into Loopback.
+TEST_F(TelephonyConfigHttpTest, DisabledTelephonySlotSavedEmptyStaysTelephony)
+{
+	AdminSession a = loginOn(_port);
+	std::string cfg = httpRaw(_port, "PUT", "/api/telephony-config/2",
+		"enabled=0&baseUrl=https%3A%2F%2Fexample.invalid&clientId=id&secret=s&routeDn=100",
+		"pd_session=" + a.cookie, a.csrf);
+	ASSERT_EQ(statusOf(cfg), 200);
+	ASSERT_EQ(_handler->getTelephonyConfigSlot(2).type, TelephonyProviderType::Telephony);
+
+	std::string put = httpRaw(_port, "PUT", "/api/telephony-config/2", "enabled=0",
+		"pd_session=" + a.cookie, a.csrf);
+	ASSERT_EQ(statusOf(put), 200);
+	EXPECT_NE(bodyOf(put).find("\"type\":\"TELEPHONY-API\""), std::string::npos) << bodyOf(put);
+	EXPECT_EQ(_handler->getTelephonyConfigSlot(2).type, TelephonyProviderType::Telephony);
+	EXPECT_FALSE(_handler->getTelephonyConfigSlot(2).enabled);
+}
+
+// #1086: one provider field is enough to count as configuring the real provider.
+TEST_F(TelephonyConfigHttpTest, SingleFieldSaveOnLoopbackSlotMakesItTelephony)
+{
+	AdminSession a = loginOn(_port);
+	ASSERT_EQ(_handler->getTelephonyConfigSlot(2).type, TelephonyProviderType::Loopback);
+
+	std::string put = httpRaw(_port, "PUT", "/api/telephony-config/2", "routeDn=100",
+		"pd_session=" + a.cookie, a.csrf);
+	ASSERT_EQ(statusOf(put), 200) << bodyOf(put);
+	EXPECT_NE(bodyOf(put).find("\"type\":\"TELEPHONY-API\""), std::string::npos) << bodyOf(put);
+	EXPECT_EQ(_handler->getTelephonyConfigSlot(2).type, TelephonyProviderType::Telephony);
+	EXPECT_EQ(_handler->getTelephonyConfigSlot(2).routeDn, "100");
+}
+
 // ── #1073: enabling or activating a slot needs an explicit acceptance ──────────
 
 namespace
