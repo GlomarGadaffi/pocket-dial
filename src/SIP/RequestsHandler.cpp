@@ -5268,18 +5268,26 @@ void RequestsHandler::noteUnregisteredEmergencyDial(const std::shared_ptr<SipMes
 		unknownAlertReason(reason, sizeof reason, v.overflow, v.summary));
 }
 
-// #1115: tallies whose window ended with no further dial. Caller holds _mutex (tick()).
+// #1115: ONE tally whose window ended with no further dial is announced per tick (1 Hz).
+// One, not all: each notify() stages a single syslog Alert slot that the next one would
+// overwrite (the overwritten text survives in the engine log, and the SIP MESSAGE path
+// has no such slot), and a burst of pending tallies must not exhaust the message pool
+// ahead of a real emergency's own notification. At most kUnknownAlertMax + 2 tallies can
+// be pending, so the last one goes out within that many seconds. Caller holds _mutex.
+// The std::string temporaries below are on the attack path: notifyEmergency() and
+// EmergencyNotifier::notify() take std::string and build one themselves, so this
+// path is not heap-free. It is bounded at one call per second.
+// A tally still pending when the handler is destroyed is dropped; its first alert and
+// every refusal's EMERGENCY log line already went out.
 void RequestsHandler::flushUnknownEmergencyTallies(std::chrono::steady_clock::time_point now)
 {
 	pbx::UnknownEmergencyAlerts::Due due;
-	for (std::size_t i = 0; i <= pbx::kUnknownAlertMax && _unknownAlerts.takeExpired(now, due); ++i)
-	{
-		const pbx::EmergencyDial emergency = pbx::classifyEmergencyDial(due.dialed);
-		if (!emergency.isEmergency) continue;
-		char reason[112];
-		notifyEmergency(emergency, due.from, due.dialed, /*routed=*/false,
-			unknownAlertReason(reason, sizeof reason, due.overflow, due.held));
-	}
+	if (!_unknownAlerts.takeExpired(now, due)) return;
+	const pbx::EmergencyDial emergency = pbx::classifyEmergencyDial(due.dialed);
+	if (!emergency.isEmergency) return;
+	char reason[112];
+	notifyEmergency(emergency, due.from, due.dialed, /*routed=*/false,
+		unknownAlertReason(reason, sizeof reason, due.overflow, due.held));
 }
 
 // Issue #166 part 2. Kept to this one small function so the compliance-relevant

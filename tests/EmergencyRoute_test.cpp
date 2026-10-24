@@ -2953,7 +2953,11 @@ TEST(EmergencyUnknownCoalesce, ExpiredTalliesAreAnnouncedByTickBeforeTheirSlotsA
 	}
 	b.handler->ageUnknownEmergencyAlertsForTest(pbx::kUnknownAlertWindow + std::chrono::seconds(1));
 	b.sent.clear();
-	b.handler->tick();
+	for (size_t i = 0; i < pbx::kUnknownAlertMax; ++i)   // one summary per tick
+	{
+		b.handler->forceNextTickForTest();
+		b.handler->tick();
+	}
 	EXPECT_EQ(b.count("MESSAGE sip:200@"), pbx::kUnknownAlertMax) << b.dump();
 	EXPECT_EQ(sentContaining(b, "1 more since"), pbx::kUnknownAlertMax) << b.dump();
 
@@ -3011,4 +3015,40 @@ TEST(EmergencyUnknownCoalesce, ARegisteredFromSentFromAForeignAddressIsNeverCoal
 	EXPECT_EQ(sentContaining(b, "more since"), 0u) << b.dump();
 	EXPECT_EQ(b.handler->getE911UnknownAlertSuppressed(), 0u);
 	EXPECT_EQ(b.handler->getE911UnknownAlertOverflow(), 0u);
+}
+
+TEST(EmergencyUnknownCoalesce, A933OverflowNeverSwallowsOrRelabelsAForged911)
+{
+	Bench b;
+	armNotifyList(b);
+	for (size_t i = 0; i < pbx::kUnknownAlertMax; ++i)
+		unknownDial(b, "911", "uc-x-" + std::to_string(i), unknownIp(i));   // table full of 911s
+	b.sent.clear();
+
+	unknownDial(b, "933", "uc-x-t0", unknownIp(40));   // 933 opens ITS overflow entry
+	unknownDial(b, "911", "uc-x-e0", unknownIp(41));   // the 911 must open its own
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 2u) << b.dump();
+	EXPECT_EQ(sentContaining(b, "EMERGENCY: 911"), 1u) << b.dump();
+	EXPECT_EQ(sentContaining(b, "TEST: 933"), 1u) << b.dump();
+
+	for (int i = 0; i < 2; ++i) unknownDial(b, "933", "uc-x-t" + std::to_string(i + 1), unknownIp(42 + i));
+	for (int i = 0; i < 3; ++i) unknownDial(b, "911", "uc-x-e" + std::to_string(i + 1), unknownIp(44 + i));
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 2u) << "the rest are held:\n" << b.dump();
+
+	b.handler->ageUnknownEmergencyAlertsForTest(pbx::kUnknownAlertWindow + std::chrono::seconds(1));
+	b.sent.clear();
+	for (int i = 0; i < 2; ++i)
+	{
+		b.handler->forceNextTickForTest();
+		b.handler->tick();
+	}
+	EXPECT_EQ(b.count("MESSAGE sip:200@"), 2u) << b.dump();
+	size_t testSummaries = 0, liveSummaries = 0;
+	for (const auto& p : b.sent)
+	{
+		if (p.second.find("2 more since") != std::string::npos && p.second.find("TEST: 933") != std::string::npos) ++testSummaries;
+		if (p.second.find("3 more since") != std::string::npos && p.second.find("EMERGENCY: 911") != std::string::npos) ++liveSummaries;
+	}
+	EXPECT_EQ(testSummaries, 1u) << b.dump();
+	EXPECT_EQ(liveSummaries, 1u) << b.dump();
 }

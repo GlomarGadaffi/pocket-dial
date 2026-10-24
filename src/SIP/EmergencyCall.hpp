@@ -194,10 +194,11 @@ private:
 // 60 s: long enough to absorb a burst, short enough that a real unknown device
 // dialling again a minute later is announced afresh.
 inline constexpr std::chrono::seconds kUnknownAlertWindow{60};
-// 16 pairs: 8 sources x {911, 933}. What bounds distinct sources is the per-source
-// rate bucket and the allowlist, not a count of sources, so a flood from many forged
-// addresses can exceed 16: those share ONE overflow entry (one notice per window,
-// the rest counted and summarised), so fan-out stays at 17 notices per window.
+// 16 pairs: 8 sources x {911, 933}. Distinct sources are bounded upstream by the
+// 256-entry rate-bucket cap (further new sources are dropped) and by the one budget
+// all unregistered sources share for emergency INVITEs (4 burst, then 1 per 10 s). A
+// flood can still exceed 16 pairs: the rest share one overflow entry per number (one
+// notice per window, the rest counted and summarised), so fan-out is at most 18.
 inline constexpr std::size_t kUnknownAlertMax = 16;
 
 class UnknownEmergencyAlerts
@@ -238,19 +239,20 @@ public:
 		if (!spare)
 		{
 			if (_overflow < UINT32_MAX) ++_overflow;
-			if (!_over.used) { fill(_over, 0, isTest, from, dialed, now); return {true, true, 0}; }
-			return touch(_over, now, true);
+			Entry& o = _over[isTest ? 1 : 0];   // 911 and 933 never share: a test must not absorb a live dial
+			if (!o.used) { fill(o, 0, isTest, from, dialed, now); return {true, true, 0}; }
+			return touch(o, now, true);
 		}
 		fill(*spare, ip, isTest, from, dialed, now);
 		return {true, false, 0};
 	}
 
-	// One expired entry with a tally, cleared as it is returned. Call until false
-	// (at most kUnknownAlertMax + 1 times).
+	// One expired entry with a tally, cleared as it is returned. At most
+	// kUnknownAlertMax + 2 are ever pending (the table plus the two overflow entries).
 	bool takeExpired(std::chrono::steady_clock::time_point now, Due& out)
 	{
 		for (Entry& e : _e) if (due(e, now)) { give(e, false, out); return true; }
-		if (due(_over, now)) { give(_over, true, out); return true; }
+		for (Entry& o : _over) if (due(o, now)) { give(o, true, out); return true; }
 		return false;
 	}
 
@@ -261,7 +263,7 @@ public:
 	void ageForTest(std::chrono::steady_clock::duration d)
 	{
 		for (Entry& e : _e) e.since -= d;
-		_over.since -= d;
+		for (Entry& o : _over) o.since -= d;
 	}
 #endif
 
@@ -281,7 +283,7 @@ private:
 	{
 		const std::size_t n = std::min(v.size(), cap);
 		std::copy(v.begin(), v.begin() + n, dst);
-		dst[n] = ' ';
+		dst[n] = '\0';
 	}
 
 	static void fill(Entry& e, uint32_t ip, bool isTest, std::string_view from, std::string_view dialed,
@@ -332,7 +334,7 @@ private:
 	}
 
 	std::array<Entry, kUnknownAlertMax> _e{};
-	Entry _over{};
+	std::array<Entry, 2> _over{};   // [0] 911, [1] 933
 	uint32_t _overflow = 0;
 	uint32_t _suppressed = 0;
 };
