@@ -1716,6 +1716,35 @@ TEST(AnchorRouting, AnAnchorCallWhoseHandsetGoesSilentIsEndedButNeverWhileHeld)
 	EXPECT_EQ(byes, 1u);
 }
 
+// #1089: the shared teardown helper hangs up a phone peer; an anchor leg is dropped
+// by endCall() through its bridge, so the helper must not BYE it as well.
+TEST(AnchorRouting, AnExpiredLeaseOnAnAnchoredCallSendsTheHandsetNoByeOfItsOwn)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.setAnchorPlacesRealCallsForTest(true);
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-1089"));
+	ASSERT_TRUE(handler.getSession("Call-ID: anchor-1089").has_value()) << "precondition: anchored call up";
+	MediaBridge* bridge = handler.anchorBridgeForCallIdForTest("Call-ID: anchor-1089");
+	ASSERT_NE(bridge, nullptr) << "precondition: a bridge backs the call";
+	ASSERT_TRUE(bridge->isActive()) << "precondition: and it is active";
+	sent.clear();
+
+	handler.expireLeaseAndSweepForTest("501");
+
+	EXPECT_FALSE(handler.getSession("Call-ID: anchor-1089").has_value());
+	EXPECT_FALSE(bridge->isActive()) << "endCall() dropped the anchor leg through its bridge";
+	for (const auto& [addr, msg] : sent)
+	{
+		(void)addr;
+		EXPECT_NE(msg ? msg->toString().rfind("BYE ", 0) : 1u, 0u) << "a BYE went out";
+	}
+}
+
 TEST(AnchorRouting, ARingingEmergencyAnchorCallIsNeverReapedForNoAnswer)
 {
 	// #712 (desmo): a 911/933 still ringing on the anchor gets no PBX-side
@@ -1802,4 +1831,47 @@ TEST(FarLegReleasePin, AnAckDeadlineReapOfAnOutboundCallDropsTheLegOnce)
 
 	EXPECT_FALSE(rig.handler.getSession("Call-ID: anchor-691-reap").has_value()) << "the call ended";
 	EXPECT_EQ(loop->dropCallCount(), before + 1) << "the leg is dropped exactly once, not again by endCall()";
+}
+
+// #1029 (last #1023 site): the ring-expiry reap of an outbound anchor call answers the caller
+// 480, and that 480 must carry the To tag the call's 180 already carried (RFC 3261 s8.2.6.2).
+TEST(AnchorRouting, TheRingExpiryReapsFourEightyCarriesTheTagOfTheOneEightyTheCallerSaw)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.forceAsyncAnchorForTest(true);   // a real anchor's async branch: 180 now, no answer ever
+	handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
+	sent.clear();
+	handler.handle(makeInvite("501", "555", "192.168.9.51", "anchor-1029"));
+
+	std::string ringTo;
+	for (const auto& m : sent)
+		if (m.second && m.second->toString().find("SIP/2.0 180") != std::string::npos)
+			ringTo = std::string(m.second->getTo());
+	const auto tagPos = ringTo.find(";tag=");
+	ASSERT_NE(tagPos, std::string::npos) << "precondition: the 180 carried a To tag: " << ringTo;
+	const std::string ringTag = ringTo.substr(tagPos);
+
+	auto found = handler.getSession("Call-ID: anchor-1029");
+	ASSERT_TRUE(found.has_value());
+	ASSERT_EQ(found.value()->getState(), Session::State::Invited) << "precondition: still ringing";
+	found.value()->armRingTimer(std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	sent.clear();
+	handler.forceNextTickForTest();
+	handler.tick();
+
+	int n480 = 0;
+	std::string to480;
+	for (const auto& m : sent)
+		if (m.second && m.second->toString().find("SIP/2.0 480") != std::string::npos)
+		{
+			++n480;
+			to480 = std::string(m.second->getTo());
+		}
+	ASSERT_EQ(n480, 1) << "the reap answers the caller 480 exactly once";
+	EXPECT_NE(to480.find(ringTag), std::string::npos)
+		<< "the 480's To must carry the 180's tag " << ringTag << ", got: " << to480;
 }

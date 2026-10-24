@@ -19,10 +19,14 @@
 #include "TelephonyProvider.hpp"
 
 #include <cstdio>
+#include <fstream>
 #include <string>
 
 namespace
 {
+	// #1073: enabling a slot needs the administrator's acceptance of the current warning text.
+	const TelephonyApiConfig::Acceptance kAccepted{TelephonyApiConfig::kAcceptanceVersion, 2, 1760000000};
+
 	class TelephonyApiConfigTest : public ::testing::Test
 	{
 	protected:
@@ -112,7 +116,7 @@ TEST_F(TelephonyApiConfigTest, EnabledRealSlotRefusesIncompleteIdentity)
 	EXPECT_FALSE(_cfg.view(0).enabled);
 
 	// The complete slot saves.
-	ASSERT_EQ(_cfg.setSlot(0, base, false), "");
+	ASSERT_EQ(_cfg.setSlot(0, base, false, &kAccepted), "");
 	EXPECT_TRUE(_cfg.view(0).enabled);
 
 	// keepSecret validates the STORED secret, not the deliberately-empty
@@ -170,8 +174,41 @@ TEST_F(TelephonyApiConfigTest, EmergencyRouteDnIsRefusedEnabledOrDraft)
 
 	// A real route DN still saves, so the refusal is narrow.
 	base.routeDn = "100";
-	EXPECT_EQ(_cfg.setSlot(0, base, false), "");
+	EXPECT_EQ(_cfg.setSlot(0, base, false, &kAccepted), "");
 	EXPECT_TRUE(_cfg.view(0).enabled);
+}
+
+TEST_F(TelephonyApiConfigTest, StoredEmergencyRouteDnIsDisabledOnLoad)
+{
+	// #1060: a store written before the #1047 refusal can hold an emergency routeDn in an
+	// enabled slot, and the boot path copies an enabled slot's routeDn into the anchor
+	// config. load() disables such a slot; a slot with a real routeDn is left alone.
+	for (const char* dn : {"911", "933", "9911", "9933", "112", "113"})
+	{
+		{
+			std::ofstream f(_path, std::ios::trunc);
+			const char* dns[] = {dn, "100"};
+			for (size_t i = 0; i < 2; ++i)
+			{
+				const std::string k = "s" + std::to_string(i);
+				f << k << "type=" << static_cast<int>(TelephonyProviderType::Telephony) << "\n"
+				  << k << "en=1\n"
+				  << k << "url=https://pbx.example.invalid\n"
+				  << k << "id=id\n"
+				  << k << "sec=sssh\n"
+				  << k << "dn=" << dns[i] << "\n";
+			}
+			f << "active=0\n";
+		}
+		TelephonyApiConfig loaded;
+		loaded.setStorePath(_path);
+		loaded.load();
+
+		EXPECT_FALSE(loaded.view(0).enabled) << "routeDn " << dn << " must load disabled";
+		EXPECT_FALSE(loaded.bootSlot(0)->enabled) << "the boot path reads bootSlot(): " << dn;
+		EXPECT_TRUE(loaded.view(1).enabled) << "a real routeDn still loads enabled";
+		EXPECT_EQ(loaded.view(1).routeDn, "100");
+	}
 }
 
 TEST_F(TelephonyApiConfigTest, SecretNeverAppearsInView)
@@ -319,7 +356,7 @@ TEST_F(TelephonyApiConfigTest, EnabledNonLoopbackSlotRequiresHttps)
 	EXPECT_FALSE(_cfg.view(0).enabled);  // rejected edit must never apply
 
 	s.baseUrl = "https://example.invalid";
-	EXPECT_EQ(_cfg.setSlot(0, s, false), "");
+	EXPECT_EQ(_cfg.setSlot(0, s, false, &kAccepted), "");
 	EXPECT_TRUE(_cfg.view(0).enabled);
 }
 
@@ -336,6 +373,194 @@ TEST_F(TelephonyApiConfigTest, OutOfRangeIndexIsRejectedEverywhere)
 	const auto v = _cfg.view(TelephonyApiConfig::kSlots);
 	EXPECT_EQ(v.type, TelephonyProviderType::Loopback);  // default view, no crash
 }
+
+// ── #1073: enabling a slot needs the administrator's acceptance ───────────────
+
+namespace
+{
+	TelephonyApiConfig::Slot realSlot()
+	{
+		TelephonyApiConfig::Slot s;
+		s.type = TelephonyProviderType::Telephony;
+		s.enabled = true;
+		s.baseUrl = "https://pbx.example.invalid";
+		s.clientId = "id";
+		s.secret = "sssh";
+		s.routeDn = "100";
+		return s;
+	}
+
+	bool refusedForAcceptance(const std::string& err)
+	{
+		return err.rfind(TelephonyApiConfig::kAcceptanceRequiredPrefix, 0) == 0;
+	}
+}
+
+TEST_F(TelephonyApiConfigTest, EnablingASlotWithoutAcceptanceIsRefusedAndChangesNothing)
+{
+	const std::string err = _cfg.setSlot(0, realSlot(), false);
+	EXPECT_TRUE(refusedForAcceptance(err)) << "got: " << err;
+	EXPECT_NE(err.find("acceptLimitations=" + std::to_string(TelephonyApiConfig::kAcceptanceVersion)), std::string::npos)
+		<< "the error names the field that is missing: " << err;
+	EXPECT_FALSE(_cfg.view(0).enabled);
+	EXPECT_EQ(_cfg.view(0).baseUrl, "") << "a refused enable must not have saved the rest of the edit";
+	EXPECT_FALSE(_cfg.view(0).secretSet);
+
+	// An acceptance of some other warning-text version is no acceptance.
+	TelephonyApiConfig::Acceptance stale = kAccepted;
+	stale.version = static_cast<uint8_t>(TelephonyApiConfig::kAcceptanceVersion + 1);
+	EXPECT_TRUE(refusedForAcceptance(_cfg.setSlot(0, realSlot(), false, &stale)));
+	stale.version = 0;
+	EXPECT_TRUE(refusedForAcceptance(_cfg.setSlot(0, realSlot(), false, &stale)));
+	EXPECT_FALSE(_cfg.view(0).enabled);
+
+	// Disabling needs none.
+	TelephonyApiConfig::Slot draft = realSlot();
+	draft.enabled = false;
+	EXPECT_EQ(_cfg.setSlot(0, draft, false), "");
+}
+
+TEST_F(TelephonyApiConfigTest, AcceptanceIsStoredWithTheSlotWhoWhenAndWhichText)
+{
+	ASSERT_EQ(_cfg.setSlot(1, realSlot(), false, &kAccepted), "");
+	const auto v = _cfg.view(1);
+	EXPECT_TRUE(v.enabled);
+	EXPECT_TRUE(v.accepted);
+	EXPECT_FALSE(v.acceptanceMissing);
+	EXPECT_EQ(v.acceptedVersion, TelephonyApiConfig::kAcceptanceVersion);
+	EXPECT_EQ(v.acceptedRole, 2u);
+	EXPECT_EQ(v.acceptedAt, 1760000000u);
+	EXPECT_EQ(_cfg.acceptanceMissingMask(), 0u);
+
+	// Editing an enabled, accepted slot needs no new acceptance and keeps the stored one.
+	TelephonyApiConfig::Slot edit = realSlot();
+	edit.routeDn = "200";
+	ASSERT_EQ(_cfg.setSlot(1, edit, true), "");
+	EXPECT_EQ(_cfg.view(1).routeDn, "200");
+	EXPECT_EQ(_cfg.view(1).acceptedAt, 1760000000u);
+	EXPECT_EQ(_cfg.view(1).acceptedRole, 2u);
+
+#if !defined(_WIN32)
+	// ...and it is in the store, so a reboot still has it.
+	TelephonyApiConfig reloaded;
+	reloaded.setStorePath(_path);
+	reloaded.load();
+	EXPECT_TRUE(reloaded.view(1).accepted);
+	EXPECT_EQ(reloaded.view(1).acceptedVersion, TelephonyApiConfig::kAcceptanceVersion);
+	EXPECT_EQ(reloaded.view(1).acceptedRole, 2u);
+	EXPECT_EQ(reloaded.view(1).acceptedAt, 1760000000u);
+#endif
+}
+
+TEST_F(TelephonyApiConfigTest, DisablingClearsTheAcceptanceSoTheNextEnableAsksAgain)
+{
+	ASSERT_EQ(_cfg.setSlot(0, realSlot(), false, &kAccepted), "");
+	TelephonyApiConfig::Slot off = realSlot();
+	off.enabled = false;
+	ASSERT_EQ(_cfg.setSlot(0, off, true), "");
+	EXPECT_FALSE(_cfg.view(0).enabled);
+	EXPECT_FALSE(_cfg.view(0).accepted);
+	EXPECT_EQ(_cfg.view(0).acceptedAt, 0u);
+
+	EXPECT_TRUE(refusedForAcceptance(_cfg.setSlot(0, realSlot(), true)))
+		<< "each enable asks: the earlier acceptance did not survive the disable";
+	EXPECT_FALSE(_cfg.view(0).enabled);
+}
+
+TEST_F(TelephonyApiConfigTest, ActivatingNeedsAnAcceptanceTheSlotHoldsOrTheCallerCarries)
+{
+	TelephonyApiConfig::Slot draft = realSlot();
+	draft.enabled = false;
+	ASSERT_EQ(_cfg.setSlot(2, draft, false), "");
+
+	EXPECT_TRUE(refusedForAcceptance(_cfg.activateSlot(2, nullptr)));
+	EXPECT_EQ(_cfg.activeSlot(), TelephonyApiConfig::kNoActiveSlot) << "a refused activation selects nothing";
+
+	EXPECT_EQ(_cfg.activateSlot(2, &kAccepted), "");
+	EXPECT_EQ(_cfg.activeSlot(), 2u);
+	EXPECT_TRUE(_cfg.view(2).accepted);
+
+	// A slot that holds an acceptance activates without one.
+	ASSERT_EQ(_cfg.setSlot(3, realSlot(), false, &kAccepted), "");
+	EXPECT_EQ(_cfg.activateSlot(3, nullptr), "");
+	EXPECT_EQ(_cfg.activeSlot(), 3u);
+
+	// Deactivating, and a bad index, are not acceptance questions.
+	EXPECT_EQ(_cfg.activateSlot(TelephonyApiConfig::kNoActiveSlot, nullptr), "");
+	EXPECT_EQ(_cfg.activeSlot(), TelephonyApiConfig::kNoActiveSlot);
+	EXPECT_EQ(_cfg.activateSlot(TelephonyApiConfig::kSlots + 1, nullptr), "Bad slot index");
+}
+
+#if !defined(_WIN32)
+namespace
+{
+	// A store as an earlier build left it: slot 1 enabled and complete, no acceptance key at all.
+	void writeLegacyStore(const std::string& path, const char* accLine)
+	{
+		std::ofstream f(path, std::ios::trunc);
+		f << "s1type=" << static_cast<int>(TelephonyProviderType::Telephony) << "\ns1en=1\n"
+		  << "s1url=https://pbx.example.invalid\ns1id=id\ns1sec=sssh\ns1dn=100\n" << accLine
+		  << "active=1\n";
+	}
+}
+
+TEST_F(TelephonyApiConfigTest, ASlotEnabledBeforeThisShippedKeepsWorkingAndReportsTheMissingAcceptance)
+{
+	writeLegacyStore(_path, "");
+	TelephonyApiConfig legacy;
+	legacy.setStorePath(_path);
+	legacy.load();
+
+	const auto v = legacy.view(1);
+	EXPECT_TRUE(v.enabled) << "not disabled by this change";
+	EXPECT_TRUE(v.active);
+	EXPECT_TRUE(v.acceptanceMissing);
+	EXPECT_FALSE(v.accepted);
+	EXPECT_EQ(legacy.acceptanceMissingMask(), 1u << 1);
+	ASSERT_NE(legacy.bootSlot(1), nullptr);
+	EXPECT_TRUE(legacy.bootSlot(1)->enabled) << "the boot path still brings it up";
+	EXPECT_FALSE(legacy.view(0).acceptanceMissing) << "an unused slot is not 'missing' anything";
+
+	// Re-saving it enabled needs the acceptance like any enable, and a refusal leaves it as it was.
+	EXPECT_TRUE(refusedForAcceptance(legacy.setSlot(1, realSlot(), true)));
+	EXPECT_TRUE(legacy.view(1).enabled);
+	EXPECT_TRUE(legacy.view(1).active);
+	EXPECT_EQ(legacy.activateSlot(1, &kAccepted), "");
+	EXPECT_FALSE(legacy.view(1).acceptanceMissing);
+	EXPECT_EQ(legacy.acceptanceMissingMask(), 0u);
+}
+
+TEST_F(TelephonyApiConfigTest, AnAcceptanceOfAnOlderWarningTextCountsAsMissing)
+{
+	// The text changed (kAcceptanceVersion was bumped): what was stored for the old text is stale.
+	const std::string stale = std::to_string(TelephonyApiConfig::kAcceptanceVersion + 1);
+	const std::string line = "s1acc=" + stale + ",2,1700000000\n";
+	writeLegacyStore(_path, line.c_str());
+	TelephonyApiConfig loaded;
+	loaded.setStorePath(_path);
+	loaded.load();
+	EXPECT_TRUE(loaded.view(1).enabled);
+	EXPECT_TRUE(loaded.view(1).acceptanceMissing);
+	EXPECT_FALSE(loaded.view(1).accepted);
+
+	// A current-version line is read back whole.
+	const std::string good = "s1acc=" + std::to_string(TelephonyApiConfig::kAcceptanceVersion) + ",1,1700000000\n";
+	writeLegacyStore(_path, good.c_str());
+	TelephonyApiConfig fresh;
+	fresh.setStorePath(_path);
+	fresh.load();
+	EXPECT_TRUE(fresh.view(1).accepted);
+	EXPECT_EQ(fresh.view(1).acceptedRole, 1u);
+	EXPECT_EQ(fresh.view(1).acceptedAt, 1700000000u);
+
+	// A mangled line is no acceptance, not a crash.
+	writeLegacyStore(_path, "s1acc=garbage\n");
+	TelephonyApiConfig bad;
+	bad.setStorePath(_path);
+	bad.load();
+	EXPECT_TRUE(bad.view(1).acceptanceMissing);
+}
+#endif
 
 #if !defined(_WIN32)
 TEST_F(TelephonyApiConfigTest, PersistsAcrossReload)

@@ -200,6 +200,11 @@ namespace SipSecretStore
 		return setHa1(ext, SipDigest::computeHa1(ext, kRealm, plaintextSecret));
 	}
 
+	bool isValidHa1Entry(const std::string& ext, const std::string& ha1)
+	{
+		return isValidExt(ext) && isValidHa1(ha1);
+	}
+
 	bool setHa1(const std::string& ext, const std::string& ha1)
 	{
 		if (!isValidExt(ext) || !isValidHa1(ha1))

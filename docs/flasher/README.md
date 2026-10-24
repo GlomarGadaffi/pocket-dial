@@ -19,10 +19,19 @@ from this repository's GitHub Releases.
 
 ```mermaid
 flowchart LR
-    R["GitHub Release"] -->|"release.yml copies images"| P["Pages: docs/firmware/tag"]
-    P -->|"same-origin fetch"| B["Browser page"]
-    B -->|"Web Serial"| D["ESP32-S3 board"]
+    T["Push of a v* tag"] --> W["release.yml builds each variant, writes manifest.json (with cfgseed_offset read from the partition table binary)"]
+    W --> R["softprops/action-gh-release publishes the GitHub Release: all assets"]
+    R --> PP["Step Publish firmware to Pages runs tools/publish_pages_firmware.py"]
+    PP --> F["docs/firmware/tag/: .bin, manifest.json and flasher_args-*.json only, plus docs/firmware/index.json"]
+    F -->|"commit and push to main by github-actions[bot]"| P["GitHub Pages serves docs/"]
+    P -->|"same-origin fetch: index.json with no-cache, then manifest.json, then the images"| B["Browser page: docs/flasher/index.html"]
+    B -->|"dynamic import of esptool-js 0.6.1 from jsDelivr on Connect, then Web Serial at 921600 baud"| D["ESP32-S3 board"]
 ```
+
+The host binary, `partitions.csv` and `SHA256SUMS` stay on the Release only. Pages carries the
+files matched by `KEEP` in `tools/publish_pages_firmware.py:39`, because the page never fetches
+anything else. `index.json` lists each tag with its date, a `prerelease` flag (set when the tag
+contains `-`) and an explicit `files` array, because Pages offers no directory listing.
 
 ## Requirements
 
@@ -234,13 +243,18 @@ full flash. The panel says this too.
 
 ```mermaid
 flowchart TD
-    A{"Apply these settings to the board checked?"} -->|No| B["cfgseed is not in the flash plan, nothing is written"]
-    A -->|Yes| C{"Flash mode"}
-    C -->|Full flash| D["Partition table and seed written together"]
-    D --> E["Board reads the seed on first boot"]
-    C -->|App only| F{"Board partition table declares cfgseed?"}
-    F -->|No| G["Seed ignored until a full flash"]
-    F -->|Yes| H["Seed read at boot"]
+    A{"Apply these settings to the board checked? seedPanelEnabled, index.html:783"} -->|No| B["seedPart returns null: cfgseed is not in the flash plan, nothing is written (:844)"]
+    A -->|Yes| M{"Manifest carries cfgseed_offset? (:1043)"}
+    M -->|Yes| MA["Seed address comes from the manifest"]
+    M -->|"No: older release"| MB["Fallback CFGSEED_OFFSET 0xFFF000 and a logged warning that the firmware ignores it (:491, :849-852)"]
+    MA --> C{"Flash mode (flashFromRelease, :1511)"}
+    MB --> C
+    C -->|Full flash| D["Parts: bootloader, partition table, otadata, app, then the seed appended (:1533-1538)"]
+    C -->|"App only"| E["Parts filtered to app and otadata (:1528), then the seed appended: the partition table is not rewritten"]
+    D --> F{"Partition table now on the board declares cfgseed?"}
+    E --> F
+    F -->|Yes| G["Firmware reads the seed once at boot via DeviceConfig::applyFlashSeed, when gen is newer"]
+    F -->|No| H["Seed ignored until a Full flash from a release whose table declares cfgseed"]
 ```
 
 ## Local development

@@ -1513,3 +1513,32 @@ TEST(UnavailableToTag, AShortCalleeTagIsStillReusedByThe480)
 	EXPECT_EQ(toTagOf(unavailable), shortTag)
 		<< "the 480 must carry the tag the caller's 180 carried: " << unavailable;
 }
+
+// #1089: the voicemail deposit's dest is a stand-in "700" carrying the CALLER's own
+// address, so a lease lapsing on the depositor must not BYE that address with the tags
+// reversed. The session still ends.
+TEST(VoicemailDivert, AnExpiredLeaseOnTheDepositorEndsTheCallWithoutAByeToItself)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.40.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.40.22");
+	handler.handle(makeRegister("305", "192.168.40.12", "reg-305-d"));
+	handler.handle(makeRegister("306", "192.168.40.22", "reg-306-d"));
+	handler.setVoicemail("305", true);
+	const std::string callId = "vm-1089-lease";
+	handler.handle(makeInvite("306", "305", "192.168.40.22", callId, "z9hG4bKvm1089"));
+	handler.getSession("Call-ID: " + callId).value()->armRingTimer(
+		std::chrono::steady_clock::now() - std::chrono::seconds(1));
+	handler.tick();
+	ASSERT_FALSE(findSentTo(sent, callerAddr, "SIP/2.0 200 OK").empty()) << "precondition: deposit answered";
+	ASSERT_TRUE(handler.getSession("Call-ID: " + callId).has_value());
+	sent.clear();
+
+	handler.expireLeaseAndSweepForTest("306");
+
+	EXPECT_FALSE(handler.getSession("Call-ID: " + callId).has_value());
+	EXPECT_TRUE(findSentTo(sent, callerAddr, "BYE sip:").empty()) << "the departing phone was BYEd";
+}

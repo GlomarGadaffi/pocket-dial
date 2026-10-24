@@ -18,10 +18,10 @@ Read the two flags in this order:
 
 ```mermaid
 flowchart TD
-    A{"supported?"} -->|"no"| B["Board cannot keep a dump, so a present value of false means nothing. Fix: one-time serial flash of the current partition table"]
-    A -->|"yes"| C{"present?"}
-    C -->|"no"| D["No crash since the last erase"]
-    C -->|"yes"| E["A dump is stored"]
+    A{"supported? (CoreDumpStore.cpp:64-66)"} -->|"false"| B["Firmware built without CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH, or no DATA/COREDUMP partition. present is meaningless. Fix: one-time serial flash of the current partition table"]
+    A -->|"true"| C{"present? (CoreDumpStore.cpp:36-48, 68-71)"}
+    C -->|"false"| D["esp_core_dump_image_get failed, or storedSize under 16 or over the partition size, or no 7F 45 4C 46 at byte 12. No crash since the last erase"]
+    C -->|"true"| E["A dump is stored: GET /api/coredump, GET /api/coredump/info, POST /api/coredump/erase"]
 ```
 
 So `"present": false` means "no crash since the last erase" only when `supported` is `true`. With `"supported": false` it means nothing. The fix for such a board is a one-time serial flash of the current partition table.

@@ -853,3 +853,64 @@ TEST(FinalFailureRelay, A2xxThatCrossesTheCancelDisarmsTheBoundedWait)
 	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 487"), 0)
 		<< "the caller must not be sent a 487 after its 200";
 }
+
+// #1057 (RFC 3261 s9.2): the PBX is the UAS of the caller's CANCEL and answers it with its own 200 at
+// once, whether or not the callee ever answers. Before the fix the CANCEL was only relayed, so a
+// callee that sent 180 and then nothing left the caller's CANCEL transaction to time out.
+// RED on main: no "SIP/2.0 200" with CSeq CANCEL reaches the caller after the CANCEL.
+TEST(FinalFailureRelay, TheCallersCancelGetsTheProxysOwn200EvenWhenTheCalleeStaysSilent)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.50.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.50.20");
+	const sockaddr_in calleeAddr = addrFor("192.168.50.21");
+	handler.handle(makeRegister("401", "192.168.50.20", "reg-401"));
+	handler.handle(makeRegister("402", "192.168.50.21", "reg-402"));
+	handler.handle(makeInvite("401", "402", "192.168.50.20", "cb-7", "z9hG4bKcb7"));
+
+	sent.clear();
+	handler.handle(makeCancel("401", "402", "192.168.50.20", "cb-7", "z9hG4bKcb7"));
+	const std::string own200 = findSentTo(sent, callerAddr, "SIP/2.0 200");
+	EXPECT_FALSE(own200.empty()) << "the PBX answers the caller's CANCEL with a 200 in the same tick";
+	EXPECT_NE(own200.find("CSeq: 1 CANCEL"), std::string::npos) << "that 200 names the CANCEL transaction";
+	EXPECT_NE(own200.find(";tag="), std::string::npos) << "a 2xx carries a To tag (RFC 3261 s8.2.6.2)";
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 200"), 1) << "exactly one 200";
+	EXPECT_EQ(countSentTo(sent, calleeAddr, "CANCEL "), 1) << "the CANCEL is still relayed to the callee";
+
+	// The callee's own 200 to the relayed CANCEL is absorbed: relayed, the caller would get two.
+	sent.clear();
+	handler.handle(makeCancelOk("401", "402", "192.168.50.20", "192.168.50.21", "cb-7", "z9hG4bKcb7"));
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 200"), 0)
+		<< "the callee's 200 to the CANCEL is not relayed after the PBX answered it";
+	auto session = handler.getSession("Call-ID: cb-7");
+	ASSERT_TRUE(session.has_value());
+	EXPECT_TRUE(session.value()->isRingExpired(TestClock::now() + std::chrono::seconds(33)))
+		<< "the #1049 bound is still armed";
+}
+
+// Rule 5: an emergency caller's CANCEL gets the same 200, and the bound stays off it.
+TEST(FinalFailureRelay, AnEmergencyCallersCancelGetsTheSame200)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.50.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.50.22");
+	handler.handle(makeRegister("403", "192.168.50.22", "reg-403"));
+	handler.handle(makeRegister("404", "192.168.50.23", "reg-404"));
+	handler.handle(makeInvite("403", "404", "192.168.50.22", "cb-8", "z9hG4bKcb8"));
+	auto session = handler.getSession("Call-ID: cb-8");
+	ASSERT_TRUE(session.has_value());
+	session.value()->setEmergency(true);
+
+	sent.clear();
+	handler.handle(makeCancel("403", "404", "192.168.50.22", "cb-8", "z9hG4bKcb8"));
+	const std::string own200 = findSentTo(sent, callerAddr, "SIP/2.0 200");
+	EXPECT_FALSE(own200.empty()) << "an emergency caller's CANCEL is answered with a 200";
+	EXPECT_NE(own200.find("CSeq: 1 CANCEL"), std::string::npos);
+	EXPECT_EQ(countSentTo(sent, callerAddr, "SIP/2.0 200"), 1);
+}

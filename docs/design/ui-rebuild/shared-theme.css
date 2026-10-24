@@ -1,0 +1,86 @@
+/* shared-theme.css - ISA-101 HMI console, dark only. UTF-8, no backslashes, no double quotes. */
+
+/* 1. TOKENS: solid hex. Grey when nominal; colour only for exceptions. */
+:root{
+color-scheme:dark;
+--chassis:#121212;
+--panel:#1c1c1c;
+--grid:#333333;
+--text:#a0a0a0;
+--dim:#666666;
+--well:#050505;
+--p1:#ff2200;
+--p2:#ffaa00;
+--live:#00aaff;
+--bevel-hi:#3a3a3a;
+--bevel-lo:#000000;
+--f-ui:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
+--f-mono:ui-monospace,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace;
+--row:24px;
+}
+
+/* 2. BASE */
+*,*::before,*::after{box-sizing:border-box;border-radius:0}
+[hidden]{display:none!important}
+html,body{margin:0;background:var(--chassis);color:var(--text)}
+body{font:12px/16px var(--f-ui);padding:30px 0 32px}
+a{color:var(--text);text-decoration:underline}
+:focus-visible{outline:1px solid var(--text);outline-offset:-1px}
+kbd,code,.mono,.num,td.num,td.mono,.kv dd,.st,.well,.unit,.tile,.fk{font-family:var(--f-mono);font-variant-numeric:tabular-nums}
+kbd{font-size:11px;padding:0 4px;color:var(--text);background:var(--chassis);border:1px solid var(--grid)}
+button,.btn{margin:0;min-height:var(--row);padding:4px 6px;font:inherit;color:var(--text);background:var(--panel);border-style:solid;border-width:1px;border-color:var(--bevel-hi) var(--bevel-lo) var(--bevel-lo) var(--bevel-hi);cursor:pointer}
+button:hover,.btn:hover{background:var(--grid)}
+button:active,.btn:active{background:var(--text);color:var(--chassis);border-color:var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo)}
+[disabled],[aria-disabled='true']{color:var(--dim);cursor:not-allowed}
+[disabled]:hover,[aria-disabled='true']:hover{background:var(--panel)}
+input,select,textarea{margin:0;min-height:var(--row);padding:4px 6px;font:inherit;color:var(--text);background:var(--well);border:1px solid var(--grid)}
+input[type=checkbox],input[type=radio]{appearance:none;-webkit-appearance:none;width:12px;height:12px;min-height:0;padding:0;margin:0 4px 0 0;vertical-align:-2px;background:var(--well);border:1px solid var(--bevel-hi)}
+input[type=checkbox]:checked,input[type=radio]:checked{background:var(--text)}
+table{border-collapse:collapse;width:100%}
+th,td{padding:4px 6px;border:1px solid var(--grid);text-align:left;vertical-align:top}
+th{background:var(--panel);color:var(--text);font-weight:normal;font-size:10px;letter-spacing:.08em;text-transform:uppercase}
+fieldset{margin:0;min-width:0;padding:4px 6px 6px;border:1px solid var(--grid);background:var(--panel)}
+legend{padding:0 4px;background:var(--panel);color:var(--text);font:10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase}
+
+/* 3. COMPONENTS */
+.alarm-bar{position:fixed;top:0;left:0;right:0;z-index:10;display:flex;align-items:stretch;height:30px;overflow:hidden;white-space:nowrap;background:var(--panel);color:var(--text);border-bottom:1px solid var(--grid);font:12px/16px var(--f-mono)}
+.alarm-bar>*{display:flex;align-items:center;padding:0 6px;border-left:1px solid var(--grid)}
+.fkey-bar{position:fixed;left:0;right:0;bottom:0;z-index:10;display:flex;height:32px;background:var(--panel);border-top:1px solid var(--grid)}
+.fkey-bar>*{flex:1 1 0;min-width:0;height:100%;padding:0 4px;overflow:hidden;white-space:nowrap;text-align:left}
+.fk{margin-right:4px;font-size:11px;font-weight:bold}
+.pane{margin:0 -1px -1px 0;padding:4px 6px;border:1px solid var(--grid);background:var(--panel)}
+.lbl{display:inline-block;margin:-6px 0 0 -2px;padding:0 4px;background:var(--panel);color:var(--text);font:10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase}
+.well{display:inline-block;min-width:8ch;padding:3px 6px;text-align:right;background:var(--well);color:var(--text);border-style:solid;border-width:1px;border-color:var(--bevel-lo) var(--bevel-hi) var(--bevel-hi) var(--bevel-lo)}
+.unit{margin-left:4px;color:var(--dim)}
+.annunciator{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:0;border-top:1px solid var(--grid);border-left:1px solid var(--grid)}
+.tile{min-width:0;padding:4px 6px;background:#181818;color:#5c5c5c;border-right:1px solid var(--grid);border-bottom:1px solid var(--grid);font:10px/12px var(--f-mono);letter-spacing:.08em;text-transform:uppercase;overflow-wrap:anywhere}
+.st{display:inline-block;padding:0 4px;border:1px solid var(--panel);color:var(--text);white-space:nowrap}
+.st.live{border-color:var(--live)}
+.btn-arm.armed{color:var(--p2);border-width:4px;border-style:solid;border-image:repeating-linear-gradient(45deg, #ffaa00 0 6px, #000 6px 12px) 4}
+.btn-exec,.btn-exec:hover{background:var(--p1);color:#000;font-weight:bold}
+.btn-arm.armed.btn-exec,.btn-arm.armed.btn-exec:hover{background:var(--p1);color:#000}
+.bus-h{display:block;height:0;border-top:2px solid var(--dim)}
+.bus-v{display:block;width:0;min-height:var(--row);margin:0 auto;border-left:2px solid var(--dim)}
+.bus-h.live,.bus-v.live{border-color:var(--live)}
+.nav{margin:0;padding:0;list-style:none;border-top:1px solid var(--grid)}
+.nav a,.nav button{display:flex;align-items:center;justify-content:space-between;width:100%;min-height:var(--row);margin:0;padding:4px 6px;border:0;border-bottom:1px solid var(--grid);background:var(--chassis);color:var(--text);text-align:left;text-decoration:none}
+.nav a:hover:not([aria-current]),.nav button:hover:not([aria-current]){background:var(--grid)}
+.nav .kbd{margin-left:auto;padding-left:6px;font-size:11px;color:var(--text)}
+.nav [aria-current] .kbd{color:var(--chassis)}
+.tabs{display:flex;flex-wrap:wrap;margin:0;padding:0;border-top:1px solid var(--grid);border-left:1px solid var(--grid)}
+.tabs button{margin:0;min-height:var(--row);border:0;border-right:1px solid var(--grid);border-bottom:1px solid var(--grid);background:var(--chassis)}
+.nav [aria-current],.tabs [aria-current],.tabs [aria-selected='true'],.fkey-bar [aria-current]{background:var(--text);color:var(--chassis)}
+.nav [aria-current]:hover,.tabs [aria-current]:hover,.tabs [aria-selected='true']:hover,.fkey-bar [aria-current]:hover{background:var(--text);color:var(--chassis)}
+.toast{position:sticky;bottom:32px;z-index:5;min-height:var(--row);padding:4px 6px;background:var(--panel);color:var(--text);border-top:1px solid var(--grid);font:12px/16px var(--f-mono)}
+.kv{display:grid;grid-template-columns:minmax(8em,max-content) minmax(0,1fr);gap:0;margin:0;border-top:1px solid var(--grid);border-left:1px solid var(--grid)}
+.kv dt,.kv dd{margin:0;min-height:var(--row);padding:4px 6px;border-right:1px solid var(--grid);border-bottom:1px solid var(--grid)}
+.kv dd{overflow-wrap:anywhere}
+@media (max-width:480px){.kv{grid-template-columns:1fr}}
+
+/* Off-normal modifiers last, so they win over component backgrounds. */
+.p1,.p1:hover{background:var(--p1);color:#000;font-weight:bold}
+.p2,.p2:hover{background:var(--p2);color:#000}
+.p1.unack{animation:blink 1s steps(1) infinite}
+@keyframes blink{0%,49%{background:#ff2200;color:#000}50%,100%{background:#000000;color:#ff2200}}
+@media (prefers-reduced-motion:reduce){.p1.unack{animation:none}}
+.tile.p1,.tile.p2{outline:1px solid #000;outline-offset:-2px}

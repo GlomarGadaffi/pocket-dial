@@ -1027,6 +1027,9 @@ TEST(DialPlanRouting, SbcModeOffUnmatchedNumberStill404s)
 	EXPECT_EQ(handler.anchorBridgeForCallIdForTest("Call-ID: sbc-off"), nullptr);
 }
 
+// #1073: selecting an SBC route slot activates it, which needs the administrator's acceptance.
+static const TelephonyApiConfig::Acceptance kSbcAccepted{TelephonyApiConfig::kAcceptanceVersion, 2, 1760000000};
+
 TEST(DialPlanRouting, SbcModeRoutesAnUnmatchedNumberToTheTrunkUnmodified)
 {
 	// The core of #201: turn SBC mode on with an empty dial-plan table, dial
@@ -1040,7 +1043,7 @@ TEST(DialPlanRouting, SbcModeRoutesAnUnmatchedNumberToTheTrunkUnmodified)
 		});
 	isolateTapiStoreForTest(handler);
 	registerThreePhones(handler);
-	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+	ASSERT_TRUE(handler.setSbcMode(true, 0, &kSbcAccepted).empty());
 
 	wire.clear();
 	handler.handle(makeInvite("500", "8005550123", "192.168.9.50", "sbc-on"));
@@ -1067,7 +1070,7 @@ TEST(DialPlanRouting, SbcModeNeverShadowsAnExplicitDialPlanRule)
 	registerThreePhones(handler);
 	handler.setRingGroup("610", "600,601", "ringall");
 	handler.setDialRule("2XX", "group", "610");
-	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+	ASSERT_TRUE(handler.setSbcMode(true, 0, &kSbcAccepted).empty());
 
 	wire.clear();
 	handler.handle(makeInvite("500", "250", "192.168.9.50", "sbc-explicit-wins"));
@@ -1090,7 +1093,7 @@ TEST(DialPlanRouting, SbcModeRingsARegisteredLocalExtensionLocally)
 		});
 	isolateTapiStoreForTest(handler);
 	registerThreePhones(handler);   // 500, 600, 601 all genuinely registered
-	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+	ASSERT_TRUE(handler.setSbcMode(true, 0, &kSbcAccepted).empty());
 
 	wire.clear();
 	handler.handle(makeInvite("500", "600", "192.168.9.50", "sbc-ext-to-ext"));
@@ -1112,7 +1115,7 @@ TEST(DialPlanRouting, SbcModeStillTrunksANumberThatIsNotARegisteredExtension)
 		});
 	isolateTapiStoreForTest(handler);
 	registerThreePhones(handler);
-	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+	ASSERT_TRUE(handler.setSbcMode(true, 0, &kSbcAccepted).empty());
 
 	wire.clear();
 	handler.handle(makeInvite("500", "602", "192.168.9.50", "sbc-unowned"));
@@ -1139,7 +1142,7 @@ TEST(DialPlanRouting, SbcModeKeepsAnOfflineSecuredVoicemailExtensionOffTheTrunk)
 	handler.adoptDeviceForTest("0200000000cc", "602", Registrar::DeviceState::Secured);
 	handler.setVoicemail("602", true);
 	handler.setForward("602", "always", "600");
-	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+	ASSERT_TRUE(handler.setSbcMode(true, 0, &kSbcAccepted).empty());
 
 	wire.clear();
 	handler.handle(makeInvite("500", "602", "192.168.9.50", "sbc-offline-owned"));
@@ -1159,7 +1162,7 @@ TEST(DialPlanRouting, SbcModeStillTrunksAnOfflineSecuredExtensionWithoutVoicemai
 	isolateTapiStoreForTest(handler);
 	registerThreePhones(handler);
 	handler.adoptDeviceForTest("0200000000cc", "602", Registrar::DeviceState::Secured);
-	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+	ASSERT_TRUE(handler.setSbcMode(true, 0, &kSbcAccepted).empty());
 
 	wire.clear();
 	handler.handle(makeInvite("500", "602", "192.168.9.50", "sbc-secured-no-vm"));
@@ -1179,7 +1182,7 @@ TEST(DialPlanRouting, SbcModeStillTrunksAnOpenRegisteredExtensionWithVoicemail)
 	registerThreePhones(handler);
 	handler.adoptDeviceForTest("0200000000cc", "602", Registrar::DeviceState::Learned);
 	handler.setVoicemail("602", true);
-	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+	ASSERT_TRUE(handler.setSbcMode(true, 0, &kSbcAccepted).empty());
 
 	wire.clear();
 	handler.handle(makeInvite("500", "602", "192.168.9.50", "sbc-open-vm"));
@@ -1202,7 +1205,7 @@ TEST(DialPlanRouting, SbcModeExplicitRuleStillBeatsARegisteredLocalExtension)
 	registerThreePhones(handler);
 	handler.setRingGroup("610", "600,601", "ringall");
 	handler.setDialRule("600", "group", "610");
-	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+	ASSERT_TRUE(handler.setSbcMode(true, 0, &kSbcAccepted).empty());
 
 	wire.clear();
 	handler.handle(makeInvite("500", "600", "192.168.9.50", "sbc-rule-over-local"));
@@ -1226,7 +1229,7 @@ TEST(DialPlanRouting, SbcModeNeverReachesReservedExtensions)
 		});
 	isolateTapiStoreForTest(handler);
 	registerThreePhones(handler);
-	ASSERT_TRUE(handler.setSbcMode(true, 0).empty());
+	ASSERT_TRUE(handler.setSbcMode(true, 0, &kSbcAccepted).empty());
 
 	wire.clear();
 	handler.handle(makeInvite("500", "777", "192.168.9.50", "sbc-echo"));
@@ -1255,7 +1258,7 @@ TEST(DialPlanRouting, SbcModeDoesNotChangeEmergencyDialingBehavior)
 		registerThreePhones(handler);
 		if (sbcOn)
 		{
-			EXPECT_TRUE(handler.setSbcMode(true, 0).empty());
+			EXPECT_TRUE(handler.setSbcMode(true, 0, &kSbcAccepted).empty());
 		}
 		const std::string callId = sbcOn ? "sbc-911-on" : "sbc-911-off";
 		wire.clear();

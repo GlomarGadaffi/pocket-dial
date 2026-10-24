@@ -454,6 +454,36 @@ public:
 		if (Entry* e = put(id, nowUs)) e->removedSeq = removedSeq > postSeq ? removedSeq : 0;
 	}
 
+	// #1095: did 3CX remove this id after the makecall went out (a Remove numbered after
+	// postSeq)? Then the leg the response names is gone before it is keyed: 3CX refused the
+	// call while the makecall was pending (on .244, 5 ms before the response). The order of
+	// the WS events decides, not a time: a Remove numbered at or before postSeq is an
+	// earlier participant's. Exact id only; a Remove pushed out of the ring (8 later ones)
+	// or of an id that does not fit is not seen, and the call goes on as before.
+	bool removedSince(std::string_view id, uint64_t postSeq) const
+	{
+		for (const Removed& r : _removed)
+		{
+			if (r.seq > postSeq && id == r.id) return true;
+		}
+		return false;
+	}
+
+	// #1095 backstop, asked once the engine has bound the leg to its session: has 3CX
+	// removed this named leg since its makecall went out? noteNamed() keeps a Remove
+	// numbered after postSeq, and release() records a later one, on the leg's own entry,
+	// so a Remove pushed out of the ring is still seen. The WS task calls release()
+	// before it queues the Remove for the worker, so a Remove this answers false for
+	// reaches the engine as Dropped after the bind, where #880 fails the call.
+	// No postSeq here: it relies on noteNamed() having normalised the entry first (a
+	// removedSeq at or before postSeq was zeroed there), so any nonzero removedSeq is a
+	// Remove after the makecall went out. Ask it only of a leg noteNamed() has seen.
+	bool removedSinceNamed(std::string_view id) const
+	{
+		const std::size_t i = indexOf(id);
+		return i != N && _e[i].removedSeq != 0;
+	}
+
 	// Held from nowUs (our outbound slot was freed); a Remove already seen stands.
 	void note(std::string_view id, int64_t nowUs) { put(id, nowUs); }
 
@@ -550,6 +580,28 @@ inline bool inboundAnnounceAllowed(const OwnLegs<N, Len>& own, std::string_view 
 	return !own.holds(partId, nowUs, wsSeq);
 }
 
+// #1097: the call slot a WS "Participant Remove" for partId ends, as an index into
+// slots, or -1 for none. A slot is free when its participantId is empty. Slot is any
+// type with std::string participantId and farPartId (the client's CallSlot).
+// Only an exact match: the slot's own leg, else the far leg it recorded at Answered.
+// A Remove that names neither ends no call. There is no "only active slot" fallback:
+// that slot can be a live 911/933 or a PSAP callback, and the Remove another handset's
+// refused makecall (#1095), or the echo of a drop of a call whose slot is already freed.
+template <class Slot, std::size_t N>
+inline int removeTargetSlot(const Slot (&slots)[N], std::string_view partId)
+{
+	if (partId.empty()) return -1;
+	for (std::size_t i = 0; i < N; ++i)
+	{
+		if (slots[i].participantId == partId) return static_cast<int>(i);
+	}
+	for (std::size_t i = 0; i < N; ++i)
+	{
+		if (!slots[i].participantId.empty() && slots[i].farPartId == partId) return static_cast<int>(i);
+	}
+	return -1;
+}
+
 // Where makeCall() got its own leg's id (resolveOutboundLeg).
 enum class OwnLegSource : uint8_t
 {
@@ -614,6 +666,7 @@ inline ListLegVerdict classifyListLeg(DirectControlField dc, bool hasId, bool sl
 // reject (by how the field looked) is told apart from a slot claim or an old leg.
 struct ListLegCounts
 {
+	bool read = false;      // #977: 3CX's list was fetched and parsed as an array (an empty one counts)
 	int listed = 0;         // participant objects
 	int controllable = 0;   // direct_control true
 	int noId = 0;
