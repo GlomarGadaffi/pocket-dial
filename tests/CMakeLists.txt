@@ -289,6 +289,8 @@ add_executable(sip_parser_tests
     # never answered by the loopback simulator -- plus the route report,
     # the boot WARN, /api/status's emergencyRoute and the dashboard banner.
     EmergencyRoute_test.cpp
+    # #1120 and #1125: who may answer a ringing call, and the final a bodiless 200 owes the caller.
+    OnOk_test.cpp
     # Dashboard review #5: logged-out roster count and call-log prompt.
     DashboardRosterText_test.cpp
     # Dashboard review #6: the Factory Reset confirm lists what it erases.
