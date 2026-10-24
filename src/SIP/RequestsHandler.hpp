@@ -2126,7 +2126,8 @@ private:
 	// callback by #659's window (#818) or a 911 a dial-plan rule produces (#834).
 	// Caller holds _mutex.
 	bool isEmergencyTraffic(const SipMessage& m);
-	void logDroppedOk(const SipMessage& data, const sockaddr_in& expected);   // #1120
+	void logDroppedOk(const SipMessage& data, const std::string& expected);   // #1120
+	bool okSourceAccepted(const SipMessage& data, const sockaddr_in& registered);   // #1120
 	void refuseBodilessOk(const std::shared_ptr<Session>& session, const SipMessage& data);   // #1125
 
 	// Issue #172 step 3, RFC 3262 §3: with the default-off flag on, does the PBX take over 100rel for this

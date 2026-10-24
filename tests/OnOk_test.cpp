@@ -118,7 +118,7 @@ namespace
 
 		// `from` answers the fork `fork` (its Via/From/To) as a 200 OK, with or without SDP.
 		void answer(const std::string& fork, const std::string& callId, const char* fromIp,
-			const std::string& toUser, bool withSdp)
+			const std::string& toUser, bool withSdp, uint16_t port = 5060)
 		{
 			const std::string body = withSdp ? sdpFor(fromIp) : std::string();
 			const std::string ok =
@@ -128,7 +128,7 @@ namespace
 				"Contact: <sip:" + toUser + "@" + std::string(fromIp) + ":5060>\r\n" +
 				(withSdp ? "Content-Type: application/sdp\r\n" : "") +
 				"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
-			handler->handle(RequestsHandler::getMessageFromPool(ok, addrFor(fromIp)));
+			handler->handle(RequestsHandler::getMessageFromPool(ok, addrFor(fromIp, port)));
 		}
 
 		size_t countTo(const char* ip, const std::string& firstLinePrefix) const
@@ -160,6 +160,13 @@ namespace
 			return out;
 		}
 	};
+
+	size_t countOf(const std::string& hay, const std::string& needle)
+	{
+		size_t n = 0;
+		for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1)) ++n;
+		return n;
+	}
 
 	// 401 calls 402 (at .21); returns the fork 402 received.
 	std::string ring402(Bench& b, const std::string& callId)
@@ -221,7 +228,12 @@ TEST(OnOk, RingGroupAnswerFromANonMemberIsIgnored)
 	ASSERT_FALSE(fork.empty()) << b.dump();
 	b.sent.clear();
 
+	testing::internal::CaptureStderr();
 	b.answer(fork, "oo-group", kIp404, "402", true);
+	const std::string err = testing::internal::GetCapturedStderr();
+
+	EXPECT_EQ(countOf(err, "(#1120)"), 1u) << "exactly one drop line:\n" << err;
+	EXPECT_EQ(countOf(err, kIp404), 1u) << "naming the real source:\n" << err;
 
 	EXPECT_EQ(b.totalTo(kIp401), 0u) << "0 relays:\n" << b.dump();
 	const auto s = b.handler->getSession("Call-ID: oo-group");
@@ -406,4 +418,60 @@ TEST(OnOk, EmergencyTwoHundredRetransmitFromTheCalleeStillGetsItsAck)
 	const auto s = b.handler->getSession("Call-ID: oo-911-rtx");
 	ASSERT_TRUE(s.has_value());
 	EXPECT_EQ(s.value()->getState(), Session::State::Connected);
+}
+
+TEST(OnOk, RingGroupAnswerFromAnUnregisteredAddressIsLogged)
+{
+	Bench b;
+	b.reg("401", kIp401);
+	b.reg("402", kIp402);
+	b.handler->setRingGroup("600", "402", "ringall");
+	b.invite("401", kIp401, "600", "oo-group-unreg");
+	const std::string fork = b.forkTo(kIp402);
+	ASSERT_FALSE(fork.empty()) << b.dump();
+	b.sent.clear();
+
+	testing::internal::CaptureStderr();
+	b.answer(fork, "oo-group-unreg", kIpThird, "402", true);
+	const std::string err = testing::internal::GetCapturedStderr();
+
+	EXPECT_EQ(countOf(err, "(#1120)"), 1u) << err;
+	EXPECT_EQ(b.totalTo(kIp401), 0u) << b.dump();
+}
+
+// -- #1120: the port rule ---------------------------------------------------------
+
+TEST(OnOk, OrdinaryAnswerFromTheRightIpButAnotherPortIsIgnored)
+{
+	Bench b;
+	const std::string fork = ring402(b, "oo-port");
+	ASSERT_FALSE(fork.empty()) << b.dump();
+	b.sent.clear();
+
+	b.answer(fork, "oo-port", kIp402, "402", true, 5099);
+
+	EXPECT_EQ(b.totalTo(kIp401), 0u) << b.dump();
+	const auto s = b.handler->getSession("Call-ID: oo-port");
+	ASSERT_TRUE(s.has_value());
+	EXPECT_EQ(s.value()->getState(), Session::State::Invited);
+}
+
+TEST(OnOk, EmergencyAnswerFromTheRightIpButAnotherPortConnects)
+{
+	Bench b;
+	const std::string fork = ringEmergencyCallback(b, "oo-911-port");
+	ASSERT_FALSE(fork.empty()) << b.dump();
+	b.sent.clear();
+
+	testing::internal::CaptureStderr();
+	b.answer(fork, "oo-911-port", kIp401, "101", true, 5099);
+	const std::string err = testing::internal::GetCapturedStderr();
+
+	EXPECT_EQ(b.totalTo(kIp402), 1u) << "exactly 1 relay to the caller:\n" << b.dump();
+	EXPECT_EQ(b.countTo(kIp402, "SIP/2.0 200"), 1u) << b.dump();
+	const auto s = b.handler->getSession("Call-ID: oo-911-port");
+	ASSERT_TRUE(s.has_value());
+	EXPECT_EQ(s.value()->getState(), Session::State::Connected);
+	EXPECT_EQ(countOf(err, "port mismatch"), 1u) << err;
+	EXPECT_NE(err.find("oo-911-port"), std::string::npos) << err;
 }
