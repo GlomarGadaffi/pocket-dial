@@ -13,7 +13,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cctype>
 #include <chrono>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -68,7 +70,7 @@ namespace
 	// call and for the picker's own **ext/*8 dial (which is, from the server's
 	// point of view, just another INVITE to a virtual extension).
 	std::shared_ptr<SipMessage> makeInvite(const std::string& fromExt, const std::string& toExt,
-		const std::string& fromIp, const std::string& callId)
+		const std::string& fromIp, const std::string& callId, const std::string& extraHeaders = "")
 	{
 		const std::string body = sdpBody(fromIp);
 		std::string raw =
@@ -78,7 +80,7 @@ namespace
 			"To: <sip:" + toExt + "@server>\r\n"
 			"Call-ID: " + callId + "\r\n"
 			"CSeq: 1 INVITE\r\n"
-			"Contact: <sip:" + fromExt + "@" + fromIp + ":5060>\r\n"
+			"Contact: <sip:" + fromExt + "@" + fromIp + ":5060>\r\n" + extraHeaders +
 			"Content-Type: application/sdp\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
 		return RequestsHandler::getMessageFromPool(raw, addrFor(fromIp));
@@ -300,6 +302,132 @@ TEST(CallPickup, PickupCancelCarriesTheRequestUriAndToOfTheInviteItCancels)
 		<< "Request-URI must match the INVITE's";
 	EXPECT_EQ(lineStarting(cancel, "To:"), lineStarting(invite, "To:"))
 		<< "To must match the INVITE's";
+}
+
+namespace
+{
+	// 200 calls 100 (which rings and never answers) and 102 picks it up with **100,
+	// both INVITEs carrying `timerLines`. `toCaller` and `toPicker` are the two
+	// 200s the pickup sends, found by the other leg's SDP each carries (the
+	// caller's has the picker's, the picker's has the caller's); empty when the
+	// pickup did not complete. `tag` keeps Call-IDs apart.
+	void pickUpWithTimerLines(RequestsHandler& handler, const std::vector<Sent>& sent,
+		const std::string& tag, const std::string& timerLines,
+		std::string& toCaller, std::string& toPicker)
+	{
+		handler.handle(makeRegister("200", "192.168.9.10", "reg-caller-" + tag));
+		handler.handle(makeRegister("100", "192.168.9.20", "reg-target-" + tag));
+		handler.handle(makeRegister("102", "192.168.9.30", "reg-picker-" + tag));
+		handler.setRingGroup("600", "100,102", "ringall");
+		handler.handle(makeInvite("200", "100", "192.168.9.10", "call-" + tag, timerLines));
+		handler.handle(makeInvite("102", "**100", "192.168.9.30", "pickup-" + tag, timerLines));
+
+		toCaller.clear();
+		toPicker.clear();
+		for (const auto& s : sent)
+		{
+			if (s.raw.rfind("SIP/2.0 200 OK", 0) != 0) continue;
+			if (s.destIp == "192.168.9.10" && s.raw.find("c=IN IP4 192.168.9.30") != std::string::npos) toCaller = s.raw;
+			if (s.destIp == "192.168.9.30" && s.raw.find("c=IN IP4 192.168.9.10") != std::string::npos) toPicker = s.raw;
+		}
+	}
+
+	// True when some Require line of `raw` (any case, any position in a list)
+	// names the timer option tag.
+	bool requireNamesTimer(const std::string& raw)
+	{
+		std::string low = raw;
+		for (char& ch : low) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+		for (size_t p = low.find("\r\nrequire:"); p != std::string::npos; p = low.find("\r\nrequire:", p + 2))
+		{
+			const size_t eol = low.find("\r\n", p + 2);
+			const std::string line = low.substr(p, eol == std::string::npos ? std::string::npos : eol - p);
+			if (line.find("timer") != std::string::npos) return true;
+		}
+		return false;
+	}
+}
+
+// Issue #739 / RFC 4028 §7.2, §9: both pickup answers are clones of an INVITE
+// (the caller's original, and the picker's own **ext), so each echoed that
+// phone's own Session-Expires with no refresher. A pickup splices two dialogs
+// and relays a re-INVITE refresh into the peer's, so the PBX does not answer it,
+// and RFC 4028 §10 says only a 2xx extends a session. A phone that merely
+// SUPPORTS timer (Supported: timer and a Session-Expires, no Require) is owed
+// none, so neither answer grants one: no Session-Expires, no Require.
+TEST(CallPickup, BothPickupAnswersToCallersThatOnlySupportTimerCarryNone)
+{
+	std::vector<Sent> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&](const sockaddr_in& to, std::shared_ptr<SipMessage> msg) {
+			sent.push_back({ ipOf(to), msg->toString() });
+		});
+
+	std::string toCaller, toPicker;
+	pickUpWithTimerLines(handler, sent, "739",
+		"Supported: timer\r\nSession-Expires: 1800\r\nMin-SE: 90\r\n", toCaller, toPicker);
+	// Positive control: the pickup completed and both answers were sent.
+	ASSERT_FALSE(toCaller.empty()) << "the caller must be answered with the picker's SDP";
+	ASSERT_FALSE(toPicker.empty()) << "the picker must be answered with the caller's SDP";
+
+	auto expectNoTimer = [](const std::string& answer, const char* who)
+	{
+		EXPECT_EQ(answer.find("\r\nSession-Expires:"), std::string::npos)
+			<< who << ": the phone's own Session-Expires must not be echoed with no refresher\n" << answer;
+		EXPECT_EQ(answer.find("\r\nx:"), std::string::npos)
+			<< who << ": nor its compact form\n" << answer;
+		EXPECT_EQ(answer.find("\r\nRequire:"), std::string::npos)
+			<< who << ": no timer, so no Require: timer\n" << answer;
+	};
+	expectNoTimer(toCaller, "caller's answer");
+	expectNoTimer(toPicker, "picker's answer");
+}
+
+// Issue #739: a phone that REQUIRES timer (Require: timer) cannot be answered
+// without one. RFC 4028 §9 puts Session-Expires and Require: timer in its 2xx,
+// and pjsua --use-timer=2 ends the call itself (BYE, Reason cause=421 "Failed
+// processing session timer response") when they are missing. So each pickup
+// answer keeps what its phone sent, in each shape a Require can take: a bare tag,
+// a list in any case, and a second Require line. The PBX arms no timer of its own.
+TEST(CallPickup, BothPickupAnswersToCallersThatRequireTimerKeepItsSessionExpiresAndRequire)
+{
+	const char* const requireShapes[] = {
+		"Require: timer\r\n",
+		"Require: replaces, TIMER\r\n",
+		"Require: replaces\r\nRequire: timer\r\n",
+	};
+	int n = 0;
+	for (const char* require : requireShapes)
+	{
+		const std::string tag = "739r" + std::to_string(n++);
+		SCOPED_TRACE(require);
+		std::vector<Sent> sent;
+		RequestsHandler handler("192.168.9.1", 5060,
+			[&](const sockaddr_in& to, std::shared_ptr<SipMessage> msg) {
+				sent.push_back({ ipOf(to), msg->toString() });
+			});
+
+		std::string toCaller, toPicker;
+		pickUpWithTimerLines(handler, sent, tag,
+			std::string("Supported: timer\r\n") + require + "Session-Expires: 1800\r\nMin-SE: 90\r\n",
+			toCaller, toPicker);
+		// Positive control: the pickup completed and both answers were sent.
+		ASSERT_FALSE(toCaller.empty()) << "the caller must be answered with the picker's SDP";
+		ASSERT_FALSE(toPicker.empty()) << "the picker must be answered with the caller's SDP";
+
+		for (const std::string* answer : {&toCaller, &toPicker})
+		{
+			EXPECT_NE(answer->find("\r\nSession-Expires: 1800"), std::string::npos)
+				<< "a phone that requires a timer is owed one (RFC 4028 §9)\n" << *answer;
+			EXPECT_TRUE(requireNamesTimer(*answer)) << "nor may Require: timer be dropped\n" << *answer;
+		}
+		for (const char* callId : {"call-", "pickup-"})
+		{
+			auto s = handler.getSession(sessionKey(callId + tag));
+			ASSERT_TRUE(s.has_value()) << callId;
+			EXPECT_EQ(s.value()->getSessionExpiresSeconds(), 0u) << callId << ": the PBX arms no expiry";
+		}
+	}
 }
 
 TEST(CallPickup, DirectedPickupOfNonPeerExtensionGets486AndLeavesTargetRinging)

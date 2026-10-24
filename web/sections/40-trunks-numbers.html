@@ -1,0 +1,45 @@
+<div class="row">
+  <h2 class="sect-t">Trunks &amp; numbers</h2>
+  <span class="fill"></span>
+  <button class="btn" onclick="tnLoad()">Refresh</button>
+</div>
+<div class="msg" id="tn-gate"></div>
+<div class="e911" id="tn-accept-banner" role="alert" style="display:none"><span class="lbl-s">Not accepted</span><span class="txt" id="tn-accept-text"></span></div>
+<div id="sbc-slot"></div>
+<p class="hint">Carrier API slots, DID mapping and the SIP trunk. SBC mode is set in <a href="#routing">Routing</a>. Secrets are write-only: a blank secret field keeps the stored one.</p>
+
+<div class="sect"><h3 class="sect-t">Carrier API slots</h3></div>
+<p class="hint">A slot with no working backend yet is labelled &ldquo;not yet connected&rdquo;. It stores what you enter, but nothing dials out through it until that provider is implemented.</p>
+<dl class="kv"><div class="kvrow"><dt>Active slot</dt><dd id="tn-tapi-active">—</dd></div></dl>
+<div class="scroll">
+  <table class="data" id="tn-tapi-table">
+    <caption class="sr">Carrier API slots</caption>
+    <thead><tr><th>Slot</th><th>Status</th><th>Base URL</th><th>Route DN</th><th><span class="sr">Actions</span></th></tr></thead>
+    <tbody id="tn-tapi-body"></tbody>
+  </table>
+</div>
+
+<div class="sect"><h3 class="sect-t" id="tn-tapi-edit-title">Configure slot</h3></div>
+<div class="field"><label for="tn-tapi-baseurl">Base URL / FQDN</label><input type="text" id="tn-tapi-baseurl" autocomplete="off" placeholder="https://" readonly aria-disabled="true"></div>
+<div class="field"><label for="tn-tapi-clientid">Client ID</label><input type="text" id="tn-tapi-clientid" autocomplete="off" readonly aria-disabled="true"></div>
+<div class="field"><label for="tn-tapi-secret">API key / secret</label><input type="password" id="tn-tapi-secret" autocomplete="new-password" placeholder="Blank keeps the stored secret" readonly aria-disabled="true"><span class="hint" id="tn-tapi-secret-state"></span></div>
+<div class="field"><label for="tn-tapi-routedn">Route point / source DN</label><input type="text" id="tn-tapi-routedn" autocomplete="off" readonly aria-disabled="true"></div>
+<label class="opt"><input type="checkbox" id="tn-tapi-enabled" aria-disabled="true"> Enabled (needs an https:// base URL to take effect)</label>
+<div class="row">
+  <button class="btn btn-primary" id="tn-tapi-save" aria-disabled="true" onclick="tnSaveSlot()">Save slot</button>
+  <button class="btn" id="tn-tapi-activate" aria-disabled="true" onclick="tnActivate(tnSelected)">Activate this slot</button>
+  <button class="btn" id="tn-tapi-test" aria-disabled="true" onclick="tnTestSlot()">Test dial</button>
+  <button class="btn" id="tn-tapi-clear" aria-disabled="true" onclick="tnClearSlot()" aria-label="[ ARM ] Clear slot">[ ARM ] Clear slot</button>
+</div>
+<div class="msg" id="tn-tapi-msg"></div>
+<p class="hint">Test dial places a real probe call through the active slot&rsquo;s live provider connection. It works only on an active, connected slot.</p>
+<div class="msg" id="tn-test-result"></div>
+
+<!-- DID -> extension lives in sections/41-did.html (left out of the SBC build). -->
+<div id="did-slot"></div>
+
+<div class="sect"><h3 class="sect-t">SIP trunk</h3></div>
+<dl class="kv" id="tn-trunk-kv"></dl>
+<p class="hint">This shows the saved trunk settings only. The device does not report trunk registration here. A SIP trunk never carries 911 or 933.</p>
+<div class="msg" id="tn-trunk-msg"></div>
+<div class="linkrow"><a class="lnk" href="/setup/trunk">Open SIP trunk setup</a></div>

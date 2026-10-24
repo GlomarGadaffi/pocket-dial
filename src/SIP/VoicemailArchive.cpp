@@ -159,6 +159,46 @@ bool parseEntryLine(const char* line, MessageInfo& info)
 	return true;
 }
 
+bool indexFileHasTombstone(std::FILE* f, const char* name)
+{
+	std::rewind(f);
+	char line[512];
+	char candidate[sizeof(MessageInfo::name)];
+	while (std::fgets(line, sizeof(line), f) != nullptr)
+	{
+		chompIndexLine(line);
+		if (parseTombstoneLine(line, candidate, sizeof(candidate)) &&
+			std::strcmp(candidate, name) == 0) return true;
+	}
+	return false;
+}
+
+size_t listIndexFile(std::FILE* f, MessageInfo* out, size_t maxCount)
+{
+	// #1043: no fixed tombstone table -- a table capped at the listing window
+	// ignored later tombstones and resurrected deleted messages. Instead each
+	// candidate entry rescans the whole file for its own tombstone: no heap,
+	// no stack growth, O(entries x rows) on a file that is only ever appended.
+	char line[512];
+	std::rewind(f);
+	size_t count = 0;
+	while (count < maxCount && std::fgets(line, sizeof(line), f) != nullptr)
+	{
+		chompIndexLine(line);
+		MessageInfo info;
+		if (!parseEntryLine(line, info)) continue;   // a tombstone row, or malformed -- skip
+
+		const long resume = std::ftell(f);
+		const bool dead = indexFileHasTombstone(f, info.name);
+		if (resume < 0 || std::fseek(f, resume, SEEK_SET) != 0) break;   // cannot resume the walk
+		if (dead) continue;
+
+		if (out != nullptr) out[count] = info;   // #756: nullptr = count only
+		++count;
+	}
+	return count;
+}
+
 #if defined(PD_ETH_HAS_SD)
 
 namespace
@@ -309,46 +349,10 @@ namespace
 
 			std::lock_guard<std::mutex> lock(_ioMutex);
 
-			// Pass 1: collect every tombstoned name (bounded the same way the
-			// listing itself is -- see PoolConfig.hpp's
-			// POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX comment for why a
-			// fixed array, not a growing one, here too).
-			char tombstoned[POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX][sizeof(MessageInfo::name)];
-			size_t tombstoneCount = 0;
-
 			std::FILE* f = std::fopen(idxPath, "r");
 			if (f == nullptr) return 0;   // no mailbox directory yet -- not an error
 
-			char line[512];
-			while (std::fgets(line, sizeof(line), f) != nullptr)
-			{
-				chompIndexLine(line);
-				if (tombstoneCount >= POCKETDIAL_VOICEMAIL_MAX_MESSAGES_PER_BOX) continue;
-				if (parseTombstoneLine(line, tombstoned[tombstoneCount], sizeof(tombstoned[0])))
-				{
-					++tombstoneCount;
-				}
-			}
-
-			// Pass 2: re-scan for real entries, skipping anything tombstoned.
-			std::rewind(f);
-			size_t count = 0;
-			while (count < maxCount && std::fgets(line, sizeof(line), f) != nullptr)
-			{
-				chompIndexLine(line);
-				MessageInfo info;
-				if (!parseEntryLine(line, info)) continue;   // a tombstone row, or malformed -- skip
-
-				bool skip = false;
-				for (size_t i = 0; i < tombstoneCount; ++i)
-				{
-					if (std::strcmp(tombstoned[i], info.name) == 0) { skip = true; break; }
-				}
-				if (skip) continue;
-
-				if (out != nullptr) out[count] = info;   // #756: nullptr = count only
-				++count;
-			}
+			const size_t count = listIndexFile(f, out, maxCount);
 			std::fclose(f);
 			return count;
 		}
@@ -410,19 +414,7 @@ namespace
 			std::FILE* f = std::fopen(idxPath, "r");
 			if (f == nullptr) return false;
 
-			char line[512];
-			char candidate[sizeof(MessageInfo::name)];
-			bool found = false;
-			while (std::fgets(line, sizeof(line), f) != nullptr)
-			{
-				chompIndexLine(line);
-				if (parseTombstoneLine(line, candidate, sizeof(candidate)) &&
-					std::strcmp(candidate, name) == 0)
-				{
-					found = true;
-					break;
-				}
-			}
+			const bool found = indexFileHasTombstone(f, name);
 			std::fclose(f);
 			return found;
 		}

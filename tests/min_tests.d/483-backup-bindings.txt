@@ -1,0 +1,2 @@
+# ConfigExportImport_test.cpp: 16 (#483 MAC-binding restore: 3 for the round trip, plaintext import adopting none and REPLACE; 10 for the first review: service name, any refused row, capacity, empty list, file without a list, sysop 403, unstaged table, lock and shared flags, full-table size, first-claim order; 3 for the second: refused list leaves secrets and mode alone, no secure over a stranded Secured row, refused rows in row order)
+16

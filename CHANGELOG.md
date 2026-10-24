@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Enabling or activating a telephony slot now needs an explicit acceptance of the limitations, stored with the slot (who, when, which text version); the API refuses it with 409 without one, an import cannot enable an unaccepted slot, and a slot enabled before this keeps working and shows a banner (see #1073). 911 and 933 routing is unchanged.
+
 ## v1.6.0 — 2026-10-20
 
 114 PRs since `v1.5.1`. Scope, exit tests and accepted gaps are in #1050. Hardware evidence is stated per item below; anything not marked "bench" was covered by host tests and the interop suite only.

@@ -467,31 +467,33 @@ The sequence for a Yealink phone, from boot to a call:
 ```mermaid
 sequenceDiagram
     participant P as Yealink phone
-    participant B as pocket-dial ESP32-S3
-    Note over P,B: SoftAP or Ethernet, HTTP on port 80, SIP on 5060 UDP
-    Note over P,B: (0) Manual bring-up. The installer types the SIP account into the phone's web UI by hand, and the board is switched to Learn mode. Without this, step 3 is a 404 forever (§0.1).
-    P->>B: (1) Associate and link up
-    P->>B: (2) DHCP DISCOVER, OFFER and ACK (standard options only, no Option 66)
-    P->>B: (3) REGISTER sip:1001@...:5060
-    Note right of B: admitLearn() maps the source IP to a MAC through ARP. On a first-packet ARP miss it accepts and adopts nothing, so the next REGISTER adopts. It adopts (mac, 1001, Learned) to NVS.
-    B-->>P: 200 OK (expires at most 3600)
-    B->>P: Register beep INVITE (signalling only, no server RTP)
-    P->>B: (4) GET /config/mac.cfg (URL typed by the installer)
-    Note right of B: Shape check: /config/ + 12 lowercase hex + .cfg, else 404. findProvisioningInfo(mac) in the adopted-device registry, else 404. isValidAor(ext) plus the reserved, emergency and PSTN-shaped re-check, else 404.
-    B-->>P: 200 OK, text/plain, account.1 settings, password field blank
+    participant U as udp_receiver_task (UDP 5060)
+    participant H as http_conn thread (TCP 80)
+    participant T as sip_server tick (1 Hz)
+    Note over P,H: SoftAP or Ethernet, HTTP on port 80, SIP on 5060 UDP
+    Note over P,H: (0) Manual bring-up. The installer types the SIP account into the phone's web UI by hand, and the board is switched to Learn mode. Without this, step 4 is a 404 forever (section 0.1).
+    P->>P: (1) Associate and link up
+    P->>P: (2) DHCP DISCOVER, OFFER and ACK (standard options only, no Option 66)
+    P->>U: (3) REGISTER sip:1001@...:5060
+    Note right of U: handle() drops invalid and rate-limited packets, then onRegister() runs admitLearn(). It maps the source IP to a MAC through ARP. On a first-packet ARP miss it accepts and adopts nothing, so the next REGISTER adopts. It adopts (mac, 1001, Learned) to NVS.
+    U-->>P: 200 OK (expires clamped to 30..3600 s)
+    T->>P: Register beep INVITE, about 500 ms after a new binding (signalling only, no server RTP)
+    P->>H: (4) GET /config/mac.cfg (URL typed by the installer)
+    Note right of H: parseProvisioningPath(): /config/ + 12 lowercase hex + .cfg, else 404. findProvisioningInfo(mac) in the adopted-device registry, else 404 (or a zero-touch autoAssign inside an open window). Config empty after render, else 404.
+    H-->>P: 200 OK, text/plain, account.1 settings, password field blank
     Note over P: (5) Phone applies the config, may reboot once, and re-registers.
-    loop Every 5 s
-        P->>B: OPTIONS keepalive
-        B-->>P: 200 OK
+    loop Every 5 s from tick()
+        T->>P: OPTIONS keepalive
+        P-->>T: 200 OK
     end
-    Note over P,B: The board prunes the phone after 15 s quiet.
-    P->>B: (6) INVITE sip:1002@...
-    Note right of B: onInvite() relays the call peer to peer. filterAudioCodecs(allowWideband=true) narrows the codec list only. The c= line is never rewritten.
-    B-->>P: 180 (relayed as-is), 200 + SDP
-    P->>B: (7) ACK
-    Note over P,B: (8) RTP audio flows phone to phone, not via the board
-    P->>B: (9) BYE
-    B-->>P: 200 OK
+    Note over P,T: tick() prunes a phone after 15 s of silence or an expired lease. A phone in a call is spared only on a missed keepalive; an expired lease still prunes it. A live 911/933 spares it on either.
+    P->>U: (6) INVITE sip:1002@...
+    Note right of U: onInvite() relays the call peer to peer. filterAudioCodecs(allowWideband=true) narrows the codec list only. The c= line is never rewritten.
+    U-->>P: 180 (relayed as-is), 200 + SDP
+    P->>U: (7) ACK
+    Note over P,U: (8) RTP audio flows phone to phone, not via the board
+    P->>U: (9) BYE
+    U-->>P: 200 OK
 ```
 
 ## 6. Original design, not implemented

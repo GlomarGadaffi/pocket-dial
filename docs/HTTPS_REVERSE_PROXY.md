@@ -12,9 +12,11 @@ Line citations are for `main` at 760f6928 unless a line says otherwise. `HS` is 
 
 ```mermaid
 flowchart LR
-    browser["Browser"] -->|HTTPS| nginx["nginx (dash.example.com)"]
-    nginx -->|HTTP| board["Board :80"]
-    phones["Phones, Prometheus"] -->|"HTTP, never via the proxy"| board
+    browser["Browser"] -->|"HTTPS 443, TLSv1.2 or 1.3"| nginx["nginx, dash.example.com: Host set to pocketdial.local, own Origin rewritten to http://pocketdial.local, /config/ and /metrics answer 404, login limited to 6 per minute"]
+    nginx -->|"HTTP 80, cleartext, client_max_body_size 16k"| board["Board HTTP listener, port 80 (HttpServer, max 3 connections, 2 per source)"]
+    phones["Phones, Prometheus"] -->|"HTTP 80, never via the proxy"| board
+    phones -->|"SIP over UDP 5060, never via the proxy"| sip["Board SIP engine"]
+    board --> chk["Board checks: captive redirect on unknown Host (HttpServer.cpp:1131-1143), isSameOrigin on mutating routes (HttpServer.cpp:4628, 4709)"]
 ```
 
 - The board stays on plain HTTP, port 80, and stays reachable on its own address (D:61-62, D:127-134). The proxy-to-board hop is cleartext (D:145), so put the proxy on the board's segment or on a link you trust.

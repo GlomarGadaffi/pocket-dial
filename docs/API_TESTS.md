@@ -197,7 +197,7 @@ the single most common failure when running a pre-existing script against curren
 ## 3. Endpoint Specifications & JSON Schemas
 
 ### 3.1 GET `/` or `/index.html`
-Serves the CGA CRT web dashboard. Ungated. Once logged in, the page also carries the
+Serves the web dashboard. Ungated. Once logged in, the page also carries the
 session's CSRF token, which is how the dashboard's own `fetch()` calls satisfy layer 3.
 * Request: `GET /`
 * Response: `200 OK`
@@ -687,13 +687,27 @@ normal `ctest` pass; see §6.
   `wifiMode` that would otherwise silently wrap into a valid value via integer
   narrowing, and a missing `confirm=REPLACE` (`400`); and that
   the admin credential's hash (and the operators' real passwords) never appear
-  anywhere in an export, plaintext or decrypted-gated.
+  anywhere in an export, plaintext or decrypted-gated. The MAC-binding restore (#483)
+  is covered end to end: a Learned, a locked and a Secured binding, Secure mode and a
+  telephony slot reproduced on a fresh handler; a plaintext import adopting none;
+  REPLACE dropping rows the file lacks; one refused row (service name, uppercase or
+  short MAC, tab in the extension, Secured without a stored secret, duplicate MAC, bad
+  state or flags, wrong shape, one row past capacity) leaving the table as it was with
+  the row and reason class reported, and, with a valid digest-secret list beside it, the
+  stored secrets and the registrar mode left alone too (the two lists stand or fall
+  together; the rest of the sealed block is not rolled back); a Secured row left without a secret never letting `secure` apply; the warning
+  that a phone with another MAC is refused a restored locked or Secured row; refused rows
+  listed in row order; an empty list clearing, and a file with no list
+  leaving the table alone; a sysop import with a password getting `403`; a table the NVS
+  writer refuses being reported rather than claimed; the lock and shared flags and the
+  first-claim order of rows for one extension surviving a round trip; and a full table
+  of `POCKETDIAL_MAX_CLIENTS` Secured bindings exporting under a stated size and
+  restoring.
 
-**Known gap this suite does NOT cover** (see `HttpServer.cpp`'s
-`sendApiConfigExport()` comment): a
-Secure-mode fleet cannot be fully restored end-to-end, because per-extension digest
-secrets and MAC-to-extension bindings export but have no import accessor on
-`RequestsHandler`/`SipSecretStore` today, and a telephony-trunk slot's client secret
-is never exported at all (`TelephonyApiConfig::SlotView` masks it with no reversing
-accessor). All three are reported `skipped` by the import response rather than
-silently dropped, and are tracked as a follow-up.
+**What this suite deliberately does not restore** (see `HttpServer.cpp`'s
+`sendApiConfigExport()` comment): a telephony-trunk slot's client secret is never
+exported (`TelephonyApiConfig::SlotView` masks it with no reversing accessor, on
+purpose: a second board holding the first one's secret would fight it for the control
+WebSocket, #396), and the slot's provider type is kept as it is on the board. The
+import names both under `skipped` rather than dropping them silently. Per-extension
+digest secrets and the MAC bindings are restored, from a password-encrypted file only.

@@ -107,13 +107,162 @@ There is no "held" event and no "held" status. A participant that our board has 
 The Remove event becomes an `AnchorClient::CallEvent::Dropped` in `TelephonyAnchorClient.cpp`. `RequestsHandler::anchorDroppedLocked()` handles that event. It calls `stopBridge()` and tears the session down.
 
 ```mermaid
-flowchart LR
-    A["3CX event: EventType 1 (Remove)"] --> B["TelephonyAnchorClient.cpp: CallEvent::Dropped"]
-    B --> C["RequestsHandler::anchorDroppedLocked()"]
-    C --> D["stopBridge() and session teardown"]
+sequenceDiagram
+    participant PBX as 3CX
+    participant WS as WS client task, handleWsEvent()
+    participant WSW as tel_wsw worker, processWsWork()
+    participant RH as RequestsHandler
+    participant H as Handset
+    PBX-)WS: event_type 1 Remove on /callcontrol/{dn}/participants/{id}
+    WS->>WS: under _mutex, _ownLegs.release(id, ++_wsSeq): a later Upsert for id may be a new call
+    WS->>WSW: WsWork::Remove on _wsWorkQueue, depth 16
+    WSW->>WSW: removeTargetSlot(): a slot whose own leg or recorded far leg is exactly id
+    alt a slot matched
+        WSW->>WSW: stopMediaStreams(slot's own leg)
+        WSW->>RH: CallEvent::Dropped with the slot's own leg
+    else no slot matched
+        WSW->>RH: CallEvent::Dropped with id as received, never the only active call (issue 1097)
+    end
+    RH->>RH: anchorDroppedLocked() under _mutex: only the session whose participant id equals it, none is a no-op
+    RH->>RH: releaseFarLeg without a drop (3CX already removed it), stopBridge()
+    alt inbound call, a handset answered
+        RH->>H: BYE
+    else inbound call, still ringing
+        RH->>H: CANCEL to every pending target
+    else outbound call, still Invited (issue 880)
+        RH->>H: 503 Service Unavailable, a 911/933 also notifies NOT ROUTED
+    else outbound call, Connected
+        RH->>H: BYE to the caller
+    end
+    RH->>RH: endCall()
 ```
 
 When diagnosing a call that vanished, **the WebSocket event log is the authority**, not the SIP side.
+
+### How this firmware drives the anchor leg
+
+The diagrams below trace `TelephonyAnchorClient` and `RequestsHandler` as they are on `main`. Every send from a worker or the WS task goes through `_asyncOutbox`, since those threads are not the SIP receive thread.
+
+An outbound call, from the handset's INVITE to the bound participant and the `Connected` status that answers it:
+
+```mermaid
+sequenceDiagram
+    participant H as Handset
+    participant RH as RequestsHandler
+    participant W as tel_ctl0/1, or tel_sos for 911/933
+    participant TA as TelephonyAnchorClient
+    participant PBX as 3CX
+    participant WSW as tel_wsw worker
+    H->>RH: INVITE to an outside number
+    RH->>W: postTelCtl(Make): a 911/933 is posted before its session is stored, any other call after the 180
+    RH->>H: 180 Ringing, session Invited, ring timer armed
+    W->>TA: makeCall(destination)
+    TA->>PBX: POST /callcontrol/{dn}/devices/{deviceid}/makecall
+    PBX-->>TA: 2xx, resolveOutboundLeg() names our own leg
+    TA->>TA: _ownLegs.noteNamed(), then removedSince(): a Remove already seen for this leg?
+    alt makeCall returned false, including a Remove seen before the response named the leg (issue 1095)
+        W->>RH: refuseRingingAnchor(), endCall()
+        RH->>H: 503 Service Unavailable, a 911/933 also notifies NOT ROUTED
+    else own leg named
+        TA->>TA: startRxIfNeeded() claims a call slot and starts tel_media_rx
+        W->>RH: bindOutboundParticipant(callId, ownLeg)
+        alt no session any more, the handset CANCELled meanwhile (issue 379)
+            W->>PBX: asyncDropCall() on tel_drop, POST .../participants/{id}/drop
+        else ownLegRemovedSinceNamed() (issue 1095)
+            W->>RH: anchorDroppedLocked(): 503 to the caller, then the drop on tel_drop
+        end
+    end
+    PBX-)TA: event_type 0 Upsert for our leg or its far leg
+    TA->>WSW: WsWork::Upset on _wsWorkQueue
+    WSW->>PBX: GET /callcontrol/{dn}/participants, read the leg's status
+    alt status Connected
+        WSW->>RH: CallEvent::Answered, once
+        RH->>H: 200 OK with the MediaBridge SDP, session Connected
+    else empty status on a 911/933
+        WSW->>WSW: ask again after kEmergencyReaskMs
+    else any other status
+        WSW->>WSW: mark the slot ringing, wait for the next Upsert
+    end
+```
+
+How `handleWsEvent()` classifies an Upsert, and what the `tel_wsw` worker then does with it:
+
+```mermaid
+flowchart TD
+    A["event_type 0 Upsert on /callcontrol/{dn}/participants/{id}"] --> DN{"dn is our source DN?"}
+    DN -- "no" --> X0["Ignored"]
+    DN -- "yes" --> S{"A call slot holds id?"}
+    S -- "yes" --> UP{"Slot already fully up?"}
+    UP -- "yes" --> X4["Nothing queued"]
+    UP -- "no" --> Q["Queue WsWork::Upset for the slot's leg"]
+    S -- "no" --> OWN{"A leg this unit created, inboundAnnounceAllowed() false?"}
+    OWN -- "yes" --> X1["Ignored: not an inbound call (issue 379)"]
+    OWN -- "no" --> N{"Outbound legs in flight, not yet answered?"}
+    N -- "none, nothing pending" --> INB["Queue with id as a new inbound leg"]
+    N -- "none, a makeCall or orphan-sweep hold pending" --> X2["Ignored as the pending call's far leg, noted in _pendingSeen"]
+    N -- "one, none pending" --> FAR["Queue for that call's own leg: id is its far leg"]
+    N -- "otherwise" --> AMB["Queue every in-flight leg: each re-reads its own status"]
+    Q --> W["tel_wsw: processWsWork()"]
+    INB --> W
+    FAR --> W
+    AMB --> W
+    W --> OB{"The leg's slot is outbound?"}
+    OB -- "yes" --> ST["Read the leg status: Connected fires CallEvent::Answered once"]
+    OB -- "no" --> RC{"A leg this unit created, on re-check?"}
+    RC -- "yes" --> X3["Dropped as our own leg"]
+    RC -- "no" --> INC["allocSlotLocked(), CallEvent::Incoming once per participant, routeInboundAnchorCall()"]
+```
+
+The orphan sweep (#977, #1040). A 911/933 whose makecall reached 3CX, but whose response went unread and whose every participant-list read failed, is still refused. A sweep then looks for the leg 3CX may hold and drops it:
+
+```mermaid
+sequenceDiagram
+    participant W as tel_sos worker
+    participant TA as makeCall()
+    participant PBX as 3CX
+    participant SW as tel_sweep task
+    participant H as Handset
+    W->>TA: makeCall(911 or 933)
+    TA->>PBX: POST makecall, the request is sent
+    Note over TA,PBX: no response read
+    loop every kUnreadAdoptPollMs, 400 ms, reads start within 4 s
+        TA->>PBX: GET participant list
+        PBX-->>TA: error, no list shown
+    end
+    TA->>SW: orphanSweepWanted() true, armOrphanSweep(): stores and a wake, unmatched Upserts held
+    TA-->>W: false
+    W->>H: 503 Service Unavailable and NOT ROUTED notify, not delayed by the sweep
+    loop reads start within kOrphanSweepWindowUs of the arm, 400 ms apart
+        SW->>PBX: fresh-client GET participant list, no _statusMutex
+    end
+    alt exactly one candidate, upserted while the makeCall was pending
+        SW->>SW: _ownLegs.noteNamed(leg), end the hold
+        SW->>PBX: dropOrphanLeg(): fresh-client POST .../participants/{id}/drop, no _ctrlMutex
+    else two or more candidates
+        SW->>SW: none dropped, one may be a PSAP callback
+    else nothing upserted in the window, gave up, too late or stopping
+        SW->>SW: none dropped, logged
+    end
+```
+
+A REGISTER with `Expires: 0` (#1089, #1094, #1098, #1100). The client's calls are ended before its binding is released, except an emergency call:
+
+```mermaid
+flowchart TD
+    A["REGISTER Expires 0 from extension X"] --> U["unregisterClient(X)"]
+    U --> E{"An isEmergency() session has X as a party, ringing included?"}
+    E -- "yes" --> L["expireLease(): binding kept, call untouched, the next sweep after the call prunes it"]
+    E -- "no" --> C["endClientCalls(X), one session per pass"]
+    C --> K{"Session kind"}
+    K -- "inbound anchored call ringing X among its pendingTargets" --> R["buildInboundCancelTo(X), remove X from pendingTargets"]
+    R --> M{"Other handsets still ringing?"}
+    M -- "yes" --> KEEP["Call kept"]
+    M -- "no" --> D["releaseFarLeg(): drop the 3CX leg on tel_drop, endCall()"]
+    K -- "any other call" --> O["CANCEL or 480 while ringing, BYE to a surviving phone peer, endCall()"]
+    KEEP --> REL["release(): binding removed"]
+    D --> REL
+    O --> REL
+```
 
 ## 5. Consequences for this project
 
@@ -127,10 +276,23 @@ The hold path from item 1, as the board and the PBX each see it:
 
 ```mermaid
 sequenceDiagram
-    participant Board as Board (MediaBridge)
+    participant H as Handset
+    participant RH as RequestsHandler
+    participant MB as MediaBridge
+    participant MOH as HoldMusic, moh_tx
+    participant TA as TelephonyAnchorClient
     participant PBX as 3CX participant
-    Board->>Board: setHeld(true): hold music goes to the anchor
-    Board->>PBX: keep feeding /stream
+    H->>RH: re-INVITE with a hold offer, or recvonly
+    RH->>RH: answerAnchorReinvite(): 481 if no MediaBridge matches the Call-ID
+    RH->>H: 200 OK from sendLocalMediaAnswer()
+    RH->>MB: setHeld(true)
+    MB->>MOH: addTap(mohTapTrampoline), no clip loaded means silence
+    Note over MB: handset RTP is discarded while held
+    loop each moh_tx tick
+        MOH->>MB: feedMohTick(): mu-law decoded to PCM16
+        MB->>TA: writeAudio(participant id)
+        TA->>PBX: PCM16 written into the slot's open POST /callcontrol/{dn}/participants/{id}/stream
+    end
     Note over PBX: Status stays Connected. No event is raised.
 ```
 

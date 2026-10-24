@@ -1029,6 +1029,19 @@ bool SipMessage::requiresReliableProvisional() const
 	return false;
 }
 
+bool SipMessage::requiresTimer() const
+{
+	for (const std::string& line : _headerLines)
+	{
+		if (iequal(headerNameOf(line), "require") &&
+			anyOptionTag(headerValueOf(line), [](std::string_view tag) { return iequalLower(tag, "timer"); }))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 void SipMessage::removeOptionTag(std::string_view name, std::string_view compact, std::string_view tag)
 {
 	for (size_t i = 0; i < _headerLines.size();)

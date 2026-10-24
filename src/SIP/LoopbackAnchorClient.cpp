@@ -150,6 +150,9 @@ bool LoopbackAnchorClient::makeCall(const std::string& destination, std::string*
 
 bool LoopbackAnchorClient::answerCall(const std::string& participantId)
 {
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	if (_ctrlBusyForTest) ++_answersWaited;   // #1103: a real anchor's answer would queue here
+#endif
 	if (!_connected)
 	{
 		return false;
@@ -218,6 +221,20 @@ void LoopbackAnchorClient::simulateInboundCall(const std::string& callerId)
 bool LoopbackAnchorClient::dropCall(const std::string& participantId)
 {
 	_dropCallCount++;   // every ATTEMPT, connected or not -- see dropCallCount()
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	{
+		// #1103: the POST's span under a real anchor's _ctrlMutex.
+		std::function<void()> hook;
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			hook = _dropHookForTest;
+		}
+		_ctrlBusyForTest = true;
+		if (hook) hook();
+		_ctrlBusyForTest = false;
+		noteTelDropReached();
+	}
+#endif
 	if (!_connected)
 	{
 		return false;

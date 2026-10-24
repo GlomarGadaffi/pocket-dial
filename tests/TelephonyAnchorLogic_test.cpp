@@ -678,6 +678,135 @@ TEST(OwnLegs, AnIdThatDoesNotFitIsNeverHeld)
 	EXPECT_TRUE(inboundAnnounceAllowed(own, "", kNamed + 1, kSeqUpsert));
 }
 
+// ── #1095: 3CX removed the leg before the makecall response named it ──────────
+// .244, 2026-10-21 (debug build 2a226092): 6101 dialed 314, a DN that does not exist.
+// 3CX's "Participant Remove 1276" was received 5 ms before the response's result.id=1276.
+// makeCall() keyed a slot for the dead leg anyway (GET 403 x6) and 6101 rang for 34 s.
+// The WS event numbers are the order the anchor client received them in.
+constexpr uint64_t kSeqPost1095   = 70;   // _wsSeq when makeCall() sent the makecall
+constexpr uint64_t kSeqRemove1095 = 71;   // 3CX's Remove of 1276, before the response
+
+TEST(MakecallLegRemoved, ARemoveOfTheNamedLegDuringTheMakecallFailsTheCall)
+{
+	AnchorOwnLegs own;
+	own.release("1276", kSeqRemove1095);   // the WS task, at the Remove
+	EXPECT_TRUE(own.removedSince("1276", kSeqPost1095))
+		<< "3CX removed 1276 before the response named it: the call must fail, no slot, no GET stream";
+}
+
+TEST(MakecallLegRemoved, AnEmergencyCallsRemovedLegFailsTheSameWay)
+{
+	// A 911/933 that 3CX ends during its makecall is gone: failing it at once (503,
+	// NOT ROUTED) is the truthful answer; ringing on would misreport it (Rule 5). The
+	// query takes no emergency flag, so nothing can exempt a 911 into ringing.
+	AnchorOwnLegs own;
+	own.release("1277", kSeqRemove1095);
+	own.noteNamed("1277", kNamed, kSeqPost1095);   // makeCall(): noted before the check
+	EXPECT_TRUE(own.removedSince("1277", kSeqPost1095)) << "a removed 911 leg was keyed and left ringing";
+}
+
+TEST(MakecallLegRemoved, ARemoveOfAnotherLegDoesNotFailTheCall)
+{
+	AnchorOwnLegs own;
+	own.release("1276", kSeqRemove1095);
+	EXPECT_TRUE(own.removedSince("1276", kSeqPost1095)) << "positive control";
+	EXPECT_FALSE(own.removedSince("1278", kSeqPost1095)) << "a Remove of 1276 failed the call for 1278";
+	EXPECT_FALSE(own.removedSince("127", kSeqPost1095)) << "a prefix is another participant";
+	EXPECT_FALSE(own.removedSince("12760", kSeqPost1095));
+	EXPECT_FALSE(own.removedSince("", kSeqPost1095));
+}
+
+TEST(MakecallLegRemoved, ARemoveReceivedBeforeTheMakecallWentOutDoesNotFailIt)
+{
+	// The window is the makecall's own: the POST to the response, by WS event order.
+	// A Remove numbered at or before postSeq is an earlier participant's, however recent.
+	AnchorOwnLegs own;
+	own.release("1276", kSeqPost1095 - 1);
+	own.release("1276", kSeqPost1095);
+	EXPECT_FALSE(own.removedSince("1276", kSeqPost1095)) << "an earlier participant's Remove failed a live call";
+	EXPECT_TRUE(own.removedSince("1276", kSeqPost1095 - 1)) << "positive control: the same entries, an earlier POST";
+}
+
+TEST(MakecallLegRemoved, AFullRingForgetsTheOldestRemoveAndAllocatesNothing)
+{
+	AnchorOwnLegs own;
+	AllocGuard guard;
+	own.release("1276", kSeqRemove1095);
+	for (int i = 0; i < 8; ++i)
+	{
+		char id[8] = { 'f', 'a', 'r', static_cast<char>('0' + i), '\0' };
+		own.release(id, kSeqRemove1095 + 1 + i);
+	}
+	const bool oldest = own.removedSince("1276", kSeqPost1095);
+	const bool newest = own.removedSince("far7", kSeqPost1095);
+	const bool eighth = own.removedSince("far0", kSeqPost1095);
+	const std::size_t allocs = guard.delta();
+	EXPECT_EQ(allocs, 0u) << "the Removes ring is fixed storage";
+	EXPECT_FALSE(oldest) << "the oldest of 9 Removes was overwritten: its call goes on as before";
+	EXPECT_TRUE(newest);
+	EXPECT_TRUE(eighth) << "the 8 latest Removes are all kept";
+}
+
+// ── #1095 backstop: a Remove taken after makeCall()'s check, before the bind ──
+// The WS task records the Remove (release) before it queues it for the worker. If the
+// worker gets to it before the engine binds the session, its Dropped matches nothing.
+// runTelCtl() asks removedSinceNamed() after the bind, and fails the call on yes.
+constexpr uint64_t kSeqLateRemove1095 = 72;   // after makeCall()'s check at the response
+
+TEST(MakecallLegRemovedAfterCheck, ARemoveAfterTheLegWasNamedIsSeenAfterTheBind)
+{
+	AnchorOwnLegs own;
+	own.noteNamed("1276", kNamed, kSeqPost1095);
+	EXPECT_FALSE(own.removedSince("1276", kSeqPost1095)) << "precondition: makeCall()'s check passed";
+	EXPECT_FALSE(own.removedSinceNamed("1276")) << "nothing removed yet";
+	own.release("1276", kSeqLateRemove1095);   // the WS task, between the check and the bind
+	EXPECT_TRUE(own.removedSinceNamed("1276")) << "the Remove the engine never matched must fail the call";
+}
+
+TEST(MakecallLegRemovedAfterCheck, ARemoveBeforeTheMakecallWentOutIsNotThisLegs)
+{
+	AnchorOwnLegs own;
+	own.release("1276", kSeqPost1095);   // an earlier participant's, received before the POST
+	own.noteNamed("1276", kNamed, kSeqPost1095);
+	EXPECT_FALSE(own.removedSinceNamed("1276")) << "an earlier participant's Remove failed a live call";
+	own.release("1276", kSeqLateRemove1095);
+	EXPECT_TRUE(own.removedSinceNamed("1276")) << "positive control: this leg's own Remove";
+}
+
+TEST(MakecallLegRemovedAfterCheck, OnlyTheNamedLegExactly)
+{
+	AnchorOwnLegs own;
+	own.noteNamed("1276", kNamed, kSeqPost1095);
+	own.noteNamed("911", kNamed, kSeqPost1095);   // another call's leg, a live 911
+	own.release("1276", kSeqLateRemove1095);
+	EXPECT_TRUE(own.removedSinceNamed("1276")) << "positive control";
+	EXPECT_FALSE(own.removedSinceNamed("911")) << "another leg's Remove failed a live 911";
+	EXPECT_FALSE(own.removedSinceNamed("127"));
+	EXPECT_FALSE(own.removedSinceNamed("12760"));
+	EXPECT_FALSE(own.removedSinceNamed(""));
+	EXPECT_FALSE(own.removedSinceNamed("1277")) << "a leg never named is never failed (list-fallback scope)";
+}
+
+TEST(MakecallLegRemovedAfterCheck, TheLegsEntryOutlivesTheRingAndAllocatesNothing)
+{
+	// The ring keeps the last 8 Removes; the leg's own entry keeps its Remove past them.
+	AnchorOwnLegs own;
+	AllocGuard guard;
+	own.noteNamed("1276", kNamed, kSeqPost1095);
+	own.release("1276", kSeqLateRemove1095);
+	for (int i = 0; i < 8; ++i)
+	{
+		char id[8] = { 'f', 'a', 'r', static_cast<char>('0' + i), '\0' };
+		own.release(id, kSeqLateRemove1095 + 1 + i);
+	}
+	const bool ring = own.removedSince("1276", kSeqPost1095);
+	const bool entry = own.removedSinceNamed("1276");
+	const std::size_t allocs = guard.delta();
+	EXPECT_EQ(allocs, 0u);
+	EXPECT_FALSE(ring) << "precondition: the ring forgot 1276's Remove";
+	EXPECT_TRUE(entry) << "the bound leg's Remove was forgotten with the ring";
+}
+
 // ── #349: the makecall POST reached 3CX and its response was never read ──────
 // The x349_unread_makecall run on .244 (main 61132ada, #349 issuecomment-6004433436):
 // 3CX had already named the leg (the probe threw result.id away), the list read
@@ -840,6 +969,106 @@ TEST(GetForbidden, AnEmergencyOrInboundLegNeverGivesUpEarly)
 		n = nextGetForbiddenCount(n, 403);
 		ASSERT_FALSE(getForbiddenGivesUp(n, /*failFastLeg=*/false)) << "403 #" << (i + 1);
 	}
+}
+
+// ── #1097: a WS Remove that names no slot ends no call ─────────────────────────
+// processWsWork()'s Remove branch drops the slot removeTargetSlot() returns: stopMediaStreams()
+// on its leg and CallEvent::Dropped for it, so RequestsHandler BYEs that call. -1 drops no slot;
+// the branch then reports Dropped for the Remove's own id (#533), which matches no live session.
+// The race (#1095, .244 2026-10-21): 3CX's "Participant Remove 1276" for another handset's
+// refused makecall arrived 5 ms before the response named 1276, so no slot held it.
+// The fields beyond the two ids are what the slot carries; the decision must not need them.
+struct RemoveSlot
+{
+	std::string   participantId;   // our own leg; "" = free
+	std::string   farPartId;       // recorded at Answered when the far leg surfaced; else ""
+	std::uint32_t emergency = 0;   // CallSlot::emergency: the 911/933 makeCall placed
+	bool          inbound = false; // an inbound leg (a PSAP callback is one; the slot cannot tell which)
+};
+
+constexpr const char* kUnknownRemove = "1276";   // the #1095 leg: no slot holds it
+
+TEST(RemoveTarget, ALive911IsNotDroppedByARemoveForALegNoSlotHolds)
+{
+	RemoveSlot slots[4];
+	slots[0] = {"1275", "1280", 911, false};   // the only active call: an answered 911
+	EXPECT_EQ(removeTargetSlot(slots, "1275"), 0) << "positive control: the 911's own Remove ends it";
+	EXPECT_EQ(removeTargetSlot(slots, kUnknownRemove), -1)
+	    << "a Remove for another handset's leg stopped the 911's media and BYEd it (Rule 5)";
+}
+
+TEST(RemoveTarget, ALive911WhoseFarLegWasNeverRecordedIsNotDroppedEither)
+{
+	// farPartId stays "" when the Answered upset named our own leg: no Remove can be tied to the
+	// far leg, so "far leg still unknown" is not evidence that this Remove is the 911's.
+	RemoveSlot slots[4];
+	slots[2] = {"1275", "", 933, false};
+	EXPECT_EQ(removeTargetSlot(slots, kUnknownRemove), -1) << "a 933 with no far-leg id was dropped";
+}
+
+TEST(RemoveTarget, AnAnsweredPsapCallbackIsNotDroppedByARemoveForALegNoSlotHolds)
+{
+	// The PSAP's callback is an inbound leg: CallSlot::emergency is 0 and farPartId is never recorded
+	// for inbound, so nothing on the slot can exempt it. Only an exact match may end it.
+	RemoveSlot slots[4];
+	slots[1] = {"1290", "", 0, true};
+	EXPECT_EQ(removeTargetSlot(slots, "1290"), 1) << "positive control: the callback's own Remove ends it";
+	EXPECT_EQ(removeTargetSlot(slots, kUnknownRemove), -1) << "a Remove for another leg hung up on the PSAP";
+}
+
+TEST(RemoveTarget, AnOrdinarySoleCallIsNotDroppedByARemoveForALegNoSlotHolds)
+{
+	// Pinned on purpose (#1097): no "only active slot" fallback for any call. The far-end hangups
+	// captured on .244 (#533, three X1 runs) named our own leg, as did every other captured
+	// teardown (#379, #901, #548, #681, #370, #1095): no capture needed the fallback, and what it
+	// could end was the wrong call.
+	RemoveSlot slots[4];
+	slots[3] = {"1275", "", 0, false};
+	EXPECT_EQ(removeTargetSlot(slots, kUnknownRemove), -1) << "an ordinary call was dropped by another leg's Remove";
+}
+
+TEST(RemoveTarget, TheEchoOfOurOwnDropDoesNotEndTheOtherCall)
+{
+	// Two calls; this unit drops 1274, whose slot is freed before 3CX's Remove 1274 arrives
+	// (#533's "echo of our own drop"). 1275 is now the only active slot.
+	RemoveSlot slots[4];
+	slots[0] = {"1275", "", 0, false};
+	slots[1] = {"", "1281", 0, false};   // 1274's slot, freed (a stale far id left on a free slot)
+	EXPECT_EQ(removeTargetSlot(slots, "1274"), -1) << "the echo of our own drop ended the other call";
+	EXPECT_EQ(removeTargetSlot(slots, "1281"), -1) << "a free slot's stale far id matched";
+}
+
+TEST(RemoveTarget, ARemoveThatNamesASlotStillEndsThatSlotOnly)
+{
+	RemoveSlot slots[4];
+	slots[0] = {"1270", "1271", 0, false};
+	slots[1] = {"1272", "", 911, false};
+	slots[2] = {"1290", "", 0, true};
+	EXPECT_EQ(removeTargetSlot(slots, "1270"), 0) << "own leg";
+	EXPECT_EQ(removeTargetSlot(slots, "1271"), 0) << "the recorded far leg";
+	EXPECT_EQ(removeTargetSlot(slots, "1272"), 1) << "a 911 3CX ended is gone: its own Remove ends it";
+	EXPECT_EQ(removeTargetSlot(slots, "1290"), 2) << "inbound own leg";
+	EXPECT_EQ(removeTargetSlot(slots, "127"), -1) << "a prefix is another participant";
+	EXPECT_EQ(removeTargetSlot(slots, "12700"), -1);
+	EXPECT_EQ(removeTargetSlot(slots, ""), -1) << "an empty id names nobody, not a slot with no far id";
+}
+
+TEST(RemoveTarget, TheDecisionAllocatesNothing)
+{
+	RemoveSlot slots[4];
+	slots[0] = {"1275", "1280", 911, false};
+	int a = 0;
+	int b = 0;
+	std::size_t allocs = 0;
+	{
+		AllocGuard g;
+		a = removeTargetSlot(slots, std::string_view("1280"));
+		b = removeTargetSlot(slots, std::string_view(kUnknownRemove));
+		allocs = g.delta();
+	}
+	EXPECT_EQ(a, 0);
+	EXPECT_EQ(b, -1);
+	EXPECT_EQ(allocs, 0u) << "the WS worker's Remove decision runs after init: no heap";
 }
 
 }  // namespace

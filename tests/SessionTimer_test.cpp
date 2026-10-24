@@ -38,6 +38,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cctype>
 #include <string>
 #include <utility>
 #include <vector>
@@ -751,6 +752,21 @@ namespace
 			<< what << ": RFC 4028 §9 requires Require: timer with refresher=uac\n" << ok;
 	}
 
+	// True when some Require line of `raw` (any case, any position in a list) names
+	// the timer option tag.
+	bool requireNamesTimer(const std::string& raw)
+	{
+		std::string low = raw;
+		for (char& ch : low) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+		for (size_t p = low.find("\r\nrequire:"); p != std::string::npos; p = low.find("\r\nrequire:", p + 2))
+		{
+			const size_t eol = low.find("\r\n", p + 2);
+			const std::string line = low.substr(p, eol == std::string::npos ? std::string::npos : eol - p);
+			if (line.find("timer") != std::string::npos) return true;
+		}
+		return false;
+	}
+
 	// No Session-Expires (full or compact) and no Require: RFC 4028 §7.2's "no
 	// session expiration". The caller checks the answer itself as positive control.
 	void expectNoTimer(const std::string& ok, const std::string& what)
@@ -791,6 +807,55 @@ TEST(SessionTimer, TheConferenceAnswerCarriesNoTimerBecauseItsRefreshIsRefused)
 	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
 	expectNoTimer(ok, "888 answer");
 	EXPECT_NE(headerValue(ok, "Contact").find("sip:888@"), std::string::npos) << ok;
+}
+
+// #739: onReinvite() answers a 440 re-INVITE 488 (the tone leg has no peer), so
+// the 440 answer grants no timer to a caller that merely SUPPORTS one (Supported:
+// timer and a Session-Expires, no Require): that caller is owed none (RFC 4028
+// §7.2). The answer is a clone of the INVITE, so it must shed the echoed line.
+TEST(SessionTimer, The440AnswerToACallerThatOnlySupportsTimerCarriesNone)
+{
+	Rig r;
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "440", "se-440", kTimerOffer));
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectNoTimer(ok, "440 answer");
+	// Positive control: it is 440's own answer, carrying the tone's SDP, that was inspected.
+	EXPECT_NE(headerValue(ok, "Contact").find("sip:440@"), std::string::npos) << ok;
+	EXPECT_NE(ok.find("c=IN IP4 " + std::string(kServerIp) + "\r\n"), std::string::npos) << ok;
+}
+
+// #739: a caller that REQUIRES timer (Require: timer) cannot be answered without
+// one. RFC 4028 §9 puts Session-Expires and Require: timer in its 2xx, and pjsua
+// --use-timer=2 ends the call itself (BYE, Reason cause=421 "Failed processing
+// session timer response") when they are missing. So the 440 answer keeps what
+// the caller sent, in each shape a Require can take: a bare tag, a list in any
+// case, and a second Require line. The PBX arms no timer of its own for the leg.
+TEST(SessionTimer, The440AnswerToACallerThatRequiresTimerKeepsItsSessionExpiresAndRequire)
+{
+	struct Case { const char* callId; const char* require; };
+	const Case cases[] = {
+		{"se-440-req",  "Require: timer\r\n"},
+		{"se-440-list", "Require: replaces, TIMER\r\n"},
+		{"se-440-two",  "Require: replaces\r\nRequire: timer\r\n"},
+	};
+	for (const Case& c : cases)
+	{
+		Rig r;
+		r.handler.handle(timerRequest("INVITE", "100", kCaller, "440", c.callId,
+			std::string(kTimerOffer) + c.require));
+		const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+		// Positive control: it is still 440's own answer, carrying the tone's SDP.
+		ASSERT_FALSE(ok.empty()) << c.callId << ": the call must still be answered";
+		EXPECT_NE(headerValue(ok, "Contact").find("sip:440@"), std::string::npos) << c.callId << "\n" << ok;
+		EXPECT_NE(ok.find("c=IN IP4 " + std::string(kServerIp) + "\r\n"), std::string::npos) << c.callId << "\n" << ok;
+		EXPECT_EQ(headerValue(ok, "Session-Expires").rfind("1800", 0), 0u)
+			<< c.callId << ": a caller that requires a timer is owed one (RFC 4028 §9)\n" << ok;
+		EXPECT_TRUE(requireNamesTimer(ok)) << c.callId << ": nor may Require: timer be dropped\n" << ok;
+		auto session = r.handler.getSession("Call-ID: " + std::string(c.callId));
+		ASSERT_TRUE(session.has_value()) << c.callId;
+		EXPECT_EQ(session.value()->getSessionExpiresSeconds(), 0u)
+			<< c.callId << ": the PBX arms no expiry for this leg";
+	}
 }
 
 // Positive control for the grant: 555 answers its own re-INVITE with a 200
@@ -899,7 +964,7 @@ TEST(SessionTimer, AnAnswerCarriesNoTimerThePhoneCannotBeTheRefresherOf)
 {
 	struct Case { const char* callId; const char* headers; const char* why; };
 	const Case cases[] = {
-		{"se-nosup", "Session-Expires: 1800\r\nRequire: timer\r\n",
+		{"se-nosup", "Session-Expires: 1800\r\n",
 		 "no Supported: timer, so refresher=uac is not the phone's to accept (RFC 4028 §9)"},
 		{"se-uas", "Supported: timer\r\nSession-Expires: 1800;refresher=uas\r\n",
 		 "refresher=uas names the PBX, which never sends a refresh"},
@@ -915,5 +980,121 @@ TEST(SessionTimer, AnAnswerCarriesNoTimerThePhoneCannotBeTheRefresherOf)
 		// No Session-Expires is RFC 4028 §7.2's "no session expiration".
 		EXPECT_EQ(linesNamed(ok, "Session-Expires"), 0) << c.callId << ": " << c.why << "\n" << ok;
 		EXPECT_EQ(linesNamed(ok, "Require"), 0) << c.callId << ": no timer, so no Require: timer\n" << ok;
+	}
+}
+
+// ── #1042: a caller that REQUIRES timer is owed one (RFC 4028 §9) ────────────
+//
+// The strip above is legal for a caller that merely SUPPORTS timer. One that
+// sends `Require: timer` (pjsua --use-timer=2) must get Session-Expires and
+// Require: timer in the 2xx; without them pjsua BYEs its own call
+// (Reason cause=421, measured on the 440 answer in #1042). Every grant=false
+// answer shares answerSessionTimer(), so the unit test covers the async anchor
+// answer too, which no host test can reach.
+namespace
+{
+	// What pjsua --use-timer=2 sends.
+	constexpr const char* kTimerRequired =
+		"Supported: timer\r\nRequire: timer\r\nSession-Expires: 1800\r\nMin-SE: 90\r\n";
+
+	// The phone's own timer lines, untouched: Session-Expires 1800 once, Require: timer once.
+	void expectTimerEchoed(const std::string& ok, const std::string& what)
+	{
+		ASSERT_FALSE(ok.empty()) << what << ": the PBX sent no 200 OK";
+		EXPECT_EQ(headerValue(ok, "Session-Expires"), "1800")
+			<< what << ": a caller that Requires timer is owed Session-Expires (RFC 4028 §9)\n" << ok;
+		EXPECT_EQ(linesNamed(ok, "Session-Expires"), 1) << what << "\n" << ok;
+		EXPECT_EQ(headerValue(ok, "Require"), "timer")
+			<< what << ": and the Require: timer that goes with it\n" << ok;
+	}
+}
+
+TEST(SessionTimer, ARequiredTimerIsEchoedOnTheServiceLegAnswers)
+{
+	const struct { const char* to; const char* contact; } legs[] = {
+		{"777", "sip:777@"}, {"888", "sip:888@"}, {"796", "sip:796@"}, {"700", "sip:700@"},
+	};
+	for (const auto& leg : legs)
+	{
+		Rig r;
+		r.handler.setVoicemail("100", true);
+		r.handler.handle(timerRequest("INVITE", "100", kCaller, leg.to, std::string("rq-") + leg.to, kTimerRequired));
+		const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+		expectTimerEchoed(ok, std::string(leg.to) + " answer");
+		// Positive control: it is that leg's own answer.
+		EXPECT_NE(headerValue(ok, "Contact").find(leg.contact), std::string::npos) << ok;
+	}
+}
+
+TEST(SessionTimer, ARequiredTimerIsEchoedOnTheParkRetrieveAnswer)
+{
+	Rig r;
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "700", "rq-park", kTimerRequired));
+	r.handler.handle(timerRequest("INVITE", "106", kOther, "700", "rq-retrieve", kTimerRequired));
+	const std::string ok = okTo(r.sent, kOther, "1 INVITE");
+	expectTimerEchoed(ok, "retrieve answer");
+	EXPECT_NE(headerValue(ok, "Contact").find("sip:700@"), std::string::npos) << ok;
+}
+
+// Rule 5 control: the grant=true 555 answer (a possible 911 path) is unchanged by the
+// echo -- it still names the phone as refresher, with one Session-Expires and one Require.
+TEST(SessionTimer, ARequiredTimerOnThe555AnswerStillNamesThePhoneAsRefresher)
+{
+	Rig r;
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "555", "rq-555", kTimerRequired));
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectPhoneRefreshes(ok, "555 answer");
+	EXPECT_EQ(linesNamed(ok, "Require"), 1) << ok;
+}
+
+TEST(SessionTimer, ARequiredTimerWithNoSupportedLineIsEchoedToo)
+{
+	Rig r;
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "777", "rq-nosup",
+		"Session-Expires: 1800\r\nRequire: timer\r\n"));
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectTimerEchoed(ok, "777 answer");
+	EXPECT_NE(headerValue(ok, "Contact").find("sip:777@"), std::string::npos) << ok;
+}
+
+TEST(SessionTimer, ARequiredTimerIsEchoedOnTheVoicemailDepositAnswer)
+{
+	Rig r;
+	r.handler.setVoicemail("106", true);
+	r.handler.handle(timerRequest("INVITE", "100", kCaller, "106", "rq-vm-dep", kTimerRequired));
+	r.handler.handle(RequestsHandler::getMessageFromPool(
+		"SIP/2.0 486 Busy Here\r\n"
+		"Via: SIP/2.0/UDP " + std::string(kOther) + ":5060;branch=z9hG4bKrq-vm-depINVITE1\r\n"
+		"From: <sip:100@server>;tag=ftrq-vm-dep\r\n"
+		"To: <sip:106@server>;tag=btrq-vm-dep\r\n"
+		"Call-ID: rq-vm-dep\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n", addrFor(kOther)));
+	const std::string ok = okTo(r.sent, kCaller, "1 INVITE");
+	expectTimerEchoed(ok, "voicemail deposit answer");
+	EXPECT_NE(ok.find("v=0"), std::string::npos) << ok;   // answered by the PBX
+}
+
+// Every grant=false site, async anchor included, runs this one function.
+TEST(SessionTimer, AnswerSessionTimerKeepsTheCloneForAnyRequireTimerAndStripsOtherwise)
+{
+	const struct { const char* lines; bool required; } cases[] = {
+		{"Supported: timer\r\nRequire: timer\r\nSession-Expires: 1800\r\n", true},
+		{"Session-Expires: 1800\r\nRequire: TIMER\r\n", true},
+		{"Session-Expires: 1800\r\nRequire: 100rel, Timer\r\n", true},
+		{"Session-Expires: 1800\r\nRequire: 100rel\r\nRequire: timer\r\n", true},
+		{"Supported: timer\r\nSession-Expires: 1800\r\n", false},
+		{"Session-Expires: 1800\r\nRequire: 100rel\r\n", false},
+	};
+	for (const auto& c : cases)
+	{
+		const auto request = timerRequest("INVITE", "100", kCaller, "777", "rq-unit", c.lines);
+		auto response = RequestsHandler::getMessageFromPool(*request);
+		ASSERT_TRUE(response != nullptr);
+		pbx::answerSessionTimer(*response, *request, /*grant=*/false);
+		const std::string raw = response->toString();
+		EXPECT_EQ(linesNamed(raw, "Session-Expires"), c.required ? 1 : 0) << c.lines << "\n" << raw;
+		EXPECT_EQ(headerValue(raw, "Session-Expires") == "1800", c.required) << c.lines << "\n" << raw;
+		EXPECT_EQ(linesNamed(raw, "Require") > 0, c.required) << c.lines << "\n" << raw;
 	}
 }

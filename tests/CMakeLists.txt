@@ -213,6 +213,8 @@ add_executable(sip_parser_tests
     # Issues #797 / #798: address requests to the Contact the phone registered.
     RegisteredContact_test.cpp
     InboundAnchorReinvite_test.cpp
+    # Issue #1098: a de-registering or lapsed handset ringing an inbound anchored call.
+    AnchorInboundDeregister_test.cpp
     # Issue #920: AudioSocket binary framing and Apidaze anchor adapter scaffold
     AudioSocket_test.cpp
     # Issue #263: sdp::isHold() (#255) had zero production callers -- the two
@@ -291,6 +293,7 @@ add_executable(sip_parser_tests
     DashboardRosterText_test.cpp
     # Dashboard review #6: the Factory Reset confirm lists what it erases.
     DashboardResetText_test.cpp
+    DashboardTelephonyActiveText_test.cpp
     # Dashboard review #4 (#641): the PBX modal has an E911 notification form.
     DashboardE911Form_test.cpp
     # #642 (dashboard review #10): Wi-Fi rows are buttons, .msg are live regions.
@@ -416,6 +419,8 @@ add_executable(sip_parser_tests
     # Issue #948: the 911/933 lane's status GET -- the failure contract on its body arena and the
     # bounded claim (src/SIP/SosStatusGet.hpp), the code the anchor client's sos lane calls.
     SosStatusGet_test.cpp
+    # #949 item 1: the worker's outbound status read: sos lane for an emergency slot, "" is UNKNOWN there.
+    OutboundLegStatus_test.cpp
     # #862: the token-body arena and its bounded field scanner (the #948 contract).
     TokenBodyArena_test.cpp
     FetchTokenOwnCode_test.cpp
@@ -500,9 +505,13 @@ add_executable(sip_parser_tests
     # Issue #746: a callee's 415/420/488/603 (and a ring-group member's refusal or
     # loser's 487) reached onFinalFailure() and went nowhere: no relay, no ACK.
     FinalFailureRelay_test.cpp
+    # Audit row 1: a CANCEL after a CFU/CFB/CFNA forward went to the original callee.
+    CancelAfterForward_test.cpp
     # Issue #802: the caller's ACK/BYE/CANCEL on a ring-group / zone / alias call
     # were dispatched on the To literal and 404'd; they reach the member now.
     GroupInDialog_test.cpp
+    # Audit row 20: a BYE for a Call-ID with no session is answered 481, not relayed.
+    ByeUnknownDialog_test.cpp
     # Issue #690 (slice 1): Session::Disposition is written once by the four outcome
     # writers (486, 480, CANCEL, BYE) and cleared by reset().
     SessionDisposition_test.cpp

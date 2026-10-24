@@ -22,10 +22,13 @@ Any other value stops the CMake configure step with a fatal error (`main/CMakeLi
 
 ```mermaid
 flowchart TD
-    A["SIP_TRANSPORT=eth"] --> B{"PD_ETH_BOARD"}
-    B -->|"elite (default)"| C["T-ETH-ELITE S3 pin map, microSD enabled"]
-    B -->|"waveshare"| D["Waveshare ESP32-S3-ETH pin map, no SD"]
-    B -->|"any other value"| E["CMake stops with a fatal error"]
+    A["SIP_TRANSPORT=eth: MAIN_SRC = esp_main_eth.cpp (main/CMakeLists.txt:31)"] --> N{"PD_ETH_BOARD defined? (:37)"}
+    N -->|"no"| B["PD_ETH_BOARD set to elite"]
+    N -->|"yes"| X{"Value"}
+    B --> X
+    X -->|"elite"| C["PD_ETH_BOARD_ELITE, PD_ETH_HAS_SD, links sdmmc, fatfs, esp_driver_sdspi (:49-52)"]
+    X -->|"waveshare"| D["PD_ETH_BOARD_WAVESHARE, no SD stack (:53-54)"]
+    X -->|"any other value"| E["message FATAL_ERROR: Unknown PD_ETH_BOARD, use elite or waveshare (:55-56)"]
 ```
 
 ## 2. Guition JC3248W535 Smart Display (3.5" Black LCD)

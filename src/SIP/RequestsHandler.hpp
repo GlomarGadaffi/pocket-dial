@@ -124,6 +124,12 @@ public:
 	// #838: a datagram off the socket; see sipmsgpool::getMessageFromWire.
 	static std::shared_ptr<SipMessage> getMessageFromWire(std::string_view message, sockaddr_in src);
 
+	// #1092: the trunk peer IP the rate limiter treats as the carrier, given the
+	// current one and this pass's resolver answer. A Hit that names a carrier
+	// replaces it; every other answer (Pending, Failed, an expired cache entry)
+	// keeps it, so the carrier is not demoted while a re-resolve is in flight.
+	static uint32_t nextTrunkPeerIp(uint32_t current, TrunkResolver::Status st, uint32_t found);
+
 	// ── Media beachhead static helpers (pure; host-unit-tested) ──────────────────
 	// Build the server's own SDP body for the 440 answer (server media: PCMU on the
 	// server's RTP port). Pure formatter — exposed so tests can assert its body and
@@ -632,6 +638,20 @@ public:
 	// #463: tick() runs at most once a second; this lets a test drive two passes
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
+	// #1092: the shared unregistered emergency INVITE budget as it stands, untouched by any
+	// packet. It must start FULL: a bucket stamped at the clock epoch refills from boot on ESP.
+	double unregisteredEmergencyTokensForTest()
+	{
+		std::lock_guard<std::mutex> rlock(_rateMutex);
+		return _unregisteredEmergency.tokens;
+	}
+	// #1092: forget one source's bucket-table entry (network-order s_addr), as tick()'s idle
+	// sweep does after 60 s, so a test can hold the table full with that source absent.
+	void eraseRateBucketForTest(uint32_t netIp)
+	{
+		std::lock_guard<std::mutex> rlock(_rateMutex);
+		_rateBuckets.erase(netIp);
+	}
 	// #986: hold _mutex for `d`, as a slow NVS commit or PIN hash would. Host builds
 	// only. Defined in the .cpp so every call is one site however the caller is inlined.
 	void holdMutexForTest(std::chrono::milliseconds d);
@@ -765,8 +785,15 @@ public:
 	// writes everything here and now (the reset has begun; a stage would be refused).
 	std::vector<TelephonyApiConfig::SlotView> getTelephonyConfigSlots();
 	TelephonyApiConfig::SlotView getTelephonyConfigSlot(size_t idx);
-	std::string setTelephonyConfigSlot(size_t idx, const TelephonyApiConfig::Slot& s, bool keepSecret);
-	std::string setTelephonyConfigActiveSlot(size_t idx);
+	// #1073: enabling a slot, and activating one, take the caller's acceptance of the
+	// limitations (TelephonyApiConfig.hpp); without one that the slot already holds,
+	// they answer "Acceptance required: ...". The SBC route does not go through here.
+	std::string setTelephonyConfigSlot(size_t idx, const TelephonyApiConfig::Slot& s, bool keepSecret,
+		const TelephonyApiConfig::Acceptance* accept = nullptr);
+	std::string setTelephonyConfigActiveSlot(size_t idx, const TelephonyApiConfig::Acceptance* accept = nullptr);
+	// Bit i set: slot i is enabled without an acceptance of the current warning text.
+	// Lock-free, for /api/status (polled every second).
+	uint8_t telephonyAcceptanceMissingMask() const { return _tapiConfig.acceptanceMissingMask(); }
 	std::string clearTelephonyConfigSlot(size_t idx);
 	std::string clearAllTelephonyConfig();
 
@@ -784,7 +811,10 @@ public:
 	// #997: the activation is staged for the NVS writer like POST .../activate, so
 	// it is refused (and SBC mode stays off) while a factory reset runs or when the
 	// writer is not running; the active slot has changed in RAM all the same.
-	std::string setSbcMode(bool enabled, size_t route);
+	// #1073: selecting a slot that is not already the active one is an activation, so it
+	// takes the same acceptance as POST .../activate ("Acceptance required: ...", SBC mode
+	// left as it was); re-selecting the slot that is active already changes nothing.
+	std::string setSbcMode(bool enabled, size_t route, const TelephonyApiConfig::Acceptance* accept = nullptr);
 
 	// ── RFC 3262 100rel on a forwarded call (Issue #172, step 3) ──────────────
 	// Off in a shipped image; in memory only (see PbxFeatureConfig::setForward100rel()).
@@ -989,6 +1019,14 @@ public:
 		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		anchorDroppedLocked(participantId);
 	}
+	// Test-only (#1095): run an outbound anchor call's Make job on the calling
+	// thread, as a tel_ctl worker does, so a test orders the anchor's events
+	// around it with no worker in between.
+	void runAnchorMakeJobForTest(const std::string& callId, const std::string& dest,
+		const std::string& callerNumber)
+	{
+		runTelCtl(TelCtlJob{ TelCtlJob::Make, dest, callId, callerNumber, {} });
+	}
 
 	// Test-only: drive an inbound anchored call (PSTN -> handset) the way a real
 	// anchor's CallEvent::Incoming does, and return the new session's Call-ID
@@ -1106,6 +1144,17 @@ public:
 	bool forgetDevice(const std::string& macOrExt);
 	// #515: forget every Learned device at once; Secured ones stay. Thread-safe + persisted.
 	size_t forgetLearnedDevices();
+	// #483: replace the whole device table with a restored config export's rows, all or
+	// nothing (Registrar::replaceDevices; only the Owner-gated import calls this), in ONE
+	// _mutex hold with one persist and one snapshot rebuild. Each extension must pass what
+	// onRegister() demands before it adopts one: the AOR charset and length, the engine's
+	// service names, the reserved / emergency / PSTN-shaped identities. `hasSecret` says
+	// whether an extension has a stored digest secret AS THE CALLER WILL LEAVE THE STORE,
+	// so a Secured row is judged with the secrets that come with it. `faults` may already
+	// hold rows the caller could not read; with any fault left on return (Refused) the table
+	// is untouched, and so it is for NotStaged. Thread-safe + persisted.
+	Registrar::ReplaceResult replaceBindings(const std::vector<Registrar::Binding>& rows,
+		FunctionRef<bool(const std::string&)> hasSecret, std::vector<Registrar::BindingFault>& faults);
 
 private:
 	void initHandlers();
@@ -2035,9 +2084,27 @@ private:
 		const std::string& fromExt, const std::string& dialed, bool routed,
 		std::string_view note = {}, bool callUp = false);
 
+	// #1107: `noRelayableCodec` is set by onInvite's relay codec gate for an emergency
+	// INVITE whose offer this PBX cannot carry. It skips the route and goes straight to
+	// the 503 below, with the codec named, the EMERGENCY log line and the routed=false
+	// notification; the anchor would refuse that offer anyway.
 	void routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		const std::shared_ptr<SipClient>& caller,
-		const pbx::EmergencyDial& emergency, const std::string& dialed);
+		const pbx::EmergencyDial& emergency, const std::string& dialed,
+		bool noRelayableCodec = false);
+
+	// #1107: the emergency number `dialed` names, directly or through a dial-plan Trunk
+	// rule (the two forms onInvite's intercept takes). False for anything else.
+	// Caller holds _mutex.
+	bool emergencyDialOf(const std::string& dialed, pbx::EmergencyDial& emergencyOut,
+		std::string& asDialedOut) const;
+	// #1107: onInvite's codec gate, for an emergency dial. True when it took the INVITE.
+	bool routeCodecRefusedEmergency(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<SipClient>& caller, const std::string& dialed);
+	// #1107: onInvite's 403 for an unknown caller, for an emergency dial: the status
+	// stands, the EMERGENCY log line and the routed=false notification are added.
+	void noteUnregisteredEmergencyDial(const std::shared_ptr<SipMessage>& data,
+		const std::string& dialed);
 
 	// #659: a call to `ext` is a PSAP callback (ext dialed 911/933 within
 	// pbx::kEmergencyCallbackWindow). Every path that creates a session for an
@@ -2169,7 +2236,9 @@ private:
 
 	// True iff every POCKETDIAL_MAX_ANCHOR_CALLS bridge slot is active — the
 	// capacity gate for both a fresh 555 dial (onAnchorInvite) and a fresh
-	// inbound anchor call (routeInboundAnchorCall). Caller holds _mutex.
+	// inbound anchor call (routeInboundAnchorCall). A PSAP callback is the one
+	// inbound that may still pre-empt a call to get past it (#967). Caller holds
+	// _mutex.
 	bool allBridgesBusy() const;
 
 	// How many anchored calls may run at once: min(what the plugged-in provider
@@ -2185,6 +2254,22 @@ private:
 	// #624: when the anchor is full, end one non-emergency anchored call so a
 	// 911/933 can take its room. Caller holds _mutex.
 	void preemptAnchorCallForEmergency();
+
+	// #967: an inbound PSAP callback that routeInboundAnchorCall() would refuse
+	// (every bridge busy, or another anchor inbound ringing or up) ends ONE
+	// non-emergency anchored call that clears every reason that applies, or ends
+	// none. True iff nothing is in the way now; false means drop the callback as
+	// before (only emergency calls in the way, or no single call makes room).
+	// Runs on the anchor's event task, so its sends go to _asyncOutbox. Caller
+	// holds _mutex.
+	bool preemptAnchorCallForPsapCallback();
+
+	// The teardown both pre-emptions share: tell the victim's phone (503, CANCEL
+	// or BYE) on `outbox`, then endCall() with `reason`. `outbox` is _outbox on
+	// the SIP thread and _asyncOutbox off it. `victim` refers into _sessions and
+	// is dead after the call. Caller holds _mutex.
+	void endAnchorCallForPreempt(const std::shared_ptr<Session>& victim,
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outbox, std::string_view reason);
 
 	// True iff the currently-selected anchor provider is Loopback — the boundary
 	// between the two calling conventions this port has to support:
@@ -2227,6 +2312,9 @@ private:
 	void refuseRingingAnchor(const std::string& callId,
 		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& outbox);
 	void asyncDropCall(const std::string& participantId);
+	// #1103: free a leg 3CX has already removed, on tel_drop, with no drop request
+	// (AnchorClient::releaseRemovedLeg). Same threading rules as asyncDropCall().
+	void asyncReleaseRemovedLeg(const std::string& participantId);
 	// #379: the one place a teardown path marks a session's far leg released, so endCall()'s
 	// no-bridge fallback does not drop it a second time. `dropLeg` true (the default): post the
 	// session's drop first, then mark. False: mark only, for a leg 3CX already dropped, or whose
@@ -2275,7 +2363,7 @@ private:
 	// post under _mutex (runTelCtl()'s #379 orphan drop).
 	struct TelCtlJob
 	{
-		enum Kind : uint8_t { Make, Answer, Drop } kind = Drop;
+		enum Kind : uint8_t { Make, Answer, Drop, Release } kind = Drop;   // Release: #1103
 		std::string dest;
 		std::string callId;
 		std::string callerNumber;
@@ -2369,6 +2457,11 @@ private:
 	void onInboundAnchorOk(const std::shared_ptr<SipMessage>& ok, const std::shared_ptr<Session>& session);
 
 	void unregisterClient(std::string_view number);
+	// #1089: end every session `extension` is on through endCall(); caller holds _mutex.
+	void endClientCalls(const std::string& extension, const std::string& reason);
+	// #1089: is `ext` a party to `s`, including the callee of a plain call still ringing?
+	static std::string_view ringingCalleeOf(const Session& s);
+	static bool sessionOnExtension(const Session& s, std::string_view ext);
 
 	// Registration-lease handling (RFC 3261 §10.2.1)
 	int parseRequestedExpires(const std::shared_ptr<SipMessage>& data) const;
@@ -2409,10 +2502,42 @@ private:
 	std::shared_ptr<SipMessage> buildPagingBye(const std::shared_ptr<SipMessage>& ok,
 		const std::shared_ptr<SipClient>& answerer);
 
-	// Issue #38: per-source-IP token bucket + optional allowlist. Both helpers
-	// assume the caller already holds _mutex.
+	// Issue #38: per-source-IP token bucket + optional allowlist. These two
+	// assume the caller holds _rateMutex (not _mutex).
 	bool ipAllowed(const sockaddr_in& src) const;
 	bool allowPacket(const sockaddr_in& src);
+
+	// #1092, Rule 5: what the per-IP limiter must never refuse. Both published
+	// from the _mutex side (tick(), setTrunkConfig(), end of handle()) INTO
+	// _rateMutex, the sanctioned _mutex -> _rateMutex order; the flood path in
+	// handle() reads them under _rateMutex alone and never takes _mutex.
+	//   (a) the configured trunk's resolved IPv4 (a PSAP calls back, and the
+	//       carrier signals a live 911, from the one carrier IP); and
+	//   (b) the Call-IDs of live emergency sessions (and the trunk dialog's own
+	//       Call-ID for the same call), so an in-dialog BYE/ACK/re-INVITE from
+	//       any source gets through. A Call-ID is not spoofable into the set:
+	//       it is only ever added from a session the engine itself marked
+	//       emergency, never from a header on a packet.
+	static constexpr size_t kMaxRateExemptCallIds  = 2 * POCKETDIAL_MAX_SESSIONS;
+	static constexpr size_t kRateExemptCallIdBytes = SipLimits::kMaxCallIdLine + 1;
+	static_assert(kMaxRateExemptCallIds <= 255, "EmergencyCallIds::count/len are uint8_t");
+	static_assert(kRateExemptCallIdBytes <= 256, "EmergencyCallIds::len is uint8_t");
+	struct EmergencyCallIds
+	{
+		std::array<std::array<char, kRateExemptCallIdBytes>, kMaxRateExemptCallIds> id{};
+		std::array<uint8_t, kMaxRateExemptCallIds> len{};   // bytes used in id[i], no NUL counted
+		uint8_t count = 0;
+	};
+	static bool emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId);
+	static bool emergencyIdsHas(const EmergencyCallIds& set, std::string_view callId);
+	static bool emergencyIdsEqual(const EmergencyCallIds& a, const EmergencyCallIds& b);
+	// Caller holds _mutex.
+	void publishRateExemptions();
+	// retire = the trunk was reconfigured: forget the old peer before looking the new one up.
+	void publishTrunkPeer(bool retire);
+	// Caller holds _rateMutex. True when the packet's Call-ID is a live emergency dialog's. Bare
+	// Call-ID values on both sides (the sessions are keyed on the whole "Call-ID: x" line).
+	bool rateExemptByCallId(const SipMessage& m) const;
 
 	void endHandle(std::string_view destNumber, std::shared_ptr<SipMessage> message);
 	std::string buildContact(std::string_view number) const;
@@ -3173,15 +3298,59 @@ private:
 	// Issue #38: token bucket keyed by source IPv4 (network-order s_addr).
 	struct RateBucket
 	{
-		// cppcheck flags this as uninitMemberVarNoCtor. False positive: every
-		// RateBucket is created via `_rateBuckets[ip] = { 40.0, now }` (below),
-		// so `tokens` is overwritten immediately and is never read from the
-		// briefly-default-constructed instance operator[] creates first.
-		// cppcheck-suppress uninitMemberVarNoCtor
-		double tokens;
+		double tokens = 0.0;
 		std::chrono::steady_clock::time_point last;
 	};
 	std::unordered_map<uint32_t, RateBucket> _rateBuckets;
+	// #1092: the trunk peer's own bucket, outside the 256-entry table (a reserved slot: a full
+	// table never refuses the carrier), with a ceiling 10x an ordinary source's. Sized for
+	// POCKETDIAL_MAX_TRUNK_CALLS (2) dialogs plus REGISTER and OPTIONS, retransmits included:
+	// real carrier traffic is a few packets a second; 200/s sustained is ~100/s per call slot.
+	// Past it the packet is dropped like any flood, which caps what a source forged as the
+	// carrier can push at _mutex.
+	static constexpr double kTrunkBucketBurst = 400.0;
+	static constexpr double kTrunkBucketRate  = 200.0;   // tokens per second
+	RateBucket _trunkBucket{ 0.0, {} };   // guarded by _rateMutex; reset when _trunkPeerIp changes
+	static bool takeToken(RateBucket& bucket, std::chrono::steady_clock::time_point now,
+		double burst, double perSec);
+
+	// #1092 follow-up: a handset's FIRST 911 INVITE has no session yet, and the handset is not
+	// the trunk peer, so neither exemption above can admit it. Two more, same locking.
+	//   (c) every registered extension's source IPv4 gets a RESERVED slot (fixed array, one per
+	//       client): it keeps a normal burst-40 bucket but is never refused for lack of a slot in
+	//       the 256-entry table, so spoofed sources filling the table cannot lock a real handset
+	//       out. Buckets carry over each rebuild; they are never reset to full by it.
+	//   (d) an INVITE whose REQUEST-URI user part or its To number is 911/933 (classifyEmergencyDial) may spend a
+	//       tiny separate budget when the ordinary bucket would drop it: burst 4, 1 per 10 s. A
+	//       registered source has its own; every unregistered source shares ONE, so a spoofer
+	//       gains kEmergencyInviteBurst packets in total however many addresses it forges. Either
+	//       header qualifies (onInvite routes on To; both are forgeable) and the cap is the same, so
+	//       a forger gains nothing extra. A dial-rule 911 (#834) gets none: the rules are _mutex's.
+	static constexpr size_t kMaxRateRegisteredSources = POCKETDIAL_MAX_CLIENTS;
+	static_assert(kMaxRateRegisteredSources > 0 && kMaxRateRegisteredSources <= 255,
+		"one reserved limiter slot per client");
+	static constexpr double kEmergencyInviteBurst  = 4.0;
+	static constexpr double kEmergencyInvitePerSec = 0.1;
+	struct RateSource
+	{
+		uint32_t ip = 0;   // network-order s_addr; 0 = unused
+		RateBucket ordinary{ 0.0, {} };
+		RateBucket emergency{ kEmergencyInviteBurst, {} };
+	};
+	// Caller holds _rateMutex. Null when `ip` is not a registered extension's source.
+	RateSource* findRateSource(uint32_t ip);
+	// Caller holds _rateMutex. The whole admission decision for one inbound packet.
+	bool admitPacket(const SipMessage& m);
+	bool allowEmergencyInvite(const SipMessage& m, const sockaddr_in& src);
+	// Caller holds _mutex.
+	void publishRegisteredSources();
+	// #1092: both guarded by _rateMutex. 0 = no trunk peer known (never matches).
+	uint32_t _trunkPeerIp = 0;   // network-order s_addr
+	EmergencyCallIds _emergencyCallIds;
+	EmergencyCallIds _emergencyIdsScratch;   // publishRateExemptions() build area; guarded by _mutex
+	std::array<RateSource, kMaxRateRegisteredSources> _rateSources{};          // guarded by _rateMutex
+	std::array<RateSource, kMaxRateRegisteredSources> _rateSourcesScratch{};   // build area; guarded by _mutex
+	RateBucket _unregisteredEmergency{ kEmergencyInviteBurst, {} };   // guarded by _rateMutex
 	// Optional CIDR allowlist (host order). _allowMask == 0 means "no allowlist".
 	uint32_t _allowNet  = 0;
 	uint32_t _allowMask = 0;
@@ -3189,8 +3358,9 @@ private:
 	// for the per-packet admission check BEFORE the big handler _mutex so a flood
 	// from blocked IPs is dropped without ever serializing on _mutex against
 	// legitimate signaling. Lock order: never acquire _mutex while holding this;
-	// tick() may nest this inside _mutex (the only place both are held), so the
-	// one ordering is _mutex → _rateMutex and handle() holds them disjointly.
+	// _mutex → _rateMutex is the one ordering. The flood check at the top of handle()
+	// holds _rateMutex alone; the _mutex side nests it in tick()'s bucket sweep and
+	// in publishRateExemptions()/publishTrunkPeer() (#1092).
 	std::mutex _rateMutex;
 
 	std::chrono::steady_clock::time_point _lastSweep{};

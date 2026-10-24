@@ -359,6 +359,31 @@ namespace
 	}
 }
 
+// #1089: the handset's lease lapsing on an answered inbound anchored call ends it
+// through endCall() (the anchor leg is dropped once) and BYEs nobody: src is the
+// zero-address PSTN stand-in, which is no phone.
+TEST(InboundAnchorBye, AnExpiredHandsetLeaseDropsTheLegOnceAndSendsNoByeToTheZeroedPeer)
+{
+	Sent sent;
+	RequestsHandler handler(kPbxIp, 5060,
+		[&sent](const sockaddr_in& a, std::shared_ptr<SipMessage> m) { sent.emplace_back(a, std::move(m)); });
+	const std::string callIdLine = answeredInboundCall(handler, sent);
+	auto* loop = dynamic_cast<LoopbackAnchorClient*>(handler.anchorClientForTest());
+	ASSERT_NE(loop, nullptr);
+	const unsigned dropsBefore = loop->dropCallCount();
+	sent.clear();
+
+	handler.expireLeaseAndSweepForTest("106");
+
+	EXPECT_FALSE(handler.getSession(callIdLine).has_value());
+	EXPECT_EQ(loop->dropCallCount(), dropsBefore + 1) << "the anchor leg is dropped exactly once";
+	for (const auto& [a, msg] : sent)
+	{
+		EXPECT_NE(a.sin_addr.s_addr, 0u) << "a datagram went to the zero-address PSTN stand-in";
+		(void)msg;
+	}
+}
+
 TEST(InboundAnchorBye, AByeFromTheHandsetAddressOnARingingInboundCallDoesNotEndIt)
 {
 	expectRingingInboundCallSurvivesABye(kHandsetIp);

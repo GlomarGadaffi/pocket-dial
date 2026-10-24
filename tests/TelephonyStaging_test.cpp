@@ -47,11 +47,13 @@ using nvswriter::Key;
 
 static_assert(TelephonyApiConfig::kSlots == 4, "the literal expectations below spell out four slots");
 static_assert(TelephonyApiConfig::kMaxUrlLen == 128, "the long-value tests use the 128-character URL cap");
-static_assert(TelephonyApiConfig::kSnapshotLen == 4 * (2 + 3 * 129) + 1, "type, enabled, three 129-byte cells per slot, then active");
+static_assert(TelephonyApiConfig::kSnapshotLen == 4 * (2 + 3 * 129 + 28) + 1, "type, enabled, three 129-byte cells and a 28-byte acceptance cell per slot, then active");
 static_assert(nvswriter::kKeyCount == 4, "devices, forwards, DID table, telephony");
 
 namespace
 {
+	// #1073: enabling a slot needs the administrator's acceptance of the current warning text.
+	const TelephonyApiConfig::Acceptance kAccepted{TelephonyApiConfig::kAcceptanceVersion, 2, 1760000000};
 	constexpr const char* kSecret = "S3CR3T-sentinel-5c1f9a77d0";
 	constexpr const char* kSecret2 = "ROTATED-sentinel-aa90e3b1";
 	constexpr const char* kClientId = "CLIENT-visible-4e2b";
@@ -126,6 +128,7 @@ namespace
 		out.emplace_back(p + "url", "");
 		out.emplace_back(p + "id", "");
 		out.emplace_back(p + "dn", "");
+		out.emplace_back(p + "acc", "");
 	}
 
 	class TelephonyStaging : public ::testing::Test
@@ -160,7 +163,7 @@ namespace
 
 TEST_F(TelephonyStaging, SetSlotStagesEveryFieldButTheSecretUnderTheOldKeys)
 {
-	ASSERT_EQ(_cfg.setSlot(1, realSlot(kSecret), /*keepSecret=*/false), "");
+	ASSERT_EQ(_cfg.setSlot(1, realSlot(kSecret), /*keepSecret=*/false, &kAccepted), "");
 	EXPECT_EQ(nvswriter::stats().staged, 1u);
 	EXPECT_EQ(stagedTel().size(), TelephonyApiConfig::kSnapshotLen);
 
@@ -172,10 +175,11 @@ TEST_F(TelephonyStaging, SetSlotStagesEveryFieldButTheSecretUnderTheOldKeys)
 	// Spelled out: the keys and values the old persist() handed nvs_set_*, in its
 	// order, with the four `s<i>sec` sets gone.
 	const Pairs want = {
-		{"s0type", "0"}, {"s0en", "0"}, {"s0url", ""}, {"s0id", ""}, {"s0dn", ""},
+		{"s0type", "0"}, {"s0en", "0"}, {"s0url", ""}, {"s0id", ""}, {"s0dn", ""}, {"s0acc", ""},
 		{"s1type", "1"}, {"s1en", "1"}, {"s1url", "https://pbx.example.invalid"}, {"s1id", kClientId}, {"s1dn", "100"},
-		{"s2type", "0"}, {"s2en", "0"}, {"s2url", ""}, {"s2id", ""}, {"s2dn", ""},
-		{"s3type", "0"}, {"s3en", "0"}, {"s3url", ""}, {"s3id", ""}, {"s3dn", ""},
+		{"s1acc", "1,2,1760000000"},
+		{"s2type", "0"}, {"s2en", "0"}, {"s2url", ""}, {"s2id", ""}, {"s2dn", ""}, {"s2acc", ""},
+		{"s3type", "0"}, {"s3en", "0"}, {"s3url", ""}, {"s3id", ""}, {"s3dn", ""}, {"s3acc", ""},
 		{"active", "255"},
 	};
 	EXPECT_EQ(d.pairs, want);
@@ -189,7 +193,7 @@ TEST_F(TelephonyStaging, SetSlotStagesEveryFieldButTheSecretUnderTheOldKeys)
 
 TEST_F(TelephonyStaging, TheActiveSlotIsStagedAndAnUnusedOneIsNone)
 {
-	ASSERT_EQ(_cfg.setSlot(2, realSlot(kSecret), false), "");
+	ASSERT_EQ(_cfg.setSlot(2, realSlot(kSecret), false, &kAccepted), "");
 	ASSERT_EQ(_cfg.setActiveSlot(2), "");
 	const Walk d = drain();
 	ASSERT_EQ(d.telephonyWrites, 1u) << "two changes, one write: the newest snapshot";
@@ -201,7 +205,7 @@ TEST_F(TelephonyStaging, TheActiveSlotIsStagedAndAnUnusedOneIsNone)
 
 TEST_F(TelephonyStaging, TheSecretIsInNoWriterBufferAfterAWriteAWriterPassOrAnotherWrite)
 {
-	ASSERT_EQ(_cfg.setSlot(1, realSlot(kSecret), false), "");
+	ASSERT_EQ(_cfg.setSlot(1, realSlot(kSecret), false, &kAccepted), "");
 	ASSERT_GE(nvswriter::stats().staged, 1u) << "nothing staged means the scans below prove nothing";
 
 	// Staged and waiting: the client id is in the slot and the queue item, the secret in neither,
@@ -217,7 +221,7 @@ TEST_F(TelephonyStaging, TheSecretIsInNoWriterBufferAfterAWriteAWriterPassOrAnot
 	EXPECT_EQ(where("S3CR3T"), 0u);
 
 	// A new secret, and then the slot cleared: neither the old nor the new one shows up anywhere.
-	ASSERT_EQ(_cfg.setSlot(1, realSlot(kSecret2), false), "");
+	ASSERT_EQ(_cfg.setSlot(1, realSlot(kSecret2), false, &kAccepted), "");
 	EXPECT_EQ(where(kClientId), kAll);
 	EXPECT_EQ(where(kSecret2), 0u);
 	EXPECT_EQ(where(kSecret), 0u);
@@ -231,7 +235,7 @@ TEST_F(TelephonyStaging, TheSecretIsInNoWriterBufferAfterAWriteAWriterPassOrAnot
 
 TEST_F(TelephonyStaging, ASnapshotDiscardedByAResetLeavesNoSecretEither)
 {
-	ASSERT_EQ(_cfg.setSlot(1, realSlot(kSecret), false), "");
+	ASSERT_EQ(_cfg.setSlot(1, realSlot(kSecret), false, &kAccepted), "");
 	ASSERT_EQ(where(kClientId), nvswriter::InSlot | nvswriter::InQueue);
 	resetguard::begin();   // the reset opens between the stage and the writer's pass
 
@@ -251,7 +255,7 @@ TEST_F(TelephonyStaging, ASecretIsWrittenOnlyWhenItChanged)
 {
 	ASSERT_EQ(_cfg.secretWrites(), 0u);
 
-	ASSERT_EQ(_cfg.setSlot(0, realSlot(kSecret), false), "");
+	ASSERT_EQ(_cfg.setSlot(0, realSlot(kSecret), false, &kAccepted), "");
 	EXPECT_EQ(_cfg.secretWrites(), 1u) << "a new secret is written";
 	EXPECT_FALSE(_cfg.secretPending(0));
 
@@ -260,13 +264,13 @@ TEST_F(TelephonyStaging, ASecretIsWrittenOnlyWhenItChanged)
 	ASSERT_EQ(_cfg.setSlot(0, edit, /*keepSecret=*/true), "");
 	EXPECT_EQ(_cfg.secretWrites(), 1u) << "an edit that keeps the secret writes none";
 
-	ASSERT_EQ(_cfg.setSlot(0, realSlot(kSecret), false), "");
+	ASSERT_EQ(_cfg.setSlot(0, realSlot(kSecret), false, &kAccepted), "");
 	EXPECT_EQ(_cfg.secretWrites(), 1u) << "saving the same value again is not a change";
 
 	ASSERT_EQ(_cfg.setActiveSlot(0), "");
 	EXPECT_EQ(_cfg.secretWrites(), 1u);
 
-	ASSERT_EQ(_cfg.setSlot(0, realSlot(kSecret2), false), "");
+	ASSERT_EQ(_cfg.setSlot(0, realSlot(kSecret2), false, &kAccepted), "");
 	EXPECT_EQ(_cfg.secretWrites(), 2u) << "a different value is a change";
 
 	ASSERT_EQ(_cfg.clearSlot(1), "");
@@ -283,14 +287,14 @@ TEST_F(TelephonyStaging, AChangedSecretIsRetriedAfterAFailedWrite)
 {
 	// The store cannot be opened: the secret write fails.
 	_cfg.setStorePath("test_telstage_no_such_dir_997/tapi.cfg");
-	EXPECT_NE(_cfg.setSlot(0, realSlot(kSecret), false), "");
+	EXPECT_NE(_cfg.setSlot(0, realSlot(kSecret), false, &kAccepted), "");
 	EXPECT_TRUE(_cfg.secretPending(0)) << "a write that failed is still owed";
 	EXPECT_EQ(_cfg.secretWrites(), 0u);
 	EXPECT_TRUE(_cfg.view(0).secretSet) << "live in RAM either way";
 
 	// Same value again: a comparison against the live value would call it unchanged and skip it forever.
 	_cfg.setStorePath(_path);
-	EXPECT_EQ(_cfg.setSlot(0, realSlot(kSecret), false), "");
+	EXPECT_EQ(_cfg.setSlot(0, realSlot(kSecret), false, &kAccepted), "");
 	EXPECT_EQ(_cfg.secretWrites(), 1u);
 	EXPECT_FALSE(_cfg.secretPending(0));
 	EXPECT_NE(slurp(_path).find(kSecret), std::string::npos) << "the host store carries the secret";
@@ -299,7 +303,7 @@ TEST_F(TelephonyStaging, AChangedSecretIsRetriedAfterAFailedWrite)
 TEST_F(TelephonyStaging, ARefusedStageWritesNeitherPartAndKeepsTheSecretPending)
 {
 	resetguard::begin();
-	const std::string err = _cfg.setSlot(0, realSlot(kSecret), false);
+	const std::string err = _cfg.setSlot(0, realSlot(kSecret), false, &kAccepted);
 	EXPECT_NE(err.find("factory reset"), std::string::npos) << err;
 	EXPECT_EQ(nvswriter::stats().suppressed, 1u);
 	EXPECT_EQ(nvswriter::stats().staged, 0u);
@@ -329,7 +333,7 @@ TEST_F(TelephonyStaging, AValueLongerThanItsCellIsRefusedWholeAndTheSecretIsNotW
 	_cfg.load();
 	nvswriter::resetForTest();
 
-	const std::string err = _cfg.setSlot(0, realSlot(kSecret), false);
+	const std::string err = _cfg.setSlot(0, realSlot(kSecret), false, &kAccepted);
 	EXPECT_NE(err, "") << "a table that could not be staged is an error, not a 200";
 	EXPECT_EQ(nvswriter::stats().tooBig, 1u);
 	EXPECT_EQ(nvswriter::stats().staged, 0u);
@@ -341,8 +345,8 @@ TEST_F(TelephonyStaging, AValueLongerThanItsCellIsRefusedWholeAndTheSecretIsNotW
 
 TEST_F(TelephonyStaging, ClearAllIsSynchronousAndWritesEveryKeyEvenAfterTheResetBegan)
 {
-	ASSERT_EQ(_cfg.setSlot(0, realSlot(kSecret), false), "");
-	ASSERT_EQ(_cfg.setSlot(2, realSlot(kSecret2), false), "");
+	ASSERT_EQ(_cfg.setSlot(0, realSlot(kSecret), false, &kAccepted), "");
+	ASSERT_EQ(_cfg.setSlot(2, realSlot(kSecret2), false, &kAccepted), "");
 	ASSERT_EQ(_cfg.setActiveSlot(2), "");
 	ASSERT_NE(slurp(_path).find(kSecret), std::string::npos);
 	nvswriter::resetForTest();
@@ -357,7 +361,7 @@ TEST_F(TelephonyStaging, ClearAllIsSynchronousAndWritesEveryKeyEvenAfterTheReset
 	for (size_t i = 0; i < TelephonyApiConfig::kSlots; ++i)
 	{
 		const std::string p = "s" + std::to_string(i);
-		empty += p + "type=0\n" + p + "en=0\n" + p + "url=\n" + p + "id=\n" + p + "sec=\n" + p + "dn=\n";
+		empty += p + "type=0\n" + p + "en=0\n" + p + "url=\n" + p + "id=\n" + p + "sec=\n" + p + "dn=\n" + p + "acc=\n";
 	}
 	EXPECT_EQ(slurp(_path), empty) << "every key written empty, secrets included, before clearAll() returned; no active slot";
 	EXPECT_EQ(_cfg.activeSlot(), TelephonyApiConfig::kNoActiveSlot);
@@ -372,7 +376,7 @@ TEST_F(TelephonyStaging, ClearAllIsSynchronousAndWritesEveryKeyEvenAfterTheReset
 
 TEST_F(TelephonyStaging, ClearSlotStagesTheRestAndErasesTheSecretWithoutWaitingForTheWriter)
 {
-	ASSERT_EQ(_cfg.setSlot(1, realSlot(kSecret), false), "");
+	ASSERT_EQ(_cfg.setSlot(1, realSlot(kSecret), false, &kAccepted), "");
 	ASSERT_EQ(_cfg.setActiveSlot(1), "");
 	ASSERT_NE(slurp(_path).find(kSecret), std::string::npos);
 	ASSERT_EQ(drain().telephonyWrites, 1u);
@@ -393,7 +397,7 @@ TEST_F(TelephonyStaging, ClearSlotStagesTheRestAndErasesTheSecretWithoutWaitingF
 
 TEST_F(TelephonyStaging, TheWalkStopsAtTheFirstFailedPutAndRefusesAMalformedSnapshot)
 {
-	ASSERT_EQ(_cfg.setSlot(1, realSlot(kSecret), false), "");
+	ASSERT_EQ(_cfg.setSlot(1, realSlot(kSecret), false, &kAccepted), "");
 	const std::string good = stagedTel();
 	ASSERT_EQ(good.size(), TelephonyApiConfig::kSnapshotLen);
 
@@ -401,7 +405,7 @@ TEST_F(TelephonyStaging, TheWalkStopsAtTheFirstFailedPutAndRefusesAMalformedSnap
 	auto okU8 = [&](const char*, uint8_t) { ++puts; return true; };
 	auto okStr = [&](const char*, const char*) { ++puts; return true; };
 	EXPECT_TRUE(TelephonyApiConfig::emitSnapshot(good.data(), good.size(), okU8, okStr));
-	EXPECT_EQ(puts, 4 * 5 + 1u);
+	EXPECT_EQ(puts, 4 * 6 + 1u);
 
 	puts = 0;
 	EXPECT_FALSE(TelephonyApiConfig::emitSnapshot(good.data(), good.size(), okU8,
@@ -417,16 +421,19 @@ TEST_F(TelephonyStaging, TheWalkStopsAtTheFirstFailedPutAndRefusesAMalformedSnap
 	std::string noNul = good;
 	noNul[3 * TelephonyApiConfig::kSlotSnapshotLen + 2 + 3 * TelephonyApiConfig::kCellLen - 1] = 'x';   // slot 3's route DN cell
 	EXPECT_FALSE(TelephonyApiConfig::emitSnapshot(noNul.data(), noNul.size(), okU8, okStr));
+	std::string noAccNul = good;
+	noAccNul[4 * TelephonyApiConfig::kSlotSnapshotLen - 1] = 'x';   // slot 3's acceptance cell
+	EXPECT_FALSE(TelephonyApiConfig::emitSnapshot(noAccNul.data(), noAccNul.size(), okU8, okStr));
 	EXPECT_EQ(puts, 0u) << "a refused snapshot must not have written a single key";
 }
 
 #if !defined(_WIN32)
 TEST_F(TelephonyStaging, WhatTheWriterEmitsPlusTheSecretIsWhatLoadReadsBack)
 {
-	ASSERT_EQ(_cfg.setSlot(0, realSlot(kSecret), false), "");
+	ASSERT_EQ(_cfg.setSlot(0, realSlot(kSecret), false, &kAccepted), "");
 	TelephonyApiConfig::Slot s2 = realSlot(kSecret2);
 	s2.routeDn = "205";
-	ASSERT_EQ(_cfg.setSlot(2, s2, false), "");
+	ASSERT_EQ(_cfg.setSlot(2, s2, false, &kAccepted), "");
 	ASSERT_EQ(_cfg.setActiveSlot(2), "");
 	const Walk d = drain();
 	ASSERT_EQ(d.telephonyWrites, 1u);
@@ -455,7 +462,14 @@ TEST_F(TelephonyStaging, WhatTheWriterEmitsPlusTheSecretIsWhatLoadReadsBack)
 		EXPECT_EQ(got->clientId, want->clientId) << i;
 		EXPECT_EQ(got->routeDn, want->routeDn) << i;
 		EXPECT_EQ(got->secret, want->secret) << i;
+		EXPECT_EQ(got->accepted.version, want->accepted.version) << i;
+		EXPECT_EQ(got->accepted.role, want->accepted.role) << i;
+		EXPECT_EQ(got->accepted.epoch, want->accepted.epoch) << i;
 	}
+	// #1073: the acceptance travels in the staged snapshot, so a reload sees what was accepted.
+	EXPECT_EQ(reloaded.bootSlot(0)->accepted.version, TelephonyApiConfig::kAcceptanceVersion);
+	EXPECT_EQ(reloaded.bootSlot(2)->accepted.role, 2u);
+	EXPECT_EQ(reloaded.bootSlot(2)->accepted.epoch, 1760000000u);
 }
 #endif
 
@@ -498,7 +512,7 @@ namespace
 
 TEST_F(TelephonyHandlerStaging, TheHttpSettersStageAndOnlyTheSecretEditWritesASecret)
 {
-	EXPECT_EQ(_h->setTelephonyConfigSlot(0, realSlot(kSecret), false), "");
+	EXPECT_EQ(_h->setTelephonyConfigSlot(0, realSlot(kSecret), false, &kAccepted), "");
 	EXPECT_EQ(_h->telephonySecretWritesForTest(), 1u);
 	EXPECT_EQ(_h->setTelephonyConfigActiveSlot(0), "");
 	TelephonyApiConfig::Slot keep = realSlot("");
@@ -521,7 +535,7 @@ TEST_F(TelephonyHandlerStaging, TheHttpSettersStageAndOnlyTheSecretEditWritesASe
 
 TEST_F(TelephonyHandlerStaging, TheSbcRouteStagesTheActiveSlotAndIsRefusedDuringAReset)
 {
-	EXPECT_EQ(_h->setSbcMode(true, 1), "");
+	EXPECT_EQ(_h->setSbcMode(true, 1, &kAccepted), "");
 	EXPECT_EQ(nvswriter::stats().staged, 1u);
 	EXPECT_EQ(lastOf(drain()), (Pair{"active", "1"}));
 	EXPECT_EQ(_h->telephonySecretWritesForTest(), 0u);
@@ -529,13 +543,13 @@ TEST_F(TelephonyHandlerStaging, TheSbcRouteStagesTheActiveSlotAndIsRefusedDuring
 	// A staged write is refused once a reset has begun, so enabling SBC mode answers an error and leaves it off.
 	ASSERT_EQ(_h->setSbcMode(false, 1), "");
 	resetguard::begin();
-	EXPECT_NE(_h->setSbcMode(true, 2), "");
+	EXPECT_NE(_h->setSbcMode(true, 2, &kAccepted), "");
 	EXPECT_FALSE(_h->getSbcMode().first);
 }
 
 TEST_F(TelephonyHandlerStaging, TheFactoryResetClearStaysSynchronous)
 {
-	ASSERT_EQ(_h->setTelephonyConfigSlot(0, realSlot(kSecret), false), "");
+	ASSERT_EQ(_h->setTelephonyConfigSlot(0, realSlot(kSecret), false, &kAccepted), "");
 	nvswriter::resetForTest();
 	resetguard::begin();
 	EXPECT_EQ(_h->clearAllTelephonyConfig(), "") << "/api/factory-reset erases after resetguard::begin() and reports the result";

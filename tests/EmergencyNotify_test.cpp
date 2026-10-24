@@ -1292,6 +1292,175 @@ TEST(E911Notify, AConnectedAnchoredCallTheAnchorDropsIsStillByed)
 	EXPECT_EQ(b.countOf("NOT ROUTED"), 0) << b.dump();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #1095 backstop: 3CX's Remove of the call's own leg is received after
+// makeCall()'s own check, and the WS worker turns it into Dropped before the
+// engine binds the leg. That Dropped matches no session (#1099: an unmatched
+// Remove is reported under its own id), so nothing answers the caller. The
+// Make job runs on the test thread; the anchor's events are ordered around it
+// by hand, with no worker and no timing in between. Each call's own job stays
+// parked on tel_ctl until the end.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+	constexpr const char* kLoopLeg = "mock-part-123";   // LoopbackAnchorClient's makeCall() leg
+
+	void dialAnchoredParked(NBench& b, const std::string& to, const std::string& callId)
+	{
+		b.handler->failTelCtlLaneForTest(RequestsHandler::kLaneSos);
+		b.handler->forceAsyncAnchorForTest(true);
+		b.handler->holdTelCtlForTest(true);
+		b.handler->handle(enInvite("101", to, "192.168.78.11", callId));
+		ASSERT_NE(b.indexOf("SIP/2.0 180"), -1) << "precondition: dispatched:\n" << b.dump();
+	}
+
+	void endParked(NBench& b)
+	{
+		b.loopback()->setOwnLegRemovedHookForTest({});
+		b.handler->holdTelCtlForTest(false);
+	}
+}
+
+TEST(AnchorLegRemovedBeforeBind, ARinging911WhoseLegWasRemovedBeforeTheBindGetsOne503AndOneNotRouted)
+{
+	pdwitness::clear();
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.wire.clear();
+	ASSERT_NO_FATAL_FAILURE(dialAnchoredParked(b, "911", "en-1095-911"));
+	ASSERT_NE(b.indexOf("ROUTED TO TRUNK"), -1) << "precondition: ROUTED at dispatch:\n" << b.dump();
+	const unsigned drops = b.loopback()->dropCallCount();
+
+	// The WS worker's Dropped for the removed leg, before the bind: it matches nothing.
+	b.handler->anchorDroppedForTest(kLoopLeg);
+	ASSERT_TRUE(b.handler->getSession("Call-ID: en-1095-911").has_value()) << "precondition: the early Dropped matched no session";
+	b.loopback()->setOwnLegRemovedHookForTest([](const std::string& leg) { return leg == kLoopLeg; });
+	b.handler->runAnchorMakeJobForTest("Call-ID: en-1095-911", "911", "101");
+	flushAsyncOutbox(b);
+
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << "the caller of a 911 3CX already ended rang on:\n" << b.dump();
+	EXPECT_EQ(countStartingAt(b, "BYE "), 0) << b.dump();
+	EXPECT_EQ(b.countOf("NOT ROUTED"), 1) << b.dump();
+	EXPECT_FALSE(b.handler->getSession("Call-ID: en-1095-911").has_value());
+	// #1103: 3CX already removed the leg, so its slot is freed locally, not by a drop POST.
+	ASSERT_TRUE(b.loopback()->waitTelDropReachedForTest(1, std::chrono::seconds(10))) << "the leg was never freed";
+	EXPECT_EQ(b.loopback()->dropCallCount(), drops) << "no drop POST to a leg 3CX already removed";
+	EXPECT_EQ(b.loopback()->releasedLegsForTest(), std::vector<std::string>{ kLoopLeg });
+
+	// The worker's Dropped may also come after the bind (the other order): still once.
+	b.handler->anchorDroppedForTest(kLoopLeg);
+	flushAsyncOutbox(b);
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << b.dump();
+	EXPECT_EQ(b.countOf("NOT ROUTED"), 1) << b.dump();
+	endParked(b);
+}
+
+// #1103: the backstop used to POST a drop to the removed leg. On a real anchor that
+// POST holds _ctrlMutex for its round trip (5-7 s on a stall) and answerCall() waits
+// on it, so a PSAP callback answered meanwhile queued behind a request 3CX refuses.
+// The loopback marks its control connection busy for a drop's span and runs the
+// PSAP answer inside it; the answer is issued again after the tel_drop job ran, in
+// case no drop came. Ordering is by the tel_drop job reaching the anchor, not time.
+TEST(AnchorLegRemovedBeforeBind, APsapAnswerNeverWaitsOnADropPostForTheRemovedLeg)
+{
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.wire.clear();
+	ASSERT_NO_FATAL_FAILURE(dialAnchoredParked(b, "911", "en-1103-911"));
+	LoopbackAnchorClient* lb = b.loopback();
+	const unsigned drops = lb->dropCallCount();
+	lb->setDropHookForTest([lb] { EXPECT_TRUE(lb->answerCall("psap-callback-1103")); });   // answered mid-POST
+
+	b.handler->anchorDroppedForTest(kLoopLeg);   // the worker's Dropped, before the bind
+	lb->setOwnLegRemovedHookForTest([](const std::string& leg) { return leg == kLoopLeg; });
+	b.handler->runAnchorMakeJobForTest("Call-ID: en-1103-911", "911", "101");
+	flushAsyncOutbox(b);
+	ASSERT_TRUE(lb->waitTelDropReachedForTest(1, std::chrono::seconds(10))) << "no tel_drop job reached the anchor";
+	EXPECT_TRUE(lb->answerCall("psap-callback-1103"));
+
+	EXPECT_EQ(lb->dropCallCount(), drops) << "a drop POST went to a leg 3CX already removed";
+	EXPECT_EQ(lb->answersThatWaitedForTest(), 0u) << "the PSAP callback's answer queued behind that POST";
+	EXPECT_EQ(lb->releasedLegsForTest(), std::vector<std::string>{ kLoopLeg })
+		<< "the removed leg's slot and media must still be freed, once";
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << b.dump();
+	EXPECT_EQ(b.countOf("NOT ROUTED"), 1) << b.dump();
+	EXPECT_FALSE(b.handler->getSession("Call-ID: en-1103-911").has_value());
+
+	b.handler->anchorDroppedForTest(kLoopLeg);   // a late Dropped too: still once
+	flushAsyncOutbox(b);
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << b.dump();
+	EXPECT_EQ(b.countOf("NOT ROUTED"), 1) << b.dump();
+	lb->setDropHookForTest({});
+	endParked(b);
+}
+
+TEST(AnchorLegRemovedBeforeBind, AnOrdinaryCallWhoseLegWasRemovedBeforeTheBindGetsOne503)
+{
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.wire.clear();
+	ASSERT_NO_FATAL_FAILURE(dialAnchoredParked(b, "555", "en-1095-555"));
+
+	b.handler->anchorDroppedForTest(kLoopLeg);
+	b.loopback()->setOwnLegRemovedHookForTest([](const std::string& leg) { return leg == kLoopLeg; });
+	b.handler->runAnchorMakeJobForTest("Call-ID: en-1095-555", "555", "101");
+	flushAsyncOutbox(b);
+
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << "6101 -> 314 on .244 rang for 34 s:\n" << b.dump();
+	EXPECT_EQ(b.indexOf("MESSAGE sip:200@"), -1) << "a 555 dial is not an emergency:\n" << b.dump();
+	EXPECT_FALSE(b.handler->getSession("Call-ID: en-1095-555").has_value());
+	endParked(b);
+}
+
+TEST(AnchorLegRemovedBeforeBind, ARemoveAfterTheBindIsFailedOnceByTheDroppedAlone)
+{
+	// The other order: the Remove's Dropped arrives after the bind (#880 answers it), and
+	// the post-bind query, asked after it, also says removed. One 503, one NOT ROUTED.
+	NBench b;
+	b.handler->setE911Config("200", "", "");
+	b.wire.clear();
+	ASSERT_NO_FATAL_FAILURE(dialAnchoredParked(b, "911", "en-1095-late"));
+	RequestsHandler* h = b.handler.get();
+	b.loopback()->setOwnLegRemovedHookForTest([h](const std::string& leg) {
+		h->anchorDroppedForTest(leg);   // the worker's Dropped, between the bind and the query
+		return leg == kLoopLeg;
+	});
+	b.handler->runAnchorMakeJobForTest("Call-ID: en-1095-late", "911", "101");
+	flushAsyncOutbox(b);
+
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << b.dump();
+	EXPECT_EQ(b.countOf("NOT ROUTED"), 1) << b.dump();
+	EXPECT_FALSE(b.handler->getSession("Call-ID: en-1095-late").has_value());
+	endParked(b);
+}
+
+TEST(AnchorLegRemovedBeforeBind, ALive911OnAnotherLegIsNeverTouched)
+{
+	NBench b;
+	b.loopback()->setMaxConcurrentCallsForTest(2);
+	b.handler->setE911Config("200", "", "");
+	b.wire.clear();
+	ASSERT_NO_FATAL_FAILURE(dialAnchoredParked(b, "911", "en-1095-live911"));
+	ASSERT_TRUE(b.handler->bindOutboundParticipantForTest("Call-ID: en-1095-live911", "leg-live-911"));
+	b.handler->handle(enInvite("101", "555", "192.168.78.11", "en-1095-other"));
+	ASSERT_EQ(countStartingAt(b, "SIP/2.0 180"), 2) << "precondition: both dispatched:\n" << b.dump();
+	b.wire.clear();
+
+	b.handler->anchorDroppedForTest(kLoopLeg);
+	b.loopback()->setOwnLegRemovedHookForTest([](const std::string& leg) { return leg == kLoopLeg; });
+	b.handler->runAnchorMakeJobForTest("Call-ID: en-1095-other", "555", "101");
+	flushAsyncOutbox(b);
+
+	EXPECT_EQ(countStartingAt(b, "SIP/2.0 503"), 1) << "positive control: the removed call failed:\n" << b.dump();
+	EXPECT_FALSE(b.handler->getSession("Call-ID: en-1095-other").has_value());
+	const auto live = b.handler->getSession("Call-ID: en-1095-live911");
+	ASSERT_TRUE(live.has_value() && live.value()) << "a live 911 on another leg was ended";
+	EXPECT_EQ(std::string(live.value()->getAnchorParticipantId()), "leg-live-911");
+	EXPECT_EQ(b.countOf("NOT ROUTED"), 0) << "a live 911 was reported NOT ROUTED:\n" << b.dump();
+	endParked(b);
+}
+
 // #880 addendum: the trunk's own exits after ROUTED.
 namespace
 {
