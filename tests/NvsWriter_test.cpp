@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+#include "AdminPinTestUtil.hpp"
 #include "ArpLookup.hpp"
 #include "NvsWriter.hpp"
 #include "NvsWriterLogic.hpp"
@@ -374,6 +375,7 @@ namespace
 		}
 		void dial(const std::string& from, const std::string& ip, const std::string& callId, const std::string& seq)
 		{
+			adminpin_test::startEchoCall(*_h, from, ip, callId);   // an INFO belongs to a live dialog
 			for (const char c : seq) _h->handle(infoDigit(from, ip, callId, c));
 		}
 		static std::string staged(Key k) { return std::string(nvswriter::stagedForTest(k)); }

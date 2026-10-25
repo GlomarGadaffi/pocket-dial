@@ -178,6 +178,8 @@ public:
 	bool forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
 	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
+	// INFO requests not acted on for want of a live dialog (answered 200) or a matching leg (403).
+	uint32_t getInfoRefused() const { return _infoRefused.load(std::memory_order_relaxed); }
 	// Issue #430: packetsDropped split by reason (their sum), and the probe
 	// itself for its recent-drop ring (read with window()/at(); thread-safe,
 	// allocation-free on both sides).
@@ -669,6 +671,14 @@ public:
 	{
 		std::lock_guard<std::mutex> rlock(_rateMutex);
 		_rateBuckets.erase(netIp);
+	}
+	// Refill a registered extension's reserved limiter bucket (network-order s_addr) to its burst.
+	// A test that sends several whole entries from the one address a dialog's INFO must come from
+	// would otherwise run out of the 40-packet burst, which a person at a keypad never does.
+	void refillRateSourceForTest(uint32_t netIp)
+	{
+		std::lock_guard<std::mutex> rlock(_rateMutex);
+		if (RateSource* r = findRateSource(netIp)) r->ordinary = { 40.0, std::chrono::steady_clock::now() };
 	}
 	// #986: hold _mutex for `d`, as a slow NVS commit or PIN hash would. Host builds
 	// only. Defined in the .cpp so every call is one site however the caller is inlined.
@@ -2709,6 +2719,25 @@ private:
 	bool isDialogSourceAuthorized(const std::shared_ptr<Session>& session,
 		const sockaddr_in& source) const;
 
+	// SIP INFO is in-dialog (RFC 6086). Allow: the Call-ID names a live session and the source
+	// IP (never the port) is one of its legs, whose number is also From's; or it is the MoH
+	// preview dialog, from the phone being previewed. Ignored: no live session, or a live
+	// emergency session and a source that is not one of its legs (a carrier on a PSAP
+	// callback) -- answered 200 and acted on by no one: a 481 ends the dialog (RFC 3261
+	// s12.2.1.2) and a live emergency dialog is never refused at all. NotALeg: a live
+	// non-emergency session, but not this source or this From -- 403.
+	// Caller holds _mutex.
+	enum class InfoVerdict : uint8_t { Allow, Ignored, NotALeg };
+	struct InfoAuth
+	{
+		InfoVerdict verdict = InfoVerdict::Ignored;
+		std::shared_ptr<Session> session;   // the dialog's session, when it has one
+		std::string_view actingExt;         // Allow only: the extension the digits act for
+	};
+	InfoAuth authorizeInfo(const SipMessage& request);
+	// Count, log (rate-limited) and, for NotALeg, queue the 403.
+	void noteInfoRefused(const std::shared_ptr<SipMessage>& request, InfoVerdict why);
+
 	// A re-INVITE/UPDATE this PBX answers itself (555 anchor, inbound anchor, 997 page)
 	// must come from a leg of the dialog. False: a 403 was queued and the request is
 	// logged; the caller returns without touching bridge, state or session timer.
@@ -3230,6 +3259,7 @@ private:
 	std::atomic<uint64_t> _headerRejected{0};         // #199 header admission refusals
 	std::atomic<uint64_t> _emergencyHeaderYields{0};  // #199 911 let through a violation
 	std::atomic<uint64_t> _headerLineCuts{0};         // #838 datagrams cut at 64 header lines
+	std::atomic<uint32_t> _infoRefused{0};   // getInfoRefused()
 	std::atomic<uint64_t> _vpeerRefusals{0};   // #409: allocateVirtualPeer() refusals
 	std::atomic<uint32_t> _emergencyRtpReaps{0};   // #741
 	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP
