@@ -371,25 +371,53 @@ namespace
 			"Content-Length: 0" + crlf + crlf, uvAddr("192.168.9.98")));
 	}
 
-	// Dials 911 as 501 from `ip`, fails the worker's makeCall(), returns the NOT ROUTED bodies.
-	std::vector<std::string> notRoutedAfterMakeCallFails(const std::string& ip, const std::string& callId)
+	struct FailRun
 	{
-		UvBench b;
+		std::vector<std::string> notRouted;   // bodies of the NOT ROUTED notifications
+		const void* session = nullptr;        // the pooled slot the call held
+	};
+
+	// Dials 911 as 501 from `ip`, fails the worker's makeCall() on `b`.
+	FailRun failMakeCall(UvBench& b, const std::string& ip, const std::string& callId)
+	{
+		FailRun run;
+		b.sent.clear();
 		b.handler->failTelCtlLaneForTest(RequestsHandler::kLaneSos);
 		b.handler->forceAsyncAnchorForTest(true);
 		b.handler->holdTelCtlForTest(true);
 		b.handler->handle(uvInvite("501", "911", ip, callId));
 		EXPECT_TRUE(waitUntil([&] { return b.handler->telCtlParkedForTest() == 1; }));
+		if (auto s = b.handler->getSession("Call-ID: " + callId); s.has_value()) run.session = s.value().get();
 		b.loopback()->stop();
 		b.handler->holdTelCtlForTest(false);
 		EXPECT_TRUE(waitUntil([&] { flushAsyncOutbox(b); return !b.responsesTo(ip).empty()
 			&& b.responsesTo(ip).back().find(" 503 ") != std::string::npos; }));
-		std::vector<std::string> out;
 		for (const std::string& n : b.notifications())
 		{
-			if (bodyOf(n).find("NOT ROUTED") != std::string::npos) out.push_back(bodyOf(n));
+			if (bodyOf(n).find("NOT ROUTED") != std::string::npos) run.notRouted.push_back(bodyOf(n));
 		}
-		return out;
+		return run;
+	}
+
+	std::vector<std::string> notRoutedAfterMakeCallFails(const std::string& ip, const std::string& callId)
+	{
+		UvBench b;
+		return failMakeCall(b, ip, callId).notRouted;
+	}
+
+	// The caller hangs up (from the address 501 registered from).
+	void uvBye(UvBench& b, const std::string& callId)
+	{
+		const std::string crlf = "\r\n";
+		b.handler->handle(RequestsHandler::getMessageFromPool(
+			"BYE sip:911@server SIP/2.0" + crlf +
+			"Via: SIP/2.0/UDP 192.168.9.51:5060;branch=z9hG4bKbye" + callId + crlf +
+			"From: <sip:501@server>;tag=ft" + callId + crlf +
+			"To: <sip:911@server>" + crlf +
+			"Call-ID: " + callId + crlf +
+			"CSeq: 2 BYE" + crlf +
+			"Max-Forwards: 70" + crlf +
+			"Content-Length: 0" + crlf + crlf, uvAddr(kRegIp)));
 	}
 }
 
@@ -407,4 +435,24 @@ TEST(E911Unverified, ANotRoutedCorrectionForAVerifiedCallIsByteIdenticalToToday)
 	ASSERT_EQ(nr.size(), 1u);
 	EXPECT_EQ(nr[0], std::string("EMERGENCY: 911 dialed by ext 501 - NOT ROUTED (the 3CX anchor could not "
 		"place the call) - callback not configured"));
+}
+
+TEST(E911Unverified, ARecycledSlotNeverMarksALaterVerifiedCall)
+{
+	// An unverified 911 ends; a verified 911 then lands on the same pooled Session slot.
+	// reset() must have cleared the marker, so the verified call's NOT ROUTED is clean.
+	UvBench b;
+	b.handler->handle(uvInvite("501", "911", kOtherIp, "uv-slot-1"));
+	auto first = b.handler->getSession("Call-ID: uv-slot-1");
+	ASSERT_TRUE(first.has_value());
+	const void* firstSlot = first.value().get();
+	first.reset();
+	uvBye(b, "uv-slot-1");
+	ASSERT_FALSE(b.handler->getSession("Call-ID: uv-slot-1").has_value()) << "precondition: the first call ended";
+
+	const FailRun second = failMakeCall(b, kRegIp, "uv-slot-2");
+	ASSERT_EQ(second.session, firstSlot) << "precondition: the second call reuses the first call's slot";
+	ASSERT_EQ(second.notRouted.size(), 1u);
+	EXPECT_EQ(second.notRouted[0], std::string("EMERGENCY: 911 dialed by ext 501 - NOT ROUTED (the 3CX anchor "
+		"could not place the call) - callback not configured"));
 }

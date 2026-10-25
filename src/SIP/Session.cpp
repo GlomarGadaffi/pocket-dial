@@ -53,6 +53,8 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_lastSpliceAckCSeq = 0;
 	_isEmergency = false;     // #604
 	_emergencyNumber = {};    // #879
+	_unverifiedCaller = false;   // #1127: a recycled slot must not mark the next call
+	_unverifiedSrc = sockaddr_in{};
 	_echoDialog = false;      // #172
 	_prackRSeq = 0;           // #172
 	_prackCSeq = 0;           // #172

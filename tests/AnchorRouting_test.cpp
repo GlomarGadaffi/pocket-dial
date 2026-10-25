@@ -1131,6 +1131,25 @@ TEST(AnchorRouting, ADegradedUnverified911ReportCarriesTheSameMarkerAsItsDispatc
 		"[CALLER UNVERIFIED: claimed ext 501, source 192.168.9.99:5060]"), 1);
 }
 
+TEST(AnchorRouting, ADegradedVerified911ReportIsByteIdenticalToToday)
+{
+	DegradedRig rig("911", "anchor-1127-ver");
+	ASSERT_NE(rig.bridge, nullptr);
+	ASSERT_TRUE(rig.degrade());
+	rig.sent.clear();
+	rig.handler.forceNextTickForTest();
+	rig.handler.tick();
+	std::string body;
+	for (const auto& [addr, msg] : rig.sent)
+	{
+		if (!msg || addr.sin_addr.s_addr != addrFor("192.168.9.20").sin_addr.s_addr) continue;
+		const std::string t = msg->toString();
+		if (t.find("AUDIO DEGRADED") != std::string::npos) body = t.substr(t.find("\r\n\r\n") + 4);
+	}
+	EXPECT_EQ(body, "EMERGENCY: 911 dialed by ext 501 - CALL STILL UP, AUDIO DEGRADED (the audio to the "
+		"anchor keeps failing; the call was not hung up) - callback not configured");
+}
+
 TEST(AnchorRouting, ADegradedConnected911Or933IsKeptUpAndReportedOnce)
 {
 	for (const std::string dialed : { "911", "933" })
