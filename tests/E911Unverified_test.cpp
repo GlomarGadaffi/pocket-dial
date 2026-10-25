@@ -359,24 +359,16 @@ namespace
 	// The SIP thread's next pass drains _asyncOutbox; an OPTIONS from an unrelated host stands in.
 	void flushAsyncOutbox(UvBench& b)
 	{
+		const std::string crlf = "\r\n";
 		b.handler->handle(RequestsHandler::getMessageFromPool(
-			"OPTIONS sip:server SIP/2.0
-"
-			"Via: SIP/2.0/UDP 192.168.9.98:5060;branch=z9hG4bKflush1127
-"
-			"From: <sip:probe@server>;tag=probe1127
-"
-			"To: <sip:server@server>
-"
-			"Call-ID: flush-1127
-"
-			"CSeq: 1 OPTIONS
-"
-			"Max-Forwards: 70
-"
-			"Content-Length: 0
-
-", uvAddr("192.168.9.98")));
+			"OPTIONS sip:server SIP/2.0" + crlf +
+			"Via: SIP/2.0/UDP 192.168.9.98:5060;branch=z9hG4bKflush1127" + crlf +
+			"From: <sip:probe@server>;tag=probe1127" + crlf +
+			"To: <sip:server@server>" + crlf +
+			"Call-ID: flush-1127" + crlf +
+			"CSeq: 1 OPTIONS" + crlf +
+			"Max-Forwards: 70" + crlf +
+			"Content-Length: 0" + crlf + crlf, uvAddr("192.168.9.98")));
 	}
 
 	// Dials 911 as 501 from `ip`, fails the worker's makeCall(), returns the NOT ROUTED bodies.
