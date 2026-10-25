@@ -83,6 +83,8 @@ add_executable(sip_parser_tests
     HotPathInPlace_test.cpp
     # The binary's one counting operator new, plus its own positive controls.
     support/AllocCounter.cpp
+    # #1136: the one WSAStartup of the process (empty off Windows).
+    support/WinsockInit.cpp
     AllocCounter_test.cpp
     PerCallHeap_test.cpp
     # #838: a hostile many-line or long-line datagram must not grow a pool slot.
@@ -890,6 +892,11 @@ else()
 endif()
 
 if (WIN32)
+    # #1136: the product sockets this binary opens (HTTP listener, RTP, hold music) bind
+    # INADDR_ANY, which raises a Defender Firewall prompt on a fresh exe. This define makes
+    # those five bind sites use loopback, in this target only. SipServer and the firmware
+    # never see it.
+    target_compile_definitions(sip_parser_tests PRIVATE PD_TEST_LOOPBACK_BIND=1)
     target_link_libraries(sip_parser_tests PRIVATE wsock32 ws2_32)
 else()
     target_link_libraries(sip_parser_tests PRIVATE pthread)
