@@ -2422,6 +2422,8 @@ private:
 	// instead. False (job deleted) when that lane is full or has none either.
 	bool postTelCtl(TelCtlJob* job, TelLane lane);
 	void runTelCtl(const TelCtlJob& job);
+	// The makeCall() failure tail of runTelCtl (503, endCall, NOT ROUTED); see its definition.
+	void onTelCtlMakeCallFailed(const TelCtlJob& job);
 #if defined(ESP_PLATFORM) || defined(ESP32)
 	struct TelCtlQueue
 	{

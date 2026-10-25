@@ -6045,6 +6045,34 @@ void RequestsHandler::asyncAnswerCall(const std::string& participantId)
 	}
 }
 
+// Out of runTelCtl() on purpose (#1127): its locals sit on the tel_ctl worker, whose static
+// depth the stack gate holds at its recorded finding. noinline keeps them off runTelCtl's frame.
+__attribute__((noinline)) void RequestsHandler::onTelCtlMakeCallFailed(const TelCtlJob& job)
+{
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
+	queueLog("[Telephony] Failed to initiate outbound call to " + job.dest, true);
+	// #1127: read the unverified marker before endCall() drops the session.
+	std::string unverifiedSrc;
+	if (auto us = _sessions.find(job.callId); us != _sessions.end() && us->second && us->second->isUnverifiedCaller())
+	{
+		unverifiedSrc = sipwire::addrToIpPort(us->second->getUnverifiedSource());
+	}
+	// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
+	refuseRingingAnchor(job.callId, _asyncOutbox);
+	endCall(job.callId, job.callerNumber, job.dest, "anchor call fail");
+	// #821: routeEmergencyCall() told the notify list ROUTED when it queued
+	// this job, and the call never came up. notifyEmergency() enqueues on
+	// _outbox, which the SIP thread's next pass clears: hand it to
+	// _asyncOutbox, as forceDisconnect() does (#714).
+	if (const pbx::EmergencyDial em = pbx::classifyEmergencyDial(job.dest); em.isEmergency)
+	{
+		notifyEmergency(em, job.callerNumber, job.dest, /*routed=*/false, kAnchorNotPlaced,
+			/*callUp=*/false, unverifiedSrc);
+		for (auto& e : _outbox) _asyncOutbox.push_back(std::move(e));
+		_outbox.clear();
+	}
+}
+
 void RequestsHandler::runTelCtl(const TelCtlJob& job)
 {
 	if (job.kind == TelCtlJob::Drop)
@@ -6069,28 +6097,7 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 	std::string ownLeg;
 	if (!_anchorClient->makeCall(job.dest, &ownLeg))
 	{
-		std::lock_guard<pd::TimedMutex> lock(_mutex);
-		queueLog("[Telephony] Failed to initiate outbound call to " + job.dest, true);
-		// #1127: read the unverified marker before endCall() drops the session.
-		std::string unverifiedSrc;
-		if (auto us = _sessions.find(job.callId); us != _sessions.end() && us->second && us->second->isUnverifiedCaller())
-		{
-			unverifiedSrc = sipwire::addrToIpPort(us->second->getUnverifiedSource());
-		}
-		// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
-		refuseRingingAnchor(job.callId, _asyncOutbox);
-		endCall(job.callId, job.callerNumber, job.dest, "anchor call fail");
-		// #821: routeEmergencyCall() told the notify list ROUTED when it queued
-		// this job, and the call never came up. notifyEmergency() enqueues on
-		// _outbox, which the SIP thread's next pass clears: hand it to
-		// _asyncOutbox, as forceDisconnect() does (#714).
-		if (const pbx::EmergencyDial em = pbx::classifyEmergencyDial(job.dest); em.isEmergency)
-		{
-			notifyEmergency(em, job.callerNumber, job.dest, /*routed=*/false, kAnchorNotPlaced,
-				/*callUp=*/false, unverifiedSrc);
-			for (auto& e : _outbox) _asyncOutbox.push_back(std::move(e));
-			_outbox.clear();
-		}
+		onTelCtlMakeCallFailed(job);
 		return;
 	}
 	// Bind this origination's own leg to its session NOW (locks _mutex
