@@ -970,9 +970,10 @@ TEST(CallPickup, AnExpiredPickerTimerByesEachPhoneOnItsOwnDialogAndEndsBoth)
 	EXPECT_FALSE(r.handler.getSession(sessionKey("pickup-1")).has_value());
 }
 
-// Rule 5: a PSAP callback that was picked up is an emergency session. The picker's
-// timer expiring must not take the callback leg down with it.
-TEST(CallPickup, AnExpiredPickerTimerNeverEndsAnEmergencyCallbackLeg)
+// Rule 5: a spliced pair with an emergency session in it is not reaped from either
+// leg. A PSAP callback (call-1) that was picked up (pickup-1): the picker's timer
+// expiring must send nothing on either dialog and leave both sessions up.
+TEST(CallPickup, AnExpiredPickerTimerLeavesAnEmergencyCallbackPairUntouched)
 {
 	PickupRig r;
 	auto callback = r.handler.getSession(sessionKey("call-1"));
@@ -984,11 +985,32 @@ TEST(CallPickup, AnExpiredPickerTimerNeverEndsAnEmergencyCallbackLeg)
 	r.sent.clear();
 	r.handler.forceNextTickForTest();
 	r.handler.tick();
-	EXPECT_TRUE(r.handler.getSession(sessionKey("call-1")).has_value())
-		<< "the emergency callback leg must stay up";
-	EXPECT_EQ(byesOn(r.sent, "192.168.9.10", "call-1"), 0u);
-	EXPECT_EQ(byesOn(r.sent, "192.168.9.10", "pickup-1"), 0u);
-	EXPECT_EQ(byesOn(r.sent, "192.168.9.30", "pickup-1"), 1u);
+	for (const char* ip : { "192.168.9.10", "192.168.9.30" })
+		for (const char* id : { "call-1", "pickup-1" })
+			EXPECT_EQ(byesOn(r.sent, ip, id), 0u) << ip << " " << id;
+	EXPECT_TRUE(r.handler.getSession(sessionKey("call-1")).has_value());
+	EXPECT_TRUE(r.handler.getSession(sessionKey("pickup-1")).has_value());
+}
+
+// The mirror: the EXPIRING session is the emergency one; its non-emergency peer must
+// not be torn down by it either.
+TEST(CallPickup, AnExpiredEmergencyLegTimerLeavesItsNonEmergencyPeerUp)
+{
+	PickupRig r;
+	auto callback = r.handler.getSession(sessionKey("call-1"));
+	auto picker   = r.handler.getSession(sessionKey("pickup-1"));
+	ASSERT_TRUE(callback.has_value());
+	ASSERT_TRUE(picker.has_value());
+	picker.value()->setEmergency(true);
+	picker.value()->armSessionTimer(1800, false, std::chrono::steady_clock::now() - std::chrono::hours(2));
+	r.sent.clear();
+	r.handler.forceNextTickForTest();
+	r.handler.tick();
+	for (const char* ip : { "192.168.9.10", "192.168.9.30" })
+		for (const char* id : { "call-1", "pickup-1" })
+			EXPECT_EQ(byesOn(r.sent, ip, id), 0u) << ip << " " << id;
+	EXPECT_TRUE(r.handler.getSession(sessionKey("call-1")).has_value());
+	EXPECT_TRUE(r.handler.getSession(sessionKey("pickup-1")).has_value());
 }
 
 // An answered call is one session (no peer): the pair rule must not touch it.

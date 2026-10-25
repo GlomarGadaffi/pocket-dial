@@ -1016,9 +1016,28 @@ TEST(ForceDisconnect, AnEmergencyPeerStillRefusesTheKill)
 	rig.sent.clear();
 	EXPECT_FALSE(rig.handler.forceDisconnect("106"));
 	flushAsyncOutbox(rig.handler);
-	size_t total = 0;
+	// A refused kill queues nothing at all, and both sessions stay up.
+	size_t toPhones = 0;   // the probe's own reply goes to kOtherIp; nothing may go anywhere else
 	for (const auto& [a, m] : rig.sent)
-		if (m && m->toString().rfind("BYE ", 0) == 0) ++total;
-	EXPECT_EQ(total, 0u);
+		if (m && !sameAddr(a, addrFor(kOtherIp))) ++toPhones;
+	EXPECT_EQ(toPhones, 0u);
+	EXPECT_TRUE(rig.handler.getSession("Call-ID: pk1").has_value());
 	EXPECT_TRUE(rig.handler.getSession("Call-ID: pk2").has_value());
+}
+
+// A dangling peerCallID (the peer session is gone) must not send the stand-in dest a
+// BYE on this session's own Call-ID: the parked phone does not hold it (481).
+TEST(ForceDisconnect, ADanglingPeerCallIdNeverByesTheStandInOnTheSessionsOwnDialog)
+{
+	Rig rig;
+	parkAndRetrieve(rig);
+	auto retrieve = rig.handler.getSession("Call-ID: pk2");
+	ASSERT_TRUE(retrieve.has_value());
+	retrieve.value()->setPeerCallID("Call-ID: gone");
+	rig.sent.clear();
+	ASSERT_TRUE(rig.handler.forceDisconnect("106"));
+	flushAsyncOutbox(rig.handler);
+	EXPECT_EQ(byesOn(rig.sent, kCalleeIp, "pk2"), 1u);
+	EXPECT_EQ(byesOn(rig.sent, kCallerIp, "pk2"), 0u);
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: pk2").has_value());
 }

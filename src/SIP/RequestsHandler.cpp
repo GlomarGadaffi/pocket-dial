@@ -10255,6 +10255,7 @@ bool RequestsHandler::forceDisconnect(const std::string& extension)
 				return false;
 			}
 		}
+		const std::string killReason = "extension " + extension + " was force-disconnected by admin";
 		for (const auto& callID : involved)
 		{
 			auto it = _sessions.find(callID);
@@ -10263,8 +10264,7 @@ bool RequestsHandler::forceDisconnect(const std::string& extension)
 #if POCKETDIAL_TRUNK_INBOUND
 			if (isTrunkInbound(*session))   // #398: the handset is dest, src has no address
 			{
-				endTrunkInboundCall(callID, session, _asyncOutbox,
-					"extension " + extension + " was force-disconnected by admin");
+				endTrunkInboundCall(callID, session, _asyncOutbox, killReason);
 				continue;
 			}
 #endif
@@ -10305,15 +10305,11 @@ bool RequestsHandler::forceDisconnect(const std::string& extension)
 				if (b) _asyncOutbox.emplace_back(dest->getAddress(), std::move(b));
 			}
 			session->noteServerCSeq(byeCSeq);
-			if (paired)
-			{
-				endSplicePeer(session, _asyncOutbox,
-				              ("extension " + extension + " was force-disconnected by admin").c_str());
-			}
+			if (paired) endSplicePeer(session, _asyncOutbox, killReason);
 			endCall(callID,
 			        src  ? src->getNumber()  : "",
 			        dest ? dest->getNumber() : "",
-			        "extension " + extension + " was force-disconnected by admin");
+			        killReason);
 		}
 		// Issue #714: endCall()'s trunk branch calls _sipTrunk.hangup(), which
 		// hands the carrier BYE to PbxEnv::enqueue() -> _outbox. This is the HTTP
@@ -13671,6 +13667,10 @@ void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point n
 			continue;
 		}
 
+		// Rule 5: a spliced pair with an emergency session in it is not reaped from
+		// either leg: ending one half would leave the other up on dead air.
+		if (isSplicedPair(session) && pairHasEmergency(session)) continue;
+
 		if (now >= session->getSessionExpiry())
 		{
 			toExpire.push_back(callID);
@@ -13702,16 +13702,13 @@ void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point n
 		}
 		// #1123: a spliced session's dest is a stand-in for the peer session's phone.
 		const bool paired = isSplicedPair(session);
-		// Rule 5: never reap a spliced peer that is an emergency session (a PSAP
-		// callback that was picked up). Only this, non-emergency, leg expires.
-		const bool keepPeer = paired && peerIsEmergency(session);
 		if (dest && !paired && !dFrom.empty() && !dTo.empty())
 		{
 			auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo, byeCSeq);
 			if (b) _outbox.emplace_back(dest->getAddress(), std::move(b));
 		}
 		session->noteServerCSeq(byeCSeq);
-		if (paired && !keepPeer) endSplicePeer(session, _outbox, "session timer expired");
+		if (paired) endSplicePeer(session, _outbox, std::string_view("session timer expired"));
 		queueLog("[session timer] expired — BYE sent for " + callID, true);
 		endCall(callID,
 		        src  ? src->getNumber()  : "",
@@ -14073,28 +14070,22 @@ bool RequestsHandler::resolveBridgeLeg(const std::shared_ptr<Session>& leg, Peer
 	return out.target != nullptr;
 }
 
+// Decided from the session's own flags, not from whether the peer still exists: a
+// dangling peerCallID must not send the stand-in dest a BYE on this Call-ID (481).
+// Transfers keep their own teardown (handleTransferFailure, onBye): both halves of a
+// blind or attended transfer carry a transfer flag, and the original dialog's dest is
+// the live transferee, not a stand-in.
 bool RequestsHandler::isSplicedPair(const std::shared_ptr<Session>& s)
 {
-	if (!s || s->getPeerCallID().empty() || s->isBlindXferLeg() || s->isTransferBridge())
-		return false;
-	auto peer = getSession(s->getPeerCallID());
-	// Transfers keep their own teardown (handleTransferFailure, onBye): the original
-	// dialog's dest is the live transferee, not a stand-in.
-	return peer.has_value() && !peer.value()->isBlindXferLeg() && !peer.value()->isTransferBridge();
+	return s && !s->getPeerCallID().empty() && !s->isBlindXferLeg() && !s->isTransferBridge();
 }
 
-// Rule 5: a kill that would end this session ends its peer too, so either one
-// being an emergency session refuses it.
+// Rule 5: a teardown of this session also ends its spliced peer, so either one
+// being an emergency session (a PSAP callback that was picked up, say) counts.
 bool RequestsHandler::pairHasEmergency(const std::shared_ptr<Session>& s)
 {
 	if (!s) return false;
-	return s->isEmergency() || peerIsEmergency(s);
-}
-
-// Rule 5: the spliced peer of `s` (a PSAP callback that was picked up, say) is an
-// emergency session.
-bool RequestsHandler::peerIsEmergency(const std::shared_ptr<Session>& s)
-{
+	if (s->isEmergency()) return true;
 	if (!isSplicedPair(s)) return false;
 	auto peer = getSession(s->getPeerCallID());
 	return peer.has_value() && peer.value()->isEmergency();
@@ -14103,9 +14094,9 @@ bool RequestsHandler::peerIsEmergency(const std::shared_ptr<Session>& s)
 // #1123: BYE the peer session's own phone on the peer's own Call-ID (the shape
 // onBye's peer branch uses), then end the peer through endCall().
 void RequestsHandler::endSplicePeer(const std::shared_ptr<Session>& s,
-	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& box, const char* reason)
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& box, std::string_view reason)
 {
-	const std::string peerId = s->getPeerCallID();
+	const std::string& peerId = s->getPeerCallID();
 	auto peerOpt = getSession(peerId);
 	if (!peerOpt.has_value()) return;
 	auto peer = peerOpt.value();
@@ -14120,9 +14111,11 @@ void RequestsHandler::endSplicePeer(const std::shared_ptr<Session>& s,
 	{
 		queueLog("[SIP] #1123 spliced peer has no usable dialog: ended without a BYE", true);
 	}
-	const std::string peerSrc  = peer->getSrc()  ? peer->getSrc()->getNumber()  : "";
-	const std::string peerDest = peer->getDest() ? peer->getDest()->getNumber() : "";
-	endCall(peerId, peerSrc, peerDest, reason);
+	static const std::string kNoNumber;
+	endCall(peerId,
+	        peer->getSrc()  ? peer->getSrc()->getNumber()  : kNoNumber,
+	        peer->getDest() ? peer->getDest()->getNumber() : kNoNumber,
+	        reason);
 }
 
 bool RequestsHandler::resolvePeerDialog(const std::shared_ptr<Session>& s, PeerDialog& out)

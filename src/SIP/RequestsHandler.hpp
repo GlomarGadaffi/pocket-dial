@@ -2710,9 +2710,8 @@ private:
 	// leg or bridge is not a pair: the transfer code owns that teardown.
 	bool isSplicedPair(const std::shared_ptr<Session>& s);
 	bool pairHasEmergency(const std::shared_ptr<Session>& s);
-	bool peerIsEmergency(const std::shared_ptr<Session>& s);
 	void endSplicePeer(const std::shared_ptr<Session>& s,
-		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& box, const char* reason);
+		std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>>& box, std::string_view reason);
 	// One transfer-bridge leg on its own: the phone on its dialog and the headers to
 	// speak to it in the dropped transferor's name. resolvePeerDialog() is this for
 	// the leg's peer; handleTransferFailure() uses it for both legs, so a leg whose
