@@ -1973,3 +1973,20 @@ TEST(TrunkByeAuth, RefusedByesAreCountedAndLoggedOncePerWindowWithoutNamingTheCa
 	EXPECT_EQ(line.find(kOffLegIp), std::string::npos) << "and no address";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
 }
+
+// #1133 (rule 5): the trunk is deprecated, not changed. A configured trunk still
+// places a call, with the same messages in the same numbers as before the notice.
+TEST(TrunkWiring, ADeprecatedTrunkStillPlacesACallWithTheSameMessageCounts)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-1133"));
+
+	EXPECT_EQ(b.sent.size(), 2u);
+	EXPECT_EQ(b.countWithTo("INVITE", kSbcIp), 1u) << "one carrier INVITE";
+	EXPECT_EQ(b.countWithTo("SIP/2.0 100", kHandsetIp), 0u);
+	EXPECT_EQ(b.countWithTo("SIP/2.0 180", kHandsetIp), 1u);
+	EXPECT_EQ(b.countWithTo("SIP/2.0 4", kHandsetIp), 0u) << "no refusal";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+}

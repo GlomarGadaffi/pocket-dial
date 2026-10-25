@@ -1745,3 +1745,163 @@ TEST(TrunkByeAuth, AHandsetThatMovedButHasNotReRegisteredIsRefusedUntilItDoes)
 	b.handler.handle(forkByeFrom(a.fork, kRoamedIp, 5060, "moved2"));
 	expectHandsetHangupOnce(b, a, kRoamedIp);
 }
+
+// #1133 (rule 5): the trunk is deprecated, not changed. A configured trunk still
+// receives a call, and a PSAP callback on it still rings, with the same messages
+// in the same numbers as before the notice.
+TEST(TrunkInbound, ADeprecatedTrunkStillRingsAnInboundCallWithTheSameMessageCounts)
+{
+	Bench b;
+	const std::string fork = ringFork(b, "in-1133");
+	ASSERT_FALSE(fork.empty()) << "the extension rings";
+	EXPECT_EQ(b.sent.size(), 2u);
+	EXPECT_EQ(b.countTo(kSbcIp), 1u) << "the carrier hears one 100 Trying";
+	EXPECT_EQ(b.countTo(kPhoneIp), 1u) << "the handset gets one INVITE";
+	EXPECT_EQ(otherForks(b, fork), 0u);
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+}
+
+TEST(TrunkInbound, ADeprecatedTrunkStillRingsAPsapCallbackWithTheSameMessageCounts)
+{
+	Bench b;
+	ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
+	b.handler.setAnchorPlacesRealCallsForTest(true);
+	b.handler.handle(makeInvite("911", "911", "in-1133-911", kPhoneIp, true, kExt));
+	ASSERT_FALSE(b.firstTo("SIP/2.0 200", kPhoneIp).empty()) << "precondition: the anchor placed 2001's 911";
+	b.sent.clear();
+
+	b.handler.handle(makeInvite(kDid, kDid, "in-1133-cb", kSbcIp, true, "+12025550177", 101, "Require: 100rel\r\n"));
+	EXPECT_TRUE(b.firstTo("420", kSbcIp).empty()) << "the callback is not refused";
+	const std::string fork = b.firstTo("INVITE sip:2001@", kPhoneIp);
+	EXPECT_FALSE(fork.empty()) << "2001 rings";
+	EXPECT_EQ(b.sent.size(), 2u);
+	EXPECT_EQ(b.countTo(kSbcIp), 1u);
+	EXPECT_EQ(b.countTo(kPhoneIp), 1u);
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	const auto cb = b.handler.getSession("Call-ID: " + field(fork, "Call-ID: "));
+	ASSERT_TRUE(cb.has_value());
+	EXPECT_TRUE(cb.value()->isEmergency()) << "the callback is flagged as a PSAP callback";
+
+	// Negative control: the same INVITE to the DID of an extension that never dialed 911.
+	b.handler.handle(makeRegister("2002", "192.168.50.22"));
+	ASSERT_EQ(b.handler.setDidMapping("+12025550189", "2002"), "");
+	b.sent.clear();
+	b.handler.handle(makeInvite("+12025550189", "+12025550189", "in-1133-other", kSbcIp, true, "+12025550177"));
+	const std::string other = b.firstTo("INVITE sip:2002@", "192.168.50.22");
+	ASSERT_FALSE(other.empty()) << "2002 rings";
+	const auto os = b.handler.getSession("Call-ID: " + field(other, "Call-ID: "));
+	ASSERT_TRUE(os.has_value());
+	EXPECT_FALSE(os.value()->isEmergency()) << "an ordinary inbound call is not flagged";
+
+// ── REFER on an inbound trunk call or a PSAP callback (transferor binding) ───
+// Rule 5: what a REFER on these sessions draws must not change. The handset's own
+// REFER, from its own IP and from the IP it re-REGISTERed at, gets one answer and
+// leaves the call up; a REFER from an address that is neither leg is refused 403
+// by the dialog check, as before the transferor binding existed.
+
+namespace
+{
+	std::shared_ptr<SipMessage> forkReferFrom(const std::string& fork, const std::string& ip, uint16_t port, int cseq,
+		const std::string& fromOverride = "")
+	{
+		const std::string raw =
+			"REFER sip:2001@" + std::string(kServerIp) + ":5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":" + std::to_string(port) + ";branch=z9hG4bKhref" + std::to_string(cseq) + "\r\n"
+			"From: " + (fromOverride.empty() ? field(fork, "To: ") : fromOverride) + ";tag=hs1\r\n"
+			"To: " + field(fork, "From: ") + "\r\n"
+			"Call-ID: " + field(fork, "Call-ID: ") + "\r\n"
+			"CSeq: " + std::to_string(cseq) + " REFER\r\n"
+			"Max-Forwards: 70\r\n"
+			"Refer-To: <sip:2002@" + std::string(kServerIp) + ">\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(ip, port));
+	}
+
+	void runHandsetRefer(bool psap, const char* callId, const char* ip, uint16_t port, bool roam)
+	{
+		Bench b;
+		b.handler.handle(makeRegister("2002", "192.168.50.22"));
+		const Answered a = bringUpInbound(b, callId, psap);
+		if (roam) b.handler.handle(makeRegister(kExt, ip));
+		b.sent.clear();
+		b.handler.handle(forkReferFrom(a.fork, ip, port, 2));
+		EXPECT_EQ(countStartTo(b, "SIP/2.0 603", ip), 1u);
+		EXPECT_EQ(countStartTo(b, "SIP/2.0 202", ip), 0u);
+		EXPECT_EQ(countStartTo(b, "BYE ", kSbcIp), 0u);
+		EXPECT_EQ(countStartTo(b, "BYE ", ip), 0u);
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+		const auto s = b.handler.getSession(a.forkId);
+		ASSERT_TRUE(s.has_value());
+		EXPECT_EQ(s.value()->getState(), Session::State::Connected);
+		EXPECT_EQ(s.value()->isEmergency(), psap);
+	}
+
+	void runNonLegRefer(bool psap, const char* callId)
+	{
+		Bench b;
+		b.handler.handle(makeRegister("2002", "192.168.50.22"));
+		const Answered a = bringUpInbound(b, callId, psap);
+		b.sent.clear();
+		b.handler.handle(forkReferFrom(a.fork, kNonLegIp, 5060, 2));
+		EXPECT_EQ(countStartTo(b, "SIP/2.0 403", kNonLegIp), 1u);
+		EXPECT_EQ(countStartTo(b, "SIP/2.0 202", kNonLegIp), 0u);
+		EXPECT_EQ(countStartTo(b, "BYE ", kSbcIp), 0u);
+		EXPECT_EQ(countStartTo(b, "BYE ", kPhoneIp), 0u);
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+		const auto s = b.handler.getSession(a.forkId);
+		ASSERT_TRUE(s.has_value());
+		EXPECT_EQ(s.value()->getState(), Session::State::Connected);
+	}
+}
+
+TEST(ReferTransferorBinding, Control_AHandsetReferOnAPsapCallbackDrawsOneDeclineAndKeepsTheCall)
+{
+	runHandsetRefer(true, "rb-cb-1", kPhoneIp, 5060, false);
+}
+
+TEST(ReferTransferorBinding, Control_AHandsetReferOnAPsapCallbackFromAnotherPortDrawsOneDecline)
+{
+	runHandsetRefer(true, "rb-cb-2", kPhoneIp, 49152, false);
+}
+
+TEST(ReferTransferorBinding, Control_AHandsetReferOnAPsapCallbackAfterARoamingReRegisterDrawsOneDecline)
+{
+	runHandsetRefer(true, "rb-cb-3", kRoamedIp, 5060, true);
+}
+
+TEST(ReferTransferorBinding, Control_AReferOnAPsapCallbackFromAThirdAddressIsRefusedAsBefore)
+{
+	runNonLegRefer(true, "rb-cb-4");
+}
+
+TEST(ReferTransferorBinding, Control_AHandsetReferOnAnInboundTrunkCallDrawsOneDecline)
+{
+	runHandsetRefer(false, "rb-in-1", kPhoneIp, 5060, false);
+}
+
+TEST(ReferTransferorBinding, Control_AReferOnAnInboundTrunkCallFromAThirdAddressIsRefusedAsBefore)
+{
+	runNonLegRefer(false, "rb-in-2");
+}
+
+// The handset's own address, but From names another registered extension: refused by the transferor
+// binding (it used to reach the decline). The call stays up and nothing goes to the carrier.
+TEST(ReferTransferorBinding, AReferOnAPsapCallbackFromTheHandsetAddressNamingAnotherExtensionIsRefused)
+{
+	Bench b;
+	b.handler.handle(makeRegister("2002", "192.168.50.22"));
+	const Answered a = bringUpInbound(b, "rb-cb-5", true);
+	b.sent.clear();
+	b.handler.handle(forkReferFrom(a.fork, kPhoneIp, 5060, 2, "<sip:2002@" + std::string(kServerIp) + ">"));
+	EXPECT_EQ(countStartTo(b, "SIP/2.0 403", kPhoneIp), 1u);
+	EXPECT_EQ(countStartTo(b, "SIP/2.0 603", kPhoneIp), 0u);
+	EXPECT_EQ(b.sent.size(), 1u);
+	EXPECT_EQ(b.countTo(kSbcIp), 0u) << "nothing goes to the carrier";
+	EXPECT_EQ(countStartTo(b, "BYE ", kPhoneIp), 0u);
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	const auto s = b.handler.getSession(a.forkId);
+	ASSERT_TRUE(s.has_value());
+	EXPECT_EQ(s.value()->getState(), Session::State::Connected);
+	EXPECT_TRUE(s.value()->isEmergency());
+	EXPECT_EQ(b.handler.referBindingRefusalsForTest(), 1u);
+}

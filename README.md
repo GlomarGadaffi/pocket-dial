@@ -17,7 +17,7 @@ flowchart LR
     A <-. "RTP, phone to phone" .-> B
     W["Browser"] -- "dashboard, HTTP 80" --- PBX
     PBX -- "3CX Call Control: token and REST over HTTPS,<br/>events over WSS, audio as HTTPS streams" --- AN["3CX media anchor<br/>dial 555, outside lines,<br/>the only route for 911 and 933"]
-    PBX -. "SIP over UDP, optional,<br/>never carries 911 or 933" .- TR["Carrier SIP trunk"]
+    PBX -. "SIP over UDP, DEPRECATED,<br/>never carries 911 or 933" .- TR["Carrier SIP trunk"]
     AN --- PSTN["Public phone network"]
     TR --- PSTN
 ```
@@ -153,7 +153,7 @@ sequenceDiagram
 | Lamps | BLF through the `dialog` event package (RFC 4235) |
 | Board-terminated | Echo `777`, tone `440`, conference `888`, voicemail, hold music |
 | Routing | Ordered dial plan, up to 16 rules, first match wins |
-| Outside lines | Cloud media anchors (3CX, Apidaze). The direct carrier SIP trunk is shelved ([ADR-002](docs/ADR-002-PROGRAMMABLE-MEDIA-ANCHOR.md)) |
+| Outside lines | Cloud media anchors (3CX, Apidaze). The direct carrier SIP trunk is DEPRECATED and shelved; the anchor is the supported ITSP path ([ADR-002](docs/ADR-002-PROGRAMMABLE-MEDIA-ANCHOR.md)) |
 | Admin | Web dashboard, HTTP API, phone provisioning, OTA updates, outbound email |
 
 Not all of this has run on hardware yet. [FEATURE_ROADMAP.md](docs/FEATURE_ROADMAP.md) says which features are bench-proven and which have only passed the host tests.

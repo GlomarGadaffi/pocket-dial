@@ -257,6 +257,10 @@ add_executable(sip_parser_tests
     # ?Replaces= splice of a consult dialog the source is not on, and that a
     # genuine in-dialog transfer still completes.
     ReferSourceAuth_test.cpp
+    # Transferor binding: an in-dialog REFER must come from the leg of the party it names
+    # as the transferor (blind and attended), the shared-address fallback, the counter
+    # and rate-limited log, and the 911 / PSAP-callback controls (see also TrunkInbound_test).
+    ReferTransferorBinding_test.cpp
     # Issue #69: the bounded pattern -> action dial plan that generalizes the
     # ring-group mechanism. Pure grammar/precedence/cap coverage against
     # DialPlan.hpp, end-to-end routing (dispatch + fallthrough) driven through
@@ -488,6 +492,7 @@ add_executable(sip_parser_tests
     # dashboard snapshot the HTTP setters do, not bypass it by writing
     # _dnd/_forwards directly from inside onDtmfInfo's _mutex lock.
     DtmfClassCodes_test.cpp
+    InfoAuth_test.cpp
     # Issue #222: the DTMF admin factory reset (*<PIN>#999#1) must wipe the SD
     # CDR archive like the HTTP factory reset does. Drives the real INFO digit
     # path with a spy Sink installed via cdrarchive::setSinkForTest().

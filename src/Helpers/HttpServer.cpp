@@ -2565,6 +2565,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json.s("\"trunkForgedRegisterResponses\":").n(handler ? handler->getTrunkForgedRegisterResponses() : 0).s(",");
 	json.s("\"trunkForgedDialogResponses\":").n(handler ? handler->getTrunkForgedDialogResponses() : 0).s(",");
 	json.s("\"trunkRefusedDialogByes\":").n(handler ? handler->getTrunkRefusedDialogByes() : 0).s(",");
+	// #1133: the SIP trunk is deprecated; the anchor is the supported ITSP path. A constant, no behaviour.
+	json.s("\"trunkDeprecated\":true,");
 	// #741: 911/933 calls ended after 4 h with both legs silent.
 	json.s("\"emergencyRtpReaps\":").n(handler ? handler->getEmergencyRtpReaps() : 0).s(",");
 	// #864: ARP requests held back for unanswered Learn REGISTERs.

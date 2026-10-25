@@ -224,3 +224,44 @@ TEST(MohPreview, DeclinedPreviewIsAckedAndReleasedWithoutAStray404)
 
 	std::remove(clip.c_str());
 }
+
+// An INFO on the preview dialog: the previewed phone's own digits reach the collector exactly as
+// they always did; the same digit from another address does not.
+TEST(InfoAuth, MohPreviewDialogInfoFromThePreviewedPhoneIsAnsweredAndCollected)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.42.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) { sent.emplace_back(addr, std::move(msg)); });
+	handler.handle(makeRegister("1003", "192.168.42.10", "reg-moh-1003"));
+	const std::string clip = writeTempUlawWav(8000);
+	ASSERT_TRUE(handler.startHoldMusic(clip));
+	ASSERT_TRUE(handler.startMohPreview("1003"));
+	handler.tick();
+	const std::string invite = findSent(sent, "INVITE sip:1003@");
+	ASSERT_FALSE(invite.empty());
+	const size_t at = invite.find("Call-ID: ");
+	ASSERT_NE(at, std::string::npos);
+	const std::string callId = invite.substr(at + 9, invite.find("\r\n", at) - (at + 9));
+
+	auto info = [&](const std::string& ip, int n) {
+		return RequestsHandler::getMessageFromPool(
+			"INFO sip:server SIP/2.0\r\nVia: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKmi" + std::to_string(n) + "\r\n"
+			"From: <sip:1003@server>;tag=it\r\nTo: <sip:moh@server>\r\nCall-ID: " + callId + "\r\nCSeq: " + std::to_string(n) + " INFO\r\n"
+			"Content-Type: application/dtmf-relay\r\nContent-Length: 24\r\n\r\nSignal=5\r\nDuration=100\r\n", addrFor(ip));
+	};
+	auto count200To = [&](const std::string& ip) {
+		size_t n = 0;
+		for (const auto& [a, m] : sent)
+			if (m && a.sin_addr.s_addr == inet_addr(ip.c_str()) && m->toString().rfind("SIP/2.0 200", 0) == 0) ++n;
+		return n;
+	};
+	sent.clear();
+	handler.handle(info("192.168.42.99", 1));
+	EXPECT_EQ(count200To("192.168.42.99"), 1u) << "answered, never ended";
+	EXPECT_EQ(handler.dtmfAccumulatorCountForTest(), 0u) << "and not collected";
+	sent.clear();
+	handler.handle(info("192.168.42.10", 2));
+	EXPECT_EQ(count200To("192.168.42.10"), 1u);
+	EXPECT_EQ(handler.dtmfAccumulatorCountForTest(), 1u);
+	std::remove(clip.c_str());
+}

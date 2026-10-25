@@ -485,7 +485,7 @@ TEST(HttpStatusAlloc, TheStatusKeyListIsPinnedAndTheDramAccountGuardAddsOnlyItsO
 		"httpStatusRefusals", "wifiCapable", "emergencyRoute", "uptime", "cdrPersistFailures", "cdrPersistSuppressed",
 		"cdrLoadFailures", "packetsProcessed", "packetsDropped", "msgPoolRefusals", "vpeerPoolRefusals", "repliesRefused", "e911UnknownAlertOverflow", "e911UnknownAlertSuppressed",
 		"optionsPingTruncated", "byeTruncated", "trunkForgedRegisterResponses", "trunkForgedDialogResponses",
-		"trunkRefusedDialogByes", "emergencyRtpReaps", "learnArpRequestsLimited", "e911Configured", "droppedInvalid",
+		"trunkRefusedDialogByes", "trunkDeprecated", "emergencyRtpReaps", "learnArpRequestsLimited", "e911Configured", "droppedInvalid",
 		"droppedRate", "keepalivesCrlf", "droppedNoPool", "droppedOversize", "rtpRxOversize", "rtpTxPoolRefused",
 		"rtpTxPoolRetired", "recvErrors", "lastRecvErrno", "recentDrops", "sd", "resetIncomplete", "resetIncompleteStage",
 		"resetFailedMask", "resetJournal", "resetJournalWriteFailures", "clients", "clientCount", "rosterVisible",
