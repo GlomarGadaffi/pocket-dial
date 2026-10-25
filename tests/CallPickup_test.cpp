@@ -874,3 +874,144 @@ TEST(CallPickup, ParkedPartyByeIsAnsweredAndFreesTheOrbitAndSession)
 		<< "the orbit must be free: nothing may be retrieved from a party that hung up";
 	EXPECT_TRUE(handler.getSession(sessionKey("park-call-804b")).has_value());
 }
+
+// ── #1123: an admin kill or a session-timer reap of a picked-up call ──────────
+// A pickup is two sessions on two dialogs: call-1 (caller 200, answered by the
+// picker) and pickup-1 (the picker's own INVITE). Each phone is told on the
+// dialog it holds, and both sessions end.
+namespace
+{
+	size_t byesOn(const std::vector<Sent>& sent, const std::string& ip, const std::string& callId)
+	{
+		size_t n = 0;
+		for (const auto& s : sent)
+		{
+			if (s.destIp == ip && s.raw.rfind("BYE ", 0) == 0 &&
+				s.raw.find("Call-ID: " + callId + "\r\n") != std::string::npos) ++n;
+		}
+		return n;
+	}
+
+	void flushAsync(RequestsHandler& handler)
+	{
+		handler.handle(RequestsHandler::getMessageFromPool(
+			"OPTIONS sip:server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP 192.168.9.99:5060;branch=z9hG4bKflush1123\r\n"
+			"From: <sip:probe@server>;tag=probetag\r\n"
+			"To: <sip:server@server>\r\n"
+			"Call-ID: flush-1123\r\n"
+			"CSeq: 1 OPTIONS\r\n"
+			"Max-Forwards: 70\r\n"
+			"Content-Length: 0\r\n\r\n", addrFor("192.168.9.99")));
+	}
+
+	struct PickupRig
+	{
+		std::vector<Sent> sent;
+		RequestsHandler handler;
+		PickupRig() : handler("192.168.9.1", 5060,
+			[this](const sockaddr_in& to, std::shared_ptr<SipMessage> msg) {
+				sent.push_back({ ipOf(to), msg->toString() });
+			})
+		{
+			handler.handle(makeRegister("200", "192.168.9.10", "reg-caller"));
+			handler.handle(makeRegister("100", "192.168.9.20", "reg-target"));
+			handler.handle(makeRegister("102", "192.168.9.30", "reg-picker"));
+			handler.setRingGroup("600", "100,102", "ringall");
+			handler.handle(makeInvite("200", "100", "192.168.9.10", "call-1"));
+			handler.handle(makeInvite("102", "**100", "192.168.9.30", "pickup-1"));
+		}
+	};
+}
+
+TEST(CallPickup, KillingThePickedUpCallerByesEachPhoneOnItsOwnDialog)
+{
+	PickupRig r;
+	ASSERT_TRUE(r.handler.getSession(sessionKey("pickup-1")).has_value());
+	r.sent.clear();
+	ASSERT_TRUE(r.handler.forceDisconnect("200"));
+	flushAsync(r.handler);
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.10", "call-1"), 1u);
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.30", "pickup-1"), 1u);
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.30", "call-1"), 0u);
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.10", "pickup-1"), 0u);
+	EXPECT_FALSE(r.handler.getSession(sessionKey("call-1")).has_value());
+	EXPECT_FALSE(r.handler.getSession(sessionKey("pickup-1")).has_value());
+}
+
+TEST(CallPickup, KillingThePickerEndsTheCallersDialogToo)
+{
+	PickupRig r;
+	r.sent.clear();
+	ASSERT_TRUE(r.handler.forceDisconnect("102"));
+	flushAsync(r.handler);
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.30", "pickup-1"), 1u);
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.10", "call-1"), 1u);
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.30", "call-1"), 0u);
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.10", "pickup-1"), 0u);
+	EXPECT_FALSE(r.handler.getSession(sessionKey("call-1")).has_value());
+	EXPECT_FALSE(r.handler.getSession(sessionKey("pickup-1")).has_value());
+}
+
+TEST(CallPickup, AnExpiredPickerTimerByesEachPhoneOnItsOwnDialogAndEndsBoth)
+{
+	PickupRig r;
+	auto picker = r.handler.getSession(sessionKey("pickup-1"));
+	ASSERT_TRUE(picker.has_value());
+	picker.value()->armSessionTimer(1800, false, std::chrono::steady_clock::now() - std::chrono::hours(2));
+	r.sent.clear();
+	r.handler.forceNextTickForTest();
+	r.handler.tick();
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.30", "pickup-1"), 1u);
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.10", "call-1"), 1u);
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.10", "pickup-1"), 0u);
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.30", "call-1"), 0u);
+	EXPECT_FALSE(r.handler.getSession(sessionKey("call-1")).has_value());
+	EXPECT_FALSE(r.handler.getSession(sessionKey("pickup-1")).has_value());
+}
+
+// Rule 5: a PSAP callback that was picked up is an emergency session. The picker's
+// timer expiring must not take the callback leg down with it.
+TEST(CallPickup, AnExpiredPickerTimerNeverEndsAnEmergencyCallbackLeg)
+{
+	PickupRig r;
+	auto callback = r.handler.getSession(sessionKey("call-1"));
+	auto picker   = r.handler.getSession(sessionKey("pickup-1"));
+	ASSERT_TRUE(callback.has_value());
+	ASSERT_TRUE(picker.has_value());
+	callback.value()->setEmergency(true);
+	picker.value()->armSessionTimer(1800, false, std::chrono::steady_clock::now() - std::chrono::hours(2));
+	r.sent.clear();
+	r.handler.forceNextTickForTest();
+	r.handler.tick();
+	EXPECT_TRUE(r.handler.getSession(sessionKey("call-1")).has_value())
+		<< "the emergency callback leg must stay up";
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.10", "call-1"), 0u);
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.10", "pickup-1"), 0u);
+	EXPECT_EQ(byesOn(r.sent, "192.168.9.30", "pickup-1"), 1u);
+}
+
+// An answered call is one session (no peer): the pair rule must not touch it.
+TEST(CallPickup, KillingAnOrdinaryAnsweredCallStillByesBothPhonesOnTheCallsOwnDialog)
+{
+	std::vector<Sent> sent;
+	RequestsHandler handler("192.168.9.1", 5060,
+		[&](const sockaddr_in& to, std::shared_ptr<SipMessage> msg) {
+			sent.push_back({ ipOf(to), msg->toString() });
+		});
+	handler.handle(makeRegister("200", "192.168.9.10", "reg-caller"));
+	handler.handle(makeRegister("100", "192.168.9.20", "reg-target"));
+	handler.handle(makeRegister("102", "192.168.9.30", "reg-picker"));
+	handler.handle(makeInvite("200", "100", "192.168.9.10", "call-ra"));
+	handler.handle(makeOk("200", "100", "192.168.9.20", "call-ra"));
+	auto s = handler.getSession(sessionKey("call-ra"));
+	ASSERT_TRUE(s.has_value());
+	ASSERT_TRUE(s.value()->getPeerCallID().empty());
+	sent.clear();
+	ASSERT_TRUE(handler.forceDisconnect("200"));
+	flushAsync(handler);
+	EXPECT_EQ(byesOn(sent, "192.168.9.10", "call-ra"), 1u);
+	EXPECT_EQ(byesOn(sent, "192.168.9.20", "call-ra"), 1u);
+	EXPECT_EQ(byesOn(sent, "192.168.9.30", "call-ra"), 0u);
+	EXPECT_FALSE(handler.getSession(sessionKey("call-ra")).has_value());
+}

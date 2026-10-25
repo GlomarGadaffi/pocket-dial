@@ -13524,13 +13524,16 @@ void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point n
 		}
 		// #1123: a spliced session's dest is a stand-in for the peer session's phone.
 		const bool paired = isSplicedPair(session);
+		// Rule 5: never reap a spliced peer that is an emergency session (a PSAP
+		// callback that was picked up). Only this, non-emergency, leg expires.
+		const bool keepPeer = paired && peerIsEmergency(session);
 		if (dest && !paired && !dFrom.empty() && !dTo.empty())
 		{
 			auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo, byeCSeq);
 			if (b) _outbox.emplace_back(dest->getAddress(), std::move(b));
 		}
 		session->noteServerCSeq(byeCSeq);
-		if (paired) endSplicePeer(session, _outbox, "session timer expired");
+		if (paired && !keepPeer) endSplicePeer(session, _outbox, "session timer expired");
 		queueLog("[session timer] expired — BYE sent for " + callID, true);
 		endCall(callID,
 		        src  ? src->getNumber()  : "",
@@ -13907,7 +13910,13 @@ bool RequestsHandler::isSplicedPair(const std::shared_ptr<Session>& s)
 bool RequestsHandler::pairHasEmergency(const std::shared_ptr<Session>& s)
 {
 	if (!s) return false;
-	if (s->isEmergency()) return true;
+	return s->isEmergency() || peerIsEmergency(s);
+}
+
+// Rule 5: the spliced peer of `s` (a PSAP callback that was picked up, say) is an
+// emergency session.
+bool RequestsHandler::peerIsEmergency(const std::shared_ptr<Session>& s)
+{
 	if (!isSplicedPair(s)) return false;
 	auto peer = getSession(s->getPeerCallID());
 	return peer.has_value() && peer.value()->isEmergency();
@@ -13928,6 +13937,10 @@ void RequestsHandler::endSplicePeer(const std::shared_ptr<Session>& s,
 		auto b = buildServerBye(pd.target->getNumber(), pd.target->getAddress(), peerId,
 			*pd.fromHdr, *pd.toHdr, peer->nextServerCSeq());
 		if (b) box.emplace_back(pd.target->getAddress(), std::move(b));
+	}
+	else
+	{
+		queueLog("[SIP] #1123 spliced peer has no usable dialog: ended without a BYE", true);
 	}
 	const std::string peerSrc  = peer->getSrc()  ? peer->getSrc()->getNumber()  : "";
 	const std::string peerDest = peer->getDest() ? peer->getDest()->getNumber() : "";

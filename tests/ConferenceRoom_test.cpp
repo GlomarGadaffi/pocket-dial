@@ -1248,3 +1248,40 @@ TEST(ToneCallCap, A440CallThatPressedStar11IsStillEndedAtTenMinutes)
 	EXPECT_FALSE(b.dial("502", "192.168.7.52", "tone-s11-again", "440").empty())
 		<< "the stream slot is free again";
 }
+
+// #1123: a conference leg has no spliced peer; an admin kill BYEs the extension
+// once on its own dialog, never a stand-in, and leaves the other legs alone.
+TEST(ConferenceRoom, AnAdminKillByesOnlyTheKilledLegOnceAndLeavesTheRest)
+{
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> sent;
+	RequestsHandler handler("192.168.7.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	handler.handle(makeRegister("501", "192.168.7.51", "reg-501"));
+	handler.handle(makeRegister("502", "192.168.7.52", "reg-502"));
+	handler.handle(makeRegister("503", "192.168.7.53", "reg-503"));
+	const std::string ext(ConferenceRoom::EXT);
+	handler.handle(makeInvite("501", ext, "192.168.7.51", "conf-501"));
+	handler.handle(makeInvite("502", ext, "192.168.7.52", "conf-502"));
+	handler.handle(makeInvite("503", ext, "192.168.7.53", "conf-503"));
+	ASSERT_EQ(handler.getConferenceLegs(), 3);
+	sent.clear();
+	ASSERT_TRUE(handler.forceDisconnect("502"));
+	handler.handle(makeBye("probe", ext, "192.168.7.99", "flush-1123"));   // next SIP-thread pass
+	size_t byes = 0, toKilled = 0;
+	for (const auto& [addr, msg] : sent)
+	{
+		if (!msg) continue;
+		const std::string raw = msg->toString();
+		if (raw.rfind("BYE ", 0) != 0 || raw.find("Call-ID: conf-502\r\n") == std::string::npos) continue;
+		++byes;
+		if (addr.sin_addr.s_addr == inet_addr("192.168.7.52")) ++toKilled;
+	}
+	EXPECT_EQ(byes, 1u);
+	EXPECT_EQ(toKilled, 1u);
+	EXPECT_EQ(handler.getConferenceLegs(), 2);
+	EXPECT_FALSE(handler.getSession("Call-ID: conf-502").has_value());
+	EXPECT_TRUE(handler.getSession("Call-ID: conf-501").has_value());
+	EXPECT_TRUE(handler.getSession("Call-ID: conf-503").has_value());
+}
