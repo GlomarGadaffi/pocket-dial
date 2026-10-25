@@ -409,11 +409,13 @@ private:
 	// Its stack and TCB, allocated once at construction (#479, like a call slot's rxMem) so start() allocates nothing
 	// and the stack sits in PSRAM, not internal RAM (internal where the build has none, e.g. the constrained profile).
 	// Safe: nothing on the sweep's path writes flash or runs in an ISR.
-	// 13376 = 12864 + 512: the static stack gate's worst-case chain for this task (a fresh TLS connect:
-	// resolveOutboundLeg -> httpGetBody -> esp_http_client_open -> cert verify -> ECP -> DRBG) plus its margin.
+	// 13392 = 12880 + 512, rounded up to 16 B: the largest worst-case chain the static stack gate reports for this task
+	// over the five images it gates (esp32s3 display, 12880 B; eth 12864; wifi 12864; lan8720 12656; constrained 11936) plus
+	// the gate's 512 B margin. The chain is a fresh TLS connect: resolveOutboundLeg -> httpGetBody -> esp_http_client_open
+	// -> cert verify -> ECP -> DRBG, ending in the image's log hook (the display image's is the heaviest).
 	// Sized from that estimate, NOT measured safe: pending the bench in #1116 (stackHwm_tel_sweep after a fresh
 	// TLS connect), after which this is trimmed to the measured high-water mark plus margin.
-	static constexpr uint32_t kSweepStackBytes = pd::rtpslots::kSweepStackBytes;   // 13376, see RtpTaskSlots.hpp
+	static constexpr uint32_t kSweepStackBytes = pd::rtpslots::kSweepStackBytes;   // 13392, see RtpTaskSlots.hpp
 	pd::StaticTaskSlot _sweepMem;
 	bool wakeSweep();   // false: no tel_sweep task
 	static void sweepTaskTrampoline(void* arg);

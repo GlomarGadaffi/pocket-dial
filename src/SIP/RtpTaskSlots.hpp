@@ -54,7 +54,7 @@ namespace pd
 		constexpr uint32_t kConfMixStackBytes  = 3072;
 		// #977, #1116: tel_sweep's boot-allocated stack. PSRAM first; internal where the build has none, so the
 		// no-PSRAM budget below counts it. One constant: TelephonyAnchorClient::kSweepStackBytes is this.
-		constexpr uint32_t kSweepStackBytes    = 13376;
+		constexpr uint32_t kSweepStackBytes    = 13392;   // 12880 + 512, rounded up to 16 B: see TelephonyAnchorClient.hpp
 	}
 }
 
@@ -63,8 +63,8 @@ namespace pd
 #if !defined(CONFIG_SPIRAM) || !CONFIG_SPIRAM
 // No PSRAM (esp32_constrained): rx stacks fall back to internal too, so every
 // slot is internal DRAM, fixed at boot. SIP_CONSTRAINED (no conference, tx
-// pool 3): 3 x 3 KB tx + 4 x 6 KB rx + 1 x 6 KB anchor tel_media_rx = 39 KB, plus tel_sweep's 13376 B
-// (#1116) = 52 KB.
+// pool 3): 3 x 3 KB tx + 4 x 6 KB rx + 1 x 6 KB anchor tel_media_rx = 39 KB, plus tel_sweep's 13392 B
+// (#1116) = 52 KB (53328 B of the 72 KB budget).
 // No conference room here.
 static_assert(!POCKETDIAL_CONFERENCE,
               "#479: no conference room on a no-PSRAM build (SIP_CONSTRAINED sets "

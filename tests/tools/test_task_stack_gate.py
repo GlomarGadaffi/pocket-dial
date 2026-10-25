@@ -1190,11 +1190,13 @@ class Gate(unittest.TestCase):
         want = {("sip_server", "main/esp_main_eth.cpp"): 9616,
                 ("sip_server", "main/esp_main_eth_lan8720.cpp"): 9408,
                 ("tel_ctl", "main/esp_main_eth.cpp"): 12816,
-                ("tel_ctl", "main/esp_main.cpp"): 12944,
-                ("tel_ctl", "main/esp_main_eth_lan8720.cpp"): 12736,
+                ("tel_ctl", "main/esp_main.cpp"): 12816,
+                ("tel_ctl", "main/esp_main_eth_lan8720.cpp"): 12608,
                 ("sip_server_task", "main/esp_main.cpp"): 9616,
                 ("sip_server_task", "main/esp_main_display.cpp"): 9632,
-                ("tel_ctl", "main/esp_main_display.cpp"): 12960}
+                ("tel_ctl", "main/esp_main_display.cpp"): 12832,
+                ("tel_ctl", "main/esp_main_eth_lan8720.cpp@constrained"): 12112,
+                ("sip_server", "main/esp_main_eth_lan8720.cpp@constrained"): 9264}
         for (name, image), cap in want.items():
             with self.subTest(name=name, image=image):
                 rows = kf[name] if isinstance(kf[name], list) else [kf[name]]
