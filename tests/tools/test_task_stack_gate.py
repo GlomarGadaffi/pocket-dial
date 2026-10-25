@@ -1242,6 +1242,13 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("FAIL big: known finding cap 2500 B is above the total 1900 B: lower max_total to 1900", out)
 
+    def test_the_checked_in_table_asserts_the_shared_spi1_bus_option_is_off(self):
+        # #1117: the constrained image's bg_enable rows leave cache_enable/cache_disable out because IDF installs
+        # them only under this option; an image that turned it on would make them real targets.
+        table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
+        absent = [d for a in table["sdkconfig_asserts"] for d in a.get("absent", [])]
+        self.assertIn("CONFIG_SPI_FLASH_SHARE_SPI1_BUS", absent)
+
     def test_a_smaller_budget_than_the_known_row_recorded_fails(self):
         for t in self.table["tasks"]:
             if t["name"] == "big":
