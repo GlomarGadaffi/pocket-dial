@@ -17,7 +17,7 @@ flowchart LR
     A <-. "RTP, phone to phone" .-> B
     W["Browser"] -- "dashboard, HTTP 80" --- PBX
     PBX -- "3CX Call Control: token and REST over HTTPS,<br/>events over WSS, audio as HTTPS streams" --- AN["3CX media anchor<br/>dial 555, outside lines,<br/>the only route for 911 and 933"]
-    PBX -. "SIP over UDP, optional,<br/>never carries 911 or 933" .- TR["Carrier SIP trunk"]
+    PBX -. "SIP over UDP, DEPRECATED,<br/>never carries 911 or 933" .- TR["Carrier SIP trunk"]
     AN --- PSTN["Public phone network"]
     TR --- PSTN
 ```

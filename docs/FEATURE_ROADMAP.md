@@ -99,7 +99,7 @@ flowchart TD
 
 ### 1.3 Outbound PSTN Interconnect & Media Anchors
 
-**Strategic architecture (October 2026).** Carrier-facing ITSP SIP trunks (`SipTrunk` over UDP) are **DEPRECATED** (#1133) and shelved behind Milestone 11. The anchor is the supported ITSP path. The reason is the network design rule: pocket-dial's design rule is that nothing is opened or forwarded from the WAN side to the board or the phones. The anchor carries provider audio over an outbound TLS WebSocket on 443. No code is removed; existing trunks and PSAP callbacks on them behave as before. Outside-line PSTN interconnect now uses **cloud media anchors and programmable telephony** only (Milestone 6, Epic #381, [ADR-002](ADR-002-PROGRAMMABLE-MEDIA-ANCHOR.md)).
+**Strategic architecture (October 2026).** Carrier-facing ITSP SIP trunks (`SipTrunk` over UDP) are **DEPRECATED** (#1133) and shelved behind Milestone 11. The anchor is the supported ITSP path. The reason is the network design rule: pocket-dial's design rule is that nothing is opened or forwarded from the WAN side to the board or the phones. The anchor is outbound HTTPS to the provider (control over a TLS WebSocket, audio over HTTPS streams), port 443 by default. No code is removed; existing trunk configurations are left in place and behaviour is unchanged by this release (outbound trunk calls remain under investigation, #618). Outside-line PSTN interconnect now uses **cloud media anchors and programmable telephony** only (Milestone 6, Epic #381, [ADR-002](ADR-002-PROGRAMMABLE-MEDIA-ANCHOR.md)).
 
 Outside-line calls leave through the **programmable media anchor interface**:
 

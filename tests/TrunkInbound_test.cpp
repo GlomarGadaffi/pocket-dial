@@ -1772,9 +1772,24 @@ TEST(TrunkInbound, ADeprecatedTrunkStillRingsAPsapCallbackWithTheSameMessageCoun
 
 	b.handler.handle(makeInvite(kDid, kDid, "in-1133-cb", kSbcIp, true, "+12025550177", 101, "Require: 100rel\r\n"));
 	EXPECT_TRUE(b.firstTo("420", kSbcIp).empty()) << "the callback is not refused";
-	EXPECT_FALSE(b.firstTo("INVITE sip:2001@", kPhoneIp).empty()) << "2001 rings";
+	const std::string fork = b.firstTo("INVITE sip:2001@", kPhoneIp);
+	EXPECT_FALSE(fork.empty()) << "2001 rings";
 	EXPECT_EQ(b.sent.size(), 2u);
 	EXPECT_EQ(b.countTo(kSbcIp), 1u);
 	EXPECT_EQ(b.countTo(kPhoneIp), 1u);
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	const auto cb = b.handler.getSession("Call-ID: " + field(fork, "Call-ID: "));
+	ASSERT_TRUE(cb.has_value());
+	EXPECT_TRUE(cb.value()->isEmergency()) << "the callback is flagged as a PSAP callback";
+
+	// Negative control: the same INVITE to the DID of an extension that never dialed 911.
+	b.handler.handle(makeRegister("2002", "192.168.50.22"));
+	ASSERT_EQ(b.handler.setDidMapping("+12025550189", "2002"), "");
+	b.sent.clear();
+	b.handler.handle(makeInvite("+12025550189", "+12025550189", "in-1133-other", kSbcIp, true, "+12025550177"));
+	const std::string other = b.firstTo("INVITE sip:2002@", "192.168.50.22");
+	ASSERT_FALSE(other.empty()) << "2002 rings";
+	const auto os = b.handler.getSession("Call-ID: " + field(other, "Call-ID: "));
+	ASSERT_TRUE(os.has_value());
+	EXPECT_FALSE(os.value()->isEmergency()) << "an ordinary inbound call is not flagged";
 }

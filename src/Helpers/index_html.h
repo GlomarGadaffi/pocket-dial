@@ -4549,7 +4549,7 @@ a{color:var(--brass-hi)}
 <div class="wrap">
   <h1>&#9742; SIP Trunk</h1>
   <p class="sub">Outbound PSTN through an ITSP. <a href="/">&larr; back to dashboard</a></p>
-  <p class="note deprec" id="trunk-deprecated"><strong>Deprecated.</strong> The SIP trunk is deprecated. The anchor is the supported ITSP path: it connects outbound only, over TLS on 443, so nothing is opened or forwarded from the WAN side. Existing trunks keep working and you can still save changes here.</p>
+  <p class="note deprec" id="trunk-deprecated"><strong>Deprecated.</strong> The SIP trunk is deprecated. The anchor is the supported ITSP path: it connects outbound only (control over a TLS WebSocket, audio over HTTPS streams, port 443 by default), so nothing is opened or forwarded from the WAN side. Existing trunk configurations are left in place and you can still save changes here.</p>
 
   <div class="card">
     <h2>Carrier</h2>
