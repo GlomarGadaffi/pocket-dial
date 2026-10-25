@@ -38,7 +38,7 @@ The `777` echo is in this half too, despite an in-code comment that calls it ser
 
 An outbound **anchor** trunk call crosses the board on **both** sides: RTP to and from the handset, and chunked-HTTPS PCM16 to and from the provider, with `MediaBridge` shuttling PCM16 between them. The board owns the handset-facing `RtpReceiver`/`RtpSender` pair for the life of that call (`src/SIP/MediaBridge.hpp:17-18`).
 
-An outbound **SIP** trunk call (§1.3) crosses the board too, as a raw RTP relay pair with no PCM16 and no `MediaBridge` (the trunk relay in `src/SIP/RequestsHandler.cpp`, `trunkRelayForward`). These are deliberate, bounded, individually dialable exceptions, not a removal of the invariant for ordinary LAN calls.
+An outbound **SIP** trunk call (DEPRECATED, §1.3) crosses the board too, as a raw RTP relay pair with no PCM16 and no `MediaBridge` (the trunk relay in `src/SIP/RequestsHandler.cpp`, `trunkRelayForward`). These are deliberate, bounded, individually dialable exceptions, not a removal of the invariant for ordinary LAN calls.
 
 The cheap/expensive axis still holds, and it is now measurable. Signalling features are bounded by the pre-allocated pools and cost a few hundred bytes. Media features cost a leg's worth of RTP tasks and rings apiece. That is why the conference is capped at 4 legs, the anchor trunk at four concurrent calls (one on the default loopback provider), the SIP trunk at two, and voicemail at two legs (see §1.3 and §1.5).
 
@@ -99,7 +99,7 @@ flowchart TD
 
 ### 1.3 Outbound PSTN Interconnect & Media Anchors
 
-**Strategic architecture (October 2026).** Carrier-facing ITSP SIP trunks (`SipTrunk` over UDP) are **shelved behind Milestone 11** because of NAT, CGNAT and SIP ALG traversal drop modes (#618, #919) and heavy embedded task stack and memory consumption. Outside-line PSTN interconnect now uses **cloud media anchors and programmable telephony** only (Milestone 6, Epic #381, [ADR-002](ADR-002-PROGRAMMABLE-MEDIA-ANCHOR.md)).
+**Strategic architecture (October 2026).** Carrier-facing ITSP SIP trunks (`SipTrunk` over UDP) are **DEPRECATED** (#1133) and shelved behind Milestone 11. The anchor is the supported ITSP path. The reason is the network design rule: pocket-dial's design rule is that nothing is opened or forwarded from the WAN side to the board or the phones. The anchor is outbound HTTPS to the provider (control over a TLS WebSocket, audio over HTTPS streams), port 443 by default. No code is removed; existing trunk configurations are left in place and behaviour is unchanged by this release (outbound trunk calls remain under investigation, #618). Outside-line PSTN interconnect now uses **cloud media anchors and programmable telephony** only (Milestone 6, Epic #381, [ADR-002](ADR-002-PROGRAMMABLE-MEDIA-ANCHOR.md)).
 
 Outside-line calls leave through the **programmable media anchor interface**:
 
@@ -109,7 +109,7 @@ Outside-line calls leave through the **programmable media anchor interface**:
 
 Points that are easy to get wrong:
 
-- **The SIP trunk registers only when it has a password.** `SipTrunk` then REGISTERs at
+- **DEPRECATED: the SIP trunk registers only when it has a password.** `SipTrunk` then REGISTERs at
   boot, refreshes before Expires and answers a `401`/`407` to the REGISTER with digest
   (#615); a `401`/`407` to its INVITE is answered with digest credentials once (#581). An
   IP-authenticated trunk does not register. Outbound calls over a registered trunk are still
