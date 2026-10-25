@@ -1820,3 +1820,156 @@ TEST(TrunkWiring, ACarrierProvisionalKeepsTheCallPastTimerB)
 	EXPECT_TRUE(b.handler.getSession("Call-ID: call-726-ctl").has_value()) << "the call is still up";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
 }
+
+// ── BYE on a trunk call must come from a leg of that call ────────────────────
+// The handset-side BYE of a trunk call is answered and acted on only when it
+// arrives from the handset leg's IP (port-agnostic). The carrier's own BYE is a
+// different dialog and is claimed by SipTrunk::handleBye(). Each case counts what
+// reached each party, and what is still held afterwards.
+
+namespace
+{
+	constexpr const char* kOffLegIp  = "192.168.50.99";
+	constexpr const char* kRoamedIp  = "192.168.50.30";
+
+	struct UpCall
+	{
+		CarrierView carrier;
+		std::string localTag;
+	};
+
+	// An ordinary outbound trunk call, answered by the carrier.
+	UpCall bringUpOutbound(Bench& b, const std::string& callId)
+	{
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "92025550123", callId));
+		UpCall u;
+		u.carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			u.carrier.response("SIP/2.0 200 OK", true), addrFor(kSbcIp)));
+		u.localTag = CarrierView::between(b.firstWith("200 OK"), ";tag=", "\r\n");
+		b.sent.clear();
+		return u;
+	}
+
+	// The handset-side BYE, sent from `ip`:`port`.
+	std::shared_ptr<SipMessage> byeFrom(const std::string& ip, uint16_t port,
+		const std::string& callId, const std::string& toTag, const std::string& branchTag = "")
+	{
+		const std::string raw =
+			"BYE sip:92025550123@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":" + std::to_string(port) + ";branch=z9hG4bKb" + callId + branchTag + "\r\n"
+			"From: <sip:1001@server>;tag=ft" + callId + "\r\n"
+			"To: <sip:92025550123@server>;tag=" + toTag + "\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 2 BYE\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(ip, port));
+	}
+
+	void expectEndedOnce(Bench& b, const std::string& handsetIp, const std::string& callId)
+	{
+		EXPECT_EQ(b.countWithTo("SIP/2.0 200", handsetIp), 1u) << "exactly one 200 to the sender";
+		EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 1u) << "exactly one BYE to the carrier";
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+		EXPECT_FALSE(b.handler.getSession("Call-ID: " + callId).has_value());
+	}
+}
+
+TEST(TrunkByeAuth, TheHandsetsOwnByeEndsAnOutboundTrunkCallOnce)
+{
+	Bench b;
+	const UpCall u = bringUpOutbound(b, "ba-out-1");
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+
+	b.handler.handle(byeFrom(kHandsetIp, 5060, "ba-out-1", u.localTag));
+
+	expectEndedOnce(b, kHandsetIp, "ba-out-1");
+}
+
+TEST(TrunkByeAuth, TheHandsetsByeFromAnotherPortOfItsIpEndsAnOutboundTrunkCall)
+{
+	Bench b;
+	const UpCall u = bringUpOutbound(b, "ba-out-2");
+
+	b.handler.handle(byeFrom(kHandsetIp, 49152, "ba-out-2", u.localTag));
+
+	expectEndedOnce(b, kHandsetIp, "ba-out-2");
+}
+
+TEST(TrunkByeAuth, TheCarriersByeEndsAnOutboundTrunkCallAndTheHandsetIsToldOnce)
+{
+	Bench b;
+	const UpCall u = bringUpOutbound(b, "ba-out-3");
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(u.carrier.bye(), addrFor(kSbcIp)));
+
+	EXPECT_EQ(b.countWithTo("SIP/2.0 200", kSbcIp), 1u) << "the carrier's BYE is answered once";
+	EXPECT_EQ(b.countWithTo("BYE", kHandsetIp), 1u) << "exactly one BYE to the handset";
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u);
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+	EXPECT_FALSE(b.handler.getSession("Call-ID: ba-out-3").has_value());
+}
+
+TEST(TrunkByeAuth, AByeFromOutsideTheCallsLegsIsRefusedAndChangesNothingOnAnOutboundTrunkCall)
+{
+	Bench b;
+	const UpCall u = bringUpOutbound(b, "ba-out-4");
+
+	b.handler.handle(byeFrom(kOffLegIp, 5060, "ba-out-4", u.localTag));
+
+	EXPECT_EQ(b.countWithTo("SIP/2.0 403", kOffLegIp), 1u);
+	EXPECT_EQ(b.countWithTo("SIP/2.0 200", kOffLegIp), 0u);
+	EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << "the carrier leg is untouched";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	ASSERT_TRUE(b.handler.getSession("Call-ID: ba-out-4").has_value());
+
+	// Positive: the handset can still hang up the same call.
+	b.sent.clear();
+	b.handler.handle(byeFrom(kHandsetIp, 5060, "ba-out-4", u.localTag));
+	expectEndedOnce(b, kHandsetIp, "ba-out-4");
+}
+
+TEST(TrunkByeAuth, AHandsetThatReRegisteredFromAnotherIpCanEndItsOutboundTrunkCall)
+{
+	Bench b;
+	const UpCall u = bringUpOutbound(b, "ba-out-5");
+	const std::string reg =
+		"REGISTER sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + std::string(kRoamedIp) + ":5060;branch=z9hG4bKrroam\r\n"
+		"From: <sip:1001@server>;tag=rtroam\r\nTo: <sip:1001@server>\r\nCall-ID: reg-roam\r\n"
+		"CSeq: 2 REGISTER\r\nContact: <sip:1001@" + std::string(kRoamedIp) + ":5060>;expires=3600\r\n"
+		"Content-Length: 0\r\n\r\n";
+	b.handler.handle(RequestsHandler::getMessageFromPool(reg, addrFor(kRoamedIp)));
+	b.sent.clear();
+
+	b.handler.handle(byeFrom(kRoamedIp, 5060, "ba-out-5", u.localTag));
+
+	expectEndedOnce(b, kRoamedIp, "ba-out-5");
+}
+
+TEST(TrunkByeAuth, RefusedByesAreCountedAndLoggedOncePerWindowWithoutNamingTheCall)
+{
+	Bench b;
+	const UpCall u = bringUpOutbound(b, "ba-out-6");
+	ASSERT_EQ(b.handler.getTrunkByeSourceRefusals(), 0u);
+
+	testing::internal::CaptureStdout();
+	testing::internal::CaptureStderr();
+	// Distinct branches: a repeated branch is a retransmission the transaction layer replays.
+	for (int i = 0; i < 3; ++i)
+		b.handler.handle(byeFrom(kOffLegIp, 5060, "ba-out-6", u.localTag, "-" + std::to_string(i)));
+	const std::string out = testing::internal::GetCapturedStdout() + testing::internal::GetCapturedStderr();
+
+	EXPECT_EQ(b.handler.getTrunkByeSourceRefusals(), 3u);
+	EXPECT_EQ(b.countWithTo("SIP/2.0 403", kOffLegIp), 3u) << "every refused BYE is answered";
+	size_t lines = 0;
+	for (size_t p = out.find("BYE on a trunk call refused"); p != std::string::npos;
+		p = out.find("BYE on a trunk call refused", p + 1)) ++lines;
+	EXPECT_EQ(lines, 1u) << out;
+	const size_t at = out.find("BYE on a trunk call refused");
+	const std::string line = at == std::string::npos ? std::string() : out.substr(at, out.find('\n', at) - at);
+	EXPECT_EQ(line.find("ba-out-6"), std::string::npos) << "the line names no call";
+	EXPECT_EQ(line.find(kOffLegIp), std::string::npos) << "and no address";
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+}

@@ -7216,6 +7216,23 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 	endHandle(data->getFromNumber(), data);
 }
 
+// A BYE on a trunk call that does not come from a leg of that call: 403, nothing
+// else changes. Counted always; logged at most once per 10 s, as a fixed line that
+// names no call, number or address. queueLog() has no non-allocating form (see
+// logDroppedOk()), so that one line per window is the only allocation.
+void RequestsHandler::refuseTrunkLegBye(const std::shared_ptr<SipMessage>& data)
+{
+	_trunkByeSourceRefusals.fetch_add(1, std::memory_order_relaxed);
+	const auto now = std::chrono::steady_clock::now();
+	if (now - _lastTrunkByeRefusalLog >= std::chrono::seconds(10))
+	{
+		_lastTrunkByeRefusalLog = now;
+		queueLog("BYE on a trunk call refused: source is not a leg of the dialog "
+			"(further ones counted, logged at most every 10 s)", true);
+	}
+	_registrar.sendForbidden(data, "Forbidden");
+}
+
 void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 {
 	// MoH preview hangup. Server-originated dialog with no Session, so it must be
@@ -7246,6 +7263,22 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 
 	auto session = getSession(data->getCallID());
 	std::string destNumber(data->getToNumber());
+
+	// The handset-side BYE of a trunk call is answered and acted on only from a leg
+	// of the call: the handset's IP, port-agnostic (isDialogSourceAuthorized(), the
+	// same rule as every other dialog). The carrier's own BYE never reaches this
+	// point: _sipTrunk.handleBye() claimed it above, on the trunk's own Call-ID.
+	//
+	// Known limit: the handset leg's IP is the one the registrar holds. A handset
+	// whose address has changed and that has not yet re-REGISTERed cannot end a
+	// PSAP callback (or any trunk call) from the new address: it gets 403 and the
+	// call stays up until it re-registers. The PSAP/carrier side can always end it.
+	if (session.has_value() && session.value()->isTrunk() &&
+		!isDialogSourceAuthorized(session.value(), data->getSource()))
+	{
+		refuseTrunkLegBye(data);
+		return;
+	}
 
 	// Issue #164: the HANDSET hanging up a trunk call. Keyed on the session
 	// flag rather than the dialled number -- by now that is a PSTN string with

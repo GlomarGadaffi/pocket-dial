@@ -1532,3 +1532,216 @@ TEST(TrunkInbound, ManyForgedSources911FloodsShareOneTinyBudget)
 	}
 	EXPECT_EQ(total, 4u) << "eight forged sources must not get eight budgets";
 }
+
+// ── BYE on an inbound trunk call must come from a leg of that call ───────────
+// The handset-side BYE of the fork is answered and acted on only when it arrives
+// from the handset's IP (port-agnostic). The carrier's BYE is a different dialog,
+// claimed by SipTrunk::handleBye(). The same holds for a PSAP callback, whose
+// session is flagged emergency (#659). Every case counts what each party got.
+
+namespace
+{
+	constexpr const char* kNonLegIp = "192.168.50.99";
+	constexpr const char* kRoamedIp = "192.168.50.31";
+
+	size_t countStartTo(const Bench& b, const std::string& prefix, const std::string& ip)
+	{
+		const uint32_t want = inet_addr(ip.c_str());
+		size_t n = 0;
+		for (const auto& [addr, msg] : b.sent)
+		{
+			if (msg && addr.sin_addr.s_addr == want && msg->toString().rfind(prefix, 0) == 0) ++n;
+		}
+		return n;
+	}
+
+	// The handset-side BYE of the fork, sent from `ip`:`port`.
+	std::shared_ptr<SipMessage> forkByeFrom(const std::string& fork, const std::string& ip, uint16_t port,
+		const std::string& branch = "hbye")
+	{
+		const std::string raw =
+			"BYE sip:2001@" + std::string(kServerIp) + ":5060 SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":" + std::to_string(port) + ";branch=z9hG4bK" + branch + "\r\n"
+			"From: " + field(fork, "To: ") + ";tag=hs1\r\n"
+			"To: " + field(fork, "From: ") + "\r\n"
+			"Call-ID: " + field(fork, "Call-ID: ") + "\r\n"
+			"CSeq: 2 BYE\r\n"
+			"Content-Length: 0\r\n\r\n";
+		return RequestsHandler::getMessageFromPool(raw, addrFor(ip, port));
+	}
+
+	// An answered, ACKed inbound call; a PSAP callback when 2001 has dialed 911 first.
+	Answered bringUpInbound(Bench& b, const std::string& callId, bool psapCallback)
+	{
+		if (psapCallback) live911(b, callId + "-911");
+		return answer(b, callId);
+	}
+
+	void expectHandsetHangupOnce(Bench& b, const Answered& a, const std::string& handsetIp)
+	{
+		EXPECT_EQ(countStartTo(b, "SIP/2.0 200", handsetIp), 1u) << "exactly one 200 to the sender";
+		EXPECT_EQ(countStartTo(b, "BYE ", kSbcIp), 1u) << "exactly one BYE to the carrier";
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+		EXPECT_FALSE(b.handler.getSession(a.forkId).has_value());
+	}
+
+	void runHandsetByeEnds(bool psap, const char* callId, const char* ip, uint16_t port, bool roam)
+	{
+		Bench b;
+		const Answered a = bringUpInbound(b, callId, psap);
+		ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+		ASSERT_TRUE(b.handler.getSession(a.forkId).has_value());
+		EXPECT_EQ(b.handler.getSession(a.forkId).value()->isEmergency(), psap);
+		if (roam) b.handler.handle(makeRegister(kExt, ip));
+		b.sent.clear();
+
+		b.handler.handle(forkByeFrom(a.fork, ip, port));
+
+		expectHandsetHangupOnce(b, a, ip);
+	}
+
+	void runCarrierByeEnds(bool psap, const char* callId)
+	{
+		Bench b;
+		const Answered a = bringUpInbound(b, callId, psap);
+
+		b.handler.handle(carrierRequest("BYE", callId, field(a.ok, "To: "), 2));
+
+		EXPECT_EQ(countStartTo(b, "SIP/2.0 200", kSbcIp), 1u) << "the carrier's BYE is answered once";
+		EXPECT_EQ(countStartTo(b, "BYE ", kPhoneIp), 1u) << "exactly one BYE to the handset";
+		EXPECT_EQ(countStartTo(b, "BYE ", kSbcIp), 0u);
+		expectAllReleased(b, a.forkId);
+	}
+
+	void runNonLegByeRefused(bool psap, const char* callId)
+	{
+		Bench b;
+		const Answered a = bringUpInbound(b, callId, psap);
+		b.sent.clear();
+
+		b.handler.handle(forkByeFrom(a.fork, kNonLegIp, 5060));
+
+		EXPECT_EQ(countStartTo(b, "SIP/2.0 403", kNonLegIp), 1u);
+		EXPECT_EQ(countStartTo(b, "SIP/2.0 200", kNonLegIp), 0u);
+		EXPECT_EQ(countStartTo(b, "BYE ", kSbcIp), 0u) << "the carrier leg is untouched";
+		EXPECT_EQ(countStartTo(b, "BYE ", kPhoneIp), 0u);
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+		const auto s = b.handler.getSession(a.forkId);
+		ASSERT_TRUE(s.has_value());
+		EXPECT_EQ(s.value()->getState(), Session::State::Connected);
+		EXPECT_EQ(s.value()->isEmergency(), psap);
+
+		// Positive: the handset can still hang up the same call.
+		b.sent.clear();
+		b.handler.handle(forkByeFrom(a.fork, kPhoneIp, 5060));
+		expectHandsetHangupOnce(b, a, kPhoneIp);
+	}
+}
+
+TEST(TrunkByeAuth, TheHandsetsOwnByeEndsAnInboundTrunkCallOnce)
+{
+	runHandsetByeEnds(false, "ba-in-1", kPhoneIp, 5060, false);
+}
+
+TEST(TrunkByeAuth, TheHandsetsByeFromAnotherPortOfItsIpEndsAnInboundTrunkCall)
+{
+	runHandsetByeEnds(false, "ba-in-2", kPhoneIp, 49152, false);
+}
+
+TEST(TrunkByeAuth, TheCarriersByeEndsAnInboundTrunkCallAndTheHandsetIsToldOnce)
+{
+	runCarrierByeEnds(false, "ba-in-3");
+}
+
+TEST(TrunkByeAuth, AByeFromOutsideTheCallsLegsIsRefusedAndChangesNothingOnAnInboundTrunkCall)
+{
+	runNonLegByeRefused(false, "ba-in-4");
+}
+
+TEST(TrunkByeAuth, TheHandsetsOwnByeEndsAPsapCallbackOnce)
+{
+	runHandsetByeEnds(true, "ba-cb-1", kPhoneIp, 5060, false);
+}
+
+TEST(TrunkByeAuth, TheHandsetsByeFromAnotherPortOfItsIpEndsAPsapCallback)
+{
+	runHandsetByeEnds(true, "ba-cb-2", kPhoneIp, 49152, false);
+}
+
+TEST(TrunkByeAuth, TheCarriersByeEndsAPsapCallbackAndTheHandsetIsToldOnce)
+{
+	runCarrierByeEnds(true, "ba-cb-3");
+}
+
+TEST(TrunkByeAuth, AByeFromOutsideTheCallsLegsIsRefusedAndChangesNothingOnAPsapCallback)
+{
+	runNonLegByeRefused(true, "ba-cb-4");
+}
+
+TEST(TrunkByeAuth, AHandsetThatReRegisteredFromAnotherIpCanEndAPsapCallback)
+{
+	runHandsetByeEnds(true, "ba-cb-5", kRoamedIp, 5060, true);
+}
+
+TEST(TrunkByeAuth, AHandsetThatReRegisteredFromAnotherIpCanEndAnInboundTrunkCall)
+{
+	runHandsetByeEnds(false, "ba-in-5", kRoamedIp, 5060, true);
+}
+
+// The carrier's BYE from an address that is not the trunk's peer or its Contact, but
+// that carries the dialog's own tags, is accepted by SipTrunk::handleBye() (the
+// tags branch) and ends the call. It must end a PSAP callback exactly as it did
+// before the handset-side source check existed: this test passes without it too.
+TEST(TrunkByeAuth, ACarrierByeFromAnotherAddressWithTheDialogTagsEndsAPsapCallbackAsBefore)
+{
+	constexpr const char* kOtherCarrierIp = "203.0.113.77";
+	Bench b;
+	const Answered a = bringUpInbound(b, "ba-cb-6", true);
+	ASSERT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	b.sent.clear();
+	const std::string raw =
+		"BYE sip:" + std::string(kDid) + "@" + kServerIp + ":5060 SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP " + std::string(kOtherCarrierIp) + ":5060;branch=z9hG4bKothercbye\r\n"
+		"From: <sip:+12025550177@" + kSbcIp + ">;tag=cfba-cb-6\r\n"
+		"To: " + field(a.ok, "To: ") + "\r\n"
+		"Call-ID: ba-cb-6\r\n"
+		"CSeq: 2 BYE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Content-Length: 0\r\n\r\n";
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(raw, addrFor(kOtherCarrierIp)));
+
+	EXPECT_EQ(countStartTo(b, "SIP/2.0 200", kOtherCarrierIp), 1u) << "answered once";
+	EXPECT_EQ(countStartTo(b, "SIP/2.0 403", kOtherCarrierIp), 0u);
+	EXPECT_EQ(countStartTo(b, "BYE ", kPhoneIp), 1u) << "exactly one BYE to the handset";
+	EXPECT_EQ(countStartTo(b, "BYE ", kSbcIp), 0u);
+	EXPECT_EQ(countStartTo(b, "BYE ", kOtherCarrierIp), 0u);
+	expectAllReleased(b, a.forkId);
+}
+
+// Known limit, pinned: a handset whose address changed and that has not yet
+// re-REGISTERed is refused from the new address (403, call kept) until it does.
+// The carrier side can still end the call (the carrier cases above).
+TEST(TrunkByeAuth, AHandsetThatMovedButHasNotReRegisteredIsRefusedUntilItDoes)
+{
+	Bench b;
+	const Answered a = bringUpInbound(b, "ba-cb-7", true);
+	b.sent.clear();
+
+	b.handler.handle(forkByeFrom(a.fork, kRoamedIp, 5060, "moved1"));
+
+	EXPECT_EQ(countStartTo(b, "SIP/2.0 403", kRoamedIp), 1u);
+	EXPECT_EQ(countStartTo(b, "SIP/2.0 200", kRoamedIp), 0u);
+	EXPECT_EQ(countStartTo(b, "BYE ", kSbcIp), 0u);
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	const auto s = b.handler.getSession(a.forkId);
+	ASSERT_TRUE(s.has_value());
+	EXPECT_EQ(s.value()->getState(), Session::State::Connected);
+	EXPECT_TRUE(s.value()->isEmergency());
+
+	// Control: after the re-REGISTER the same handset's BYE ends the call.
+	b.handler.handle(makeRegister(kExt, kRoamedIp));
+	b.sent.clear();
+	b.handler.handle(forkByeFrom(a.fork, kRoamedIp, 5060, "moved2"));
+	expectHandsetHangupOnce(b, a, kRoamedIp);
+}

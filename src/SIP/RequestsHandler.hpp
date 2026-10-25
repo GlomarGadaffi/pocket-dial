@@ -223,6 +223,8 @@ public:
 	// Issue #497: INVITEs refused because they did not come from the caller's
 	// registered address (the 403 "Caller Not Registered From This Address").
 	uint64_t getUnboundCallerRefusals() const { return _unboundCallerRefusals.load(std::memory_order_relaxed); }
+	// BYEs on a trunk call refused (403) because they did not come from a leg of the call.
+	uint32_t getTrunkByeSourceRefusals() const { return _trunkByeSourceRefusals.load(std::memory_order_relaxed); }
 	// Issue #424: responses drainOutbox() refused to send because they answered
 	// a response or an ACK. Any non-zero value is a handler bug the guard caught.
 	uint32_t getRepliesRefused() const;
@@ -2141,6 +2143,7 @@ private:
 	// Caller holds _mutex.
 	bool isEmergencyTraffic(const SipMessage& m);
 	void logDroppedOk(const SipMessage& data, const std::string& expected);   // #1120
+	void refuseTrunkLegBye(const std::shared_ptr<SipMessage>& data);
 	bool okSourceAccepted(const SipMessage& data, const sockaddr_in& registered);   // #1120
 	void refuseBodilessOk(const std::shared_ptr<Session>& session, const SipMessage& data);   // #1125
 
@@ -3225,6 +3228,8 @@ private:
 	std::atomic<uint32_t> _emergencyRtpReaps{0};   // #741
 	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP
 	std::chrono::steady_clock::time_point _lastUnboundCallerLog{};   // #497 log rate limit; under _mutex
+	std::atomic<uint32_t> _trunkByeSourceRefusals{0};   // BYE on a trunk call from a non-leg source
+	std::chrono::steady_clock::time_point _lastTrunkByeRefusalLog{};   // its log rate limit; under _mutex
 #if POCKETDIAL_TRUNK_INBOUND
 	std::chrono::steady_clock::time_point _lastTrunkInboundLog{};   // #398 log rate limit; under _mutex
 	// #398 part C, per relay pair: whether it carries a carrier's call to us, and
