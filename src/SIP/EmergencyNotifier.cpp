@@ -204,7 +204,7 @@ std::size_t EmergencyNotifier::notify(const pbx::E911Config& cfg, bool isTest,
 	const std::string text =
 		pbx::formatE911Notification(isTest, fromExt, dialed, hadTrunkPrefix, routed, cfg, note, callUp);
 
-	// 1. The record. Unconditional and unconfigurable: an operator can leave
+	// 1. The record (stageAlert). Unconditional and unconfigurable: an operator can leave
 	//    notifyExts empty, but they cannot turn off the fact that a 911 dial is
 	//    written down. Alert (severity 1) rather than Emergency (0) -- 0 is
 	//    "system is unusable", which this is not; Alert is "action must be taken
@@ -215,26 +215,73 @@ std::size_t EmergencyNotifier::notify(const pbx::E911Config& cfg, bool isTest,
 	//    under the engine mutex. flushStaged() sends it after the lock is
 	//    released. One slot: a second notify() before the flush replaces this
 	//    text, and flushStaged() says so; the text below is the record of it.
-	{
-		std::lock_guard<std::mutex> lock(_slotMutex);
-		if (_staged.load() && _slotOverwritten < UINT8_MAX)
-		{
-			++_slotOverwritten;
-		}
-		const std::size_t n = std::min(text.size(), sizeof(_slot) - 1);
-		std::memcpy(_slot, text.data(), n);
-		_slot[n] = '\0';
-		_staged.store(true);
-	}
+	stageAlert(text, /*onlyIfEmpty=*/false);
 
 	// 1b. Also into the engine's own log so it lands in the UART/dashboard record
 	//     for a deployment with no syslog collector configured, and so a text the
 	//     slot replaces is still on record.
 	_env.log(text, true);
 
-	// 2. The notifications. Every one is independent and every failure is
-	//    swallowed: an unregistered extension or an exhausted pool costs that
-	//    one notification and nothing else.
+	// 2. The notifications (fanOut).
+	return fanOut(cfg, text);
+}
+
+bool EmergencyNotifier::stageAlert(const std::string& text, bool onlyIfEmpty)
+{
+	std::lock_guard<std::mutex> lock(_slotMutex);
+	if (_staged.load())
+	{
+		if (onlyIfEmpty) return false;
+		if (_slotOverwritten < UINT8_MAX) ++_slotOverwritten;
+	}
+	const std::size_t n = std::min(text.size(), sizeof(_slot) - 1);
+	std::memcpy(_slot, text.data(), n);
+	_slot[n] = '\0';
+	_staged.store(true);
+	return true;
+}
+
+bool EmergencyNotifier::notifyDegraded(const pbx::E911Config& cfg, std::string_view text, std::size_t& enqueued)
+{
+	enqueued = 0;
+	const std::string t(text.substr(0, 512));
+	if (!stageAlert(t, /*onlyIfEmpty=*/true)) return false;
+	_env.log(t, true);
+	enqueued = fanOut(cfg, t);
+	return true;
+}
+
+std::size_t EmergencyNotifier::resendDegraded(const pbx::E911Config& cfg, std::string_view text)
+{
+	return fanOut(cfg, std::string(text.substr(0, 512)));
+}
+
+bool EmergencyNotifier::hasNotifyExts(const pbx::E911Config& cfg)
+{
+	std::size_t considered = 0;
+	for (const std::string& ext : cfg.notifyExts)
+	{
+		if (considered++ >= pbx::kMaxE911NotifyExts) break;
+		if (!ext.empty()) return true;
+	}
+	return false;
+}
+
+bool EmergencyNotifier::anyNotifyRegistered(const pbx::E911Config& cfg)
+{
+	std::size_t considered = 0;
+	for (const std::string& ext : cfg.notifyExts)
+	{
+		if (considered++ >= pbx::kMaxE911NotifyExts) break;
+		if (!ext.empty() && _env.findRegistered(ext)) return true;
+	}
+	return false;
+}
+
+// Every notification is independent and every failure is swallowed: an unregistered extension or an
+// exhausted pool costs that one notification and nothing else.
+std::size_t EmergencyNotifier::fanOut(const pbx::E911Config& cfg, const std::string& text)
+{
 	std::size_t enqueued = 0;
 	std::size_t considered = 0;
 	for (const std::string& ext : cfg.notifyExts)
