@@ -147,6 +147,12 @@ public:
 	// (pbx::kEmergencyNumber / kEmergencyTestNumber); empty on any other session.
 	std::string_view getEmergencyNumber() const { return _emergencyNumber; }
 	void setEmergencyNumber(std::string_view number) { _emergencyNumber = number; }
+	// #1127: the INVITE source of a 911/933 whose IP was not the caller's registered
+	// address, kept so the later notifications for the same call (anchor never came
+	// up, audio degraded) carry the same unverified marker. Reporting only.
+	bool isUnverifiedCaller() const { return _unverifiedCaller; }
+	const sockaddr_in& getUnverifiedSource() const { return _unverifiedSrc; }
+	void setUnverifiedSource(const sockaddr_in& src) { _unverifiedSrc = src; _unverifiedCaller = true; }
 	void setEmergency(bool val)
 	{
 		_isEmergency = val;
@@ -500,6 +506,8 @@ private:
 	uint32_t _fwdCSeq = 0;          // #172 step 3
 	uint32_t _fwdRSeq = 0;          // #172 step 3
 	std::string_view _emergencyNumber;                  // #879
+	sockaddr_in _unverifiedSrc{};                       // #1127
+	bool _unverifiedCaller = false;                     // #1127
 	bool _rtpWatchArmed = false;                        // #604
 	uint32_t _rtpMarkA = 0;                             // #604
 	uint32_t _rtpMarkB = 0;                             // #604

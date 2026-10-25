@@ -66,8 +66,12 @@ class AnchorRemovedBeforeNamedTest(unittest.TestCase):
         failed = self.run_tel_ctl.find("if (!_anchorClient->makeCall(job.dest, &ownLeg))")
         self.assertNotEqual(failed, -1, "positive control: runTelCtl's makeCall-failed branch")
         branch = self.run_tel_ctl[failed:self.run_tel_ctl.index("return;", failed)]
-        self.assertIn("refuseRingingAnchor(job.callId, _asyncOutbox)", branch, "the caller gets its final 503")
-        self.assertIn("/*routed=*/false", branch, "a 911/933 is reported NOT ROUTED")
+        # #1127: the failure tail lives in a noinline member (it keeps its locals off runTelCtl's
+        # stack frame); the branch must still hand the job to it, and it still does the work.
+        self.assertIn("onTelCtlMakeCallFailed(job)", branch, "the failed branch runs the failure tail")
+        tail = body_of(read("RequestsHandler.cpp"), "void RequestsHandler::onTelCtlMakeCallFailed(")
+        self.assertIn("refuseRingingAnchor(job.callId, _asyncOutbox)", tail, "the caller gets its final 503")
+        self.assertIn("/*routed=*/false", tail, "a 911/933 is reported NOT ROUTED")
 
 
 class AnchorRemovedBeforeBindTest(unittest.TestCase):

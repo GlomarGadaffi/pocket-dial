@@ -5079,12 +5079,19 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// still gets "911" -- never the prefixed form, and never a stripped "11".
 	const std::string bare(emergency.number);
 	const std::string asDialed = emergency.hadTrunkPrefix ? " (dialed " + dialed + ")" : "";
+	// #1127: a source IP other than the one `from` registered from is REPORTED, never
+	// acted on (#454: 911 is never gated). IP only, as #497 and isDialogSourceAuthorized
+	// do: a phone may change ports. Empty for a verified caller, whose text is unchanged.
+	const std::string unverifiedSrc = caller->getAddress().sin_addr.s_addr == data->getSource().sin_addr.s_addr
+		? std::string() : sipwire::addrToIpPort(data->getSource());
+	const std::string unverifiedTag = unverifiedSrc.empty()
+		? std::string() : pbx::e911UnverifiedTag(from, unverifiedSrc);
 
 	// Log BEFORE routing, so the attempt is on the record even if everything
 	// after this line fails. This is the honest floor of Kari's Law's
 	// notification requirement; the on-site notification hook itself is the
 	// companion half of #166 and lands separately.
-	queueLog("EMERGENCY: " + kind + " dialed by " + from + asDialed, true);
+	queueLog("EMERGENCY: " + kind + " dialed by " + from + asDialed + unverifiedTag, true);
 
 	// Issue #521: only a provider that places REAL calls is offered the call.
 	// The loopback simulator answers whatever it is handed, so giving it 911
@@ -5103,6 +5110,7 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		{
 			s->second->setEmergency(true);
 			s->second->setEmergencyNumber(emergency.number);   // #879
+			if (!unverifiedSrc.empty()) s->second->setUnverifiedSource(data->getSource());   // #1127
 		}
 		// #659: opens this extension's PSAP callback window.
 		_emergencyCallbacks.note(caller->getNumber(), std::chrono::steady_clock::now());
@@ -5137,7 +5145,7 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 			// returned true. Telling the front desk a 911 call went through when
 			// it was refused for capacity is the worst error this feature could make.
 			notifyEmergency(emergency, from, dialed, /*routed=*/placed,
-				placed ? std::string_view() : kAnchorNotPlaced);
+				placed ? std::string_view() : kAnchorNotPlaced, /*callUp=*/false, unverifiedSrc);
 			return;
 		}
 	}
@@ -5189,11 +5197,11 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		// Pool exhausted: drop and let the peer retransmit (#101A). The log line
 		// above already recorded the attempt, which is the part that matters.
 		queueLog("EMERGENCY: " + kind + " from " + from +
-			" NOT ROUTED and no message available to answer with", true);
+			" NOT ROUTED and no message available to answer with" + unverifiedTag, true);
 		// Still notify. A 911 attempt that produced neither a call nor even a
 		// failure response is the single most important thing to put in front of
 		// a human, and the notification path has its own pooled messages.
-		notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted);
+		notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted, /*callUp=*/false, unverifiedSrc);
 		return;
 	}
 	response->setHeader("SIP/2.0 503 Emergency Call Not Routable");
@@ -5204,10 +5212,10 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	_outbox.emplace_back(data->getSource(), std::move(response));
 
 	queueLog("EMERGENCY: " + kind + " from " + from + " COULD NOT BE ROUTED (" +
-		warningDetail + ") - answered 503", true);
+		warningDetail + ") - answered 503" + unverifiedTag, true);
 
 	// 503 is enqueued; notify after it, same ordering rule as the routed path.
-	notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted);
+	notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted, /*callUp=*/false, unverifiedSrc);
 }
 
 bool RequestsHandler::emergencyDialOf(const std::string& dialed, pbx::EmergencyDial& emergencyOut,
@@ -5345,12 +5353,12 @@ void RequestsHandler::serviceBootFan(std::chrono::steady_clock::time_point now)
 // response before reaching here, and nothing below can fail back into the call.
 void RequestsHandler::notifyEmergency(const pbx::EmergencyDial& emergency,
 	const std::string& fromExt, const std::string& dialed, bool routed,
-	std::string_view notRoutedReason, bool callUp)
+	std::string_view notRoutedReason, bool callUp, std::string_view unverifiedSource)
 {
 	const pbx::E911Config& cfg = _cfg.e911Config();
 
 	_e911Notifier.notify(cfg, emergency.isTest, fromExt, dialed,
-		emergency.hadTrunkPrefix, routed, notRoutedReason, callUp);
+		emergency.hadTrunkPrefix, routed, notRoutedReason, callUp, unverifiedSource);
 
 	// Make the notified phones audibly alert, on top of the MESSAGE text. The
 	// beep is the existing register-beep INVITE (auto-answer headers, no RTP),
@@ -6082,6 +6090,37 @@ void RequestsHandler::asyncAnswerCall(const std::string& participantId)
 	}
 }
 
+// Out of runTelCtl() on purpose (#1127): its locals sit on the tel_ctl worker, whose static
+// depth the stack gate holds at its recorded finding. noinline keeps them off runTelCtl's frame.
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+void RequestsHandler::onTelCtlMakeCallFailed(const TelCtlJob& job)
+{
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
+	queueLog("[Telephony] Failed to initiate outbound call to " + job.dest, true);
+	// #1127: read the unverified marker before endCall() drops the session.
+	std::string unverifiedSrc;
+	if (auto us = _sessions.find(job.callId); us != _sessions.end() && us->second && us->second->isUnverifiedCaller())
+	{
+		unverifiedSrc = sipwire::addrToIpPort(us->second->getUnverifiedSource());
+	}
+	// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
+	refuseRingingAnchor(job.callId, _asyncOutbox);
+	endCall(job.callId, job.callerNumber, job.dest, "anchor call fail");
+	// #821: routeEmergencyCall() told the notify list ROUTED when it queued
+	// this job, and the call never came up. notifyEmergency() enqueues on
+	// _outbox, which the SIP thread's next pass clears: hand it to
+	// _asyncOutbox, as forceDisconnect() does (#714).
+	if (const pbx::EmergencyDial em = pbx::classifyEmergencyDial(job.dest); em.isEmergency)
+	{
+		notifyEmergency(em, job.callerNumber, job.dest, /*routed=*/false, kAnchorNotPlaced,
+			/*callUp=*/false, unverifiedSrc);
+		for (auto& e : _outbox) _asyncOutbox.push_back(std::move(e));
+		_outbox.clear();
+	}
+}
+
 void RequestsHandler::runTelCtl(const TelCtlJob& job)
 {
 	if (job.kind == TelCtlJob::Drop)
@@ -6106,21 +6145,7 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 	std::string ownLeg;
 	if (!_anchorClient->makeCall(job.dest, &ownLeg))
 	{
-		std::lock_guard<pd::TimedMutex> lock(_mutex);
-		queueLog("[Telephony] Failed to initiate outbound call to " + job.dest, true);
-		// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
-		refuseRingingAnchor(job.callId, _asyncOutbox);
-		endCall(job.callId, job.callerNumber, job.dest, "anchor call fail");
-		// #821: routeEmergencyCall() told the notify list ROUTED when it queued
-		// this job, and the call never came up. notifyEmergency() enqueues on
-		// _outbox, which the SIP thread's next pass clears: hand it to
-		// _asyncOutbox, as forceDisconnect() does (#714).
-		if (const pbx::EmergencyDial em = pbx::classifyEmergencyDial(job.dest); em.isEmergency)
-		{
-			notifyEmergency(em, job.callerNumber, job.dest, /*routed=*/false, kAnchorNotPlaced);
-			for (auto& e : _outbox) _asyncOutbox.push_back(std::move(e));
-			_outbox.clear();
-		}
+		onTelCtlMakeCallFailed(job);
 		return;
 	}
 	// Bind this origination's own leg to its session NOW (locks _mutex
@@ -11876,7 +11901,9 @@ void RequestsHandler::tick()
 			{
 				notifyEmergency(pbx::classifyEmergencyDial(number), std::string(session->getSrc()->getNumber()),
 					std::string(number), /*routed=*/true,
-					"the audio to the anchor keeps failing; the call was not hung up", /*callUp=*/true);
+					"the audio to the anchor keeps failing; the call was not hung up", /*callUp=*/true,
+					session->isUnverifiedCaller()
+						? sipwire::addrToIpPort(session->getUnverifiedSource()) : std::string());
 			}
 		}
 		for (const auto& callID : degradedAnchorCallIds)

@@ -1171,7 +1171,7 @@ class Gate(unittest.TestCase):
     def test_checked_in_known_findings_cap_the_two_911_tasks_at_their_totals(self):
         table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
         kf = table["known_findings"]
-        for name, cap in (("sip_server", 9616), ("tel_ctl", 12944)):
+        for name, cap in (("sip_server", 9616), ("tel_ctl", 12816)):
             with self.subTest(name):
                 self.assertEqual(kf.get(name, {}).get("max_total"), cap)
                 self.assertIn("#1116", kf[name]["reason"])
