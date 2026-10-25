@@ -8406,9 +8406,12 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// could still name any unrelated call A happens to be in as ?Replaces= and
 	// splice A out of it. A real transferor is a leg of both dialogs and passes
 	// both checks; anyone else fails one.
+	// The consult dialog's key is built once and shared by both checks and the splice below.
+	const std::string replacesCallIdKey =
+		replacesCallIdBare.empty() ? std::string() : "Call-ID: " + replacesCallIdBare;
 	if (!replacesCallIdBare.empty())
 	{
-		if (auto consult = getSession("Call-ID: " + replacesCallIdBare);
+		if (auto consult = getSession(replacesCallIdKey);
 			consult.has_value() &&
 			!isDialogSourceAuthorized(consult.value(), data->getSource()))
 		{
@@ -8419,6 +8422,10 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		}
 	}
 
+	// The sender must also be the leg of the party From names as the transferor, on this dialog and,
+	// for an attended transfer, on the consult dialog.
+	if (!authorizeReferTransferor(data, callID, replacesCallIdKey, transferor->getNumber())) return;
+
 	// ── Attended transfer (RFC 3891 Replaces), issue #131 ─────────────────────────
 	// A (transferor) has two active calls: A-B (this REFER's own dialog, callID)
 	// and A-C (the consult session, replacesCallIdBare). Splice B<->C via cross
@@ -8426,7 +8433,6 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// to the blind-transfer path below when Replaces is absent (or unusable).
 	if (!replacesCallIdBare.empty() || replacesMalformed)
 	{
-		const std::string replacesCallIdKey = "Call-ID: " + replacesCallIdBare;
 		bool canSplice = false;
 		std::shared_ptr<Session> ab, ac;
 		std::shared_ptr<SipClient> bClient, cClient;
@@ -12864,6 +12870,48 @@ void RequestsHandler::refuseNonLegRequest(const std::shared_ptr<SipMessage>& dat
 	++_localReinviteRefusals;
 	logNonLegRequest(data, _refusalLog, "refused", true);
 	_registrar.sendForbidden(data, "Forbidden");
+}
+
+bool RequestsHandler::isReferSourceTransferorLeg(const std::shared_ptr<Session>& session,
+	const sockaddr_in& source, const std::string& transferor) const
+{
+	if (!session) return true;
+	const auto src = session->getSrc();
+	const auto dest = session->getDest();
+	if (!src || !dest) return true;   // half-set-up dialog: same as isDialogSourceAuthorized()
+	const bool srcHit = source.sin_addr.s_addr == src->getAddress().sin_addr.s_addr;
+	const bool destHit = source.sin_addr.s_addr == dest->getAddress().sin_addr.s_addr;
+	const bool srcNamed = src->getNumber() == transferor;
+	const bool destNamed = dest->getNumber() == transferor;
+	if (srcHit && destHit) return srcNamed || destNamed;   // one shared address: From decides
+	if (srcHit) return srcNamed;
+	if (destHit) return destNamed;
+	return false;
+}
+
+bool RequestsHandler::authorizeReferTransferor(const std::shared_ptr<SipMessage>& data, const std::string& callID,
+	const std::string& replacesCallIdKey, const std::string& transferor)
+{
+	const sockaddr_in source = data->getSource();
+	bool ok = true;
+	if (auto own = getSession(callID); own.has_value())
+		ok = isReferSourceTransferorLeg(own.value(), source, transferor);
+	if (ok && !replacesCallIdKey.empty())
+	{
+		if (auto consult = getSession(replacesCallIdKey); consult.has_value())
+			ok = isReferSourceTransferorLeg(consult.value(), source, transferor);
+	}
+	if (ok) return true;
+	++_referBindingRefusals;
+	if (_referBindingLog.due(data->getCallID()))
+	{
+		char ip[INET_ADDRSTRLEN] = {};
+		if (inet_ntop(AF_INET, &source.sin_addr, ip, sizeof(ip)) == nullptr) ip[0] = '\0';
+		queueLog("REFER for " + std::string(data->getCallID()) + " from " + ip +
+			": source is not the named transferor's own leg, refused", true);
+	}
+	_registrar.sendForbidden(data, "Forbidden");
+	return false;
 }
 
 bool RequestsHandler::authorizeLocalDialogRequest(const std::shared_ptr<SipMessage>& data,
