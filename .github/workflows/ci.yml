@@ -752,9 +752,33 @@ jobs:
   # A signal, not a gate: do not add it to a required-checks list (desmo
   # 2026-10-09), and there is no continue-on-error to hide the red. It uploads
   # nothing.
+  #
+  # #1117: one leg per esp_main variant, the four images CI builds (build-esp-idf's
+  # eth, lan8720, wifi and display legs). The gate walks one image per run, so a
+  # variant with no leg here could overflow a task stack with CI green.
+  # tests/tools/test_stack_gate_all_variants.py fails when a main/esp_main*.cpp has no
+  # leg, and the gate itself fails on a --main that names no such file. A leg that
+  # cannot build or cannot run the gate is red, never skipped (fail-fast is off so
+  # one red leg does not hide the other three).
   stack-depth-gate:
-    name: Stack Depth Gate (esp32s3 / eth, #457)
+    name: Stack Depth Gate (${{ matrix.chip }} / ${{ matrix.transport }}, #457)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - chip: esp32s3
+            transport: eth
+            main: main/esp_main_eth.cpp
+          - chip: esp32
+            transport: lan8720
+            main: main/esp_main_eth_lan8720.cpp
+          - chip: esp32s3
+            transport: wifi
+            main: main/esp_main.cpp
+          - chip: esp32s3
+            transport: display
+            main: main/esp_main_display.cpp
     needs: site-gate
     if: ${{ !cancelled() && needs.site-gate.outputs.code != 'false' }}
     container:
@@ -777,9 +801,9 @@ jobs:
         with:
           # No ~/.ccache: IDF_CCACHE_ENABLE=0 below, so nothing writes to it.
           path: build
-          key: ${{ runner.os }}-idf-callgraph-su-v6.0.1-esp32s3-eth-${{ github.sha }}
+          key: ${{ runner.os }}-idf-callgraph-su-v6.0.1-${{ matrix.chip }}-${{ matrix.transport }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-idf-callgraph-su-v6.0.1-esp32s3-eth-
+            ${{ runner.os }}-idf-callgraph-su-v6.0.1-${{ matrix.chip }}-${{ matrix.transport }}-
 
       - name: Export Environment & Build Firmware with call-graph flags
         env:
@@ -790,11 +814,11 @@ jobs:
           IDF_CCACHE_ENABLE: "0"
         run: |
           . $IDF_PATH/export.sh
-          idf.py set-target esp32s3
-          idf.py -D SIP_TRANSPORT=eth build
+          idf.py set-target ${{ matrix.chip }}
+          idf.py -D SIP_TRANSPORT=${{ matrix.transport }} build
 
       - name: Per-task stack depth gate (#457)
-        run: python3 tools/ci/task_stack_gate.py --ci-dir build/esp-idf --project-root "$GITHUB_WORKSPACE"
+        run: python3 tools/ci/task_stack_gate.py --ci-dir build/esp-idf --project-root "$GITHUB_WORKSPACE" --main ${{ matrix.main }}
 
   # Job 2b: Heap-poisoning build.
   # The shipped default is HEAP_POISONING_LIGHT, which only checks an

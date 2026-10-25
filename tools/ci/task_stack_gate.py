@@ -327,6 +327,10 @@ MAIN_VARIANT_RE = re.compile(r"^main/esp_main[^/]*\.cpp$")
 
 
 def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=None):
+    # #1117: a --main that names no esp_main file would skip every variant-bound row and pass.
+    if not (MAIN_VARIANT_RE.match(main_variant) and os.path.isfile(os.path.join(REPO, main_variant))):
+        print(f"FAIL --main {main_variant}: not a main/esp_main*.cpp file in the repo, so no variant would be gated")
+        return 1
     table = json.load(open(table_path, encoding="utf-8"))
     margin = table["margin_bytes"]
     ceiling = table["frame_ceiling_bytes"]
