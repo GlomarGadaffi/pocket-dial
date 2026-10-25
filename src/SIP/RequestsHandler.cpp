@@ -5294,17 +5294,44 @@ void RequestsHandler::flushUnknownEmergencyTallies(std::chrono::steady_clock::ti
 // #1126: an emergency-path task (tel_sweep) that has no worker since boot is reported once to the E911
 // notification list. Visibility only: a few atomic loads when nothing is wrong, no I/O here (the Alert is
 // staged and flushPass() sends it), and it never touches a call. A busy alert slot defers it a tick
-// rather than displace a 911 frame.
-void RequestsHandler::raiseBootSlotAlert()
+// rather than displace a 911 frame (onlyIfEmpty). The syslog frame is latched once; the MESSAGEs retry in
+// serviceBootFan(), because at the first tick no notify phone has re-registered yet.
+void RequestsHandler::raiseBootSlotAlert(std::chrono::steady_clock::time_point now)
 {
+	if (_bootFan.pending)
+	{
+		serviceBootFan(now);
+		return;
+	}
 	pd::BootTask task;
 	if (!pd::bootTaskSlots().alertDue(task)) return;
-	char text[160];
-	std::snprintf(text, sizeof text,
+	std::snprintf(_bootFan.text, sizeof _bootFan.text,
 		"DEGRADED: emergency-path task %s has no worker since boot (no stack); see /api/status telSweepWorker",
 		pd::BootTaskSlots::name(task));
-	if (_e911Notifier.notifyDegraded(_cfg.e911Config(), text))
-		pd::bootTaskSlots().markAlerted(task);
+	const pbx::E911Config& cfg = _cfg.e911Config();
+	std::size_t sent = 0;
+	if (!_e911Notifier.notifyDegraded(cfg, _bootFan.text, sent)) return;
+	pd::bootTaskSlots().markAlerted(task);
+	_bootFan.task    = task;
+	_bootFan.since   = now;
+	_bootFan.pending = (sent == 0) && EmergencyNotifier::hasNotifyExts(cfg);
+}
+
+// Waiting costs a registration check and nothing else. Ends when a MESSAGE is enqueued or _bootFanLimit
+// (10 minutes in service) has passed, with one witness line.
+void RequestsHandler::serviceBootFan(std::chrono::steady_clock::time_point now)
+{
+	if (now - _bootFan.since >= _bootFanLimit)
+	{
+		PD_WITNESS_W("e911", "boot alert for %s: no notify extension registered within %lld s, MESSAGE retries stopped",
+			pd::BootTaskSlots::name(_bootFan.task),
+			static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(_bootFanLimit).count()));
+		_bootFan.pending = false;
+		return;
+	}
+	const pbx::E911Config& cfg = _cfg.e911Config();
+	if (!_e911Notifier.anyNotifyRegistered(cfg)) return;
+	if (_e911Notifier.resendDegraded(cfg, _bootFan.text) > 0) _bootFan.pending = false;
 }
 
 // Issue #166 part 2. Kept to this one small function so the compliance-relevant
@@ -11355,7 +11382,7 @@ void RequestsHandler::tick()
 
 		sweepExpired();
 		flushUnknownEmergencyTallies(now);   // #1115
-		raiseBootSlotAlert();                // #1126
+		raiseBootSlotAlert(now);             // #1126
 
 		// AnchorClient::tick(): "periodic, non-blocking maintenance pump ... (<=1 Hz)"
 		// per its doc comment. Loopback's is a no-op; a real anchor uses this for

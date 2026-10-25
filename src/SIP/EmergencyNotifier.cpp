@@ -241,13 +241,41 @@ bool EmergencyNotifier::stageAlert(const std::string& text, bool onlyIfEmpty)
 	return true;
 }
 
-bool EmergencyNotifier::notifyDegraded(const pbx::E911Config& cfg, std::string_view text)
+bool EmergencyNotifier::notifyDegraded(const pbx::E911Config& cfg, std::string_view text, std::size_t& enqueued)
 {
+	enqueued = 0;
 	const std::string t(text.substr(0, 512));
 	if (!stageAlert(t, /*onlyIfEmpty=*/true)) return false;
 	_env.log(t, true);
-	fanOut(cfg, t);
+	enqueued = fanOut(cfg, t);
 	return true;
+}
+
+std::size_t EmergencyNotifier::resendDegraded(const pbx::E911Config& cfg, std::string_view text)
+{
+	return fanOut(cfg, std::string(text.substr(0, 512)));
+}
+
+bool EmergencyNotifier::hasNotifyExts(const pbx::E911Config& cfg)
+{
+	std::size_t considered = 0;
+	for (const std::string& ext : cfg.notifyExts)
+	{
+		if (considered++ >= pbx::kMaxE911NotifyExts) break;
+		if (!ext.empty()) return true;
+	}
+	return false;
+}
+
+bool EmergencyNotifier::anyNotifyRegistered(const pbx::E911Config& cfg)
+{
+	std::size_t considered = 0;
+	for (const std::string& ext : cfg.notifyExts)
+	{
+		if (considered++ >= pbx::kMaxE911NotifyExts) break;
+		if (!ext.empty() && _env.findRegistered(ext)) return true;
+	}
+	return false;
 }
 
 // Every notification is independent and every failure is swallowed: an unregistered extension or an

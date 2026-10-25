@@ -172,8 +172,15 @@ public:
 	// #1126: an operator alert that is not a 911 dial (an emergency-path task is absent). Same record and
 	// the same notify list as notify(), but it never replaces a frame already staged, so it can never
 	// displace a 911 alert. False: the slot was busy, nothing was sent, try again next tick. Never gates
-	// anything.
-	bool notifyDegraded(const pbx::E911Config& cfg, std::string_view text);
+	// anything. `enqueued` is how many MESSAGEs went out with it (0 when no notify phone is registered yet).
+	bool notifyDegraded(const pbx::E911Config& cfg, std::string_view text, std::size_t& enqueued);
+	// The MESSAGE half again, for a retry: no syslog frame, no log line. Allocates, so call it only once
+	// anyNotifyRegistered() says a phone can take it.
+	std::size_t resendDegraded(const pbx::E911Config& cfg, std::string_view text);
+	// Is any configured notify extension registered right now? Allocates nothing.
+	bool anyNotifyRegistered(const pbx::E911Config& cfg);
+	// Does the notify list name any extension at all?
+	static bool hasNotifyExts(const pbx::E911Config& cfg);
 
 private:
 	// notify()'s two halves: stage the Alert (onlyIfEmpty: leave an already staged frame alone), and

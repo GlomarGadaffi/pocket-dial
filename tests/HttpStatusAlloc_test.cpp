@@ -391,6 +391,80 @@ TEST(HttpStatusAlloc, AFailedSlotThatIsNotOnTheEmergencyPathCountsButRaisesNoAle
 	EXPECT_EQ(AlertCapture::frames().size(), 0u);
 }
 
+namespace
+{
+	// A handler whose send callback counts the boot alert's MESSAGEs. No phone is registered at the start.
+	struct FanBench
+	{
+		int messages = 0;
+		std::unique_ptr<RequestsHandler> handler;
+		FanBench()
+		{
+			handler = std::make_unique<RequestsHandler>("10.0.0.1", 5060,
+				[this](const sockaddr_in&, std::shared_ptr<SipMessage> m) {
+					if (m && m->toString().find("DEGRADED") != std::string::npos) ++messages;
+				});
+			handler->tick();
+		}
+	};
+}
+
+TEST(HttpStatusAlloc, TheBootAlertMessageWaitsForANotifyPhoneThenGoesOutExactlyOnce)
+{
+	CleanBootSlots clean;
+	FanBench b;
+	b.handler->setE911Config("200", "", "");
+	AlertCapture alerts;
+	pd::bootTaskSlots().noteAlloc("tel_sweep", false);
+	tickTimes(*b.handler, 1);
+	EXPECT_EQ(b.messages, 0) << "nobody is registered at the first tick";
+	EXPECT_EQ(AlertCapture::frames().size(), 1u);
+	b.handler->handle(makeRegister("200"));
+	tickTimes(*b.handler, 1);
+	EXPECT_EQ(b.messages, 1);
+	tickTimes(*b.handler, 5);
+	EXPECT_EQ(b.messages, 1);
+	EXPECT_EQ(AlertCapture::frames().size(), 1u) << "the syslog frame is latched once";
+}
+
+TEST(HttpStatusAlloc, AnEmptyNotifyListSendsTheFrameOnceAndRetriesNothing)
+{
+	CleanBootSlots clean;
+	FanBench b;
+	AlertCapture alerts;
+	pd::bootTaskSlots().noteAlloc("tel_sweep", false);
+	tickTimes(*b.handler, 2);   // stage + flush, then a pass with nothing pending
+	size_t allocs = 1;
+	{
+		AllocGuard g;
+		tickTimes(*b.handler, 1);
+		allocs = g.delta();
+	}
+	EXPECT_EQ(allocs, 0u);
+	b.handler->setE911Config("200", "", "");
+	b.handler->handle(makeRegister("200"));
+	tickTimes(*b.handler, 3);
+	EXPECT_EQ(b.messages, 0) << "an empty list at the alert means no retry, even if a phone is added later";
+	EXPECT_EQ(AlertCapture::frames().size(), 1u);
+}
+
+TEST(HttpStatusAlloc, ARetryThatRunsOutOfTimeLogsOnceAndStops)
+{
+	CleanBootSlots clean;
+	FanBench b;
+	b.handler->setE911Config("200", "", "");
+	AlertCapture alerts;
+	b.handler->setBootAlertLimitForTest(std::chrono::milliseconds(0));
+	pd::bootTaskSlots().noteAlloc("tel_sweep", false);
+	tickTimes(*b.handler, 4);
+	EXPECT_EQ(pdwitness::count("MESSAGE retries stopped"), 1u);
+	b.handler->handle(makeRegister("200"));
+	tickTimes(*b.handler, 3);
+	EXPECT_EQ(b.messages, 0);
+	EXPECT_EQ(pdwitness::count("MESSAGE retries stopped"), 1u);
+	EXPECT_EQ(AlertCapture::frames().size(), 1u);
+}
+
 TEST(HttpStatusAlloc, TheStatusKeyListIsPinnedAndTheDramAccountGuardAddsOnlyItsOwnKey)
 {
 	// #410/#328: POCKETDIAL_HTTP_DRAM_ACCOUNT is bench-only and defaults to 0.

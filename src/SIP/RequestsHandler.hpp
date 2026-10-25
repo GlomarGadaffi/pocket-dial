@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <atomic>
 #include <chrono>
+#include "BootTaskSlots.hpp"   // #1126: pd::BootTask for the boot alert fan-out
 #include <array>
 #include <thread>   // host-build async anchor-start worker (_anchorStartThread below)
 #include <condition_variable>   // host-build tel_ctl pool (#657)
@@ -650,6 +651,8 @@ public:
 	// #463: tick() runs at most once a second; this lets a test drive two passes
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
+	// #1126: shorten the boot alert's MESSAGE retry limit (10 minutes in service).
+	void setBootAlertLimitForTest(std::chrono::milliseconds limit) { std::lock_guard<pd::TimedMutex> lk(_mutex); _bootFanLimit = limit; }
 	// #1092: the shared unregistered emergency INVITE budget as it stands, untouched by any
 	// packet. It must start FULL: a bucket stamped at the clock epoch refills from boot on ESP.
 	double unregisteredEmergencyTokensForTest()
@@ -2123,7 +2126,20 @@ private:
 	// window ended with no further dial. Notices are coalesced per (source, number), so this
 	// is the "N more since" summary, not a repeat alert. Caller holds _mutex.
 	void flushUnknownEmergencyTallies(std::chrono::steady_clock::time_point now);
-	void raiseBootSlotAlert();   // #1126: the one boot alert for an absent emergency-path task
+	void raiseBootSlotAlert(std::chrono::steady_clock::time_point now);   // #1126: the one boot alert for an absent emergency-path task
+	// #1126: the boot alert's MESSAGE fan-out. The syslog frame goes once; the MESSAGEs retry each tick
+	// (only a registration check while waiting, no allocation) until one is enqueued, the notify list is
+	// empty, or kBootFanLimit passes (then one witness line and the retries stop).
+	struct BootFan
+	{
+		bool                                  pending = false;
+		pd::BootTask                          task{};
+		std::chrono::steady_clock::time_point since{};
+		char                                  text[160] = {};
+	};
+	BootFan                   _bootFan;                                  // under _mutex
+	std::chrono::milliseconds _bootFanLimit{std::chrono::minutes(10)};   // under _mutex
+	void serviceBootFan(std::chrono::steady_clock::time_point now);
 
 	// #659: a call to `ext` is a PSAP callback (ext dialed 911/933 within
 	// pbx::kEmergencyCallbackWindow). Every path that creates a session for an
