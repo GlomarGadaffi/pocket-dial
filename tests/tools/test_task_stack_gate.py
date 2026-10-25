@@ -1318,6 +1318,21 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("not a list of existing", out)
 
+    def test_a_whole_target_pattern_can_be_listed_absent_on_one_image(self):
+        self.indirect_fixture()
+        row = {"targets": [r"SlowSink::write\(", r"Missing::here\("], "reason": "fixture",
+               "absent": {self.DISP: [r"Missing::here\("]}}
+        self.table["indirect_allowlist"] = {r"void mid\(\)": row}
+        rc, out = self.run_gate(main=self.DISP)
+        self.assertEqual(rc, 0, out)                    # the other target still bounds the site
+        rc, out = self.run_gate(main=self.ETH)          # not listed for eth: still required there
+        self.assertEqual(rc, 1, out)
+        self.assertIn("Missing::here", out)
+        self.add_ci(node("here", "void Missing::here()", 10))
+        rc, out = self.run_gate(main=self.DISP)         # linked after all: stale
+        self.assertEqual(rc, 1, out)
+        self.assertIn("listed absent", out)
+
     def test_absent_values_must_be_lists_of_alternatives_the_row_spells(self):
         self.indirect_fixture()
         for bad in ("gone", ["gon"], [], ["gone", 7], {"gone": 1}):

@@ -359,7 +359,7 @@ def absent_ok(row, key):
     absent = row.get("absent")
     if absent is None:
         return True
-    spelled = {a for pat in row.get("targets", ()) if isinstance(pat, str) for a, _ in alternatives(pat) if a}
+    spelled = {a if a else pat for pat in row.get("targets", ()) if isinstance(pat, str) for a, _ in alternatives(pat)}
     if not (isinstance(absent, dict) and all(
             isinstance(v, list) and v and all(isinstance(a, str) and a in spelled for a in v)
             for v in absent.values())):
@@ -491,7 +491,7 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             if len(alts) > 1:
                 for a, ap in alts:
                     here = find(re.compile(ap))
-                    # #1117: "absent" {image: [alternative, ...]} names alternatives this image does not link.
+                    # #1117: "absent" {image: [alternative or whole target pattern, ...]} names targets this image does not link.
                     # Such an alternative must still match nothing there: one that is linked is a stale entry.
                     gone = a in (row.get("absent") or {}).get(image, ())
                     if gone and here:
@@ -500,6 +500,11 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                     elif not here and not gone:
                         rc_rows = 1
                         print(f"FAIL indirect_allowlist row '{k}': target alternative '{a}' (of '{pat}') matches no function, so it bounds nothing")
+            elif pat in (row.get("absent") or {}).get(image, ()):
+                # a whole target pattern this image does not link; one that matches here is a stale entry
+                if found:
+                    rc_rows = 1
+                    print(f"FAIL indirect_allowlist row '{k}': target '{pat}' is listed absent on {image} but matches a function there: remove it from absent")
             elif not found:
                 rc_rows = 1
                 print(f"FAIL indirect_allowlist row '{k}': target '{pat}' matches no function, so it bounds nothing")
