@@ -1242,12 +1242,26 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("FAIL big: known finding cap 2500 B is above the total 1900 B: lower max_total to 1900", out)
 
-    def test_the_checked_in_table_asserts_the_shared_spi1_bus_option_is_off(self):
+    def test_an_image_that_shares_the_spi1_bus_fails_the_checked_in_asserts(self):
         # #1117: the constrained image's bg_enable rows leave cache_enable/cache_disable out because IDF installs
-        # them only under this option; an image that turned it on would make them real targets.
-        table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
-        absent = [d for a in table["sdkconfig_asserts"] for d in a.get("absent", [])]
-        self.assertIn("CONFIG_SPI_FLASH_SHARE_SPI1_BUS", absent)
+        # them only under CONFIG_SPI_FLASH_SHARE_SPI1_BUS. The checked-in asserts are run against a fixture
+        # sdkconfig.h, on the default image and on the constrained profile.
+        real = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
+        self.table["sdkconfig_asserts"] = real["sdkconfig_asserts"]
+        cfg = os.path.join(self.tmp.name, "build", "config")
+        os.makedirs(cfg)
+        h = os.path.join(cfg, "sdkconfig.h")
+        for profile in (None, "constrained"):
+            with self.subTest(profile=profile):
+                with open(h, "w") as f:
+                    f.write("#define CONFIG_LOG_VERSION_1 1\n")
+                rc, out = self.run_profile(profile)
+                self.assertEqual(rc, 0, out)
+                with open(h, "w") as f:
+                    f.write("#define CONFIG_LOG_VERSION_1 1\n#define CONFIG_SPI_FLASH_SHARE_SPI1_BUS 1\n")
+                rc, out = self.run_profile(profile)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("CONFIG_SPI_FLASH_SHARE_SPI1_BUS is defined", out)
 
     def test_a_smaller_budget_than_the_known_row_recorded_fails(self):
         for t in self.table["tasks"]:
