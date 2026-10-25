@@ -11,6 +11,7 @@
 // addresses are RFC 5737 TEST-NETs. The 911/933 INVITEs are synthetic host
 // messages captured in `sent`; nothing reaches a network.
 
+#include <regex>
 #include <gtest/gtest.h>
 
 #include <cstdio>
@@ -1196,6 +1197,98 @@ TEST(TrunkInbound, ACarrierOfferAimedAtLoopbackMulticastOrUsIsRefused)
 		EXPECT_TRUE(b.firstTo("INVITE", kPhoneIp).empty()) << ip;
 		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u) << ip;
 	}
+}
+
+// #873 item 1: 2001 dials 911 (opens #659's window), then the carrier calls back
+// on its DID with `ip` in the offer's c=. Returns the INVITE the handset got.
+static std::string psapCallbackWithOfferAt(Bench& b, const std::string& ip, const std::string& callId)
+{
+	EXPECT_EQ(b.handler.setDidMapping(kDid, kExt), "");
+	b.handler.setAnchorPlacesRealCallsForTest(true);
+	b.handler.handle(makeInvite("911", "911", callId + "-911", kPhoneIp, true, kExt));
+	EXPECT_FALSE(b.firstTo("SIP/2.0 200", kPhoneIp).empty()) << "precondition: the anchor placed 2001's 911";
+	b.sent.clear();
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		withConnection(makeInvite(kDid, kDid, callId, kSbcIp, true, "+12025550177", 100)->toString(), ip),
+		addrFor(kSbcIp)));
+	return b.firstTo("INVITE sip:2001@", kPhoneIp);
+}
+
+TEST(TrunkInbound, APsapCallbackWithAnUnusableCarrierAddressStillRingsTheHandset)
+{
+	// #873 item 1, Rule 5: the address check is for ordinary calls (#861); a PSAP
+	// callback is taken at whatever address the carrier gave.
+	const MockedInterface net;
+	for (const char* ip : { "127.0.0.1", "224.0.0.1", "192.168.50.1" })
+	{
+		Bench b;
+		const std::string fork = psapCallbackWithOfferAt(b, ip, "in-873-cb");
+		EXPECT_FALSE(fork.empty()) << ip << ": the handset must ring";
+		EXPECT_EQ(b.countTo(kPhoneIp), 1u) << ip << ": exactly one INVITE to the handset";
+		EXPECT_TRUE(b.firstTo("SIP/2.0 488", kSbcIp).empty()) << ip << ": refused on media grounds";
+		EXPECT_TRUE(b.firstTo("SIP/2.0 4", kSbcIp).empty()) << ip;
+		if (fork.empty()) continue;
+		auto s = b.handler.getSession("Call-ID: " + field(fork, "Call-ID: "));
+		ASSERT_TRUE(s.has_value()) << ip;
+		EXPECT_TRUE(s.value()->isEmergency()) << ip << ": flagged as a PSAP callback";
+	}
+}
+
+TEST(TrunkInbound, AnOrdinaryCallWithTheSameUnusableAddressIsStillRefused488)
+{
+	const MockedInterface net;
+	for (const char* ip : { "127.0.0.1", "224.0.0.1", "192.168.50.1" })
+	{
+		Bench b;
+		ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			withConnection(makeInvite(kDid, kDid, "in-873-ord", kSbcIp, true, "+12025550177", 100)->toString(), ip),
+			addrFor(kSbcIp)));
+		EXPECT_EQ(b.carrierStatus(), "SIP/2.0 488 Not Acceptable Here") << ip;
+		EXPECT_EQ(b.countTo(kSbcIp), 1u) << ip;
+		EXPECT_TRUE(b.firstTo("INVITE", kPhoneIp).empty()) << ip;
+	}
+}
+
+TEST(TrunkInbound, APsapCallbackWithANormalOfferIsUnchanged)
+{
+	Bench b;
+	const std::string fork = psapCallbackWithOfferAt(b, kSbcIp, "in-873-ok");
+	EXPECT_FALSE(fork.empty());
+	EXPECT_EQ(b.countTo(kPhoneIp), 1u);
+	EXPECT_TRUE(b.firstTo("SIP/2.0 4", kSbcIp).empty());
+	if (fork.empty()) return;
+	auto s = b.handler.getSession("Call-ID: " + field(fork, "Call-ID: "));
+	ASSERT_TRUE(s.has_value());
+	EXPECT_TRUE(s.value()->isEmergency());
+}
+
+TEST(TrunkInbound, APsapCallbackWithNoOfferStillRingsTheHandset)
+{
+	// #873: with no address to read at all, a PSAP callback rings; the audio waits
+	// on the handset's answer. An ordinary call without an offer keeps its 488.
+	const MockedInterface net;
+	auto noOffer = [](std::string raw) {
+		raw.erase(raw.find("\r\n\r\n") + 4);
+		raw = std::regex_replace(raw, std::regex("Content-Type: [^\r]*\r\n"), "");
+		return RequestsHandler::getMessageFromPool(
+			std::regex_replace(raw, std::regex("Content-Length: [0-9]+"), "Content-Length: 0"), addrFor(kSbcIp));
+	};
+	Bench b;
+	ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
+	b.handler.setAnchorPlacesRealCallsForTest(true);
+	b.handler.handle(makeInvite("911", "911", "in-873-no-911", kPhoneIp, true, kExt));
+	ASSERT_FALSE(b.firstTo("SIP/2.0 200", kPhoneIp).empty()) << "precondition: the anchor placed 2001's 911";
+	b.sent.clear();
+	b.handler.handle(noOffer(makeInvite(kDid, kDid, "in-873-no", kSbcIp, true, "+12025550177", 100)->toString()));
+	const std::string fork = b.firstTo("INVITE sip:2001@", kPhoneIp);
+	EXPECT_FALSE(fork.empty());
+	EXPECT_EQ(b.countTo(kPhoneIp), 1u);
+	EXPECT_TRUE(b.firstTo("SIP/2.0 4", kSbcIp).empty());
+	if (fork.empty()) return;
+	auto s = b.handler.getSession("Call-ID: " + field(fork, "Call-ID: "));
+	ASSERT_TRUE(s.has_value());
+	EXPECT_TRUE(s.value()->isEmergency());
 }
 
 TEST(TrunkInbound, TheHandsetsOkToOurCancelIsAbsorbed)
