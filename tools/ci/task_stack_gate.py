@@ -460,7 +460,14 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             alts = alternatives(pat)
             if len(alts) > 1:
                 for a, ap in alts:
-                    if not find(re.compile(ap)):
+                    here = find(re.compile(ap))
+                    # #1117: "absent" {image: [alternative, ...]} names alternatives this image does not link.
+                    # Such an alternative must still match nothing there: one that is linked is a stale entry.
+                    gone = a in (row.get("absent") or {}).get(main_variant, ())
+                    if gone and here:
+                        rc_rows = 1
+                        print(f"FAIL indirect_allowlist row '{k}': alternative '{a}' is listed absent on {main_variant} but matches a function there: remove it from absent")
+                    elif not here and not gone:
                         rc_rows = 1
                         print(f"FAIL indirect_allowlist row '{k}': target alternative '{a}' (of '{pat}') matches no function, so it bounds nothing")
             elif not found:

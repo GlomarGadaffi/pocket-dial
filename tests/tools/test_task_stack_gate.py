@@ -1069,6 +1069,21 @@ class Gate(unittest.TestCase):
 
     # A target pattern of the form `X::(?:a|b)\(` names several functions: each alternative is checked on
     # its own, so one that is not in the image fails the gate instead of riding on its siblings.
+    def test_an_alternative_listed_absent_on_this_image_is_not_required(self):
+        self.indirect_fixture()
+        row = {"targets": [r"SlowSink::(?:write|gone)\("], "reason": "fixture",
+               "absent": {self.DISP: ["gone"]}}
+        self.table["indirect_allowlist"] = {r"void mid\(\)": row}
+        rc, out = self.run_gate(main=self.DISP)
+        self.assertEqual(rc, 0, out)                    # gone is not linked into this image
+        rc, out = self.run_gate(main=self.ETH)          # absent names display only: eth still requires it
+        self.assertEqual(rc, 1, out)
+        self.assertIn("alternative 'gone'", out)
+        self.add_ci(node("gone", "void SlowSink::gone()", 10))
+        rc, out = self.run_gate(main=self.DISP)         # linked after all: the absent entry is stale
+        self.assertEqual(rc, 1, out)
+        self.assertIn("listed absent", out)
+
     def test_every_alternative_of_a_target_pattern_must_match_a_function(self):
         self.indirect_fixture()
         self.table["indirect_allowlist"] = {r"void mid\(\)": {
