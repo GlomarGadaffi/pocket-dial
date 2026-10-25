@@ -12700,6 +12700,95 @@ void RequestsHandler::answerPageReinvite(const std::shared_ptr<SipMessage>& data
 #endif
 }
 
+// ── Source check for requests this PBX answers itself ────────────────────────
+// A re-INVITE/UPDATE on a leg this PBX terminates (555 anchor incl. the 911 leg,
+// inbound anchor, 997 page) is answered locally, so nothing downstream checks who
+// sent it. The sender must be a leg of the dialog by the BYE rule (IP only, via
+// isDialogSourceAuthorized): src is the registered handset, dest is the stand-in
+// carrying the INVITE's source, and either passes, so a handset whose registered
+// contact and call source differ (NAT) keeps its own hold/resume/refresh. The page's
+// caller is src, so only the paging extension may re-INVITE its page.
+//
+// Sessions without both legs are answered as before.
+//
+// Rule 5: on an emergency session a RESUME (an SDP offer that is not a hold) is
+// accepted from any source, so a handset that roamed while its call was held can
+// still resume. The answer never moves RTP to the offer's address. A HOLD, and a
+// bodiless refresh, still need a dialog leg. Caller holds _mutex.
+namespace
+{
+	bool offersHold(const SipMessage& m)
+	{
+		if (!m.hasSdp()) return false;
+		const auto* sdp = static_cast<const SipSdpMessage*>(&m);
+		return sdp->isHoldOffer() || m.getSdpDirection() == SipMessage::SdpDirection::RecvOnly;
+	}
+}
+
+bool RequestsHandler::LogLimiter::due(std::string_view callId)
+{
+	uint32_t key = 2166136261u;   // FNV-1a over the Call-ID
+	for (const char c : callId) key = (key ^ static_cast<uint8_t>(c)) * 16777619u;
+	const auto now = std::chrono::steady_clock::now();
+	for (auto& slot : slots)
+	{
+		if (!slot.used || slot.key != key) continue;
+		if (now - slot.last < std::chrono::seconds(kSeconds)) return false;
+		slot.last = now;
+		return true;
+	}
+	Slot& slot = slots[next];
+	next = (next + 1) % kSlots;
+	slot.used = true;
+	slot.key = key;
+	slot.last = now;
+	return true;
+}
+
+void RequestsHandler::logNonLegRequest(const std::shared_ptr<SipMessage>& data, LogLimiter& limiter,
+	const char* verdict, bool isError)
+{
+	if (!limiter.due(data->getCallID())) return;
+	char ip[INET_ADDRSTRLEN] = {};
+	const sockaddr_in source = data->getSource();
+	if (inet_ntop(AF_INET, &source.sin_addr, ip, sizeof(ip)) == nullptr) ip[0] = '\0';
+	queueLog(std::string(data->getType()) + " for Call-ID " + std::string(data->getCallID()) +
+	         " from " + ip + ": non-dialog source " + verdict, isError);
+}
+
+void RequestsHandler::refuseNonLegRequest(const std::shared_ptr<SipMessage>& data)
+{
+	++_localReinviteRefusals;
+	logNonLegRequest(data, _refusalLog, "refused", true);
+	_registrar.sendForbidden(data, "Forbidden");
+}
+
+bool RequestsHandler::authorizeLocalDialogRequest(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<Session>& session)
+{
+	if (isDialogSourceAuthorized(session, data->getSource())) return true;
+	if (session->isEmergency() && data->hasSdp() && !offersHold(*data))
+	{
+		++_localResumeAccepts;
+		logNonLegRequest(data, _resumeLog, "resume accepted (emergency call)", false);
+		return true;
+	}
+	refuseNonLegRequest(data);
+	return false;
+}
+
+// A bodiless UPDATE on a spliced dialog is answered here, so only the phone that
+// owns the dialog (the relayIntoPeerDialog() rule) may re-arm its timer. IP only,
+// like isDialogSourceAuthorized(): a NAT handset may refresh from another port.
+bool RequestsHandler::authorizeSplicedRefresh(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<Session>& session)
+{
+	const auto own = ownPartyOf(session);
+	if (own && data->getSource().sin_addr.s_addr == own->getAddress().sin_addr.s_addr) return true;
+	refuseNonLegRequest(data);
+	return false;
+}
+
 // ── Mid-dialog re-INVITE (RFC 3261 §12.2 hold/resume) ────────────────────────
 
 void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
@@ -12720,6 +12809,7 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 	// refusal below, which still applies to 777/888 (no real peer at all).
 	if (destNum == kAnchorCallExt && src && dest)
 	{
+		if (!authorizeLocalDialogRequest(data, session)) return;
 		answerAnchorReinvite(data, session, src);
 		return;
 	}
@@ -12731,6 +12821,7 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 	// unanswered. The phone leg here is dest.
 	if (session->isAnchorInbound() && dest)
 	{
+		if (!authorizeLocalDialogRequest(data, session)) return;
 		answerAnchorReinvite(data, session, dest);
 		return;
 	}
@@ -12739,6 +12830,7 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 	// Keyed on the page's own dialog, never on the To number.
 	if (isMulticastPageCall(data->getCallID()))
 	{
+		if (!authorizeLocalDialogRequest(data, session)) return;
 		answerPageReinvite(data, session);
 		return;
 	}
@@ -12906,6 +12998,7 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 	// so a bodiless refresh is answered locally rather than offered to the anchor.
 	if (destNum == kAnchorCallExt && src && dest)
 	{
+		if (!authorizeLocalDialogRequest(data, session)) return;
 		if (!data->hasSdp())
 		{
 			answerRefreshLocally();
@@ -12924,6 +13017,7 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 	// (buildInboundInviteFork()), exactly the Contact the handset was offered.
 	if (session->isAnchorInbound() && dest)
 	{
+		if (!authorizeLocalDialogRequest(data, session)) return;
 		if (!data->hasSdp())
 		{
 			answerRefreshLocally();
@@ -12937,6 +13031,7 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 	// re-INVITE. A bodiless one is a refresh and falls to the guard below.
 	if (isMulticastPageCall(data->getCallID()) && data->hasSdp())
 	{
+		if (!authorizeLocalDialogRequest(data, session)) return;
 		answerPageReinvite(data, session);
 		return;
 	}
@@ -12954,6 +13049,8 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 	    (!splicedLeg && (destNum == "440" || pbx::isParkOrbitExt(destNum))) ||
 	    (session && session->isTrunk()) || isMulticastPageCall(data->getCallID()) || !src || !dest)
 	{
+		// Sessions without both legs are answered as before.
+		if (!authorizeLocalDialogRequest(data, session)) return;
 		if (!data->hasSdp())
 		{
 			answerRefreshLocally();
@@ -12978,6 +13075,7 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 	// dialog's session timer is refreshed on its own; nothing needs to cross.
 	if (!session->getPeerCallID().empty() && !data->hasSdp())
 	{
+		if (!authorizeSplicedRefresh(data, session)) return;
 		answerRefreshLocally();
 		return;
 	}

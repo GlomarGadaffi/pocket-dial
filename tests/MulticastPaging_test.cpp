@@ -560,6 +560,35 @@ TEST(MulticastPaging, AHoldReinviteIsAnsweredWith200AndSdpNot488AndThePageSurviv
 	EXPECT_TRUE(b.handler->multicastPageActiveForTest());
 }
 
+// Only the paging extension may re-INVITE or UPDATE its page: a non-leg source naming the Call-ID gets a
+// 403 and the page is neither held nor answered.
+TEST(AnchorReinviteAuth, NonLegSourceReinviteAndUpdateOnPageAreRefusedAndPagerHoldStillWorks)
+{
+	Bench b;
+	b.send(invite("501", "997", "192.168.80.51", "pg-auth"), "192.168.80.51");
+	const int pagePort = audioPortOf(b.first());
+	ASSERT_GT(pagePort, 0) << b.first();
+	b.sent.clear();
+
+	b.send(midDialog("INVITE", "192.168.80.99", "pg-auth", 2, "sendonly"), "192.168.80.99");
+	b.send(midDialog("UPDATE", "192.168.80.99", "pg-auth", 3, "sendonly"), "192.168.80.99");
+	size_t ok = 0, forbidden = 0;
+	for (const auto& s : b.sent)
+	{
+		if (s.first.sin_addr.s_addr != inet_addr("192.168.80.99")) continue;
+		if (s.second.rfind("SIP/2.0 200", 0) == 0) ++ok;
+		if (s.second.rfind("SIP/2.0 403", 0) == 0) ++forbidden;
+	}
+	EXPECT_EQ(ok, 0u);
+	EXPECT_EQ(forbidden, 2u);
+	EXPECT_TRUE(b.handler->multicastPageActiveForTest());
+
+	b.sent.clear();
+	b.send(reinvite("pg-auth", 4, "sendonly"), "192.168.80.51");
+	ASSERT_EQ(b.sent.size(), 1u);
+	expectPageAnswer(b.first(), pagePort, "recvonly");
+}
+
 TEST(MulticastPaging, ResumeAfterHoldIsAnsweredSendrecvAndTheT29HoldLoopIsBroken)
 {
 	Bench b;

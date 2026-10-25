@@ -1,0 +1,2 @@
+# AnchorReinviteAuth_test.cpp + MulticastPaging_test.cpp: AnchorReinviteAuth.* (18). A re-INVITE/UPDATE on a locally answered anchor, inbound-anchor or page leg must come from a dialog leg; Rule 5 controls for the handset own 911 hold/resume/refresh.
+18

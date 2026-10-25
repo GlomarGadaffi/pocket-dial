@@ -213,6 +213,8 @@ add_executable(sip_parser_tests
     # Issues #797 / #798: address requests to the Contact the phone registered.
     RegisteredContact_test.cpp
     InboundAnchorReinvite_test.cpp
+    # Source authorization for re-INVITE/UPDATE on locally answered anchor and page legs.
+    AnchorReinviteAuth_test.cpp
     # Issue #1098: a de-registering or lapsed handset ringing an inbound anchored call.
     AnchorInboundDeregister_test.cpp
     # Issue #920: AudioSocket binary framing and Apidaze anchor adapter scaffold

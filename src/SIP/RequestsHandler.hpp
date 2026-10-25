@@ -2686,6 +2686,44 @@ private:
 	bool isDialogSourceAuthorized(const std::shared_ptr<Session>& session,
 		const sockaddr_in& source) const;
 
+	// A re-INVITE/UPDATE this PBX answers itself (555 anchor, inbound anchor, 997 page)
+	// must come from a leg of the dialog. False: a 403 was queued and the request is
+	// logged; the caller returns without touching bridge, state or session timer.
+	// Caller holds _mutex.
+	bool authorizeLocalDialogRequest(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<Session>& session);
+	bool authorizeSplicedRefresh(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<Session>& session);
+	// 403 + count + (rate-limited) log for a request from a non-dialog source.
+	void refuseNonLegRequest(const std::shared_ptr<SipMessage>& data);
+	// A fixed table of recent Call-IDs: due() is true at most once per kSeconds per Call-ID
+	// (no heap). One instance for refusals, one for accepted emergency resumes.
+	struct LogLimiter
+	{
+		static constexpr size_t kSlots = 8;
+		static constexpr int kSeconds = 10;
+		struct Slot
+		{
+			uint32_t key = 0;
+			bool used = false;
+			std::chrono::steady_clock::time_point last{};
+		};
+		Slot slots[kSlots];
+		size_t next = 0;
+		bool due(std::string_view callId);
+	};
+	LogLimiter _refusalLog;
+	LogLimiter _resumeLog;
+	uint32_t _localReinviteRefusals = 0;   // every refused request, logged or not
+	uint32_t _localResumeAccepts = 0;      // every accepted non-leg emergency resume
+	void logNonLegRequest(const std::shared_ptr<SipMessage>& data, LogLimiter& limiter, const char* verdict,
+		bool isError);
+
+public:
+	uint32_t localReinviteRefusalsForTest() const { return _localReinviteRefusals; }
+	uint32_t localResumeAcceptsForTest() const { return _localResumeAccepts; }
+private:
+
 	// Server-side RTP media source (the 440 tone stream). One concurrent stream; the
 	// ESP-only UDP socket + 20 ms pacing task live inside it, guarded for host builds.
 	RtpSender _rtpSender;
