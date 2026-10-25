@@ -6047,7 +6047,10 @@ void RequestsHandler::asyncAnswerCall(const std::string& participantId)
 
 // Out of runTelCtl() on purpose (#1127): its locals sit on the tel_ctl worker, whose static
 // depth the stack gate holds at its recorded finding. noinline keeps them off runTelCtl's frame.
-__attribute__((noinline)) void RequestsHandler::onTelCtlMakeCallFailed(const TelCtlJob& job)
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+void RequestsHandler::onTelCtlMakeCallFailed(const TelCtlJob& job)
 {
 	std::lock_guard<pd::TimedMutex> lock(_mutex);
 	queueLog("[Telephony] Failed to initiate outbound call to " + job.dest, true);
