@@ -52,6 +52,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 
 #include "PoolConfig.hpp"
@@ -177,6 +178,165 @@ private:
 		std::string_view view() const { return {ext.data(), len}; }
 	};
 	std::array<Mark, POCKETDIAL_MAX_CLIENTS> _marks{};
+};
+
+// ── Unknown-caller alert coalescing (#1115) ──────────────────────────────────
+//
+// An INVITE to 911/933 from a caller that is not a registered extension is
+// refused (403) and, since #1107, written to the EMERGENCY log and announced to
+// the E911 notify list. The log line is never coalesced. The announcement goes
+// out once per (source IP, emergency number) per window, so a flood of forged
+// 911s cannot teach the notify list to ignore the alert. A registered caller's
+// 911 does not pass through here at all. Nothing is lost silently: refusals held
+// back are reported as an "N more since" summary, by the next dial after the
+// window or, if none comes, by takeExpired() from tick().
+//
+// 60 s: long enough to absorb a burst, short enough that a real unknown device
+// dialling again a minute later is announced afresh.
+inline constexpr std::chrono::seconds kUnknownAlertWindow{60};
+// 16 pairs: 8 sources x {911, 933}. Distinct sources are bounded upstream by the
+// 256-entry rate-bucket cap (further new sources are dropped) and by the one budget
+// all unregistered sources share for emergency INVITEs (4 burst, then 1 per 10 s). A
+// flood can still exceed 16 pairs: the rest share one overflow entry per number (one
+// notice per window, the rest counted and summarised), so fan-out is at most 18.
+inline constexpr std::size_t kUnknownAlertMax = 16;
+
+class UnknownEmergencyAlerts
+{
+public:
+	static constexpr std::size_t kFromLen = 32;
+	static constexpr std::size_t kDialedLen = 16;
+
+	struct Verdict
+	{
+		bool notify = true;
+		bool overflow = false;   // the shared overflow entry spoke, not a per-source one
+		uint32_t summary = 0;    // refusals coalesced since the last announcement
+	};
+
+	// A tally due for announcement: window over, nobody dialled again.
+	struct Due
+	{
+		bool overflow = false;
+		bool isTest = false;
+		char from[kFromLen + 1] = {};
+		char dialed[kDialedLen + 1] = {};
+		uint32_t held = 0;
+	};
+
+	// `ip` is the source address (network order), `isTest` selects 933 over 911.
+	Verdict check(uint32_t ip, bool isTest, std::string_view from, std::string_view dialed,
+		std::chrono::steady_clock::time_point now)
+	{
+		Entry* spare = nullptr;
+		for (Entry& e : _e)
+		{
+			if (!e.used) { if (!spare) spare = &e; continue; }
+			if (e.ip != ip || e.isTest != isTest) continue;
+			return touch(e, now, false);
+		}
+		if (!spare) spare = reclaimExpired(now);
+		if (!spare)
+		{
+			if (_overflow < UINT32_MAX) ++_overflow;
+			Entry& o = _over[isTest ? 1 : 0];   // 911 and 933 never share: a test must not absorb a live dial
+			if (!o.used) { fill(o, 0, isTest, from, dialed, now); return {true, true, 0}; }
+			return touch(o, now, true);
+		}
+		fill(*spare, ip, isTest, from, dialed, now);
+		return {true, false, 0};
+	}
+
+	// One expired entry with a tally, cleared as it is returned. At most
+	// kUnknownAlertMax + 2 are ever pending (the table plus the two overflow entries).
+	bool takeExpired(std::chrono::steady_clock::time_point now, Due& out)
+	{
+		for (Entry& e : _e) if (due(e, now)) { give(e, false, out); return true; }
+		for (Entry& o : _over) if (due(o, now)) { give(o, true, out); return true; }
+		return false;
+	}
+
+	uint32_t overflow() const { return _overflow; }
+	uint32_t suppressed() const { return _suppressed; }
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+	void ageForTest(std::chrono::steady_clock::duration d)
+	{
+		for (Entry& e : _e) e.since -= d;
+		for (Entry& o : _over) o.since -= d;
+	}
+#endif
+
+private:
+	struct Entry
+	{
+		bool used = false;
+		bool isTest = false;
+		uint32_t ip = 0;
+		std::chrono::steady_clock::time_point since{};
+		uint32_t held = 0;
+		char from[kFromLen + 1] = {};
+		char dialed[kDialedLen + 1] = {};
+	};
+
+	static void copyTo(char* dst, std::size_t cap, std::string_view v)
+	{
+		const std::size_t n = std::min(v.size(), cap);
+		std::copy(v.begin(), v.begin() + n, dst);
+		dst[n] = '\0';
+	}
+
+	static void fill(Entry& e, uint32_t ip, bool isTest, std::string_view from, std::string_view dialed,
+		std::chrono::steady_clock::time_point now)
+	{
+		e.used = true; e.isTest = isTest; e.ip = ip; e.since = now; e.held = 0;
+		copyTo(e.from, kFromLen, from);
+		copyTo(e.dialed, kDialedLen, dialed);
+	}
+
+	Verdict touch(Entry& e, std::chrono::steady_clock::time_point now, bool overflow)
+	{
+		if (now - e.since < kUnknownAlertWindow)
+		{
+			if (e.held < UINT32_MAX) ++e.held;
+			if (!overflow) ++_suppressed;
+			return {false, overflow, 0};
+		}
+		const Verdict v{true, overflow, e.held};   // window over: announce again, with the tally
+		e.since = now;
+		e.held = 0;
+		return v;
+	}
+
+	static bool due(const Entry& e, std::chrono::steady_clock::time_point now)
+	{
+		return e.used && e.held != 0 && now - e.since >= kUnknownAlertWindow;
+	}
+
+	static void give(Entry& e, bool overflow, Due& out)
+	{
+		out.overflow = overflow;
+		out.isTest = e.isTest;
+		copyTo(out.from, kFromLen, e.from);
+		copyTo(out.dialed, kDialedLen, e.dialed);
+		out.held = e.held;
+		e.held = 0;   // keeps its window start: the next dial renotifies as usual
+	}
+
+	// The oldest expired entry with no tally pending. One with a tally waits for
+	// takeExpired(), so a slot is never reused before its summary has gone out.
+	Entry* reclaimExpired(std::chrono::steady_clock::time_point now)
+	{
+		Entry* oldest = nullptr;
+		for (Entry& e : _e)
+			if (now - e.since >= kUnknownAlertWindow && e.held == 0 && (!oldest || e.since < oldest->since)) oldest = &e;
+		return oldest;
+	}
+
+	std::array<Entry, kUnknownAlertMax> _e{};
+	std::array<Entry, 2> _over{};   // [0] 911, [1] 933
+	uint32_t _overflow = 0;
+	uint32_t _suppressed = 0;
 };
 
 } // namespace pbx

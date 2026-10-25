@@ -2416,20 +2416,21 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 #endif
 
 	const std::string destNumber(data->getToNumber());
+	const auto inviteAt = std::chrono::steady_clock::now();   // #1115: one clock read for the alert window
 
 	if (!caller.has_value())
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response)
 		{
-			noteUnregisteredEmergencyDial(data, destNumber);   // #1107: the 911 is still on the record
+			noteUnregisteredEmergencyDial(data, destNumber, inviteAt);   // #1107: the 911 is still on the record
 			return;   // pool exhausted: drop, peer retransmits (#101A)
 		}
 		response->setHeader("SIP/2.0 403 Forbidden");
 		response->clearBody();
 		response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
 		_outbox.emplace_back(data->getSource(), std::move(response));
-		noteUnregisteredEmergencyDial(data, destNumber);   // #1107: after the 403, as routeEmergencyCall orders it
+		noteUnregisteredEmergencyDial(data, destNumber, inviteAt);   // #1107: after the 403, as routeEmergencyCall orders it
 		return;
 	}
 
@@ -5231,8 +5232,23 @@ bool RequestsHandler::routeCodecRefusedEmergency(const std::shared_ptr<SipMessag
 	return true;
 }
 
+namespace
+{
+	// #1115: the reason text of an unknown-caller notice. `overflow`: the shared entry
+	// spoke for sources the table had no room for. `held`: refusals coalesced since.
+	std::string_view unknownAlertReason(char* buf, std::size_t cap, bool overflow, uint32_t held)
+	{
+		const char* base = overflow ? "unknown-caller 911 attempts from many sources"
+		                            : "caller is not a registered extension";
+		const int n = held == 0
+			? std::snprintf(buf, cap, "%s", base)
+			: std::snprintf(buf, cap, "%s; %u more since the last notice", base, static_cast<unsigned>(held));
+		return std::string_view(buf, n < 0 ? 0 : std::min(static_cast<std::size_t>(n), cap - 1));
+	}
+}
+
 void RequestsHandler::noteUnregisteredEmergencyDial(const std::shared_ptr<SipMessage>& data,
-	const std::string& dialed)
+	const std::string& dialed, std::chrono::steady_clock::time_point now)
 {
 	pbx::EmergencyDial emergency;
 	std::string asDialed;
@@ -5240,7 +5256,38 @@ void RequestsHandler::noteUnregisteredEmergencyDial(const std::shared_ptr<SipMes
 	const std::string from(data->getFromNumber());
 	queueLog("EMERGENCY: " + std::string(emergency.isTest ? "TEST 933" : "911") + " dialed by " + from +
 		" - caller is not a registered extension, refused (403)", true);
-	notifyEmergency(emergency, from, asDialed, /*routed=*/false, "caller is not a registered extension");
+	// #1115: the log line above is every refusal's record; only the announcement is
+	// coalesced, once per (source, number) per window. The 403 is already queued.
+	const pbx::UnknownEmergencyAlerts::Verdict v =
+		_unknownAlerts.check(data->getSource().sin_addr.s_addr, emergency.isTest, from, asDialed, now);
+	_unknownAlertOverflow.store(_unknownAlerts.overflow(), std::memory_order_relaxed);
+	_unknownAlertSuppressed.store(_unknownAlerts.suppressed(), std::memory_order_relaxed);
+	if (!v.notify) return;
+	char reason[112];
+	notifyEmergency(emergency, from, asDialed, /*routed=*/false,
+		unknownAlertReason(reason, sizeof reason, v.overflow, v.summary));
+}
+
+// #1115: ONE tally whose window ended with no further dial is announced per tick (1 Hz).
+// One, not all: each notify() stages a single syslog Alert slot that the next one would
+// overwrite (the overwritten text survives in the engine log, and the SIP MESSAGE path
+// has no such slot), and a burst of pending tallies must not exhaust the message pool
+// ahead of a real emergency's own notification. At most kUnknownAlertMax + 2 tallies can
+// be pending, so the last one goes out within that many seconds. Caller holds _mutex.
+// The std::string temporaries below are on the attack path: notifyEmergency() and
+// EmergencyNotifier::notify() take std::string and build one themselves, so this
+// path is not heap-free. It is bounded at one call per second.
+// A tally still pending when the handler is destroyed is dropped; its first alert and
+// every refusal's EMERGENCY log line already went out.
+void RequestsHandler::flushUnknownEmergencyTallies(std::chrono::steady_clock::time_point now)
+{
+	pbx::UnknownEmergencyAlerts::Due due;
+	if (!_unknownAlerts.takeExpired(now, due)) return;
+	const pbx::EmergencyDial emergency = pbx::classifyEmergencyDial(due.dialed);
+	if (!emergency.isEmergency) return;
+	char reason[112];
+	notifyEmergency(emergency, due.from, due.dialed, /*routed=*/false,
+		unknownAlertReason(reason, sizeof reason, due.overflow, due.held));
 }
 
 // Issue #166 part 2. Kept to this one small function so the compliance-relevant
@@ -11257,6 +11304,7 @@ void RequestsHandler::tick()
 		_dtmf.applyAdminPin();
 
 		sweepExpired();
+		flushUnknownEmergencyTallies(now);   // #1115
 
 		// AnchorClient::tick(): "periodic, non-blocking maintenance pump ... (<=1 Hz)"
 		// per its doc comment. Loopback's is a no-op; a real anchor uses this for

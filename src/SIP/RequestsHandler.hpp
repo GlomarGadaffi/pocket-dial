@@ -226,6 +226,10 @@ public:
 	// Issue #424: responses drainOutbox() refused to send because they answered
 	// a response or an ACK. Any non-zero value is a handler bug the guard caught.
 	uint32_t getRepliesRefused() const;
+	// #1115: unknown-caller 911/933 announcements sent because the coalescing table was
+	// full (they notify rather than drop), and refusals folded into an earlier one.
+	uint32_t getE911UnknownAlertOverflow() const { return _unknownAlertOverflow.load(std::memory_order_relaxed); }
+	uint32_t getE911UnknownAlertSuppressed() const { return _unknownAlertSuppressed.load(std::memory_order_relaxed); }
 	// OPTIONS keep-alive pings refused because they would not fit their stack
 	// buffer (#463). Not reachable with a real AOR and IPv4 address; counted so
 	// a clipped request can never go out silently.
@@ -579,6 +583,12 @@ public:
 	{
 		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_emergencyCallbacks.ageForTest(d);
+	}
+	// Test-only (#1115): move every unknown-caller coalescing window `d` into the past.
+	void ageUnknownEmergencyAlertsForTest(std::chrono::steady_clock::duration d)
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		_unknownAlerts.ageForTest(d);
 	}
 	// Test-only (#726): move every armed client give-up timer (Timer B/F) into
 	// the past, so the next tick() fires it. The trunk's own deadline is left
@@ -2106,7 +2116,11 @@ private:
 	// #1107: onInvite's 403 for an unknown caller, for an emergency dial: the status
 	// stands, the EMERGENCY log line and the routed=false notification are added.
 	void noteUnregisteredEmergencyDial(const std::shared_ptr<SipMessage>& data,
-		const std::string& dialed);
+		const std::string& dialed, std::chrono::steady_clock::time_point now);
+	// #1115: announce ONE held unknown-caller tally per call (tick() calls it at 1 Hz) whose
+	// window ended with no further dial. Notices are coalesced per (source, number), so this
+	// is the "N more since" summary, not a repeat alert. Caller holds _mutex.
+	void flushUnknownEmergencyTallies(std::chrono::steady_clock::time_point now);
 
 	// #659: a call to `ext` is a PSAP callback (ext dialed 911/933 within
 	// pbx::kEmergencyCallbackWindow). Every path that creates a session for an
@@ -3220,6 +3234,9 @@ private:
 	std::array<TrunkInboundPair, POCKETDIAL_MAX_TRUNK_CALLS> _trunkInbound{};
 #endif
 	std::atomic<uint32_t> _repliesRefused{0}; // #424 replies to a response/ACK dropped
+	pbx::UnknownEmergencyAlerts _unknownAlerts;   // #1115, under _mutex
+	std::atomic<uint32_t> _unknownAlertOverflow{0};     // #1115: mirrors _unknownAlerts for the HTTP thread
+	std::atomic<uint32_t> _unknownAlertSuppressed{0};   // #1115
 	std::atomic<uint32_t> _optionsPingTruncated{0};   // #463: see getOptionsPingTruncated()
 	std::atomic<uint32_t> _byeTruncated{0};           // #744: see getByeTruncated()
 	// Requests answered from a §17.2 server transaction's stored response rather

@@ -327,7 +327,7 @@ TEST(HttpStatusAlloc, TheStatusKeyListIsPinnedAndTheDramAccountGuardAddsOnlyItsO
 	std::vector<std::string> want = {
 		"ip", "port", "httpPort", "version", "httpReadDeadlineDrops", "httpPerSourceRefusals",
 		"httpStatusRefusals", "wifiCapable", "emergencyRoute", "uptime", "cdrPersistFailures", "cdrPersistSuppressed",
-		"cdrLoadFailures", "packetsProcessed", "packetsDropped", "msgPoolRefusals", "vpeerPoolRefusals", "repliesRefused",
+		"cdrLoadFailures", "packetsProcessed", "packetsDropped", "msgPoolRefusals", "vpeerPoolRefusals", "repliesRefused", "e911UnknownAlertOverflow", "e911UnknownAlertSuppressed",
 		"optionsPingTruncated", "byeTruncated", "trunkForgedRegisterResponses", "trunkForgedDialogResponses",
 		"trunkRefusedDialogByes", "emergencyRtpReaps", "learnArpRequestsLimited", "e911Configured", "droppedInvalid",
 		"droppedRate", "keepalivesCrlf", "droppedNoPool", "droppedOversize", "rtpRxOversize", "rtpTxPoolRefused",

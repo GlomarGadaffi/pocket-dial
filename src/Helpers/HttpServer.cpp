@@ -2556,6 +2556,8 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	json.s("\"vpeerPoolRefusals\":").n(handler ? handler->getVirtualPeerRefusals() : 0).s(",");
 	// #702 item 19: two "should stay zero" counters that were test-only until now.
 	json.s("\"repliesRefused\":").n(handler ? handler->getRepliesRefused() : 0).s(",");   // #424
+	json.s("\"e911UnknownAlertOverflow\":").n(handler ? handler->getE911UnknownAlertOverflow() : 0).s(",");   // #1115
+	json.s("\"e911UnknownAlertSuppressed\":").n(handler ? handler->getE911UnknownAlertSuppressed() : 0).s(",");   // #1115
 	json.s("\"optionsPingTruncated\":").n(handler ? handler->getOptionsPingTruncated() : 0).s(",");   // #463
 	json.s("\"byeTruncated\":").n(handler ? handler->getByeTruncated() : 0).s(",");   // #744
 	// Issue #663: trunk responses dropped as not from the carrier (#617, #356).
