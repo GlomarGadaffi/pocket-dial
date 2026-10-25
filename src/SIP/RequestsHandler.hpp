@@ -948,6 +948,16 @@ public:
 		return _tapiConfig.secretWrites();
 	}
 
+	// Test-only (#1136): the live in-RAM client secret of slot `idx`, "" when out of range.
+	// Where the host store does not persist (_WIN32) this is the only place to see that an
+	// import left the secret alone.
+	std::string telephonySecretForTest(size_t idx)
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		const TelephonyApiConfig::Slot* s = _tapiConfig.bootSlot(idx);
+		return s ? s->secret : std::string();
+	}
+
 	// Test-only: seed one CDR record directly (bypassing a real call flow) and
 	// read the ring back, so a factory-reset test can assert clearAllCallHistory()
 	// actually empties it without driving a full INVITE/BYE sequence just to

@@ -494,7 +494,11 @@ bool HoldMusic::start()
 
 	sockaddr_in bindAddr{};
 	bindAddr.sin_family = AF_INET;
+#if defined(PD_TEST_LOOPBACK_BIND)   // host test target on Windows only (#1136): keep test sockets off the LAN
+	bindAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#else
 	bindAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+#endif
 	bindAddr.sin_port = 0;             // ephemeral: read it back for the SDP answer
 	if (bind(_sock, reinterpret_cast<sockaddr*>(&bindAddr), sizeof(bindAddr)) < 0)
 	{

@@ -514,7 +514,10 @@ TEST_F(ConfigExportImportTest, Import_StagesTheTelephonyConfigOnceAndWritesNoSec
 	EXPECT_NE(nvswriter::buffersHoldingForTest("imp-client-id"), 0u) << "the pairing: the scan does see the staged fields";
 	EXPECT_EQ(nvswriter::buffersHoldingForTest(secret), 0u) << "the secret is in no writer buffer";
 
-#if !defined(_WIN32)   // TelephonyApiConfig::persistNow() is in-memory only on Windows: no file to read (#1136)
+	// The live table, on every platform: the import left both secrets in RAM.
+	EXPECT_EQ(_handler->telephonySecretForTest(0), secret) << "keepSecret: the import left the live secret alone";
+	EXPECT_EQ(_handler->telephonySecretForTest(1), draftSecret) << "...and the disabled draft's too";
+#if !defined(_WIN32)   // the stored file: persistNow() is in-memory only on Windows, so no file to read (#1136)
 	std::ifstream store(_tapiPath, std::ios::binary);
 	const std::string file((std::istreambuf_iterator<char>(store)), std::istreambuf_iterator<char>());
 	EXPECT_NE(file.find(secret), std::string::npos) << "keepSecret: the import left the stored secret alone";

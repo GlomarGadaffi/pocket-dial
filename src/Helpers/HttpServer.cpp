@@ -306,7 +306,11 @@ bool HttpServer::openListenSocket()
 	// 192.168.4.1 worked). INADDR_ANY serves on every interface/IP and is robust
 	// across AP/STA mode switches and IP/lease changes. _ip is still used for
 	// display/logging and the captive-portal same-origin check.
+#if defined(PD_TEST_LOOPBACK_BIND)   // host test target on Windows only (#1136): keep test sockets off the LAN
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#else
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+#endif
 	addr.sin_port = htons(static_cast<uint16_t>(_port));
 
 	if (bind(sock, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr)) < 0)

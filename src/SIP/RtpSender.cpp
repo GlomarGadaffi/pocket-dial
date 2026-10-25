@@ -308,7 +308,11 @@ bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::s
 	// matches the SDP we advertised (some UAs symmetric-RTP latch the source port).
 	sockaddr_in local{};
 	local.sin_family      = AF_INET;
+#if defined(PD_TEST_LOOPBACK_BIND)   // host test target on Windows only (#1136): keep test sockets off the LAN
+	local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#else
 	local.sin_addr.s_addr = htonl(INADDR_ANY);
+#endif
 	local.sin_port        = htons(static_cast<uint16_t>(_serverRtpPort));
 	if (bind(sock, reinterpret_cast<sockaddr*>(&local), sizeof(local)) < 0)
 	{
@@ -611,7 +615,11 @@ bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::s
 	// and matches the SDP we advertised (mirrors the ESP path).
 	sockaddr_in local{};
 	local.sin_family      = AF_INET;
+#if defined(PD_TEST_LOOPBACK_BIND)   // host test target on Windows only (#1136): keep test sockets off the LAN
+	local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#else
 	local.sin_addr.s_addr = htonl(INADDR_ANY);
+#endif
 	local.sin_port        = htons(static_cast<uint16_t>(_serverRtpPort));
 	if (bind(sock, reinterpret_cast<sockaddr*>(&local), sizeof(local)) < 0)
 	{
