@@ -761,7 +761,7 @@ jobs:
   # cannot build or cannot run the gate is red, never skipped (fail-fast is off so
   # one red leg does not hide the other three).
   stack-depth-gate:
-    name: Stack Depth Gate (${{ matrix.chip }} / ${{ matrix.transport }}, #457)
+    name: "Stack Depth Gate (${{ matrix.chip }} / ${{ matrix.transport }}, #457)"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
