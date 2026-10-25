@@ -6783,6 +6783,20 @@ void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 	{
 		return;
 	}
+	// Blind-transfer leg (#1124): the PBX is the UAC, so the target's 100 is the
+	// PBX's, as its 180 is (onRinging). The transferee is mid-call on another dialog.
+	if (session.has_value() && session.value()->isBlindXferLeg())
+	{
+		return;
+	}
+	// Attended-transfer splice (#1124): the PBX is the UAC of the re-INVITE that is
+	// still awaiting its 200 (_transferPendingAcks), so its 100 is the PBX's, not the
+	// dropped transferor's.
+	if (std::find(_transferPendingAcks.begin(), _transferPendingAcks.end(),
+	              std::string(data->getCallID())) != _transferPendingAcks.end())
+	{
+		return;
+	}
 	endHandle(data->getFromNumber(), data);
 }
 
