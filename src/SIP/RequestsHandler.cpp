@@ -13846,8 +13846,12 @@ bool RequestsHandler::resolveBridgeLeg(const std::shared_ptr<Session>& leg, Peer
 
 bool RequestsHandler::isSplicedPair(const std::shared_ptr<Session>& s)
 {
-	if (!s || s->getPeerCallID().empty() || s->isBlindXferLeg()) return false;
-	return getSession(s->getPeerCallID()).has_value();
+	if (!s || s->getPeerCallID().empty() || s->isBlindXferLeg() || s->isTransferBridge())
+		return false;
+	auto peer = getSession(s->getPeerCallID());
+	// Transfers keep their own teardown (handleTransferFailure, onBye): the original
+	// dialog's dest is the live transferee, not a stand-in.
+	return peer.has_value() && !peer.value()->isBlindXferLeg() && !peer.value()->isTransferBridge();
 }
 
 // Rule 5: a kill that would end this session ends its peer too, so either one

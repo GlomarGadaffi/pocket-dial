@@ -1418,3 +1418,45 @@ TEST(PoolRefusalAfterCommit, ABlindReferWhoseTransferCannotBeDrawnAnswers503Not2
 	EXPECT_FALSE(got503);
 	EXPECT_TRUE(bridge);
 }
+
+// #1123: a blind transfer's dialogs are linked by peerCallID but are not a splice
+// pair; an admin kill of the transferee still BYEs it on its own dialog.
+TEST(BlindTransfer, KillingTheTransfereeStillByesItOnItsOwnDialog)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.33.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in transferorAddr = addrFor("192.168.33.10");
+	const sockaddr_in transfereeAddr = addrFor("192.168.33.20");
+	handler.handle(makeRegister("100", "192.168.33.10", "reg-100k"));
+	handler.handle(makeRegister("106", "192.168.33.20", "reg-106k"));
+	handler.handle(makeRegister("107", "192.168.33.30", "reg-107k"));
+	const std::string callId = "blindxfer-1123";
+	connectCall(handler, sent, callId,
+		"100", transferorAddr, "atag", sdpBodyFor("10.1.1.1", 10001),
+		"106", transfereeAddr, "btag", sdpBodyFor("10.2.2.2", 20002));
+	handler.handle(makeRefer(callId, "100", transferorAddr, "atag", "106", "btag", "107"));
+	sent.clear();
+	ASSERT_TRUE(handler.forceDisconnect("106"));
+	handler.handle(RequestsHandler::getMessageFromPool(
+		"OPTIONS sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.33.99:5060;branch=z9hG4bKflushk\r\n"
+		"From: <sip:probe@server>;tag=probetag\r\n"
+		"To: <sip:server@server>\r\n"
+		"Call-ID: flush-1123\r\n"
+		"CSeq: 1 OPTIONS\r\n"
+		"Max-Forwards: 70\r\n"
+		"Content-Length: 0\r\n\r\n", addrFor("192.168.33.99")));
+	size_t onOwn = 0, other = 0;
+	for (const auto& [a, m] : sent)
+	{
+		if (!m || a.sin_addr.s_addr != transfereeAddr.sin_addr.s_addr) continue;
+		const std::string raw = m->toString();
+		if (raw.rfind("BYE ", 0) != 0) continue;
+		if (raw.find("Call-ID: " + callId) != std::string::npos) ++onOwn; else ++other;
+	}
+	EXPECT_EQ(onOwn, 1u);
+	EXPECT_EQ(other, 0u);
+}

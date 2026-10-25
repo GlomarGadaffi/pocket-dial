@@ -2622,10 +2622,10 @@ private:
 	// The peer dialog of a spliced session: who to send to and as whom. BYE's
 	// two bridge branches and the in-dialog relay all resolve it the same way.
 	bool resolvePeerDialog(const std::shared_ptr<Session>& s, PeerDialog& out);
-	// #1123: a spliced pair (park retrieve, pickup, attended bridge) is two sessions on two
+	// #1123: a spliced pair (park retrieve, pickup) is two sessions on two
 	// dialogs. A server-side teardown of one BYEs the other's own phone on the other's own
-	// Call-ID (endSplicePeer) and never the stand-in dest on this dialog. A blind-transfer
-	// leg is not a pair: its peer is the transferee's dialog, owned by the transfer code.
+	// Call-ID (endSplicePeer) and never the stand-in dest on this dialog. A transfer
+	// leg or bridge is not a pair: the transfer code owns that teardown.
 	bool isSplicedPair(const std::shared_ptr<Session>& s);
 	bool pairHasEmergency(const std::shared_ptr<Session>& s);
 	void endSplicePeer(const std::shared_ptr<Session>& s,
