@@ -497,3 +497,20 @@ TEST_F(TrunkHttpTest, SetupPageIsServedAndCarriesNoConfigData)
 	EXPECT_EQ(body.find("sip.carrier.example"), std::string::npos);
 	EXPECT_EQ(body.find("auth-id-9876"), std::string::npos);
 }
+
+// #1133: the page carries a persistent deprecation notice that is plain markup:
+// no modal, no script gate, and the Save button is not disabled by it.
+TEST_F(TrunkHttpTest, SetupPageShowsAPersistentDeprecationNoticeThatBlocksNothing)
+{
+	const std::string body = bodyOf(httpGet(_port, "/setup/trunk"));
+	const size_t at = body.find("id=\"trunk-deprecated\"");
+	ASSERT_NE(at, std::string::npos) << "the deprecation notice is on the trunk page";
+	const size_t end = body.find("</p>", at);
+	ASSERT_NE(end, std::string::npos);
+	const std::string notice = body.substr(at, end - at);
+	EXPECT_NE(notice.find("anchor is the supported ITSP path"), std::string::npos);
+	EXPECT_EQ(notice.find("<button"), std::string::npos) << "no dismiss or confirm control";
+	EXPECT_EQ(body.find("role=\"dialog\""), std::string::npos) << "not a modal";
+	EXPECT_EQ(body.find("alert("), std::string::npos);
+	EXPECT_EQ(body.find("confirm("), std::string::npos);
+}

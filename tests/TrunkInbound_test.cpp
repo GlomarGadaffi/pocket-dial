@@ -1745,3 +1745,51 @@ TEST(TrunkByeAuth, AHandsetThatMovedButHasNotReRegisteredIsRefusedUntilItDoes)
 	b.handler.handle(forkByeFrom(a.fork, kRoamedIp, 5060, "moved2"));
 	expectHandsetHangupOnce(b, a, kRoamedIp);
 }
+
+// #1133 (rule 5): the trunk is deprecated, not changed. A configured trunk still
+// receives a call, and a PSAP callback on it still rings, with the same messages
+// in the same numbers as before the notice.
+TEST(TrunkInbound, ADeprecatedTrunkStillRingsAnInboundCallWithTheSameMessageCounts)
+{
+	Bench b;
+	const std::string fork = ringFork(b, "in-1133");
+	ASSERT_FALSE(fork.empty()) << "the extension rings";
+	EXPECT_EQ(b.sent.size(), 2u);
+	EXPECT_EQ(b.countTo(kSbcIp), 1u) << "the carrier hears one 100 Trying";
+	EXPECT_EQ(b.countTo(kPhoneIp), 1u) << "the handset gets one INVITE";
+	EXPECT_EQ(otherForks(b, fork), 0u);
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+}
+
+TEST(TrunkInbound, ADeprecatedTrunkStillRingsAPsapCallbackWithTheSameMessageCounts)
+{
+	Bench b;
+	ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
+	b.handler.setAnchorPlacesRealCallsForTest(true);
+	b.handler.handle(makeInvite("911", "911", "in-1133-911", kPhoneIp, true, kExt));
+	ASSERT_FALSE(b.firstTo("SIP/2.0 200", kPhoneIp).empty()) << "precondition: the anchor placed 2001's 911";
+	b.sent.clear();
+
+	b.handler.handle(makeInvite(kDid, kDid, "in-1133-cb", kSbcIp, true, "+12025550177", 101, "Require: 100rel\r\n"));
+	EXPECT_TRUE(b.firstTo("420", kSbcIp).empty()) << "the callback is not refused";
+	const std::string fork = b.firstTo("INVITE sip:2001@", kPhoneIp);
+	EXPECT_FALSE(fork.empty()) << "2001 rings";
+	EXPECT_EQ(b.sent.size(), 2u);
+	EXPECT_EQ(b.countTo(kSbcIp), 1u);
+	EXPECT_EQ(b.countTo(kPhoneIp), 1u);
+	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+	const auto cb = b.handler.getSession("Call-ID: " + field(fork, "Call-ID: "));
+	ASSERT_TRUE(cb.has_value());
+	EXPECT_TRUE(cb.value()->isEmergency()) << "the callback is flagged as a PSAP callback";
+
+	// Negative control: the same INVITE to the DID of an extension that never dialed 911.
+	b.handler.handle(makeRegister("2002", "192.168.50.22"));
+	ASSERT_EQ(b.handler.setDidMapping("+12025550189", "2002"), "");
+	b.sent.clear();
+	b.handler.handle(makeInvite("+12025550189", "+12025550189", "in-1133-other", kSbcIp, true, "+12025550177"));
+	const std::string other = b.firstTo("INVITE sip:2002@", "192.168.50.22");
+	ASSERT_FALSE(other.empty()) << "2002 rings";
+	const auto os = b.handler.getSession("Call-ID: " + field(other, "Call-ID: "));
+	ASSERT_TRUE(os.has_value());
+	EXPECT_FALSE(os.value()->isEmergency()) << "an ordinary inbound call is not flagged";
+}

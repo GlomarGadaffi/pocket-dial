@@ -10,12 +10,30 @@ If you have not flashed firmware yet, do that first. See the build instructions 
 
 What you will do:
 
+0. [Check the network requirements](#network-requirements)
 1. [Power on and join the device's Wi-Fi](#1-power-on-and-join-the-device)
 2. [Open the dashboard](#2-open-the-dashboard)
 3. [Log in and complete setup (do this first)](#3-log-in-and-complete-setup-first)
 4. [Register a softphone or IP phone](#4-register-a-phone)
 5. [Make a test call (777 echo, then 999 all-page)](#5-make-a-test-call)
 6. [Quick-start checklist](#6-quick-start-checklist)
+
+## Network requirements
+
+These requirements describe an **anchor-only** deployment, the supported path. A
+pocket-dial with the anchor opens nothing to the internet and needs nothing forwarded to
+it. Check these against your router and firewall:
+
+- **No inbound WAN ports are needed or wanted.** Do not forward any port from the WAN side
+  to the board or to a phone.
+- **The ITSP connection is outbound only.** Provider calls go through the anchor, which is
+  outbound HTTPS to the provider (control over a TLS WebSocket, audio over HTTPS streams), port 443 by default. The provider never connects in to you.
+- **The phones' RTP stays on the LAN.** Phone-to-phone audio never leaves your network.
+- **No port forwarding and no firewall "RTP range" are required.** Do not open a UDP media
+  range for the board or the phones.
+
+A configured legacy SIP trunk (DEPRECATED) is the exception: it carries SIP and RTP across
+the WAN, and an IP-authenticated trunk may need inbound SIP.
 
 ## 1. Power on and join the device
 
@@ -292,14 +310,14 @@ registered extension** at once, injecting auto-answer headers; the first device 
 - [ ] Dialed **`999`**, other phones paged.
 - [ ] Placed a direct `1001 → 1002` call, two-way audio.
 
-## 7. Optional: E911 notification and a carrier trunk
+## 7. Optional: E911 notification and a carrier trunk (DEPRECATED)
 
 **E911 notification.** Open **PBX Settings** (the **PBX** button or F6) →
 **E911 Notification**. Set the extensions to notify on site when somebody dials 911,
 the callback number and the location, then **Save**. The fields refill with what the
 server kept. A factory reset clears these, so set them again after one (#646).
 
-**Carrier trunk.** Configure it at `/setup/trunk`. A trunk with a password REGISTERs with the carrier and answers a 401 or 407 challenge with digest authentication. An IP-authenticated trunk does not register (#615). Outbound calls over the trunk are still under investigation: the carrier accepts the REGISTER but does not answer the INVITE (#618).
+**Carrier trunk (DEPRECATED).** The SIP trunk is deprecated; the anchor is the supported ITSP path. The reason is the network design rule: pocket-dial's design rule is that nothing is opened or forwarded from the WAN side to the board or the phones (see [Network requirements](#network-requirements)). Existing trunk configurations are left in place and behaviour is unchanged by this release (outbound trunk calls remain under investigation, #618). Configure one at `/setup/trunk`. A trunk with a password REGISTERs with the carrier and answers a 401 or 407 challenge with digest authentication. An IP-authenticated trunk does not register (#615). Outbound calls over the trunk are still under investigation: the carrier accepts the REGISTER but does not answer the INVITE (#618).
 
 Next: [PHONE_COMPATIBILITY.md](PHONE_COMPATIBILITY.md) ·
 [HARDWARE_SELECTION.md](HARDWARE_SELECTION.md) ·
