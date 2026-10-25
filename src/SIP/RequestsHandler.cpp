@@ -965,7 +965,8 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	{
 		std::lock_guard<std::mutex> rlock(_rateMutex);
 		// #1092, Rule 5: admitPacket() = allowlist, then live emergency Call-ID, then the bucket
-		// (trunk peer, registered source, or table), then the emergency INVITE budget. No _mutex.
+		// (trunk peer, registered source, or table), then the emergency INVITE budget,
+		// then the live dialog's small spill budget. No _mutex.
 		if (!admitPacket(*request))
 		{
 			const sockaddr_in src = request->getSource();
@@ -12433,7 +12434,28 @@ uint32_t RequestsHandler::nextTrunkPeerIp(uint32_t current, TrunkResolver::Statu
 	return (st == TrunkResolver::Status::Hit && found != 0) ? found : current;
 }
 
-bool RequestsHandler::emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId)
+bool RequestsHandler::emergencyEndpointsAdd(EmergencyEndpoints& ep, uint32_t ip)
+{
+	if (ip == 0) return false;   // unset: names no host
+	if (emergencyEndpointsHas(ep, ip)) return true;
+	if (ep.count >= kMaxRateExemptEndpoints) return false;
+	ep.ip[ep.count] = ip;
+	++ep.count;
+	return true;
+}
+
+bool RequestsHandler::emergencyEndpointsHas(const EmergencyEndpoints& ep, uint32_t ip)
+{
+	if (ip == 0) return false;
+	for (size_t i = 0; i < ep.count && i < kMaxRateExemptEndpoints; ++i)
+	{
+		if (ep.ip[i] == ip) return true;
+	}
+	return false;
+}
+
+bool RequestsHandler::emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId,
+	const EmergencyEndpoints& ep)
 {
 	callId = siphdr::stripHeaderNameView(callId);   // bare value, whatever form the caller holds
 	// A Call-ID that does not fit is not stored truncated: a prefix would exempt other dialogs.
@@ -12442,19 +12464,25 @@ bool RequestsHandler::emergencyIdsAdd(EmergencyCallIds& set, std::string_view ca
 	if (emergencyIdsHas(set, callId)) return true;
 	std::memcpy(set.id[set.count].data(), callId.data(), callId.size());
 	set.len[set.count] = static_cast<uint8_t>(callId.size());
+	set.ep[set.count] = ep;
 	++set.count;
 	return true;
 }
 
-bool RequestsHandler::emergencyIdsHas(const EmergencyCallIds& set, std::string_view callId)
+size_t RequestsHandler::emergencyIdsFind(const EmergencyCallIds& set, std::string_view callId)
 {
 	callId = siphdr::stripHeaderNameView(callId);
 	for (size_t i = 0; i < set.count && i < kMaxRateExemptCallIds; ++i)
 	{
 		if (set.len[i] == callId.size() && std::memcmp(set.id[i].data(), callId.data(), callId.size()) == 0)
-			return true;
+			return i;
 	}
-	return false;
+	return kMaxRateExemptCallIds;
+}
+
+bool RequestsHandler::emergencyIdsHas(const EmergencyCallIds& set, std::string_view callId)
+{
+	return emergencyIdsFind(set, callId) < kMaxRateExemptCallIds;
 }
 
 bool RequestsHandler::emergencyIdsEqual(const EmergencyCallIds& a, const EmergencyCallIds& b)
@@ -12464,25 +12492,74 @@ bool RequestsHandler::emergencyIdsEqual(const EmergencyCallIds& a, const Emergen
 	{
 		if (a.len[i] != b.len[i] || std::memcmp(a.id[i].data(), b.id[i].data(), a.len[i]) != 0)
 			return false;
+		const EmergencyEndpoints& x = a.ep[i];
+		const EmergencyEndpoints& y = b.ep[i];
+		if (x.count != y.count || x.viaTrunk != y.viaTrunk) return false;
+		if (std::memcmp(x.ip.data(), y.ip.data(), x.count * sizeof(uint32_t)) != 0) return false;
 	}
 	return true;
 }
 
+void RequestsHandler::collectEmergencyEndpoints(const Session& s, const SipTrunk::Dialog* d,
+	EmergencyEndpoints& out) const
+{
+	out.count = 0;
+	out.viaTrunk = false;
+	// A leg's address is read live from its client, so a roaming re-REGISTER moves it in place and
+	// the next publish carries the new one. A leg with no address (a virtual peer) adds nothing.
+	for (const auto& leg : { s.getSrc(), s.getDest() })
+	{
+		if (leg) (void)emergencyEndpointsAdd(out, leg->getAddress().sin_addr.s_addr);
+	}
+	// A callback's ringing targets answer before any leg is set as the dest.
+	const auto& pending = s.getPendingTargets();
+	for (size_t i = 0; i < pending.size() && i < kMaxRateExemptEndpoints; ++i)
+	{
+		if (pending[i]) (void)emergencyEndpointsAdd(out, pending[i]->getAddress().sin_addr.s_addr);
+	}
+	if (d == nullptr) return;
+	// The carrier side of the dialog: where its requests come from (peer / next hop), or the
+	// trunk's resolved IP, which the check reads live under _rateMutex.
+	(void)emergencyEndpointsAdd(out, d->peer.sin_addr.s_addr);
+	(void)emergencyEndpointsAdd(out, d->nextHop.sin_addr.s_addr);
+	// SipTrunk::handleBye() also takes an in-dialog BYE from the remote target's host, the node
+	// the callback's Contact names. A pool node accepted on the dialog tags alone has no address
+	// known ahead of its packet, so it cannot be published here; it takes the ordinary buckets,
+	// then the entry's small shared budget (takeEmergencySpill).
+	uint32_t target = 0;
+	if (SipTrunk::remoteTargetIpv4(*d, target)) (void)emergencyEndpointsAdd(out, target);
+	out.viaTrunk = true;
+}
+
 void RequestsHandler::publishRateExemptions()
 {
-	// Member scratch (guarded by _mutex), not a stack local: it is ~2 KB and this runs from the SIP task.
+	// Member scratch (guarded by _mutex), not a stack local: it is ~4.5 KB (default pools) and this runs from the SIP task.
 	EmergencyCallIds& fresh = _emergencyIdsScratch;
 	fresh.count = 0;   // entries past count are never read
+	EmergencyEndpoints ep;   // ~150 B
 	for (const auto& [callID, s] : _sessions)
 	{
 		if (!s || !s->isEmergency()) continue;
-		(void)emergencyIdsAdd(fresh, callID);
 		// #818: the carrier speaks on the trunk dialog's own Call-ID, not the handset leg's.
-		if (const SipTrunk::Dialog* d = _sipTrunk.findByCallID(callID); d)
-			(void)emergencyIdsAdd(fresh, d->callID);
+		const SipTrunk::Dialog* d = _sipTrunk.findByCallID(callID);
+		collectEmergencyEndpoints(*s, d, ep);
+		(void)emergencyIdsAdd(fresh, callID, ep);
+		if (d) (void)emergencyIdsAdd(fresh, d->callID, ep);
 	}
 	std::lock_guard<std::mutex> rlock(_rateMutex);
-	if (!emergencyIdsEqual(fresh, _emergencyCallIds)) _emergencyCallIds = fresh;
+	if (emergencyIdsEqual(fresh, _emergencyCallIds)) return;
+	// A rebuild must never refill a drained spill bucket: carry each one over by Call-ID, and start
+	// a new dialog's full. (Same rule as _rateSources.) 16 buckets of 16 B on the stack.
+	const auto now = std::chrono::steady_clock::now();
+	std::array<RateBucket, kMaxRateExemptCallIds> next{};
+	for (size_t i = 0; i < fresh.count && i < kMaxRateExemptCallIds; ++i)
+	{
+		const std::string_view id(fresh.id[i].data(), fresh.len[i]);
+		const size_t old = emergencyIdsFind(_emergencyCallIds, id);
+		next[i] = old < kMaxRateExemptCallIds ? _emergencySpill[old] : RateBucket{ kEmergencySpillBurst, now };
+	}
+	_emergencySpill = next;
+	_emergencyCallIds = fresh;
 }
 
 void RequestsHandler::publishTrunkPeer(bool retire)
@@ -12567,12 +12644,26 @@ bool RequestsHandler::admitPacket(const SipMessage& m)
 	const sockaddr_in src = m.getSource();
 	if (!ipAllowed(src)) return false;
 	if (rateExemptByCallId(m)) return true;
-	return allowPacket(src) || allowEmergencyInvite(m, src);
+	if (allowPacket(src) || allowEmergencyInvite(m, src)) return true;
+	return takeEmergencySpill(m);
 }
 
 bool RequestsHandler::rateExemptByCallId(const SipMessage& m) const
 {
-	return emergencyIdsHas(_emergencyCallIds, m.getCallID());
+	const uint32_t ip = m.getSource().sin_addr.s_addr;   // IP only: a NAT'd leg's port moves
+	if (ip == 0) return false;
+	const size_t i = emergencyIdsFind(_emergencyCallIds, m.getCallID());
+	if (i >= kMaxRateExemptCallIds) return false;   // not a live emergency dialog: the ordinary buckets
+	const EmergencyEndpoints& ep = _emergencyCallIds.ep[i];
+	return emergencyEndpointsHas(ep, ip) || (ep.viaTrunk && _trunkPeerIp != 0 && ip == _trunkPeerIp);
+}
+
+bool RequestsHandler::takeEmergencySpill(const SipMessage& m)
+{
+	const size_t i = emergencyIdsFind(_emergencyCallIds, m.getCallID());
+	if (i >= kMaxRateExemptCallIds) return false;
+	return takeToken(_emergencySpill[i], std::chrono::steady_clock::now(), kEmergencySpillBurst,
+		kEmergencySpillPerSec);
 }
 
 bool RequestsHandler::takeToken(RateBucket& bucket, std::chrono::steady_clock::time_point now,

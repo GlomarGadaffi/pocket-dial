@@ -2578,30 +2578,72 @@ private:
 	//   (a) the configured trunk's resolved IPv4 (a PSAP calls back, and the
 	//       carrier signals a live 911, from the one carrier IP); and
 	//   (b) the Call-IDs of live emergency sessions (and the trunk dialog's own
-	//       Call-ID for the same call), so an in-dialog BYE/ACK/re-INVITE from
-	//       any source gets through. A Call-ID is not spoofable into the set:
-	//       it is only ever added from a session the engine itself marked
+	//       Call-ID for the same call), each with the endpoints that dialog belongs
+	//       to: the legs' registered IPv4 addresses, plus the trunk dialog's peer.
+	//       A packet is exempt only when its Call-ID is in the set AND its source
+	//       IP (port ignored) is one of that entry's endpoints; any other source
+	//       takes the ordinary buckets, then the entry's small shared budget
+	//       (takeEmergencySpill), which keeps a node whose address is not known
+	//       ahead of its packet from being dropped outright. A Call-ID is not spoofable into
+	//       the set: it is only ever added from a session the engine itself marked
 	//       emergency, never from a header on a packet.
 	static constexpr size_t kMaxRateExemptCallIds  = 2 * POCKETDIAL_MAX_SESSIONS;
 	static constexpr size_t kRateExemptCallIdBytes = SipLimits::kMaxCallIdLine + 1;
+	// Worst case: every ringing target of a callback fork, both legs, and the trunk dialog's peer,
+	// next hop and remote target. Nothing is silently dropped: the cap covers all of them.
+	static constexpr size_t kMaxRateExemptEndpoints = static_cast<size_t>(POCKETDIAL_MAX_CLIENTS) + 5;
 	static_assert(kMaxRateExemptCallIds <= 255, "EmergencyCallIds::count/len are uint8_t");
 	static_assert(kRateExemptCallIdBytes <= 256, "EmergencyCallIds::len is uint8_t");
+	static_assert(kMaxRateExemptEndpoints <= 255, "EmergencyEndpoints::count is uint8_t");
+	struct EmergencyEndpoints
+	{
+		std::array<uint32_t, kMaxRateExemptEndpoints> ip{};   // network-order s_addr, never 0
+		uint8_t count = 0;
+		bool    viaTrunk = false;   // the live trunk peer (_trunkPeerIp) is an endpoint too
+	};
 	struct EmergencyCallIds
 	{
 		std::array<std::array<char, kRateExemptCallIdBytes>, kMaxRateExemptCallIds> id{};
 		std::array<uint8_t, kMaxRateExemptCallIds> len{};   // bytes used in id[i], no NUL counted
+		std::array<EmergencyEndpoints, kMaxRateExemptCallIds> ep{};
 		uint8_t count = 0;
 	};
-	static bool emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId);
+	// Size. Measured sizeof(EmergencyCallIds): 4500 B with the default pools (32 clients, 8
+	// sessions), 1484 B with the constrained ones (8 clients, 4 sessions). It exists twice, the
+	// live set and the build scratch, and the spill buckets add 16 B per entry (256 B default,
+	// 128 B constrained), so the change adds about 5.1 KB (default) or 1.0 KB (lan8720 /
+	// constrained) over the Call-ID-only set. All are members of the handler, built at
+	// init: internal DRAM on a build without PSRAM, and no per-call allocation. The bound below is
+	// the per-entry cost (id bytes, length, endpoints and their count and flag) plus a little
+	// slack for padding; it trips if a field is added without anyone looking at that DRAM bill.
+	static constexpr size_t kEmergencyCallIdsBudget = kMaxRateExemptCallIds *
+		(kRateExemptCallIdBytes + 1 + sizeof(uint32_t) * kMaxRateExemptEndpoints + 8) + 16;   // 4576 default, 1528 constrained
+	static_assert(sizeof(EmergencyCallIds) <= kEmergencyCallIdsBudget,
+		"EmergencyCallIds grew past its measured size: check the DRAM it costs twice over (live + scratch)");
+	static bool emergencyEndpointsAdd(EmergencyEndpoints& ep, uint32_t ip);
+	static bool emergencyEndpointsHas(const EmergencyEndpoints& ep, uint32_t ip);
+	static bool emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId, const EmergencyEndpoints& ep);
 	static bool emergencyIdsHas(const EmergencyCallIds& set, std::string_view callId);
+	// Index of `callId` in the set, or kMaxRateExemptCallIds when it is not there.
+	static size_t emergencyIdsFind(const EmergencyCallIds& set, std::string_view callId);
 	static bool emergencyIdsEqual(const EmergencyCallIds& a, const EmergencyCallIds& b);
+	// Caller holds _mutex. Fills `out` with the addresses the session's dialog belongs to.
+	void collectEmergencyEndpoints(const Session& s, const SipTrunk::Dialog* d, EmergencyEndpoints& out) const;
 	// Caller holds _mutex.
 	void publishRateExemptions();
 	// retire = the trunk was reconfigured: forget the old peer before looking the new one up.
 	void publishTrunkPeer(bool retire);
-	// Caller holds _rateMutex. True when the packet's Call-ID is a live emergency dialog's. Bare
-	// Call-ID values on both sides (the sessions are keyed on the whole "Call-ID: x" line).
+	// Caller holds _rateMutex. True when the packet's Call-ID is a live emergency dialog's AND
+	// its source IP is one of that dialog's endpoints. Bare Call-ID values on both sides (the
+	// sessions are keyed on the whole "Call-ID: x" line).
 	bool rateExemptByCallId(const SipMessage& m) const;
+	// Caller holds _rateMutex. A packet whose Call-ID is a live emergency dialog's but whose source is not
+	// one of its endpoints (a carrier pool node accepted on the dialog tags, a handset whose address
+	// changed before it re-REGISTERed) and that the ordinary buckets refused: a small budget shared by
+	// that dialog's entry, outside the bucket table. Everything beyond it is refused as before.
+	bool takeEmergencySpill(const SipMessage& m);
+	static constexpr double kEmergencySpillBurst  = 8.0;
+	static constexpr double kEmergencySpillPerSec = 1.0;
 
 	void endHandle(std::string_view destNumber, std::shared_ptr<SipMessage> message);
 	std::string buildContact(std::string_view number) const;
@@ -3490,6 +3532,8 @@ private:
 	uint32_t _trunkPeerIp = 0;   // network-order s_addr
 	EmergencyCallIds _emergencyCallIds;
 	EmergencyCallIds _emergencyIdsScratch;   // publishRateExemptions() build area; guarded by _mutex
+	// One spill bucket per _emergencyCallIds entry (same index), carried across a republish by Call-ID.
+	std::array<RateBucket, kMaxRateExemptCallIds> _emergencySpill{};   // guarded by _rateMutex
 	std::array<RateSource, kMaxRateRegisteredSources> _rateSources{};          // guarded by _rateMutex
 	std::array<RateSource, kMaxRateRegisteredSources> _rateSourcesScratch{};   // build area; guarded by _mutex
 	RateBucket _unregisteredEmergency{ kEmergencyInviteBurst, {} };   // guarded by _rateMutex
