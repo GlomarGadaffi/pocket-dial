@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include <arpa/inet.h>
+#include "net_compat.h"
 
 #include "LoopbackAnchorClient.hpp"
 #include "MediaBridge.hpp"
