@@ -15,6 +15,11 @@
 // would actually use — the same observable the bug hid from.
 
 #include <gtest/gtest.h>
+#include "AdminPinTestUtil.hpp"
+#include "CdrRing.hpp"
+#include "DtmfFeatureCodes.hpp"
+#include "FakePbxEnv.hpp"
+#include "PbxFeatureConfig.hpp"
 #include "RequestsHandler.hpp"
 #include "SipMessage.hpp"
 
@@ -67,6 +72,7 @@ namespace
 	                      const std::string& srcIp, const std::string& callId,
 	                      const std::string& seq)
 	{
+		adminpin_test::startEchoCall(handler, from, srcIp, callId);   // an INFO belongs to a live dialog
 		for (char c : seq)
 		{
 			handler.handle(makeInfoDigit(from, srcIp, callId, c));
@@ -153,17 +159,26 @@ TEST(DtmfClassCodes, Star73_ClearsForwardSetByStar72NNNN)
 
 TEST(DtmfClassCodes, Star72NNNN_RejectsVirtualExtensionAsTheConfiguredExtension)
 {
-	// Issue #77: setForward()'s "extension == 777/999" guard used to only
-	// apply to the HTTP-facing setter — the DTMF *72NNNN inline path skipped
-	// it. A crafted mid-dialog INFO with From: 777 must not be able to set up
-	// a forward entry on the virtual echo extension.
-	RequestsHandler handler("192.168.5.1", 5060,
-		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	// Issue #77: setForward()'s "extension == 777/999" guard used to only apply to the HTTP-facing
+	// setter -- the DTMF *72NNNN inline path skipped it. An INFO is now accepted only from a leg
+	// of its dialog, and no registered leg is 777, so the guard is reached directly through the
+	// collector: digits that act for 777 must not set up a forward entry on the virtual extension.
+	FakePbxEnv env;
+	PbxFeatureConfig cfg(env, [](PbxFeatureConfig::Table) {});
+	CdrRing cdr;
+	DtmfFeatureCodes dtmf(env, cfg, cdr);
 
-	sendDtmfSequence(handler, "777", "192.168.5.54", "dtmf-virt", "*725502");
-
-	for (const auto& [ext, always, busy, noAnswer, noAnswerSeconds] : handler.getForwards())
+	uint32_t tick = 1000;
+	for (char c : std::string("*725502"))
 	{
-		EXPECT_NE(ext, "777") << "virtual extension 777 must never get a forward entry";
+		dtmf.onDigit("Call-ID: dtmf-virt", c, DtmfFeatureCodes::DigitSource::Info, tick += 10, nullptr, "777");
 	}
+
+	EXPECT_TRUE(cfg.getForwardTarget("777", "always").empty()) << "virtual extension 777 must never get a forward entry";
+	size_t refusals = 0;
+	for (const auto& line : env.logs)
+	{
+		if (line == "Forward set ignored for virtual extension 777") ++refusals;
+	}
+	EXPECT_EQ(refusals, 1u) << "the guard, and nothing else, refused it";
 }
