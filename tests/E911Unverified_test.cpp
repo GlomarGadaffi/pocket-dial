@@ -8,7 +8,10 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <functional>
 #include <memory>
+#include <thread>
 #include <string>
 #include <utility>
 #include <vector>
@@ -331,6 +334,85 @@ TEST(E911Unverified, AVerifiedFormatIsUnchangedByTheNewArgument)
 	pbx::E911Config cfg;
 	cfg.callback = "2025550123";
 	cfg.location = "Front office";
-	EXPECT_EQ(pbx::formatE911Notification(false, "501", "911", false, true, cfg),
-		pbx::formatE911Notification(false, "501", "911", false, true, cfg, {}, false, {}));
+	const char* const golden =
+		"EMERGENCY: 911 dialed by ext 501 - ROUTED TO TRUNK - callback 2025550123 - Front office";
+	EXPECT_EQ(pbx::formatE911Notification(false, "501", "911", false, true, cfg), golden);
+	EXPECT_EQ(pbx::formatE911Notification(false, "501", "911", false, true, cfg, {}, false, {}), golden);
+}
+
+// The later notification for the SAME call: the anchor accepted the INVITE, then makeCall()
+// failed on its worker. routeEmergencyCall() had said ROUTED; the NOT ROUTED correction
+// must agree with it about who is calling from where.
+namespace
+{
+	bool waitUntil(const std::function<bool()>& done)
+	{
+		const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+		while (!done())
+		{
+			if (std::chrono::steady_clock::now() > until) return false;
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+		return true;
+	}
+
+	// The SIP thread's next pass drains _asyncOutbox; an OPTIONS from an unrelated host stands in.
+	void flushAsyncOutbox(UvBench& b)
+	{
+		b.handler->handle(RequestsHandler::getMessageFromPool(
+			"OPTIONS sip:server SIP/2.0
+"
+			"Via: SIP/2.0/UDP 192.168.9.98:5060;branch=z9hG4bKflush1127
+"
+			"From: <sip:probe@server>;tag=probe1127
+"
+			"To: <sip:server@server>
+"
+			"Call-ID: flush-1127
+"
+			"CSeq: 1 OPTIONS
+"
+			"Max-Forwards: 70
+"
+			"Content-Length: 0
+
+", uvAddr("192.168.9.98")));
+	}
+
+	// Dials 911 as 501 from `ip`, fails the worker's makeCall(), returns the NOT ROUTED bodies.
+	std::vector<std::string> notRoutedAfterMakeCallFails(const std::string& ip, const std::string& callId)
+	{
+		UvBench b;
+		b.handler->failTelCtlLaneForTest(RequestsHandler::kLaneSos);
+		b.handler->forceAsyncAnchorForTest(true);
+		b.handler->holdTelCtlForTest(true);
+		b.handler->handle(uvInvite("501", "911", ip, callId));
+		EXPECT_TRUE(waitUntil([&] { return b.handler->telCtlParkedForTest() == 1; }));
+		b.loopback()->stop();
+		b.handler->holdTelCtlForTest(false);
+		EXPECT_TRUE(waitUntil([&] { flushAsyncOutbox(b); return !b.responsesTo(ip).empty()
+			&& b.responsesTo(ip).back().find(" 503 ") != std::string::npos; }));
+		std::vector<std::string> out;
+		for (const std::string& n : b.notifications())
+		{
+			if (bodyOf(n).find("NOT ROUTED") != std::string::npos) out.push_back(bodyOf(n));
+		}
+		return out;
+	}
+}
+
+TEST(E911Unverified, ANotRoutedCorrectionForAnUnverifiedCallCarriesTheFlagAndSource)
+{
+	const auto nr = notRoutedAfterMakeCallFails(kOtherIp, "uv-nr-1");
+	ASSERT_EQ(nr.size(), 1u);
+	EXPECT_EQ(nr[0], std::string("EMERGENCY: 911 dialed by ext 501 - NOT ROUTED (the 3CX anchor could not "
+		"place the call) - callback not configured [CALLER UNVERIFIED: claimed ext 501, source 192.168.9.99:5060]"));
+}
+
+TEST(E911Unverified, ANotRoutedCorrectionForAVerifiedCallIsByteIdenticalToToday)
+{
+	const auto nr = notRoutedAfterMakeCallFails(kRegIp, "uv-nr-2");
+	ASSERT_EQ(nr.size(), 1u);
+	EXPECT_EQ(nr[0], std::string("EMERGENCY: 911 dialed by ext 501 - NOT ROUTED (the 3CX anchor could not "
+		"place the call) - callback not configured"));
 }

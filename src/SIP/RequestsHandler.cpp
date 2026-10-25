@@ -5103,6 +5103,7 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		{
 			s->second->setEmergency(true);
 			s->second->setEmergencyNumber(emergency.number);   // #879
+			if (!unverifiedSrc.empty()) s->second->setUnverifiedSource(data->getSource());   // #1127
 		}
 		// #659: opens this extension's PSAP callback window.
 		_emergencyCallbacks.note(caller->getNumber(), std::chrono::steady_clock::now());
@@ -6065,6 +6066,12 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 	{
 		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		queueLog("[Telephony] Failed to initiate outbound call to " + job.dest, true);
+		// #1127: read the unverified marker before endCall() drops the session.
+		std::string unverifiedSrc;
+		if (auto us = _sessions.find(job.callId); us != _sessions.end() && us->second && us->second->isUnverifiedCaller())
+		{
+			unverifiedSrc = sipwire::addrToIpPort(us->second->getUnverifiedSource());
+		}
 		// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
 		refuseRingingAnchor(job.callId, _asyncOutbox);
 		endCall(job.callId, job.callerNumber, job.dest, "anchor call fail");
@@ -6074,7 +6081,8 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 		// _asyncOutbox, as forceDisconnect() does (#714).
 		if (const pbx::EmergencyDial em = pbx::classifyEmergencyDial(job.dest); em.isEmergency)
 		{
-			notifyEmergency(em, job.callerNumber, job.dest, /*routed=*/false, kAnchorNotPlaced);
+			notifyEmergency(em, job.callerNumber, job.dest, /*routed=*/false, kAnchorNotPlaced,
+				/*callUp=*/false, unverifiedSrc);
 			for (auto& e : _outbox) _asyncOutbox.push_back(std::move(e));
 			_outbox.clear();
 		}
@@ -11811,7 +11819,9 @@ void RequestsHandler::tick()
 			{
 				notifyEmergency(pbx::classifyEmergencyDial(number), std::string(session->getSrc()->getNumber()),
 					std::string(number), /*routed=*/true,
-					"the audio to the anchor keeps failing; the call was not hung up", /*callUp=*/true);
+					"the audio to the anchor keeps failing; the call was not hung up", /*callUp=*/true,
+					session->isUnverifiedCaller()
+						? sipwire::addrToIpPort(session->getUnverifiedSource()) : std::string());
 			}
 		}
 		for (const auto& callID : degradedAnchorCallIds)

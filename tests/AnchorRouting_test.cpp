@@ -1072,13 +1072,14 @@ namespace
 			}};
 		MediaBridge* bridge = nullptr;
 
-		DegradedRig(const std::string& dialed, const std::string& callId)
+		DegradedRig(const std::string& dialed, const std::string& callId,
+			const std::string& inviteIp = "192.168.9.51")
 		{
 			handler.setAnchorPlacesRealCallsForTest(true);
 			handler.handle(makeRegister("501", "192.168.9.51", "reg-501"));
 			handler.handle(makeRegister("200", "192.168.9.20", "reg-200"));
 			handler.setE911Config("200", "", "");
-			handler.handle(makeInvite("501", dialed, "192.168.9.51", callId));
+			handler.handle(makeInvite("501", dialed, inviteIp, callId));
 			bridge = handler.anchorBridgeForCallIdForTest("Call-ID: " + callId);
 		}
 
@@ -1114,6 +1115,20 @@ namespace
 			return n;
 		}
 	};
+}
+
+TEST(AnchorRouting, ADegradedUnverified911ReportCarriesTheSameMarkerAsItsDispatch)
+{
+	// #1127: 501 registered from .51, the 911 came from .99.
+	DegradedRig rig("911", "anchor-1127-deg", "192.168.9.99");
+	ASSERT_NE(rig.bridge, nullptr);
+	ASSERT_TRUE(rig.degrade());
+	rig.sent.clear();
+	rig.handler.forceNextTickForTest();
+	rig.handler.tick();
+	EXPECT_EQ(rig.countContaining("192.168.9.20", "AUDIO DEGRADED"), 1);
+	EXPECT_EQ(rig.countContaining("192.168.9.20",
+		"[CALLER UNVERIFIED: claimed ext 501, source 192.168.9.99:5060]"), 1);
 }
 
 TEST(AnchorRouting, ADegradedConnected911Or933IsKeptUpAndReportedOnce)
