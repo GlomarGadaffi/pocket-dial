@@ -5308,11 +5308,11 @@ void RequestsHandler::raiseBootSlotAlert(std::chrono::steady_clock::time_point n
 		serviceBootFan(now);
 		return;
 	}
-	pd::BootTask task;
+	pd::BootTask task = pd::BootTask::TelSweep;
 	if (!pd::bootTaskSlots().alertDue(task)) return;
-	std::snprintf(_bootFan.text, sizeof _bootFan.text,
+	if (std::snprintf(_bootFan.text, sizeof _bootFan.text,
 		"DEGRADED: emergency-path task %s has no worker since boot (no stack); see /api/status telSweepWorker",
-		pd::BootTaskSlots::name(task));
+		pd::BootTaskSlots::name(task)) < 0) return;   // cannot fail for this format; checked for cert-err33-c
 	const pbx::E911Config& cfg = _cfg.e911Config();
 	std::size_t sent = 0;
 	if (!_e911Notifier.notifyDegraded(cfg, _bootFan.text, sent)) return;
