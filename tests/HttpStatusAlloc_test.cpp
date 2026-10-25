@@ -419,6 +419,14 @@ TEST(HttpStatusAlloc, TheBootAlertMessageWaitsForANotifyPhoneThenGoesOutExactlyO
 	tickTimes(*b.handler, 1);
 	EXPECT_EQ(b.messages, 0) << "nobody is registered at the first tick";
 	EXPECT_EQ(AlertCapture::frames().size(), 1u);
+	size_t waitAllocs = 1;
+	{
+		AllocGuard g;   // a tick that is only waiting for a notify phone
+		tickTimes(*b.handler, 1);
+		waitAllocs = g.delta();
+	}
+	EXPECT_EQ(waitAllocs, 0u) << "waiting costs a registration check, no allocation";
+	EXPECT_EQ(b.messages, 0);
 	b.handler->handle(makeRegister("200"));
 	tickTimes(*b.handler, 1);
 	EXPECT_EQ(b.messages, 1);
