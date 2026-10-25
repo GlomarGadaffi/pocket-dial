@@ -153,7 +153,7 @@ sequenceDiagram
 | Lamps | BLF through the `dialog` event package (RFC 4235) |
 | Board-terminated | Echo `777`, tone `440`, conference `888`, voicemail, hold music |
 | Routing | Ordered dial plan, up to 16 rules, first match wins |
-| Outside lines | Cloud media anchors (3CX, Apidaze). The direct carrier SIP trunk is shelved ([ADR-002](docs/ADR-002-PROGRAMMABLE-MEDIA-ANCHOR.md)) |
+| Outside lines | Cloud media anchors (3CX, Apidaze). The direct carrier SIP trunk is DEPRECATED and shelved; the anchor is the supported ITSP path ([ADR-002](docs/ADR-002-PROGRAMMABLE-MEDIA-ANCHOR.md)) |
 | Admin | Web dashboard, HTTP API, phone provisioning, OTA updates, outbound email |
 
 Not all of this has run on hardware yet. [FEATURE_ROADMAP.md](docs/FEATURE_ROADMAP.md) says which features are bench-proven and which have only passed the host tests.

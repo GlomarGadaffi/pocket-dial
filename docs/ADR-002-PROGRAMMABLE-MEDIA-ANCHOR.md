@@ -1,6 +1,6 @@
 # ADR-002: Programmable Media Anchor Interface for PSTN Interconnect
 
-Outside-line (PSTN) calls go through cloud media anchors behind one interface. The direct carrier SIP trunk is shelved.
+Outside-line (PSTN) calls go through cloud media anchors behind one interface. The direct carrier SIP trunk is DEPRECATED (#1133). The anchor is the supported ITSP path.
 
 ## Status
 
