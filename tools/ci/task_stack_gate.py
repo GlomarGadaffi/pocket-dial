@@ -333,12 +333,17 @@ def row_images(row):
 
 def images_ok(row, key):
     """#1117: an "image" names esp_main files that exist; an unknown one is refused, never ignored."""
+    def good(i):
+        return isinstance(i, str) and MAIN_VARIANT_RE.match(i) and os.path.isfile(os.path.join(REPO, i))
     imgs = row_images(row)
-    if imgs is None:
-        return True
-    if not (isinstance(imgs, list) and imgs and all(isinstance(i, str) and MAIN_VARIANT_RE.match(i)
-                                                    and os.path.isfile(os.path.join(REPO, i)) for i in imgs)):
-        print(f"FAIL row '{key}': image {imgs!r} is not a list of existing main/esp_main*.cpp files")
+    names = list(imgs) if isinstance(imgs, list) else [] if imgs is None else [None]
+    absent = row.get("absent") or {}
+    if imgs is not None and not (isinstance(imgs, list) and imgs):
+        names = [None]
+    names += list(absent) if isinstance(absent, dict) else [None]
+    if not all(good(i) for i in names):
+        print(f"FAIL row '{key}': image {imgs!r} / absent {list(absent) if isinstance(absent, dict) else absent!r} "
+              f"is not a list of existing main/esp_main*.cpp files")
         return False
     return True
 

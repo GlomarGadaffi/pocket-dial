@@ -1311,6 +1311,12 @@ class Gate(unittest.TestCase):
         rc, out = self.run_gate(main=self.ETH)
         self.assertEqual(rc, 1, out)
         self.assertIn("not a list of existing", out)
+        # an `absent` key is an image name too: a typo there would silently drop the exclusion
+        self.table["indirect_allowlist"] = {r"nothing\(": {"targets": [], "reason": "x",
+                                                               "absent": {"main/esp_main_eth_lan8702.cpp": ["a"]}}}
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not a list of existing", out)
 
     def test_an_image_scoped_indirect_row_is_not_checked_on_another_image(self):
         row = {"targets": [], "reason": "nothing installed"}
