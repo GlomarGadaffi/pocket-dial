@@ -323,6 +323,7 @@ def find_entry(nodes, pattern):
     return sorted(t for t in nodes if rx.search(pretty(nodes[t])))
 
 
+PROFILES = {"constrained"}     # build profiles of an image that CI gates apart from its default build (#1117)
 MAIN_VARIANT_RE = re.compile(r"^main/esp_main[^/]*\.cpp$")
 
 
@@ -334,7 +335,12 @@ def row_images(row):
 def images_ok(row, key):
     """#1117: an "image" names esp_main files that exist; an unknown one is refused, never ignored."""
     def good(i):
-        return isinstance(i, str) and MAIN_VARIANT_RE.match(i) and os.path.isfile(os.path.join(REPO, i))
+        # an image is an esp_main file, or "<file>@<profile>" for a build profile of that image
+        if not isinstance(i, str):
+            return False
+        main, _, prof = i.partition("@")
+        return bool(MAIN_VARIANT_RE.match(main) and os.path.isfile(os.path.join(REPO, main))
+                    and ("@" not in i or prof in PROFILES))
     imgs = row_images(row)
     names = list(imgs) if isinstance(imgs, list) else [] if imgs is None else [None]
     absent = row.get("absent") or {}
@@ -343,17 +349,36 @@ def images_ok(row, key):
     names += list(absent) if isinstance(absent, dict) else [None]
     if not all(good(i) for i in names):
         print(f"FAIL row '{key}': image {imgs!r} / absent {list(absent) if isinstance(absent, dict) else absent!r} "
-              f"is not a list of existing main/esp_main*.cpp files")
+              f"is not a list of existing main/esp_main*.cpp files (optionally @profile)")
         return False
     return True
 
 
-def applies(row, main_variant):
+def absent_ok(row, key):
+    """#1117: every `absent` value is a list of alternative names that one of the row's targets spells."""
+    absent = row.get("absent")
+    if absent is None:
+        return True
+    spelled = {a for pat in row.get("targets", ()) if isinstance(pat, str) for a, _ in alternatives(pat) if a}
+    if not (isinstance(absent, dict) and all(
+            isinstance(v, list) and v and all(isinstance(a, str) and a in spelled for a in v)
+            for v in absent.values())):
+        print(f"FAIL row '{key}': absent must map each image to a non-empty list of alternatives that "
+              f"the row's targets spell ({sorted(spelled)})")
+        return False
+    return True
+
+
+def applies(row, image):
     imgs = row_images(row)
-    return imgs is None or main_variant in imgs
+    return imgs is None or image in imgs
 
 
-def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=None):
+def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=None, profile=None):
+    image = main_variant + ("@" + profile if profile else "")      # what image-scoped rows are matched against
+    if profile is not None and profile not in PROFILES:
+        print(f"FAIL --profile {profile}: not one of {sorted(PROFILES)}")
+        return 1
     # #1117: a --main that names no esp_main file would skip every variant-bound row and pass.
     if not (MAIN_VARIANT_RE.match(main_variant) and os.path.isfile(os.path.join(REPO, main_variant))):
         print(f"FAIL --main {main_variant}: not a main/esp_main*.cpp file in the repo, so no variant would be gated")
@@ -392,7 +417,7 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             if not images_ok(row, k):
                 return 1
     for k, row in sorted(table.get("indirect_allowlist", {}).items()):
-        if isinstance(row, dict) and not images_ok(row, k):
+        if isinstance(row, dict) and not (images_ok(row, k) and absent_ok(row, k)):
             return 1
     names = {t["name"] for t in tasks}
     for k in sorted(known):
@@ -432,7 +457,7 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
     irows = table.get("indirect_allowlist", {})
     for k in sorted(irows):
         row = irows[k]
-        if isinstance(row, dict) and not applies(row, main_variant):
+        if isinstance(row, dict) and not applies(row, image):
             continue        # #1117: written for another image; says nothing here
         tg = row.get("targets") if isinstance(row, dict) else None
         if not (isinstance(tg, list) and all(isinstance(x, str) and x for x in tg)
@@ -468,10 +493,10 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                     here = find(re.compile(ap))
                     # #1117: "absent" {image: [alternative, ...]} names alternatives this image does not link.
                     # Such an alternative must still match nothing there: one that is linked is a stale entry.
-                    gone = a in (row.get("absent") or {}).get(main_variant, ())
+                    gone = a in (row.get("absent") or {}).get(image, ())
                     if gone and here:
                         rc_rows = 1
-                        print(f"FAIL indirect_allowlist row '{k}': alternative '{a}' is listed absent on {main_variant} but matches a function there: remove it from absent")
+                        print(f"FAIL indirect_allowlist row '{k}': alternative '{a}' is listed absent on {image} but matches a function there: remove it from absent")
                     elif not here and not gone:
                         rc_rows = 1
                         print(f"FAIL indirect_allowlist row '{k}': target alternative '{a}' (of '{pat}') matches no function, so it bounds nothing")
@@ -656,9 +681,9 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             # is below the cap, or the stack size differs from the row's) fails too and says what to change.
             kfs = known.get(t["name"])
             kfs = [r for r in (kfs if isinstance(kfs, list) else [kfs] if kfs else [])
-                   if applies(r, main_variant) and r.get("file") in (None, t["file"])]
+                   if applies(r, image) and r.get("file") in (None, t["file"])]
             if len(kfs) > 1:
-                print(f"FAIL known_findings: {len(kfs)} rows for '{t['name']}' apply to {main_variant} ({t['file']}): ambiguous")
+                print(f"FAIL known_findings: {len(kfs)} rows for '{t['name']}' apply to {image} ({t['file']}): ambiguous")
                 rc |= 1
             kf = kfs[0] if len(kfs) == 1 else None      # a row for another image or site covers nothing here
             stale = []          # a known row is a ratchet: these make the job fail, whatever the total
@@ -790,8 +815,9 @@ def main():
                     help="the esp_main variant linked into the image the .ci files came from")
     ap.add_argument("--with", dest="features", action="append", default=[],
                     help="a build feature this image has (heap_trace); repeatable")
+    ap.add_argument("--profile", default=None, help="the build profile of the image (constrained); image-scoped rows name it as <main>@<profile>")
     a = ap.parse_args()
-    return run(a.ci_dir, a.table, a.src_root, a.main, tuple(a.features), a.project_root)
+    return run(a.ci_dir, a.table, a.src_root, a.main, tuple(a.features), a.project_root, a.profile)
 
 
 if __name__ == "__main__":

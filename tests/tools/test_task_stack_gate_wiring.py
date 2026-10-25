@@ -30,7 +30,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 JOB = "stack-depth-gate"
 FLAGS = "-fcallgraph-info=su -fstack-usage"
 IF = "${{ !cancelled() && needs.site-gate.outputs.code != 'false' }}"
-GATE_CMD = 'python3 tools/ci/task_stack_gate.py --ci-dir build/esp-idf --project-root "$GITHUB_WORKSPACE" --main ${{ matrix.main }}'
+GATE_CMD = 'python3 tools/ci/task_stack_gate.py --ci-dir build/esp-idf --project-root "$GITHUB_WORKSPACE" --main ${{ matrix.main }} ${{ matrix.gate-args }}'
 
 
 def code(path):
@@ -121,8 +121,8 @@ class StackGateWiring(unittest.TestCase):
         # IDF reads EXTRA_C*FLAGS in project.cmake when CMake configures, and set-target is the
         # first configure of this job's build dir (also with a restored cache: it always reruns CMake).
         run = self.build[self.build.index("run: |"):] + "\n"
-        lines = ["          . $IDF_PATH/export.sh", "          idf.py set-target ${{ matrix.chip }}",
-                 "          idf.py -D SIP_TRANSPORT=${{ matrix.transport }} build"]
+        lines = ["          . $IDF_PATH/export.sh", "          idf.py ${{ matrix.args }} set-target ${{ matrix.chip }}",
+                 "          idf.py -D SIP_TRANSPORT=${{ matrix.transport }} ${{ matrix.args }} build"]
         at = [run.find("\n" + ln + "\n") for ln in lines]
         self.assertNotIn(-1, at, "export.sh, set-target and the build, each on a line of its own")
         self.assertEqual(at, sorted(at))

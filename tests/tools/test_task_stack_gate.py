@@ -1318,6 +1318,46 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("not a list of existing", out)
 
+    def test_absent_values_must_be_lists_of_alternatives_the_row_spells(self):
+        self.indirect_fixture()
+        for bad in ("gone", ["gon"], [], ["gone", 7], {"gone": 1}):
+            with self.subTest(bad=bad):
+                self.table["indirect_allowlist"] = {r"void mid\(\)": {
+                    "targets": [r"SlowSink::(?:write|gone)\("], "reason": "fixture", "absent": {self.DISP: bad}}}
+                rc, out = self.run_gate(main=self.DISP)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("absent must map each image to a non-empty list", out)
+
+    CON = "main/esp_main_eth_lan8720.cpp"
+
+    def run_profile(self, profile):
+        p = os.path.join(self.tmp.name, "t.json")
+        json.dump(self.table, open(p, "w"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = g.run(self.ci, p, self.tmp.name, self.CON, (), None, profile)
+        return rc, out.getvalue()
+
+    def test_a_profile_is_its_own_image_for_scoped_rows(self):
+        self.known_big([{"max_total": 1900, "bytes": 2000, "image": [self.CON], "reason": "#1116"},
+                        {"max_total": 1900, "bytes": 2000, "image": [self.CON + "@constrained"], "reason": "#1116"}])
+        for profile in (None, "constrained"):
+            rc, out = self.run_profile(profile)
+            self.assertEqual(rc, 0, out)                 # each image meets exactly one row: not ambiguous
+        self.table["known_findings"]["big"][1]["max_total"] = 1899
+        rc, out = self.run_profile("constrained")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.run_profile(None)[0], 0)   # the default image is untouched by the constrained row
+
+    def test_an_unknown_profile_is_refused(self):
+        rc, out = self.run_profile("tiny")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("--profile tiny", out)
+        self.known_big({"max_total": 1900, "bytes": 2000, "image": [self.CON + "@tiny"], "reason": "#1116"})
+        rc, out = self.run_profile(None)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not a list of existing", out)
+
     def test_an_image_scoped_indirect_row_is_not_checked_on_another_image(self):
         row = {"targets": [], "reason": "nothing installed"}
         self.table["indirect_allowlist"] = {r"nothing_here\(": dict(row)}

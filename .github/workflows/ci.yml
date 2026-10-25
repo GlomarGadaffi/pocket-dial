@@ -761,7 +761,7 @@ jobs:
   # cannot build or cannot run the gate is red, never skipped (fail-fast is off so
   # one red leg does not hide the other three).
   stack-depth-gate:
-    name: "Stack Depth Gate (${{ matrix.chip }} / ${{ matrix.transport }}, #457)"
+    name: "Stack Depth Gate (${{ matrix.slug }}, #457)"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -770,15 +770,28 @@ jobs:
           - chip: esp32s3
             transport: eth
             main: main/esp_main_eth.cpp
+            slug: esp32s3-eth
           - chip: esp32
             transport: lan8720
             main: main/esp_main_eth_lan8720.cpp
+            slug: esp32-lan8720
           - chip: esp32s3
             transport: wifi
             main: main/esp_main.cpp
+            slug: esp32s3-wifi
           - chip: esp32s3
             transport: display
             main: main/esp_main_display.cpp
+            slug: esp32s3-display
+          # build-constrained's image: the 4 MB no-PSRAM profile, where tel_sweep and tel_ctl keep their
+          # stacks in internal DRAM (#1116). Same esp_main file as lan8720, its own build and its own rows.
+          - chip: esp32
+            transport: lan8720
+            main: main/esp_main_eth_lan8720.cpp
+            profile: constrained
+            slug: constrained-esp32-lan8720
+            args: -D SIP_CONSTRAINED=1 -D SIP_OUTSIDE_LINE=anchor -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32_constrained"
+            gate-args: --profile constrained
     needs: site-gate
     if: ${{ !cancelled() && needs.site-gate.outputs.code != 'false' }}
     container:
@@ -801,9 +814,9 @@ jobs:
         with:
           # No ~/.ccache: IDF_CCACHE_ENABLE=0 below, so nothing writes to it.
           path: build
-          key: ${{ runner.os }}-idf-callgraph-su-v6.0.1-${{ matrix.chip }}-${{ matrix.transport }}-${{ github.sha }}
+          key: ${{ runner.os }}-idf-callgraph-su-v6.0.1-${{ matrix.slug }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-idf-callgraph-su-v6.0.1-${{ matrix.chip }}-${{ matrix.transport }}-
+            ${{ runner.os }}-idf-callgraph-su-v6.0.1-${{ matrix.slug }}-
 
       - name: Export Environment & Build Firmware with call-graph flags
         env:
@@ -814,11 +827,11 @@ jobs:
           IDF_CCACHE_ENABLE: "0"
         run: |
           . $IDF_PATH/export.sh
-          idf.py set-target ${{ matrix.chip }}
-          idf.py -D SIP_TRANSPORT=${{ matrix.transport }} build
+          idf.py ${{ matrix.args }} set-target ${{ matrix.chip }}
+          idf.py -D SIP_TRANSPORT=${{ matrix.transport }} ${{ matrix.args }} build
 
       - name: Per-task stack depth gate (#457)
-        run: python3 tools/ci/task_stack_gate.py --ci-dir build/esp-idf --project-root "$GITHUB_WORKSPACE" --main ${{ matrix.main }}
+        run: python3 tools/ci/task_stack_gate.py --ci-dir build/esp-idf --project-root "$GITHUB_WORKSPACE" --main ${{ matrix.main }} ${{ matrix.gate-args }}
 
   # Job 2b: Heap-poisoning build.
   # The shipped default is HEAP_POISONING_LIGHT, which only checks an
