@@ -1176,3 +1176,33 @@ TEST(AttendedTransfer, SpliceReinvitesTryingIsNotRelayedToTheDroppedTransferor)
 	EXPECT_EQ(rig.sent.size(), 0u);
 	EXPECT_EQ(countContaining(rig.sent, rig.aAddr, ""), 0u);
 }
+
+// #1123: an attended-transfer bridge is not a spliced pair; an admin kill of the
+// consulted party keeps the teardown the transfer code owns.
+TEST(AttendedTransfer, KillingABridgePartyDoesNotUseTheSplicedPairTeardown)
+{
+	Rig rig;
+	setUpSplicedCalls(rig);
+	sendAttendedRefer(rig);
+	rig.sent.clear();
+	ASSERT_TRUE(rig.handler->forceDisconnect("106"));
+	rig.handler->handle(RequestsHandler::getMessageFromPool(
+		"OPTIONS sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.40.99:5060;branch=z9hG4bKflush1123\r\n"
+		"From: <sip:probe@server>;tag=probetag\r\n"
+		"To: <sip:server@server>\r\n"
+		"Call-ID: flush-1123\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 70\r\n"
+		"Content-Length: 0\r\n\r\n", rig.aAddr));
+	size_t byes = 0, toB = 0, toA = 0;
+	for (auto& [ad, m] : rig.sent)
+	{
+		if (m->toString().rfind("BYE ", 0) != 0) continue;
+		++byes;
+		if (ad.sin_addr.s_addr == rig.bAddr.sin_addr.s_addr) ++toB;
+		if (ad.sin_addr.s_addr == rig.aAddr.sin_addr.s_addr) ++toA;
+	}
+	// Unchanged from before #1123: the transfer code, not the pair rule, owns this.
+	EXPECT_EQ(byes, 2u);
+	EXPECT_EQ(toB, 1u);
+	EXPECT_EQ(toA, 1u);
+}

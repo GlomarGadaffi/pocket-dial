@@ -922,3 +922,122 @@ TEST(DeregisterMidCall, ACallerDeregisteringWhileARingAllGroupRingsCancelsEveryM
 {
 	expectGroupCancelledOnCallerDeregister("ringall", 2u);
 }
+
+// ── #1123: a park retrieve is two sessions, one per dialog ───────────────────
+// 100 parks on 700 (Call-ID pk1); 106 retrieves it (pk2). The retrieve session's
+// dest is a stand-in carrying the parked phone's number and address, so a kill
+// must BYE each phone on ITS OWN Call-ID and end both sessions.
+namespace
+{
+	void sendParkInvite(RequestsHandler& h, const std::string& ext, const std::string& ip,
+	                    const std::string& callId)
+	{
+		const std::string body = sdpBody(ip);
+		std::string raw =
+			"INVITE sip:700@server SIP/2.0\r\n"
+			"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKp" + callId + "\r\n"
+			"From: <sip:" + ext + "@server>;tag=ptag" + callId + "\r\n"
+			"To: <sip:700@server>\r\n"
+			"Call-ID: " + callId + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Max-Forwards: 70\r\n"
+			"Contact: <sip:" + ext + "@" + ip + ":5060>\r\n"
+			"Content-Type: application/sdp\r\n"
+			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+		h.handle(RequestsHandler::getMessageFromPool(raw, addrFor(ip)));
+	}
+
+	void parkAndRetrieve(Rig& rig)
+	{
+		sendParkInvite(rig.handler, "100", kCallerIp, "pk1");
+		sendParkInvite(rig.handler, "106", kCalleeIp, "pk2");
+		ASSERT_TRUE(rig.handler.getSession("Call-ID: pk1").has_value()) << "precondition: park session";
+		ASSERT_TRUE(rig.handler.getSession("Call-ID: pk2").has_value()) << "precondition: retrieve session";
+	}
+
+	size_t byesOn(const Sent& sent, const char* ip, const std::string& callId)
+	{
+		size_t n = 0;
+		for (const auto& raw : byesTo(sent, addrFor(ip)))
+			if (headerValue(raw, "Call-ID") == callId) ++n;
+		return n;
+	}
+}
+
+TEST(ForceDisconnect, KillingAParkRetrieverByesTheParkedPhoneOnTheParkCallId)
+{
+	Rig rig;
+	parkAndRetrieve(rig);
+	rig.sent.clear();
+	ASSERT_TRUE(rig.handler.forceDisconnect("106"));
+	flushAsyncOutbox(rig.handler);
+	EXPECT_EQ(byesOn(rig.sent, kCalleeIp, "pk2"), 1u);
+	EXPECT_EQ(byesOn(rig.sent, kCallerIp, "pk1"), 1u);
+	EXPECT_EQ(byesOn(rig.sent, kCallerIp, "pk2"), 0u);
+	size_t total = 0;
+	for (const auto& [a, m] : rig.sent)
+		if (m && m->toString().rfind("BYE ", 0) == 0) ++total;
+	EXPECT_EQ(total, 2u);
+}
+
+TEST(ForceDisconnect, KillingAParkRetrieverEndsTheParkSession)
+{
+	Rig rig;
+	parkAndRetrieve(rig);
+	ASSERT_TRUE(rig.handler.cdrSnapshotForTest().empty());
+	ASSERT_TRUE(rig.handler.forceDisconnect("106"));
+	flushAsyncOutbox(rig.handler);
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: pk1").has_value());
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: pk2").has_value());
+	EXPECT_EQ(rig.handler.cdrSnapshotForTest().size(), 2u);
+}
+
+TEST(ForceDisconnect, KillingTheParkedPartyEndsTheRetrieveToo)
+{
+	Rig rig;
+	parkAndRetrieve(rig);
+	rig.sent.clear();
+	ASSERT_TRUE(rig.handler.forceDisconnect("100"));
+	flushAsyncOutbox(rig.handler);
+	EXPECT_EQ(byesOn(rig.sent, kCalleeIp, "pk1"), 0u);
+	EXPECT_EQ(byesOn(rig.sent, kCalleeIp, "pk2"), 1u);
+	EXPECT_EQ(byesOn(rig.sent, kCallerIp, "pk1"), 1u);
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: pk1").has_value());
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: pk2").has_value());
+}
+
+TEST(ForceDisconnect, AnEmergencyPeerStillRefusesTheKill)
+{
+	Rig rig;
+	parkAndRetrieve(rig);
+	auto peer = rig.handler.getSession("Call-ID: pk1");
+	ASSERT_TRUE(peer.has_value());
+	peer.value()->setEmergency(true);
+	rig.sent.clear();
+	EXPECT_FALSE(rig.handler.forceDisconnect("106"));
+	flushAsyncOutbox(rig.handler);
+	// A refused kill queues nothing at all, and both sessions stay up.
+	size_t toPhones = 0;   // the probe's own reply goes to kOtherIp; nothing may go anywhere else
+	for (const auto& [a, m] : rig.sent)
+		if (m && !sameAddr(a, addrFor(kOtherIp))) ++toPhones;
+	EXPECT_EQ(toPhones, 0u);
+	EXPECT_TRUE(rig.handler.getSession("Call-ID: pk1").has_value());
+	EXPECT_TRUE(rig.handler.getSession("Call-ID: pk2").has_value());
+}
+
+// A dangling peerCallID (the peer session is gone) must not send the stand-in dest a
+// BYE on this session's own Call-ID: the parked phone does not hold it (481).
+TEST(ForceDisconnect, ADanglingPeerCallIdNeverByesTheStandInOnTheSessionsOwnDialog)
+{
+	Rig rig;
+	parkAndRetrieve(rig);
+	auto retrieve = rig.handler.getSession("Call-ID: pk2");
+	ASSERT_TRUE(retrieve.has_value());
+	retrieve.value()->setPeerCallID("Call-ID: gone");
+	rig.sent.clear();
+	ASSERT_TRUE(rig.handler.forceDisconnect("106"));
+	flushAsyncOutbox(rig.handler);
+	EXPECT_EQ(byesOn(rig.sent, kCalleeIp, "pk2"), 1u);
+	EXPECT_EQ(byesOn(rig.sent, kCallerIp, "pk2"), 0u);
+	EXPECT_FALSE(rig.handler.getSession("Call-ID: pk2").has_value());
+}
