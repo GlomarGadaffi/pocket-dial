@@ -1232,6 +1232,72 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 1, out)                     # the task is at src/SIP/X.cpp: not covered
         self.assertIn("FAIL big: 1900 B", out)
 
+    # #1117: rows scoped to one esp_main image.
+    ETH, DISP = "main/esp_main_eth.cpp", "main/esp_main_display.cpp"
+
+    def known_big(self, rows):
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["bytes"] = 2000
+        self.table["known_findings"] = {"big": rows}
+
+    def test_an_image_scoped_known_row_covers_only_its_image(self):
+        self.known_big({"max_total": 1900, "bytes": 2000, "image": self.DISP, "reason": "#1116"})
+        rc, out = self.run_gate(main=self.DISP)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("KNOWN big: 1900 B", out)
+        rc, out = self.run_gate(main=self.ETH)          # not its image: no cover, and no stale complaint
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL big: 1900 B", out)
+        self.assertNotIn("stale", out)
+
+    def test_an_image_scoped_row_does_not_go_stale_on_another_image(self):
+        # fits on eth (4096 B): the row for display must not say "remove the row" there
+        self.table["known_findings"] = {"big": {"max_total": 1900, "bytes": 2000, "image": self.DISP, "reason": "#1116"}}
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("stale", out)
+
+    def test_a_per_image_cap_passes_at_its_total_and_fails_one_over(self):
+        self.known_big([{"max_total": 1900, "bytes": 2000, "image": self.ETH, "reason": "#1116"},
+                        {"max_total": 1899, "bytes": 2000, "image": self.DISP, "reason": "#1116"}])
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 0, out)                    # at its total
+        rc, out = self.run_gate(main=self.DISP)
+        self.assertEqual(rc, 1, out)                    # cap 1899 < total 1900
+        self.assertIn("FAIL big: 1900 B", out)
+        self.assertIn("deeper than the known finding's 1899 B", out)
+
+    def test_two_rows_for_one_image_are_ambiguous(self):
+        self.known_big([{"max_total": 1900, "bytes": 2000, "image": self.ETH, "reason": "#1116"},
+                        {"max_total": 1900, "bytes": 2000, "reason": "#1116"}])
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ambiguous", out)
+
+    def test_a_row_with_an_unknown_image_is_refused(self):
+        self.known_big({"max_total": 1900, "bytes": 2000, "image": "main/esp_main_nope.cpp", "reason": "#1116"})
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not a list of existing main/esp_main*.cpp files", out)
+        self.table["known_findings"] = {}
+        self.table["indirect_allowlist"] = {r"nothing\(": {"targets": [], "reason": "x", "image": "nope"}}
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not a list of existing", out)
+
+    def test_an_image_scoped_indirect_row_is_not_checked_on_another_image(self):
+        row = {"targets": [], "reason": "nothing installed"}
+        self.table["indirect_allowlist"] = {r"nothing_here\(": dict(row)}
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 1, out)                    # unscoped: matches no indirect-call function
+        self.assertIn("matches no function that makes an indirect call", out)
+        self.table["indirect_allowlist"] = {r"nothing_here\(": dict(row, image=self.DISP)}
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_gate(main=self.DISP)
+        self.assertEqual(rc, 1, out)                    # on its own image it still fails closed
+
     def test_a_known_row_without_a_recorded_budget_is_refused(self):
         self.table["known_findings"] = {"big": {"max_total": 1900, "reason": "#1116"}}
         rc, out = self.run_gate()

@@ -326,6 +326,28 @@ def find_entry(nodes, pattern):
 MAIN_VARIANT_RE = re.compile(r"^main/esp_main[^/]*\.cpp$")
 
 
+def row_images(row):
+    img = row.get("image")
+    return None if img is None else ([img] if isinstance(img, str) else img)
+
+
+def images_ok(row, key):
+    """#1117: an "image" names esp_main files that exist; an unknown one is refused, never ignored."""
+    imgs = row_images(row)
+    if imgs is None:
+        return True
+    if not (isinstance(imgs, list) and imgs and all(isinstance(i, str) and MAIN_VARIANT_RE.match(i)
+                                                    and os.path.isfile(os.path.join(REPO, i)) for i in imgs)):
+        print(f"FAIL row '{key}': image {imgs!r} is not a list of existing main/esp_main*.cpp files")
+        return False
+    return True
+
+
+def applies(row, main_variant):
+    imgs = row_images(row)
+    return imgs is None or main_variant in imgs
+
+
 def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=None):
     # #1117: a --main that names no esp_main file would skip every variant-bound row and pass.
     if not (MAIN_VARIANT_RE.match(main_variant) and os.path.isfile(os.path.join(REPO, main_variant))):
@@ -354,10 +376,18 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
                 cfg_rc = 1
     tasks = table["tasks"]
     known = table.get("known_findings", {})
-    for k, row in sorted(known.items()):
-        if not (isinstance(row.get("max_total"), int) and row["max_total"] >= 1 and row.get("reason")
-                and isinstance(row.get("bytes"), int) and row["bytes"] >= 1):
-            print(f"FAIL known_findings row '{k}': needs a whole-number max_total >= 1, the stack `bytes` it was written for, and a reason")
+    # A known_findings value is one row or a list of rows (a task whose total differs per image has one
+    # row per image). A row with an "image" (an esp_main file, or a list of them) applies to those images only.
+    for k, v in sorted(known.items()):
+        for row in (v if isinstance(v, list) else [v]):
+            if not (isinstance(row.get("max_total"), int) and row["max_total"] >= 1 and row.get("reason")
+                    and isinstance(row.get("bytes"), int) and row["bytes"] >= 1):
+                print(f"FAIL known_findings row '{k}': needs a whole-number max_total >= 1, the stack `bytes` it was written for, and a reason")
+                return 1
+            if not images_ok(row, k):
+                return 1
+    for k, row in sorted(table.get("indirect_allowlist", {}).items()):
+        if isinstance(row, dict) and not images_ok(row, k):
             return 1
     names = {t["name"] for t in tasks}
     for k in sorted(known):
@@ -397,6 +427,8 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
     irows = table.get("indirect_allowlist", {})
     for k in sorted(irows):
         row = irows[k]
+        if isinstance(row, dict) and not applies(row, main_variant):
+            continue        # #1117: written for another image; says nothing here
         tg = row.get("targets") if isinstance(row, dict) else None
         if not (isinstance(tg, list) and all(isinstance(x, str) and x for x in tg)
                 and isinstance(row.get("reason"), str) and row["reason"].strip()):
@@ -610,9 +642,13 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             # something new. It holds only while the chain is no deeper than the recorded max_total; a
             # deeper chain is a new finding and fails. A ratchet: a stale row (the task fits again, the total
             # is below the cap, or the stack size differs from the row's) fails too and says what to change.
-            kf = known.get(t["name"])
-            if kf and kf.get("file") not in (None, t["file"]):
-                kf = None       # written for another site (another esp_main variant): it covers nothing here
+            kfs = known.get(t["name"])
+            kfs = [r for r in (kfs if isinstance(kfs, list) else [kfs] if kfs else [])
+                   if applies(r, main_variant) and r.get("file") in (None, t["file"])]
+            if len(kfs) > 1:
+                print(f"FAIL known_findings: {len(kfs)} rows for '{t['name']}' apply to {main_variant} ({t['file']}): ambiguous")
+                rc |= 1
+            kf = kfs[0] if len(kfs) == 1 else None      # a row for another image or site covers nothing here
             stale = []          # a known row is a ratchet: these make the job fail, whatever the total
             if kf and kf["bytes"] != t["bytes"]:
                 stale.append(f"known finding was written for a {kf['bytes']} B stack, the site now has {t['bytes']} B: "
