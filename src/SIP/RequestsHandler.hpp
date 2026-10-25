@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <atomic>
 #include <chrono>
+#include "BootTaskSlots.hpp"   // #1126: pd::BootTask for the boot alert fan-out
 #include <array>
 #include <thread>   // host-build async anchor-start worker (_anchorStartThread below)
 #include <condition_variable>   // host-build tel_ctl pool (#657)
@@ -178,6 +179,8 @@ public:
 	bool forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
 	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
+	// INFO requests not acted on for want of a live dialog (answered 200) or a matching leg (403).
+	uint32_t getInfoRefused() const { return _infoRefused.load(std::memory_order_relaxed); }
 	// Issue #430: packetsDropped split by reason (their sum), and the probe
 	// itself for its recent-drop ring (read with window()/at(); thread-safe,
 	// allocation-free on both sides).
@@ -586,6 +589,12 @@ public:
 		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_emergencyCallbacks.ageForTest(d);
 	}
+	// Test-only (#1127): whether `ext`'s PSAP callback window is open.
+	bool emergencyCallbackOpenForTest(std::string_view ext)
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		return isEmergencyCallback(ext);
+	}
 	// Test-only (#1115): move every unknown-caller coalescing window `d` into the past.
 	void ageUnknownEmergencyAlertsForTest(std::chrono::steady_clock::duration d)
 	{
@@ -650,6 +659,8 @@ public:
 	// #463: tick() runs at most once a second; this lets a test drive two passes
 	// back to back (the second is the steady-state one an AllocGuard measures).
 	void forceNextTickForTest() { _lastTick = {}; }
+	// #1126: shorten the boot alert's MESSAGE retry limit (10 minutes in service).
+	void setBootAlertLimitForTest(std::chrono::milliseconds limit) { std::lock_guard<pd::TimedMutex> lk(_mutex); _bootFanLimit = limit; }
 	// #1092: the shared unregistered emergency INVITE budget as it stands, untouched by any
 	// packet. It must start FULL: a bucket stamped at the clock epoch refills from boot on ESP.
 	double unregisteredEmergencyTokensForTest()
@@ -663,6 +674,14 @@ public:
 	{
 		std::lock_guard<std::mutex> rlock(_rateMutex);
 		_rateBuckets.erase(netIp);
+	}
+	// Refill a registered extension's reserved limiter bucket (network-order s_addr) to its burst.
+	// A test that sends several whole entries from the one address a dialog's INFO must come from
+	// would otherwise run out of the 40-packet burst, which a person at a keypad never does.
+	void refillRateSourceForTest(uint32_t netIp)
+	{
+		std::lock_guard<std::mutex> rlock(_rateMutex);
+		if (RateSource* r = findRateSource(netIp)) r->ordinary = { 40.0, std::chrono::steady_clock::now() };
 	}
 	// #986: hold _mutex for `d`, as a slow NVS commit or PIN hash would. Host builds
 	// only. Defined in the .cpp so every call is one site however the caller is inlined.
@@ -936,6 +955,16 @@ public:
 	{
 		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		return _tapiConfig.secretWrites();
+	}
+
+	// Test-only (#1136): the live in-RAM client secret of slot `idx`, "" when out of range.
+	// Where the host store does not persist (_WIN32) this is the only place to see that an
+	// import left the secret alone.
+	std::string telephonySecretForTest(size_t idx)
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		const TelephonyApiConfig::Slot* s = _tapiConfig.bootSlot(idx);
+		return s ? s->secret : std::string();
 	}
 
 	// Test-only: seed one CDR record directly (bypassing a real call flow) and
@@ -2096,7 +2125,7 @@ private:
 	// false, or the anchor a trunk call stood in for.
 	void notifyEmergency(const pbx::EmergencyDial& emergency,
 		const std::string& fromExt, const std::string& dialed, bool routed,
-		std::string_view note = {}, bool callUp = false);
+		std::string_view note = {}, bool callUp = false, std::string_view unverifiedSource = {});
 
 	// #1107: `noRelayableCodec` is set by onInvite's relay codec gate for an emergency
 	// INVITE whose offer this PBX cannot carry. It skips the route and goes straight to
@@ -2123,6 +2152,20 @@ private:
 	// window ended with no further dial. Notices are coalesced per (source, number), so this
 	// is the "N more since" summary, not a repeat alert. Caller holds _mutex.
 	void flushUnknownEmergencyTallies(std::chrono::steady_clock::time_point now);
+	void raiseBootSlotAlert(std::chrono::steady_clock::time_point now);   // #1126: the one boot alert for an absent emergency-path task
+	// #1126: the boot alert's MESSAGE fan-out. The syslog frame goes once; the MESSAGEs retry each tick
+	// (only a registration check while waiting, no allocation) until one is enqueued, the notify list is
+	// empty, or kBootFanLimit passes (then one witness line and the retries stop).
+	struct BootFan
+	{
+		bool                                  pending = false;
+		pd::BootTask                          task{};
+		std::chrono::steady_clock::time_point since{};
+		char                                  text[160] = {};
+	};
+	BootFan                   _bootFan;                                  // under _mutex
+	std::chrono::milliseconds _bootFanLimit{std::chrono::minutes(10)};   // under _mutex
+	void serviceBootFan(std::chrono::steady_clock::time_point now);
 
 	// #659: a call to `ext` is a PSAP callback (ext dialed 911/933 within
 	// pbx::kEmergencyCallbackWindow). Every path that creates a session for an
@@ -2205,6 +2248,11 @@ private:
 	// The RTP address an offer or answer names, only when its c= is a dotted
 	// quad that is neither 0.0.0.0 nor broadcast: a relay is never aimed at one.
 	bool trunkInboundRtp(const std::shared_ptr<SipMessage>& m, sockaddr_in& out);
+	// #873: trunkInboundRtp() for an ordinary call; a PSAP callback is taken at any dotted-quad address.
+	bool trunkCarrierRtp(const std::shared_ptr<SipMessage>& m, bool psapCallback, sockaddr_in& out);
+	// The fork INVITE to the handset, or the end of the call if it cannot be drawn.
+	void sendTrunkFork(Session& session, const std::shared_ptr<SipClient>& handset, int slot,
+		int dtmfPt, const std::string& callId, const std::string& caller);
 	// #398 part D. A request in the fork's own INVITE transaction (the INVITE,
 	// or its CANCEL, RFC 3261 s9.1): one Request-URI, Via branch, From and To.
 	std::shared_ptr<SipMessage> trunkForkRequest(const Session& s, const SipClient& handset,
@@ -2406,6 +2454,8 @@ private:
 	// instead. False (job deleted) when that lane is full or has none either.
 	bool postTelCtl(TelCtlJob* job, TelLane lane);
 	void runTelCtl(const TelCtlJob& job);
+	// The makeCall() failure tail of runTelCtl (503, endCall, NOT ROUTED); see its definition.
+	void onTelCtlMakeCallFailed(const TelCtlJob& job);
 #if defined(ESP_PLATFORM) || defined(ESP32)
 	struct TelCtlQueue
 	{
@@ -2536,30 +2586,72 @@ private:
 	//   (a) the configured trunk's resolved IPv4 (a PSAP calls back, and the
 	//       carrier signals a live 911, from the one carrier IP); and
 	//   (b) the Call-IDs of live emergency sessions (and the trunk dialog's own
-	//       Call-ID for the same call), so an in-dialog BYE/ACK/re-INVITE from
-	//       any source gets through. A Call-ID is not spoofable into the set:
-	//       it is only ever added from a session the engine itself marked
+	//       Call-ID for the same call), each with the endpoints that dialog belongs
+	//       to: the legs' registered IPv4 addresses, plus the trunk dialog's peer.
+	//       A packet is exempt only when its Call-ID is in the set AND its source
+	//       IP (port ignored) is one of that entry's endpoints; any other source
+	//       takes the ordinary buckets, then the entry's small shared budget
+	//       (takeEmergencySpill), which keeps a node whose address is not known
+	//       ahead of its packet from being dropped outright. A Call-ID is not spoofable into
+	//       the set: it is only ever added from a session the engine itself marked
 	//       emergency, never from a header on a packet.
 	static constexpr size_t kMaxRateExemptCallIds  = 2 * POCKETDIAL_MAX_SESSIONS;
 	static constexpr size_t kRateExemptCallIdBytes = SipLimits::kMaxCallIdLine + 1;
+	// Worst case: every ringing target of a callback fork, both legs, and the trunk dialog's peer,
+	// next hop and remote target. Nothing is silently dropped: the cap covers all of them.
+	static constexpr size_t kMaxRateExemptEndpoints = static_cast<size_t>(POCKETDIAL_MAX_CLIENTS) + 5;
 	static_assert(kMaxRateExemptCallIds <= 255, "EmergencyCallIds::count/len are uint8_t");
 	static_assert(kRateExemptCallIdBytes <= 256, "EmergencyCallIds::len is uint8_t");
+	static_assert(kMaxRateExemptEndpoints <= 255, "EmergencyEndpoints::count is uint8_t");
+	struct EmergencyEndpoints
+	{
+		std::array<uint32_t, kMaxRateExemptEndpoints> ip{};   // network-order s_addr, never 0
+		uint8_t count = 0;
+		bool    viaTrunk = false;   // the live trunk peer (_trunkPeerIp) is an endpoint too
+	};
 	struct EmergencyCallIds
 	{
 		std::array<std::array<char, kRateExemptCallIdBytes>, kMaxRateExemptCallIds> id{};
 		std::array<uint8_t, kMaxRateExemptCallIds> len{};   // bytes used in id[i], no NUL counted
+		std::array<EmergencyEndpoints, kMaxRateExemptCallIds> ep{};
 		uint8_t count = 0;
 	};
-	static bool emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId);
+	// Size. Measured sizeof(EmergencyCallIds): 4500 B with the default pools (32 clients, 8
+	// sessions), 1484 B with the constrained ones (8 clients, 4 sessions). It exists twice, the
+	// live set and the build scratch, and the spill buckets add 16 B per entry (256 B default,
+	// 128 B constrained), so the change adds about 5.1 KB (default) or 1.0 KB (lan8720 /
+	// constrained) over the Call-ID-only set. All are members of the handler, built at
+	// init: internal DRAM on a build without PSRAM, and no per-call allocation. The bound below is
+	// the per-entry cost (id bytes, length, endpoints and their count and flag) plus a little
+	// slack for padding; it trips if a field is added without anyone looking at that DRAM bill.
+	static constexpr size_t kEmergencyCallIdsBudget = kMaxRateExemptCallIds *
+		(kRateExemptCallIdBytes + 1 + sizeof(uint32_t) * kMaxRateExemptEndpoints + 8) + 16;   // 4576 default, 1528 constrained
+	static_assert(sizeof(EmergencyCallIds) <= kEmergencyCallIdsBudget,
+		"EmergencyCallIds grew past its measured size: check the DRAM it costs twice over (live + scratch)");
+	static bool emergencyEndpointsAdd(EmergencyEndpoints& ep, uint32_t ip);
+	static bool emergencyEndpointsHas(const EmergencyEndpoints& ep, uint32_t ip);
+	static bool emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId, const EmergencyEndpoints& ep);
 	static bool emergencyIdsHas(const EmergencyCallIds& set, std::string_view callId);
+	// Index of `callId` in the set, or kMaxRateExemptCallIds when it is not there.
+	static size_t emergencyIdsFind(const EmergencyCallIds& set, std::string_view callId);
 	static bool emergencyIdsEqual(const EmergencyCallIds& a, const EmergencyCallIds& b);
+	// Caller holds _mutex. Fills `out` with the addresses the session's dialog belongs to.
+	void collectEmergencyEndpoints(const Session& s, const SipTrunk::Dialog* d, EmergencyEndpoints& out) const;
 	// Caller holds _mutex.
 	void publishRateExemptions();
 	// retire = the trunk was reconfigured: forget the old peer before looking the new one up.
 	void publishTrunkPeer(bool retire);
-	// Caller holds _rateMutex. True when the packet's Call-ID is a live emergency dialog's. Bare
-	// Call-ID values on both sides (the sessions are keyed on the whole "Call-ID: x" line).
+	// Caller holds _rateMutex. True when the packet's Call-ID is a live emergency dialog's AND
+	// its source IP is one of that dialog's endpoints. Bare Call-ID values on both sides (the
+	// sessions are keyed on the whole "Call-ID: x" line).
 	bool rateExemptByCallId(const SipMessage& m) const;
+	// Caller holds _rateMutex. A packet whose Call-ID is a live emergency dialog's but whose source is not
+	// one of its endpoints (a carrier pool node accepted on the dialog tags, a handset whose address
+	// changed before it re-REGISTERed) and that the ordinary buckets refused: a small budget shared by
+	// that dialog's entry, outside the bucket table. Everything beyond it is refused as before.
+	bool takeEmergencySpill(const SipMessage& m);
+	static constexpr double kEmergencySpillBurst  = 8.0;
+	static constexpr double kEmergencySpillPerSec = 1.0;
 
 	void endHandle(std::string_view destNumber, std::shared_ptr<SipMessage> message);
 	std::string buildContact(std::string_view number) const;
@@ -2703,6 +2795,25 @@ private:
 	bool isDialogSourceAuthorized(const std::shared_ptr<Session>& session,
 		const sockaddr_in& source) const;
 
+	// SIP INFO is in-dialog (RFC 6086). Allow: the Call-ID names a live session and the source
+	// IP (never the port) is one of its legs, whose number is also From's; or it is the MoH
+	// preview dialog, from the phone being previewed. Ignored: no live session, or a live
+	// emergency session and a source that is not one of its legs (a carrier on a PSAP
+	// callback) -- answered 200 and acted on by no one: a 481 ends the dialog (RFC 3261
+	// s12.2.1.2) and a live emergency dialog is never refused at all. NotALeg: a live
+	// non-emergency session, but not this source or this From -- 403.
+	// Caller holds _mutex.
+	enum class InfoVerdict : uint8_t { Allow, Ignored, NotALeg };
+	struct InfoAuth
+	{
+		InfoVerdict verdict = InfoVerdict::Ignored;
+		std::shared_ptr<Session> session;   // the dialog's session, when it has one
+		std::string_view actingExt;         // Allow only: the extension the digits act for
+	};
+	InfoAuth authorizeInfo(const SipMessage& request);
+	// Count, log (rate-limited) and, for NotALeg, queue the 403.
+	void noteInfoRefused(const std::shared_ptr<SipMessage>& request, InfoVerdict why);
+
 	// A re-INVITE/UPDATE this PBX answers itself (555 anchor, inbound anchor, 997 page)
 	// must come from a leg of the dialog. False: a 403 was queued and the request is
 	// logged; the caller returns without touching bridge, state or session timer.
@@ -2711,6 +2822,16 @@ private:
 		const std::shared_ptr<Session>& session);
 	bool authorizeSplicedRefresh(const std::shared_ptr<SipMessage>& data,
 		const std::shared_ptr<Session>& session);
+	// True when `source` is the leg of `session` whose extension is `transferor` (IP only). With both
+	// legs at one IP the legs cannot be told apart, so the named party must be one of the two. A
+	// missing leg or no session: true, as isDialogSourceAuthorized() (tracked separately).
+	bool isReferSourceTransferorLeg(const std::shared_ptr<Session>& session, const sockaddr_in& source,
+		const std::string& transferor) const;
+	// The binding for a REFER's own dialog and, when attended, its consult dialog (its Call-ID key,
+	// empty when the REFER is not attended). False: a 403 was
+	// queued, the refusal counted and (rate-limited) logged; the caller returns. Caller holds _mutex.
+	bool authorizeReferTransferor(const std::shared_ptr<SipMessage>& data, const std::string& callID,
+		const std::string& replacesCallIdKey, const std::string& transferor);
 	// 403 + count + (rate-limited) log for a request from a non-dialog source.
 	void refuseNonLegRequest(const std::shared_ptr<SipMessage>& data);
 	// A fixed table of recent Call-IDs: due() is true at most once per kSeconds per Call-ID
@@ -2731,14 +2852,19 @@ private:
 	};
 	LogLimiter _refusalLog;
 	LogLimiter _resumeLog;
+	LogLimiter _referBindingLog;
+	uint32_t _referBindingRefusals = 0;    // every REFER refused by the transferor binding, logged or not
 	uint32_t _localReinviteRefusals = 0;   // every refused request, logged or not
 	uint32_t _localResumeAccepts = 0;      // every accepted non-leg emergency resume
 	void logNonLegRequest(const std::shared_ptr<SipMessage>& data, LogLimiter& limiter, const char* verdict,
 		bool isError);
 
 public:
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	uint32_t localReinviteRefusalsForTest() const { return _localReinviteRefusals; }
+	uint32_t referBindingRefusalsForTest() const { return _referBindingRefusals; }
 	uint32_t localResumeAcceptsForTest() const { return _localResumeAccepts; }
+#endif
 private:
 
 	// Server-side RTP media source (the 440 tone stream). One concurrent stream; the
@@ -3224,6 +3350,7 @@ private:
 	std::atomic<uint64_t> _headerRejected{0};         // #199 header admission refusals
 	std::atomic<uint64_t> _emergencyHeaderYields{0};  // #199 911 let through a violation
 	std::atomic<uint64_t> _headerLineCuts{0};         // #838 datagrams cut at 64 header lines
+	std::atomic<uint32_t> _infoRefused{0};   // getInfoRefused()
 	std::atomic<uint64_t> _vpeerRefusals{0};   // #409: allocateVirtualPeer() refusals
 	std::atomic<uint32_t> _emergencyRtpReaps{0};   // #741
 	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP
@@ -3413,6 +3540,8 @@ private:
 	uint32_t _trunkPeerIp = 0;   // network-order s_addr
 	EmergencyCallIds _emergencyCallIds;
 	EmergencyCallIds _emergencyIdsScratch;   // publishRateExemptions() build area; guarded by _mutex
+	// One spill bucket per _emergencyCallIds entry (same index), carried across a republish by Call-ID.
+	std::array<RateBucket, kMaxRateExemptCallIds> _emergencySpill{};   // guarded by _rateMutex
 	std::array<RateSource, kMaxRateRegisteredSources> _rateSources{};          // guarded by _rateMutex
 	std::array<RateSource, kMaxRateRegisteredSources> _rateSourcesScratch{};   // build area; guarded by _mutex
 	RateBucket _unregisteredEmergency{ kEmergencyInviteBurst, {} };   // guarded by _rateMutex

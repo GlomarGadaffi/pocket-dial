@@ -1418,3 +1418,177 @@ TEST(PoolRefusalAfterCommit, ABlindReferWhoseTransferCannotBeDrawnAnswers503Not2
 	EXPECT_FALSE(got503);
 	EXPECT_TRUE(bridge);
 }
+
+// ── #1124: a provisional from the blind-transfer target is the PBX's ─────────
+namespace
+{
+	size_t countTo(const SentList& sent, size_t from, const sockaddr_in& addr)
+	{
+		size_t n = 0;
+		for (size_t i = from; i < sent.size(); ++i)
+		{
+			if (sent[i].first.sin_addr.s_addr == addr.sin_addr.s_addr &&
+				sent[i].first.sin_port == addr.sin_port) ++n;
+		}
+		return n;
+	}
+
+	// 100 and 106 connected, 100 REFERs 106 to 107, 107 answers the PBX's INVITE
+	// with `status`. Returns how many messages went to 106 after that answer.
+	size_t targetProvisionalReachesTransferee(const std::string& status)
+	{
+		SentList sent;
+		RequestsHandler handler("192.168.33.1", 5060,
+			[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+				sent.emplace_back(addr, std::move(msg));
+			});
+		const sockaddr_in transferorAddr = addrFor("192.168.33.10");
+		const sockaddr_in transfereeAddr = addrFor("192.168.33.20");
+		const sockaddr_in targetAddr     = addrFor("192.168.33.30");
+		handler.handle(makeRegister("100", "192.168.33.10", "reg-100p"));
+		handler.handle(makeRegister("106", "192.168.33.20", "reg-106p"));
+		handler.handle(makeRegister("107", "192.168.33.30", "reg-107p"));
+		const std::string callId = "blindxfer-1124";
+		connectCall(handler, sent, callId,
+			"100", transferorAddr, "atag", sdpBodyFor("10.1.1.1", 10001),
+			"106", transfereeAddr, "btag", sdpBodyFor("10.2.2.2", 20002));
+		handler.handle(makeRefer(callId, "100", transferorAddr, "atag", "106", "btag", "107"));
+		const std::string inviteToC = findSentTo(sent, targetAddr, "INVITE sip:107@");
+		EXPECT_FALSE(inviteToC.empty());
+		if (inviteToC.empty()) return 9999;
+		const size_t before = sent.size();
+		std::string raw =
+			"SIP/2.0 " + status + "\r\n" +
+			extractHeaderLine(inviteToC, "Via:") + "\r\n" +
+			extractHeaderLine(inviteToC, "From:") + "\r\n"
+			"To: <sip:107@192.168.33.1:5060>;tag=ctag\r\n" +
+			extractHeaderLine(inviteToC, "Call-ID:") + "\r\n"
+			"CSeq: 1 INVITE\r\n"
+			"Content-Length: 0\r\n\r\n";
+		handler.handle(RequestsHandler::getMessageFromPool(raw, targetAddr));
+		return countTo(sent, before, transfereeAddr);
+	}
+}
+
+TEST(BlindTransfer, TheTargets100TryingIsNotRelayedToTheTransferee)
+{
+	EXPECT_EQ(targetProvisionalReachesTransferee("100 Trying"), 0u);
+}
+
+TEST(BlindTransfer, TheTargets180IsStillNotRelayedToTheTransferee)
+{
+	EXPECT_EQ(targetProvisionalReachesTransferee("180 Ringing"), 0u);
+}
+
+TEST(Trying, AnOrdinaryCalleesHundredTryingStillReachesTheCaller)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.33.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.33.10");
+	const sockaddr_in calleeAddr = addrFor("192.168.33.20");
+	handler.handle(makeRegister("100", "192.168.33.10", "reg-100q"));
+	handler.handle(makeRegister("106", "192.168.33.20", "reg-106q"));
+	const std::string sdp = sdpBodyFor("10.1.1.1", 10001);
+	std::string inv =
+		"INVITE sip:106@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.33.10:5060;branch=z9hG4bKitry\r\n"
+		"From: <sip:100@server>;tag=atag\r\n"
+		"To: <sip:106@server>\r\n"
+		"Call-ID: trying-1124\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:100@192.168.33.10:5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
+	handler.handle(RequestsHandler::getMessageFromPool(inv, callerAddr));
+	const std::string fork = findSentTo(sent, calleeAddr, "INVITE sip:106@");
+	ASSERT_FALSE(fork.empty());
+	const size_t before = sent.size();
+	std::string raw =
+		"SIP/2.0 100 Trying\r\n" +
+		extractHeaderLine(fork, "Via:") + "\r\n" +
+		extractHeaderLine(fork, "From:") + "\r\n"
+		"To: <sip:106@server>\r\n"
+		"Call-ID: trying-1124\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(raw, calleeAddr));
+	size_t n = 0;
+	for (size_t i = before; i < sent.size(); ++i)
+	{
+		if (sent[i].first.sin_addr.s_addr == callerAddr.sin_addr.s_addr &&
+			sent[i].second->toString().find("SIP/2.0 100") == 0) ++n;
+	}
+	EXPECT_EQ(n, 1u);
+}
+
+// ── #1124, Rule 5: a 911 call's provisionals are untouched by the new claims ──
+// The claims match a blind-transfer leg or a Call-ID pending a transfer splice.
+// An emergency-flagged session is neither, even while an unrelated blind transfer
+// is in flight: its callee's 100 and 180 reach the caller exactly once each.
+TEST(BlindTransfer, AnEmergencyCallsProvisionalsStillReachTheCallerDuringAnUnrelatedTransfer)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.33.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.33.10");
+	const sockaddr_in calleeAddr = addrFor("192.168.33.20");
+	const sockaddr_in xferorAddr = addrFor("192.168.33.40");
+	const sockaddr_in xfereeAddr = addrFor("192.168.33.50");
+	handler.handle(makeRegister("100", "192.168.33.10", "reg-100e"));
+	handler.handle(makeRegister("106", "192.168.33.20", "reg-106e"));
+	handler.handle(makeRegister("108", "192.168.33.40", "reg-108e"));
+	handler.handle(makeRegister("109", "192.168.33.50", "reg-109e"));
+	handler.handle(makeRegister("107", "192.168.33.30", "reg-107e"));
+
+	// An unrelated blind transfer in flight (108 moves 109 to 107).
+	connectCall(handler, sent, "xfer-unrelated-1124",
+		"108", xferorAddr, "xtag", sdpBodyFor("10.4.4.4", 40004),
+		"109", xfereeAddr, "ytag", sdpBodyFor("10.5.5.5", 50005));
+	handler.handle(makeRefer("xfer-unrelated-1124", "108", xferorAddr, "xtag", "109", "ytag", "107"));
+
+	// The emergency-flagged call, still ringing.
+	const std::string sdp = sdpBodyFor("10.1.1.1", 10001);
+	const std::string inv =
+		"INVITE sip:106@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.33.10:5060;branch=z9hG4bKiemg\r\n"
+		"From: <sip:100@server>;tag=etag\r\n"
+		"To: <sip:106@server>\r\n"
+		"Call-ID: emergency-1124\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:100@192.168.33.10:5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
+	handler.handle(RequestsHandler::getMessageFromPool(inv, callerAddr));
+	const std::string fork = findSentTo(sent, calleeAddr, "INVITE sip:106@");
+	ASSERT_FALSE(fork.empty());
+	auto sess = handler.getSession("Call-ID: emergency-1124");
+	ASSERT_TRUE(sess.has_value());
+	sess.value()->setEmergency(true);
+
+	const std::string head =
+		extractHeaderLine(fork, "Via:") + "\r\n" + extractHeaderLine(fork, "From:") + "\r\n"
+		"To: <sip:106@server>\r\nCall-ID: emergency-1124\r\nCSeq: 1 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n";
+	const size_t before = sent.size();
+	handler.handle(RequestsHandler::getMessageFromPool("SIP/2.0 100 Trying\r\n" + head, calleeAddr));
+	handler.handle(RequestsHandler::getMessageFromPool("SIP/2.0 180 Ringing\r\n" + head, calleeAddr));
+	size_t trying = 0, ringing = 0, other = 0;
+	for (size_t i = before; i < sent.size(); ++i)
+	{
+		if (sent[i].first.sin_addr.s_addr != callerAddr.sin_addr.s_addr) continue;
+		const std::string raw = sent[i].second->toString();
+		if (raw.rfind("SIP/2.0 100", 0) == 0) ++trying;
+		else if (raw.rfind("SIP/2.0 180", 0) == 0) ++ringing;
+		else ++other;
+	}
+	EXPECT_EQ(trying, 1u);
+	EXPECT_EQ(ringing, 1u);
+	EXPECT_EQ(other, 0u);
+}

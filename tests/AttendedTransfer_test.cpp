@@ -1159,3 +1159,20 @@ TEST(AttendedTransfer, ReferOnConsultDialogSplicesAboveTheHoldReinviteCSeq)
 	EXPECT_GT(cseqOf(byeAonAB), holdCSeq);
 	EXPECT_GT(cseqOf(byeAonAC), 2);
 }
+
+TEST(AttendedTransfer, SpliceReinvitesTryingIsNotRelayedToTheDroppedTransferor)
+{
+	Rig rig;
+	setUpSplicedCalls(rig);
+	sendAttendedRefer(rig);
+	std::string invToB = findSentTo(rig.sent, rig.bAddr, "CSeq: 3 INVITE");
+	ASSERT_FALSE(invToB.empty());
+	rig.sent.clear();
+	std::string raw =
+		"SIP/2.0 100 Trying\r\n" + extractHeaderLine(invToB, "Via:") + "\r\n" +
+		extractHeaderLine(invToB, "From:") + "\r\n" + extractHeaderLine(invToB, "To:") + "\r\n"
+		"Call-ID: " + rig.abCallId + "\r\nCSeq: 3 INVITE\r\nContent-Length: 0\r\n\r\n";
+	rig.handler->handle(RequestsHandler::getMessageFromPool(raw, rig.bAddr));
+	EXPECT_EQ(rig.sent.size(), 0u);
+	EXPECT_EQ(countContaining(rig.sent, rig.aAddr, ""), 0u);
+}

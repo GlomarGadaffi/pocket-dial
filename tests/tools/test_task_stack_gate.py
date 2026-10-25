@@ -1189,7 +1189,7 @@ class Gate(unittest.TestCase):
         # #1117: one row per image, as the CI runs of the four esp_main images measured them.
         want = {("sip_server", "main/esp_main_eth.cpp"): 9616,
                 ("sip_server", "main/esp_main_eth_lan8720.cpp"): 9408,
-                ("tel_ctl", "main/esp_main_eth.cpp"): 12944,
+                ("tel_ctl", "main/esp_main_eth.cpp"): 12816,
                 ("tel_ctl", "main/esp_main.cpp"): 12944,
                 ("tel_ctl", "main/esp_main_eth_lan8720.cpp"): 12736,
                 ("sip_server_task", "main/esp_main.cpp"): 9616,

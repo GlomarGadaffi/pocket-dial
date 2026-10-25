@@ -911,6 +911,13 @@ TEST(ConferenceReap, FourHarnessUasThatDieWithoutByeAreAllReapedAndTheRoomIsReus
 			<< "leg " << i << " must not keep an RTP sender streaming";
 	}
 
+	// leave() only marks a port Draining; the mix driver's next 20 ms tick returns it to Free
+	// (MixBus::tick). Wait for that, capped at 1 s, so the re-dial below does not race it.
+	for (int w = 0; w < 200 && b.handler.conferenceForTest()->bus().freePortsForTest() != MixBus::MAX_PORTS; ++w)
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	ASSERT_EQ(b.handler.conferenceForTest()->bus().freePortsForTest(), MixBus::MAX_PORTS)
+		<< "every reaped port must be Free within one second";
+
 	// Nothing leaked: the whole room can be filled again.
 	for (int i = 0; i < kLegs; ++i)
 	{

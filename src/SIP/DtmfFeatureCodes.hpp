@@ -43,8 +43,10 @@ public:
 	enum class DigitSource : uint8_t { Info = 1, Rfc4733 = 2 };
 
 	// Parse one SIP INFO's Signal=X body and hand the digit to onDigit().
+	// `actingExt` is the extension of the dialog leg the INFO arrived from; the
+	// caller has already matched it to the dialog, so it is used in place of From.
 	// Caller holds _mutex.
-	void onInfo(std::shared_ptr<SipMessage> data);
+	void onInfo(std::shared_ptr<SipMessage> data, std::string_view actingExt);
 
 	// One key press, from either source. Accumulates per Call-ID and acts on
 	// completed CLASS/admin sequences. Caller holds _mutex.
@@ -60,8 +62,12 @@ public:
 	// this path can emit (403 to a non-admin caller attempting the admin menu) is
 	// therefore skipped for an RTP digit; the accumulator is still cleared, so
 	// the refusal has the same effect on state either way.
+	//
+	// `actingExt`, when given, names the extension the digit acts for; empty falls
+	// back to From (INFO) or the session's src leg (RFC 4733).
 	void onDigit(std::string_view callId, char digit, DigitSource source,
-		uint32_t arrivedTick, const std::shared_ptr<SipMessage>& data);
+		uint32_t arrivedTick, const std::shared_ptr<SipMessage>& data,
+		std::string_view actingExt = {});
 
 	// The clock onDigit()'s timeouts are measured on: FreeRTOS ticks on device,
 	// a monotonic millisecond counter on host. Public so the RTP-side capture

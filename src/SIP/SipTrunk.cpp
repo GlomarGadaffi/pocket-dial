@@ -609,6 +609,11 @@ void SipTrunk::clearCredentials()
 	_reg.clearCredentials();
 }
 
+bool SipTrunk::remoteTargetIpv4(const Dialog& d, uint32_t& out)
+{
+	return uriHostIpv4(d.remoteTarget, out) && out != 0;
+}
+
 const SipTrunk::Dialog* SipTrunk::findByCallID(std::string_view callID) const
 {
 	return const_cast<SipTrunk*>(this)->findMutableByCallID(callID);

@@ -1,6 +1,7 @@
 // RequestsHandler.cpp: Issues #24 and #28 resolved.
 #include "RequestsHandler.hpp"
 #include "SipMessageBuilder.hpp"
+#include "BootTaskSlots.hpp"   // #1126: the boot alert for an absent emergency-path task
 #include "SipMessagePool.hpp"
 #include <cassert>
 #include <atomic>
@@ -964,7 +965,8 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 	{
 		std::lock_guard<std::mutex> rlock(_rateMutex);
 		// #1092, Rule 5: admitPacket() = allowlist, then live emergency Call-ID, then the bucket
-		// (trunk peer, registered source, or table), then the emergency INVITE budget. No _mutex.
+		// (trunk peer, registered source, or table), then the emergency INVITE budget,
+		// then the live dialog's small spill budget. No _mutex.
 		if (!admitPacket(*request))
 		{
 			const sockaddr_in src = request->getSource();
@@ -1247,9 +1249,14 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// so it is never mistakenly forwarded by a catch-all entry.
 		if (handlerKey == "INFO")
 		{
+			// An INFO is in-dialog: it is acted on only from a leg of a live dialog (see
+			// authorizeInfo), so nothing below reads its body unless it is allowed.
+			const InfoAuth infoAuth = authorizeInfo(*request);
+			if (infoAuth.verdict != InfoVerdict::Allow) noteInfoRefused(request, infoAuth.verdict);
 			// Scan headers for Content-Type: application/dtmf-relay.
 			const std::string& rawMsg = request->toString();
 			bool isDtmfRelay = false;
+			if (infoAuth.verdict == InfoVerdict::Allow)
 			{
 				size_t pos = 0;
 				while (pos < rawMsg.size())
@@ -1278,7 +1285,8 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 					pos = next;
 				}
 			}
-			// Always 200 OK a SIP INFO (RFC 6086 §4.2.1).
+			// 200 OK a SIP INFO (RFC 6086 §4.2.1), except one from a non-leg source (403 above).
+			if (infoAuth.verdict != InfoVerdict::NotALeg)
 			{
 				auto infoOk = getMessageFromPool(*request);
 				if (!infoOk) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -1297,10 +1305,9 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				// only digit path this MVP's menu wires up (see
 				// answerVoicemailRetrieval()'s DtmfSink); SIP INFO support
 				// for it is an explicit follow-up, not an oversight.
-				auto infoSession = findSession(request->getCallID());
-				if (!infoSession || !infoSession->isVoicemail())
+				if (!infoAuth.session || !infoAuth.session->isVoicemail())
 				{
-					_dtmf.onInfo(request);
+					_dtmf.onInfo(request, infoAuth.actingExt);
 				}
 			}
 		}
@@ -5072,12 +5079,19 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// still gets "911" -- never the prefixed form, and never a stripped "11".
 	const std::string bare(emergency.number);
 	const std::string asDialed = emergency.hadTrunkPrefix ? " (dialed " + dialed + ")" : "";
+	// #1127: a source IP other than the one `from` registered from is REPORTED, never
+	// acted on (#454: 911 is never gated). IP only, as #497 and isDialogSourceAuthorized
+	// do: a phone may change ports. Empty for a verified caller, whose text is unchanged.
+	const std::string unverifiedSrc = caller->getAddress().sin_addr.s_addr == data->getSource().sin_addr.s_addr
+		? std::string() : sipwire::addrToIpPort(data->getSource());
+	const std::string unverifiedTag = unverifiedSrc.empty()
+		? std::string() : pbx::e911UnverifiedTag(from, unverifiedSrc);
 
 	// Log BEFORE routing, so the attempt is on the record even if everything
 	// after this line fails. This is the honest floor of Kari's Law's
 	// notification requirement; the on-site notification hook itself is the
 	// companion half of #166 and lands separately.
-	queueLog("EMERGENCY: " + kind + " dialed by " + from + asDialed, true);
+	queueLog("EMERGENCY: " + kind + " dialed by " + from + asDialed + unverifiedTag, true);
 
 	// Issue #521: only a provider that places REAL calls is offered the call.
 	// The loopback simulator answers whatever it is handed, so giving it 911
@@ -5096,6 +5110,7 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		{
 			s->second->setEmergency(true);
 			s->second->setEmergencyNumber(emergency.number);   // #879
+			if (!unverifiedSrc.empty()) s->second->setUnverifiedSource(data->getSource());   // #1127
 		}
 		// #659: opens this extension's PSAP callback window.
 		_emergencyCallbacks.note(caller->getNumber(), std::chrono::steady_clock::now());
@@ -5130,7 +5145,7 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 			// returned true. Telling the front desk a 911 call went through when
 			// it was refused for capacity is the worst error this feature could make.
 			notifyEmergency(emergency, from, dialed, /*routed=*/placed,
-				placed ? std::string_view() : kAnchorNotPlaced);
+				placed ? std::string_view() : kAnchorNotPlaced, /*callUp=*/false, unverifiedSrc);
 			return;
 		}
 	}
@@ -5182,11 +5197,11 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		// Pool exhausted: drop and let the peer retransmit (#101A). The log line
 		// above already recorded the attempt, which is the part that matters.
 		queueLog("EMERGENCY: " + kind + " from " + from +
-			" NOT ROUTED and no message available to answer with", true);
+			" NOT ROUTED and no message available to answer with" + unverifiedTag, true);
 		// Still notify. A 911 attempt that produced neither a call nor even a
 		// failure response is the single most important thing to put in front of
 		// a human, and the notification path has its own pooled messages.
-		notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted);
+		notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted, /*callUp=*/false, unverifiedSrc);
 		return;
 	}
 	response->setHeader("SIP/2.0 503 Emergency Call Not Routable");
@@ -5197,10 +5212,10 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	_outbox.emplace_back(data->getSource(), std::move(response));
 
 	queueLog("EMERGENCY: " + kind + " from " + from + " COULD NOT BE ROUTED (" +
-		warningDetail + ") - answered 503", true);
+		warningDetail + ") - answered 503" + unverifiedTag, true);
 
 	// 503 is enqueued; notify after it, same ordering rule as the routed path.
-	notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted);
+	notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted, /*callUp=*/false, unverifiedSrc);
 }
 
 bool RequestsHandler::emergencyDialOf(const std::string& dialed, pbx::EmergencyDial& emergencyOut,
@@ -5290,17 +5305,60 @@ void RequestsHandler::flushUnknownEmergencyTallies(std::chrono::steady_clock::ti
 		unknownAlertReason(reason, sizeof reason, due.overflow, due.held));
 }
 
+// #1126: an emergency-path task (tel_sweep) that has no worker since boot is reported once to the E911
+// notification list. Visibility only: a few atomic loads when nothing is wrong, no I/O here (the Alert is
+// staged and flushPass() sends it), and it never touches a call. A busy alert slot defers it a tick
+// rather than displace a 911 frame (onlyIfEmpty). The syslog frame is latched once; the MESSAGEs retry in
+// serviceBootFan(), because at the first tick no notify phone has re-registered yet.
+void RequestsHandler::raiseBootSlotAlert(std::chrono::steady_clock::time_point now)
+{
+	if (_bootFan.pending)
+	{
+		serviceBootFan(now);
+		return;
+	}
+	pd::BootTask task = pd::BootTask::TelSweep;
+	if (!pd::bootTaskSlots().alertDue(task)) return;
+	if (std::snprintf(_bootFan.text, sizeof _bootFan.text,
+		"DEGRADED: emergency-path task %s has no worker since boot (no stack); see /api/status telSweepWorker",
+		pd::BootTaskSlots::name(task)) < 0) return;   // cannot fail for this format; checked for cert-err33-c
+	const pbx::E911Config& cfg = _cfg.e911Config();
+	std::size_t sent = 0;
+	if (!_e911Notifier.notifyDegraded(cfg, _bootFan.text, sent)) return;
+	pd::bootTaskSlots().markAlerted(task);
+	_bootFan.task    = task;
+	_bootFan.since   = now;
+	_bootFan.pending = (sent == 0) && EmergencyNotifier::hasNotifyExts(cfg);
+}
+
+// Waiting costs a registration check and nothing else. Ends when a MESSAGE is enqueued or _bootFanLimit
+// (10 minutes in service) has passed, with one witness line.
+void RequestsHandler::serviceBootFan(std::chrono::steady_clock::time_point now)
+{
+	if (now - _bootFan.since >= _bootFanLimit)
+	{
+		PD_WITNESS_W("e911", "boot alert for %s: no notify extension registered within %lld s, MESSAGE retries stopped",
+			pd::BootTaskSlots::name(_bootFan.task),
+			static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(_bootFanLimit).count()));
+		_bootFan.pending = false;
+		return;
+	}
+	const pbx::E911Config& cfg = _cfg.e911Config();
+	if (!_e911Notifier.anyNotifyRegistered(cfg)) return;
+	if (_e911Notifier.resendDegraded(cfg, _bootFan.text) > 0) _bootFan.pending = false;
+}
+
 // Issue #166 part 2. Kept to this one small function so the compliance-relevant
 // ordering is visible in one place: every caller has already enqueued its
 // response before reaching here, and nothing below can fail back into the call.
 void RequestsHandler::notifyEmergency(const pbx::EmergencyDial& emergency,
 	const std::string& fromExt, const std::string& dialed, bool routed,
-	std::string_view notRoutedReason, bool callUp)
+	std::string_view notRoutedReason, bool callUp, std::string_view unverifiedSource)
 {
 	const pbx::E911Config& cfg = _cfg.e911Config();
 
 	_e911Notifier.notify(cfg, emergency.isTest, fromExt, dialed,
-		emergency.hadTrunkPrefix, routed, notRoutedReason, callUp);
+		emergency.hadTrunkPrefix, routed, notRoutedReason, callUp, unverifiedSource);
 
 	// Make the notified phones audibly alert, on top of the MESSAGE text. The
 	// beep is the existing register-beep INVITE (auto-answer headers, no RTP),
@@ -6032,6 +6090,37 @@ void RequestsHandler::asyncAnswerCall(const std::string& participantId)
 	}
 }
 
+// Out of runTelCtl() on purpose (#1127): its locals sit on the tel_ctl worker, whose static
+// depth the stack gate holds at its recorded finding. noinline keeps them off runTelCtl's frame.
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+void RequestsHandler::onTelCtlMakeCallFailed(const TelCtlJob& job)
+{
+	std::lock_guard<pd::TimedMutex> lock(_mutex);
+	queueLog("[Telephony] Failed to initiate outbound call to " + job.dest, true);
+	// #1127: read the unverified marker before endCall() drops the session.
+	std::string unverifiedSrc;
+	if (auto us = _sessions.find(job.callId); us != _sessions.end() && us->second && us->second->isUnverifiedCaller())
+	{
+		unverifiedSrc = sipwire::addrToIpPort(us->second->getUnverifiedSource());
+	}
+	// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
+	refuseRingingAnchor(job.callId, _asyncOutbox);
+	endCall(job.callId, job.callerNumber, job.dest, "anchor call fail");
+	// #821: routeEmergencyCall() told the notify list ROUTED when it queued
+	// this job, and the call never came up. notifyEmergency() enqueues on
+	// _outbox, which the SIP thread's next pass clears: hand it to
+	// _asyncOutbox, as forceDisconnect() does (#714).
+	if (const pbx::EmergencyDial em = pbx::classifyEmergencyDial(job.dest); em.isEmergency)
+	{
+		notifyEmergency(em, job.callerNumber, job.dest, /*routed=*/false, kAnchorNotPlaced,
+			/*callUp=*/false, unverifiedSrc);
+		for (auto& e : _outbox) _asyncOutbox.push_back(std::move(e));
+		_outbox.clear();
+	}
+}
+
 void RequestsHandler::runTelCtl(const TelCtlJob& job)
 {
 	if (job.kind == TelCtlJob::Drop)
@@ -6056,21 +6145,7 @@ void RequestsHandler::runTelCtl(const TelCtlJob& job)
 	std::string ownLeg;
 	if (!_anchorClient->makeCall(job.dest, &ownLeg))
 	{
-		std::lock_guard<pd::TimedMutex> lock(_mutex);
-		queueLog("[Telephony] Failed to initiate outbound call to " + job.dest, true);
-		// Off the SIP thread: 503 goes via _asyncOutbox (endCall() sends nothing).
-		refuseRingingAnchor(job.callId, _asyncOutbox);
-		endCall(job.callId, job.callerNumber, job.dest, "anchor call fail");
-		// #821: routeEmergencyCall() told the notify list ROUTED when it queued
-		// this job, and the call never came up. notifyEmergency() enqueues on
-		// _outbox, which the SIP thread's next pass clears: hand it to
-		// _asyncOutbox, as forceDisconnect() does (#714).
-		if (const pbx::EmergencyDial em = pbx::classifyEmergencyDial(job.dest); em.isEmergency)
-		{
-			notifyEmergency(em, job.callerNumber, job.dest, /*routed=*/false, kAnchorNotPlaced);
-			for (auto& e : _outbox) _asyncOutbox.push_back(std::move(e));
-			_outbox.clear();
-		}
+		onTelCtlMakeCallFailed(job);
 		return;
 	}
 	// Bind this origination's own leg to its session NOW (locks _mutex
@@ -6780,6 +6855,21 @@ void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 	// provisional to US — swallow it rather than echoing it at the handset (see
 	// onRinging below).
 	if (session.has_value() && session.value()->isAnchorInbound())
+	{
+		return;
+	}
+	// Blind-transfer leg (#1124): the PBX is the UAC, so the target's 100 is the
+	// PBX's, as its 180 is (onRinging). The transferee is mid-call on another dialog.
+	if (session.has_value() && session.value()->isBlindXferLeg())
+	{
+		return;
+	}
+	// Attended-transfer splice (#1124): the PBX is the UAC of the re-INVITE that is
+	// still awaiting its 200 (_transferPendingAcks), so its 100 is the PBX's, not the
+	// dropped transferor's.
+	const std::string_view tryingCallId = data->getCallID();
+	if (std::any_of(_transferPendingAcks.begin(), _transferPendingAcks.end(),
+	                [tryingCallId](const std::string& id) { return id == tryingCallId; }))
 	{
 		return;
 	}
@@ -8386,9 +8476,12 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// could still name any unrelated call A happens to be in as ?Replaces= and
 	// splice A out of it. A real transferor is a leg of both dialogs and passes
 	// both checks; anyone else fails one.
+	// The consult dialog's key is built once and shared by both checks and the splice below.
+	const std::string replacesCallIdKey =
+		replacesCallIdBare.empty() ? std::string() : "Call-ID: " + replacesCallIdBare;
 	if (!replacesCallIdBare.empty())
 	{
-		if (auto consult = getSession("Call-ID: " + replacesCallIdBare);
+		if (auto consult = getSession(replacesCallIdKey);
 			consult.has_value() &&
 			!isDialogSourceAuthorized(consult.value(), data->getSource()))
 		{
@@ -8399,6 +8492,10 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		}
 	}
 
+	// The sender must also be the leg of the party From names as the transferor, on this dialog and,
+	// for an attended transfer, on the consult dialog.
+	if (!authorizeReferTransferor(data, callID, replacesCallIdKey, transferor->getNumber())) return;
+
 	// ── Attended transfer (RFC 3891 Replaces), issue #131 ─────────────────────────
 	// A (transferor) has two active calls: A-B (this REFER's own dialog, callID)
 	// and A-C (the consult session, replacesCallIdBare). Splice B<->C via cross
@@ -8406,7 +8503,6 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// to the blind-transfer path below when Replaces is absent (or unusable).
 	if (!replacesCallIdBare.empty() || replacesMalformed)
 	{
-		const std::string replacesCallIdKey = "Call-ID: " + replacesCallIdBare;
 		bool canSplice = false;
 		std::shared_ptr<Session> ab, ac;
 		std::shared_ptr<SipClient> bClient, cClient;
@@ -11338,6 +11434,7 @@ void RequestsHandler::tick()
 
 		sweepExpired();
 		flushUnknownEmergencyTallies(now);   // #1115
+		raiseBootSlotAlert(now);             // #1126
 
 		// AnchorClient::tick(): "periodic, non-blocking maintenance pump ... (<=1 Hz)"
 		// per its doc comment. Loopback's is a no-op; a real anchor uses this for
@@ -11804,7 +11901,9 @@ void RequestsHandler::tick()
 			{
 				notifyEmergency(pbx::classifyEmergencyDial(number), std::string(session->getSrc()->getNumber()),
 					std::string(number), /*routed=*/true,
-					"the audio to the anchor keeps failing; the call was not hung up", /*callUp=*/true);
+					"the audio to the anchor keeps failing; the call was not hung up", /*callUp=*/true,
+					session->isUnverifiedCaller()
+						? sipwire::addrToIpPort(session->getUnverifiedSource()) : std::string());
 			}
 		}
 		for (const auto& callID : degradedAnchorCallIds)
@@ -12362,7 +12461,28 @@ uint32_t RequestsHandler::nextTrunkPeerIp(uint32_t current, TrunkResolver::Statu
 	return (st == TrunkResolver::Status::Hit && found != 0) ? found : current;
 }
 
-bool RequestsHandler::emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId)
+bool RequestsHandler::emergencyEndpointsAdd(EmergencyEndpoints& ep, uint32_t ip)
+{
+	if (ip == 0) return false;   // unset: names no host
+	if (emergencyEndpointsHas(ep, ip)) return true;
+	if (ep.count >= kMaxRateExemptEndpoints) return false;
+	ep.ip[ep.count] = ip;
+	++ep.count;
+	return true;
+}
+
+bool RequestsHandler::emergencyEndpointsHas(const EmergencyEndpoints& ep, uint32_t ip)
+{
+	if (ip == 0) return false;
+	for (size_t i = 0; i < ep.count && i < kMaxRateExemptEndpoints; ++i)
+	{
+		if (ep.ip[i] == ip) return true;
+	}
+	return false;
+}
+
+bool RequestsHandler::emergencyIdsAdd(EmergencyCallIds& set, std::string_view callId,
+	const EmergencyEndpoints& ep)
 {
 	callId = siphdr::stripHeaderNameView(callId);   // bare value, whatever form the caller holds
 	// A Call-ID that does not fit is not stored truncated: a prefix would exempt other dialogs.
@@ -12371,19 +12491,25 @@ bool RequestsHandler::emergencyIdsAdd(EmergencyCallIds& set, std::string_view ca
 	if (emergencyIdsHas(set, callId)) return true;
 	std::memcpy(set.id[set.count].data(), callId.data(), callId.size());
 	set.len[set.count] = static_cast<uint8_t>(callId.size());
+	set.ep[set.count] = ep;
 	++set.count;
 	return true;
 }
 
-bool RequestsHandler::emergencyIdsHas(const EmergencyCallIds& set, std::string_view callId)
+size_t RequestsHandler::emergencyIdsFind(const EmergencyCallIds& set, std::string_view callId)
 {
 	callId = siphdr::stripHeaderNameView(callId);
 	for (size_t i = 0; i < set.count && i < kMaxRateExemptCallIds; ++i)
 	{
 		if (set.len[i] == callId.size() && std::memcmp(set.id[i].data(), callId.data(), callId.size()) == 0)
-			return true;
+			return i;
 	}
-	return false;
+	return kMaxRateExemptCallIds;
+}
+
+bool RequestsHandler::emergencyIdsHas(const EmergencyCallIds& set, std::string_view callId)
+{
+	return emergencyIdsFind(set, callId) < kMaxRateExemptCallIds;
 }
 
 bool RequestsHandler::emergencyIdsEqual(const EmergencyCallIds& a, const EmergencyCallIds& b)
@@ -12393,25 +12519,74 @@ bool RequestsHandler::emergencyIdsEqual(const EmergencyCallIds& a, const Emergen
 	{
 		if (a.len[i] != b.len[i] || std::memcmp(a.id[i].data(), b.id[i].data(), a.len[i]) != 0)
 			return false;
+		const EmergencyEndpoints& x = a.ep[i];
+		const EmergencyEndpoints& y = b.ep[i];
+		if (x.count != y.count || x.viaTrunk != y.viaTrunk) return false;
+		if (std::memcmp(x.ip.data(), y.ip.data(), x.count * sizeof(uint32_t)) != 0) return false;
 	}
 	return true;
 }
 
+void RequestsHandler::collectEmergencyEndpoints(const Session& s, const SipTrunk::Dialog* d,
+	EmergencyEndpoints& out) const
+{
+	out.count = 0;
+	out.viaTrunk = false;
+	// A leg's address is read live from its client, so a roaming re-REGISTER moves it in place and
+	// the next publish carries the new one. A leg with no address (a virtual peer) adds nothing.
+	for (const auto& leg : { s.getSrc(), s.getDest() })
+	{
+		if (leg) (void)emergencyEndpointsAdd(out, leg->getAddress().sin_addr.s_addr);
+	}
+	// A callback's ringing targets answer before any leg is set as the dest.
+	const auto& pending = s.getPendingTargets();
+	for (size_t i = 0; i < pending.size() && i < kMaxRateExemptEndpoints; ++i)
+	{
+		if (pending[i]) (void)emergencyEndpointsAdd(out, pending[i]->getAddress().sin_addr.s_addr);
+	}
+	if (d == nullptr) return;
+	// The carrier side of the dialog: where its requests come from (peer / next hop), or the
+	// trunk's resolved IP, which the check reads live under _rateMutex.
+	(void)emergencyEndpointsAdd(out, d->peer.sin_addr.s_addr);
+	(void)emergencyEndpointsAdd(out, d->nextHop.sin_addr.s_addr);
+	// SipTrunk::handleBye() also takes an in-dialog BYE from the remote target's host, the node
+	// the callback's Contact names. A pool node accepted on the dialog tags alone has no address
+	// known ahead of its packet, so it cannot be published here; it takes the ordinary buckets,
+	// then the entry's small shared budget (takeEmergencySpill).
+	uint32_t target = 0;
+	if (SipTrunk::remoteTargetIpv4(*d, target)) (void)emergencyEndpointsAdd(out, target);
+	out.viaTrunk = true;
+}
+
 void RequestsHandler::publishRateExemptions()
 {
-	// Member scratch (guarded by _mutex), not a stack local: it is ~2 KB and this runs from the SIP task.
+	// Member scratch (guarded by _mutex), not a stack local: it is ~4.5 KB (default pools) and this runs from the SIP task.
 	EmergencyCallIds& fresh = _emergencyIdsScratch;
 	fresh.count = 0;   // entries past count are never read
+	EmergencyEndpoints ep;   // ~150 B
 	for (const auto& [callID, s] : _sessions)
 	{
 		if (!s || !s->isEmergency()) continue;
-		(void)emergencyIdsAdd(fresh, callID);
 		// #818: the carrier speaks on the trunk dialog's own Call-ID, not the handset leg's.
-		if (const SipTrunk::Dialog* d = _sipTrunk.findByCallID(callID); d)
-			(void)emergencyIdsAdd(fresh, d->callID);
+		const SipTrunk::Dialog* d = _sipTrunk.findByCallID(callID);
+		collectEmergencyEndpoints(*s, d, ep);
+		(void)emergencyIdsAdd(fresh, callID, ep);
+		if (d) (void)emergencyIdsAdd(fresh, d->callID, ep);
 	}
 	std::lock_guard<std::mutex> rlock(_rateMutex);
-	if (!emergencyIdsEqual(fresh, _emergencyCallIds)) _emergencyCallIds = fresh;
+	if (emergencyIdsEqual(fresh, _emergencyCallIds)) return;
+	// A rebuild must never refill a drained spill bucket: carry each one over by Call-ID, and start
+	// a new dialog's full. (Same rule as _rateSources.) 16 buckets of 16 B on the stack.
+	const auto now = std::chrono::steady_clock::now();
+	std::array<RateBucket, kMaxRateExemptCallIds> next{};
+	for (size_t i = 0; i < fresh.count && i < kMaxRateExemptCallIds; ++i)
+	{
+		const std::string_view id(fresh.id[i].data(), fresh.len[i]);
+		const size_t old = emergencyIdsFind(_emergencyCallIds, id);
+		next[i] = old < kMaxRateExemptCallIds ? _emergencySpill[old] : RateBucket{ kEmergencySpillBurst, now };
+	}
+	_emergencySpill = next;
+	_emergencyCallIds = fresh;
 }
 
 void RequestsHandler::publishTrunkPeer(bool retire)
@@ -12496,12 +12671,26 @@ bool RequestsHandler::admitPacket(const SipMessage& m)
 	const sockaddr_in src = m.getSource();
 	if (!ipAllowed(src)) return false;
 	if (rateExemptByCallId(m)) return true;
-	return allowPacket(src) || allowEmergencyInvite(m, src);
+	if (allowPacket(src) || allowEmergencyInvite(m, src)) return true;
+	return takeEmergencySpill(m);
 }
 
 bool RequestsHandler::rateExemptByCallId(const SipMessage& m) const
 {
-	return emergencyIdsHas(_emergencyCallIds, m.getCallID());
+	const uint32_t ip = m.getSource().sin_addr.s_addr;   // IP only: a NAT'd leg's port moves
+	if (ip == 0) return false;
+	const size_t i = emergencyIdsFind(_emergencyCallIds, m.getCallID());
+	if (i >= kMaxRateExemptCallIds) return false;   // not a live emergency dialog: the ordinary buckets
+	const EmergencyEndpoints& ep = _emergencyCallIds.ep[i];
+	return emergencyEndpointsHas(ep, ip) || (ep.viaTrunk && _trunkPeerIp != 0 && ip == _trunkPeerIp);
+}
+
+bool RequestsHandler::takeEmergencySpill(const SipMessage& m)
+{
+	const size_t i = emergencyIdsFind(_emergencyCallIds, m.getCallID());
+	if (i >= kMaxRateExemptCallIds) return false;
+	return takeToken(_emergencySpill[i], std::chrono::steady_clock::now(), kEmergencySpillBurst,
+		kEmergencySpillPerSec);
 }
 
 bool RequestsHandler::takeToken(RateBucket& bucket, std::chrono::steady_clock::time_point now,
@@ -12842,6 +13031,48 @@ void RequestsHandler::refuseNonLegRequest(const std::shared_ptr<SipMessage>& dat
 	++_localReinviteRefusals;
 	logNonLegRequest(data, _refusalLog, "refused", true);
 	_registrar.sendForbidden(data, "Forbidden");
+}
+
+bool RequestsHandler::isReferSourceTransferorLeg(const std::shared_ptr<Session>& session,
+	const sockaddr_in& source, const std::string& transferor) const
+{
+	if (!session) return true;
+	const auto src = session->getSrc();
+	const auto dest = session->getDest();
+	if (!src || !dest) return true;   // half-set-up dialog: same as isDialogSourceAuthorized()
+	const bool srcHit = source.sin_addr.s_addr == src->getAddress().sin_addr.s_addr;
+	const bool destHit = source.sin_addr.s_addr == dest->getAddress().sin_addr.s_addr;
+	const bool srcNamed = src->getNumber() == transferor;
+	const bool destNamed = dest->getNumber() == transferor;
+	if (srcHit && destHit) return srcNamed || destNamed;   // one shared address: From decides
+	if (srcHit) return srcNamed;
+	if (destHit) return destNamed;
+	return false;
+}
+
+bool RequestsHandler::authorizeReferTransferor(const std::shared_ptr<SipMessage>& data, const std::string& callID,
+	const std::string& replacesCallIdKey, const std::string& transferor)
+{
+	const sockaddr_in source = data->getSource();
+	bool ok = true;
+	if (auto own = getSession(callID); own.has_value())
+		ok = isReferSourceTransferorLeg(own.value(), source, transferor);
+	if (ok && !replacesCallIdKey.empty())
+	{
+		if (auto consult = getSession(replacesCallIdKey); consult.has_value())
+			ok = isReferSourceTransferorLeg(consult.value(), source, transferor);
+	}
+	if (ok) return true;
+	++_referBindingRefusals;
+	if (_referBindingLog.due(data->getCallID()))
+	{
+		char ip[INET_ADDRSTRLEN] = {};
+		if (inet_ntop(AF_INET, &source.sin_addr, ip, sizeof(ip)) == nullptr) ip[0] = '\0';
+		queueLog("REFER for " + std::string(data->getCallID()) + " from " + ip +
+			": source is not the named transferor's own leg, refused", true);
+	}
+	_registrar.sendForbidden(data, "Forbidden");
+	return false;
 }
 
 bool RequestsHandler::authorizeLocalDialogRequest(const std::shared_ptr<SipMessage>& data,
@@ -13246,6 +13477,56 @@ bool RequestsHandler::isDialogSourceAuthorized(const std::shared_ptr<Session>& s
 	const uint32_t fromIp = source.sin_addr.s_addr;
 	return fromIp == src->getAddress().sin_addr.s_addr ||
 	       fromIp == dest->getAddress().sin_addr.s_addr;
+}
+
+// ── INFO authorization ───────────────────────────────────────────────────────
+
+RequestsHandler::InfoAuth RequestsHandler::authorizeInfo(const SipMessage& request)
+{
+	InfoAuth out;
+	const uint32_t srcIp = request.getSource().sin_addr.s_addr;
+	out.session = findSession(request.getCallID());
+	if (!out.session)
+	{
+		// The MoH preview is a server-originated dialog with no Session: its phone's digits count,
+		// from the phone's own address and extension only.
+		if (mohPreviewOwnsCallID(request.getCallID()) && srcIp != 0 &&
+			srcIp == _mohPreview.addr.sin_addr.s_addr && request.getFromNumber() == _mohPreview.extension)
+		{
+			out.verdict = InfoVerdict::Allow;
+			out.actingExt = _mohPreview.extension;
+		}
+		return out;
+	}
+	out.verdict = InfoVerdict::NotALeg;
+	// IP only, as isDialogSourceAuthorized() does: a phone's source port changes. A leg with no
+	// address (the anchor stand-in, a carrier peer) matches nothing. The leg's address moves in
+	// place when its phone re-REGISTERs from a new IP, so a roaming handset keeps matching.
+	const std::array<std::shared_ptr<SipClient>, 2> legs = { out.session->getSrc(), out.session->getDest() };
+	for (const auto& leg : legs)
+	{
+		if (!leg || srcIp == 0 || leg->getAddress().sin_addr.s_addr != srcIp) continue;
+		if (leg->getNumber() != request.getFromNumber()) continue;
+		out.verdict = InfoVerdict::Allow;
+		out.actingExt = leg->getNumber();
+		break;
+	}
+	// A live emergency session is never ended or acted on by an INFO from outside it: a
+	// carrier's INFO on a PSAP callback (its PSTN leg has no address) is answered 200, nothing more.
+	if (out.verdict == InfoVerdict::NotALeg && out.session->isEmergency()) out.verdict = InfoVerdict::Ignored;
+	return out;
+}
+
+void RequestsHandler::noteInfoRefused(const std::shared_ptr<SipMessage>& request, InfoVerdict why)
+{
+	_infoRefused.fetch_add(1, std::memory_order_relaxed);
+	if (why == InfoVerdict::NotALeg)
+	{
+		logNonLegRequest(request, _refusalLog, "refused", true);
+		_registrar.sendForbidden(request, "Forbidden");
+		return;
+	}
+	logNonLegRequest(request, _refusalLog, "ignored, not acted on", false);
 }
 
 // ── BLF presence: FSM lives in BlfSubscriptions.cpp ──────────────────────────
@@ -14534,13 +14815,75 @@ bool RequestsHandler::trunkInboundRtp(const std::shared_ptr<SipMessage>& m, sock
 	return parseCallerRtp(m, ip, port) && rtpPeerFrom(ip, port, _localIp, out);
 }
 
+// The carrier's telephone-event number, offered to the handset too, so both legs
+// number DTMF alike and the relay copies it unchanged. Only at the 8000 Hz clock
+// buildMediaSdp() states; at any other, neither leg gets it (-1).
+static int carrierDtmfPayloadType(const SipMessage& data)
+{
+	const int dtmfPt = data.getTelephoneEventPayloadType();
+	if (dtmfPt < 0) return -1;
+	const std::string_view body = data.getBody();
+	const size_t map = body.find("a=rtpmap:" + std::to_string(dtmfPt) + " ");
+	const size_t slash = map == std::string_view::npos ? map : body.find('/', map);
+	if (slash == std::string_view::npos || body.substr(slash + 1, 4) != "8000" ||
+		(slash + 5 < body.size() && std::isdigit(static_cast<unsigned char>(body[slash + 5]))))
+	{
+		return -1;
+	}
+	return dtmfPt;
+}
+
+bool RequestsHandler::trunkCarrierRtp(const std::shared_ptr<SipMessage>& m, bool psapCallback, sockaddr_in& out)
+{
+	if (!psapCallback) return trunkInboundRtp(m, out);
+
+	// #873, as an outbound 911/933 (#861): audio goes to whatever address the
+	// carrier gave. Only an address that is not a strict dotted quad, or an offer
+	// with no media port, leaves no peer to send to; that stays the 488 it was,
+	// since a call with no peer would connect with one-way audio.
+	std::string ip;
+	uint16_t    port = 0;
+	uint32_t    addr = 0;
+	if (!parseCallerRtp(m, ip, port) || !TrunkResolver::parseDottedQuad(ip, addr)) return false;
+	out = sockaddr_in{};
+	out.sin_family = AF_INET;
+	out.sin_addr.s_addr = addr;
+	out.sin_port = htons(port);
+	sockaddr_in checked{};
+	if (!rtpPeerFrom(ip, port, _localIp, checked))
+	{
+		queueLog("trunk: PSAP callback " + std::string(m->getCallID()) + " offers RTP address " + ip + ":" +
+			std::to_string(port) + ", used as given (#873)");
+	}
+	return true;
+}
+
+void RequestsHandler::sendTrunkFork(Session& session, const std::shared_ptr<SipClient>& handset, int slot,
+	int dtmfPt, const std::string& callId, const std::string& caller)
+{
+	const std::string dn = handset->getNumber();
+	auto invite = trunkForkRequest(session, *handset, "INVITE",
+		buildMediaSdp(_localIp, _handsetRx[slot].localPort(), /*sendrecv=*/true, dtmfPt));
+	if (!invite)
+	{
+		// endCall() answers the carrier 480 (SipTrunk::hangup) and frees the relay.
+		endCall(callId, caller, dn, "message pool exhausted forking a carrier call");
+		return;
+	}
+	_outbox.emplace_back(handset->getAddress(), std::move(invite));
+	queueLog("trunk: inbound call ringing ext " + dn + " (relay pair " + std::to_string(slot) + ")");
+}
+
 int RequestsHandler::forkInboundTrunkCall(const std::shared_ptr<SipMessage>& data,
 	const std::shared_ptr<SipClient>& handset)
 {
 	// Where the carrier wants its audio. An INVITE without an offer would need
 	// its answer in our 200 and the carrier's in its ACK; not handled yet.
+	// #873: a PSAP callback is classified first and never refused for an unusual
+	// media address (Rule 5); an ordinary call keeps the 488.
+	const bool psapCallback = isEmergencyCallback(handset->getNumber());   // #659
 	sockaddr_in carrierRtp{};
-	if (!trunkInboundRtp(data, carrierRtp)) return 488;
+	if (!trunkCarrierRtp(data, psapCallback, carrierRtp)) return 488;
 
 	// The fork's own Call-ID, never the carrier's: SipTrunk owns that one, and a
 	// handset BYE on it would be taken for the carrier's (#386). A zeroed peer
@@ -14569,21 +14912,7 @@ int RequestsHandler::forkInboundTrunkCall(const std::shared_ptr<SipMessage>& dat
 		releaseTrunkRelay(slot);
 		return refused;
 	}
-	// The carrier's telephone-event number is offered to the handset too, so
-	// both legs number DTMF alike and the relay copies it unchanged. Only at the
-	// 8000 Hz clock buildMediaSdp() states; at any other, neither leg gets it.
-	int dtmfPt = data->getTelephoneEventPayloadType();
-	if (dtmfPt >= 0)
-	{
-		const std::string_view body = data->getBody();
-		const size_t map = body.find("a=rtpmap:" + std::to_string(dtmfPt) + " ");
-		const size_t slash = map == std::string_view::npos ? map : body.find('/', map);
-		if (slash == std::string_view::npos || body.substr(slash + 1, 4) != "8000" ||
-			(slash + 5 < body.size() && std::isdigit(static_cast<unsigned char>(body[slash + 5]))))
-		{
-			dtmfPt = -1;
-		}
-	}
+	const int dtmfPt = carrierDtmfPayloadType(*data);
 	_trunkInbound[slot] = { true, dtmfPt };
 	session->setDest(handset);
 	session->setTrunk(true);   // endCall() then ends the carrier leg and frees the relay
@@ -14591,23 +14920,13 @@ int RequestsHandler::forkInboundTrunkCall(const std::shared_ptr<SipMessage>& dat
 	session->setState(Session::State::Invited);
 	session->setLocalTag(IDGen::GenerateID(9));
 	session->setUacBranch("z9hG4bK" + IDGen::GenerateID(12));
-	session->setEmergency(isEmergencyCallback(handset->getNumber()));   // #659: a PSAP calling back
+	session->setEmergency(psapCallback);   // #659: a PSAP calling back, classified above (#873)
 	// Decision 5: 20 s to answer (a ringing PSAP callback is exempt, as a ringing 911 is: #712).
 	session->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
 	_sessions.emplace(callId, session);
 	(void)_sipTrunk.respond(callId, 100);
 
-	const std::string dn = handset->getNumber();
-	auto invite = trunkForkRequest(*session, *handset, "INVITE",
-		buildMediaSdp(_localIp, _handsetRx[slot].localPort(), /*sendrecv=*/true, dtmfPt));
-	if (!invite)
-	{
-		// endCall() answers the carrier 480 (SipTrunk::hangup) and frees the relay.
-		endCall(callId, caller, dn, "message pool exhausted forking a carrier call");
-		return 0;
-	}
-	_outbox.emplace_back(handset->getAddress(), std::move(invite));
-	queueLog("trunk: inbound call ringing ext " + dn + " (relay pair " + std::to_string(slot) + ")");
+	sendTrunkFork(*session, handset, slot, dtmfPt, callId, caller);
 	return 0;
 }
 

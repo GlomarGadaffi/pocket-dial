@@ -64,3 +64,12 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
 # NOTE: PTHREAD_TASK_STACK_SIZE_DEFAULT (8192, set in base) is deliberately kept —
 # the HTTP dashboard's std::thread overflows a smaller stack. Do not shrink it.
+
+# ── IPv4 only: drop the lwIP IPv6 stack (#489) ──────────────────────────────
+# The 4 MB app slot fell under app_slot_margin.py's 32 KB floor (31424 B free on
+# main after #1138). Nothing in src/ or main/ opens an IPv6 socket or handles an
+# IPv6 event: SIP, RTP, the dashboard and the anchor link are all IPv4. This
+# profile therefore carries no IPv6: no link-local address, no NDP/MLD, no AAAA
+# lookups (SmtpClient's getaddrinfo(AF_UNSPEC) returns A records only). Measured
+# on this profile: 27.7 KB of flash. The 16 MB builds keep IPv6.
+CONFIG_LWIP_IPV6=n

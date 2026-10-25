@@ -25,7 +25,7 @@
 #include "esp_system.h"
 #endif
 
-void DtmfFeatureCodes::onInfo(std::shared_ptr<SipMessage> data)
+void DtmfFeatureCodes::onInfo(std::shared_ptr<SipMessage> data, std::string_view actingExt)
 {
 	// --- 1. Parse "Signal=X" from the body -----------------------------------
 	const std::string& raw = data->toString();
@@ -54,7 +54,7 @@ void DtmfFeatureCodes::onInfo(std::shared_ptr<SipMessage> data)
 		return; // malformed / no signal — nothing to do
 	}
 
-	onDigit(data->getCallID(), digit, DigitSource::Info, nowTickMs(), data);
+	onDigit(data->getCallID(), digit, DigitSource::Info, nowTickMs(), data, actingExt);
 }
 
 uint32_t DtmfFeatureCodes::nowTickMs()
@@ -69,7 +69,8 @@ uint32_t DtmfFeatureCodes::nowTickMs()
 }
 
 void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
-	DigitSource source, uint32_t arrivedTick, const std::shared_ptr<SipMessage>& data)
+	DigitSource source, uint32_t arrivedTick, const std::shared_ptr<SipMessage>& data,
+	std::string_view actingExt)
 {
 	// --- 2. Look up or create the per-Call-ID accumulator -------------------
 	std::string callId(callIdView);
@@ -120,7 +121,11 @@ void DtmfFeatureCodes::onDigit(std::string_view callIdView, char digit,
 	// arrives with only a Call-ID, so resolve it off the live session — the same
 	// dialog the accumulator is keyed by.
 	std::string callerExt;
-	if (data)
+	if (!actingExt.empty())
+	{
+		callerExt = std::string(actingExt);
+	}
+	else if (data)
 	{
 		callerExt = std::string(data->getFromNumber());
 	}
