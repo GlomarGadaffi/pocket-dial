@@ -1247,9 +1247,14 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// so it is never mistakenly forwarded by a catch-all entry.
 		if (handlerKey == "INFO")
 		{
+			// An INFO is in-dialog: it is acted on only from a leg of a live dialog (see
+			// authorizeInfo), so nothing below reads its body unless it is allowed.
+			const InfoAuth infoAuth = authorizeInfo(*request);
+			if (infoAuth.verdict != InfoVerdict::Allow) noteInfoRefused(request, infoAuth.verdict);
 			// Scan headers for Content-Type: application/dtmf-relay.
 			const std::string& rawMsg = request->toString();
 			bool isDtmfRelay = false;
+			if (infoAuth.verdict == InfoVerdict::Allow)
 			{
 				size_t pos = 0;
 				while (pos < rawMsg.size())
@@ -1278,7 +1283,8 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 					pos = next;
 				}
 			}
-			// Always 200 OK a SIP INFO (RFC 6086 §4.2.1).
+			// 200 OK a SIP INFO (RFC 6086 §4.2.1), except one from a non-leg source (403 above).
+			if (infoAuth.verdict != InfoVerdict::NotALeg)
 			{
 				auto infoOk = getMessageFromPool(*request);
 				if (!infoOk) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -1297,10 +1303,9 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				// only digit path this MVP's menu wires up (see
 				// answerVoicemailRetrieval()'s DtmfSink); SIP INFO support
 				// for it is an explicit follow-up, not an oversight.
-				auto infoSession = findSession(request->getCallID());
-				if (!infoSession || !infoSession->isVoicemail())
+				if (!infoAuth.session || !infoAuth.session->isVoicemail())
 				{
-					_dtmf.onInfo(request);
+					_dtmf.onInfo(request, infoAuth.actingExt);
 				}
 			}
 		}
@@ -13246,6 +13251,56 @@ bool RequestsHandler::isDialogSourceAuthorized(const std::shared_ptr<Session>& s
 	const uint32_t fromIp = source.sin_addr.s_addr;
 	return fromIp == src->getAddress().sin_addr.s_addr ||
 	       fromIp == dest->getAddress().sin_addr.s_addr;
+}
+
+// ── INFO authorization ───────────────────────────────────────────────────────
+
+RequestsHandler::InfoAuth RequestsHandler::authorizeInfo(const SipMessage& request)
+{
+	InfoAuth out;
+	const uint32_t srcIp = request.getSource().sin_addr.s_addr;
+	out.session = findSession(request.getCallID());
+	if (!out.session)
+	{
+		// The MoH preview is a server-originated dialog with no Session: its phone's digits count,
+		// from the phone's own address and extension only.
+		if (mohPreviewOwnsCallID(request.getCallID()) && srcIp != 0 &&
+			srcIp == _mohPreview.addr.sin_addr.s_addr && request.getFromNumber() == _mohPreview.extension)
+		{
+			out.verdict = InfoVerdict::Allow;
+			out.actingExt = _mohPreview.extension;
+		}
+		return out;
+	}
+	out.verdict = InfoVerdict::NotALeg;
+	// IP only, as isDialogSourceAuthorized() does: a phone's source port changes. A leg with no
+	// address (the anchor stand-in, a carrier peer) matches nothing. The leg's address moves in
+	// place when its phone re-REGISTERs from a new IP, so a roaming handset keeps matching.
+	const std::array<std::shared_ptr<SipClient>, 2> legs = { out.session->getSrc(), out.session->getDest() };
+	for (const auto& leg : legs)
+	{
+		if (!leg || srcIp == 0 || leg->getAddress().sin_addr.s_addr != srcIp) continue;
+		if (leg->getNumber() != request.getFromNumber()) continue;
+		out.verdict = InfoVerdict::Allow;
+		out.actingExt = leg->getNumber();
+		break;
+	}
+	// A live emergency session is never ended or acted on by an INFO from outside it: a
+	// carrier's INFO on a PSAP callback (its PSTN leg has no address) is answered 200, nothing more.
+	if (out.verdict == InfoVerdict::NotALeg && out.session->isEmergency()) out.verdict = InfoVerdict::Ignored;
+	return out;
+}
+
+void RequestsHandler::noteInfoRefused(const std::shared_ptr<SipMessage>& request, InfoVerdict why)
+{
+	_infoRefused.fetch_add(1, std::memory_order_relaxed);
+	if (why == InfoVerdict::NotALeg)
+	{
+		logNonLegRequest(request, _refusalLog, "refused", true);
+		_registrar.sendForbidden(request, "Forbidden");
+		return;
+	}
+	logNonLegRequest(request, _refusalLog, "ignored, not acted on", false);
 }
 
 // ── BLF presence: FSM lives in BlfSubscriptions.cpp ──────────────────────────

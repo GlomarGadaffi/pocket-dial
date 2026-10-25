@@ -488,6 +488,7 @@ add_executable(sip_parser_tests
     # dashboard snapshot the HTTP setters do, not bypass it by writing
     # _dnd/_forwards directly from inside onDtmfInfo's _mutex lock.
     DtmfClassCodes_test.cpp
+    InfoAuth_test.cpp
     # Issue #222: the DTMF admin factory reset (*<PIN>#999#1) must wipe the SD
     # CDR archive like the HTTP factory reset does. Drives the real INFO digit
     # path with a spy Sink installed via cdrarchive::setSinkForTest().
