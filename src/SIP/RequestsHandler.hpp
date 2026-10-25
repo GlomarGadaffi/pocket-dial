@@ -586,6 +586,12 @@ public:
 		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_emergencyCallbacks.ageForTest(d);
 	}
+	// Test-only (#1127): whether `ext`'s PSAP callback window is open.
+	bool emergencyCallbackOpenForTest(std::string_view ext)
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		return isEmergencyCallback(ext);
+	}
 	// Test-only (#1115): move every unknown-caller coalescing window `d` into the past.
 	void ageUnknownEmergencyAlertsForTest(std::chrono::steady_clock::duration d)
 	{
@@ -2096,7 +2102,7 @@ private:
 	// false, or the anchor a trunk call stood in for.
 	void notifyEmergency(const pbx::EmergencyDial& emergency,
 		const std::string& fromExt, const std::string& dialed, bool routed,
-		std::string_view note = {}, bool callUp = false);
+		std::string_view note = {}, bool callUp = false, std::string_view unverifiedSource = {});
 
 	// #1107: `noRelayableCodec` is set by onInvite's relay codec gate for an emergency
 	// INVITE whose offer this PBX cannot carry. It skips the route and goes straight to

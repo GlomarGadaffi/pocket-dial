@@ -109,6 +109,10 @@ struct E911Config
 //   EMERGENCY: 911 dialed by ext 101 - ROUTED TO TRUNK - callback 5550100 - Front desk
 //   TEST: 933 dialed by ext 101 - NOT ROUTED (the trunk refused it) - callback not configured
 //
+// `unverifiedSource` (#1127), "ip:port", is empty for a verified caller, whose text
+// is unchanged. When set, " [CALLER UNVERIFIED: claimed ext X, source ip:port]" is
+// appended, after the 512-byte cap has been applied to the rest so it is never cut.
+//
 // `routed` false produces the NOT ROUTED wording, which is the case that most
 // needs a human. A test asserts the two are never confusable. `note` names
 // what failed (desmo, #878): the route for NOT ROUTED, where empty keeps "no
@@ -117,7 +121,14 @@ struct E911Config
 // is ignored).
 std::string formatE911Notification(bool isTest, std::string_view fromExt,
 	std::string_view dialed, bool hadTrunkPrefix, bool routed,
-	const E911Config& cfg, std::string_view note = {}, bool callUp = false);
+	const E911Config& cfg, std::string_view note = {}, bool callUp = false,
+	std::string_view unverifiedSource = {});
+
+// #1127: the marker appended to a 911/933 notification and to its EMERGENCY log
+// lines when the INVITE's source IP is not the address the named extension
+// registered from. Reporting only: the call is routed and answered as ever.
+// Starts with a space so it can be appended as is.
+std::string e911UnverifiedTag(std::string_view claimedExt, std::string_view source);
 
 } // namespace pbx
 
@@ -158,7 +169,8 @@ public:
 	// log line — NOT as a success/failure signal.
 	std::size_t notify(const pbx::E911Config& cfg, bool isTest,
 		std::string_view fromExt, std::string_view dialed,
-		bool hadTrunkPrefix, bool routed, std::string_view note = {}, bool callUp = false);
+		bool hadTrunkPrefix, bool routed, std::string_view note = {}, bool callUp = false,
+		std::string_view unverifiedSource = {});
 
 	// Send the staged Alert, if any. Call it with the engine lock RELEASED: this is
 	// the blocking syslog send. Safe from any thread, against notify() and against

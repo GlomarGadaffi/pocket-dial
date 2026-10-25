@@ -5072,12 +5072,19 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	// still gets "911" -- never the prefixed form, and never a stripped "11".
 	const std::string bare(emergency.number);
 	const std::string asDialed = emergency.hadTrunkPrefix ? " (dialed " + dialed + ")" : "";
+	// #1127: a source IP other than the one `from` registered from is REPORTED, never
+	// acted on (#454: 911 is never gated). IP only, as #497 and isDialogSourceAuthorized
+	// do: a phone may change ports. Empty for a verified caller, whose text is unchanged.
+	const std::string unverifiedSrc = caller->getAddress().sin_addr.s_addr == data->getSource().sin_addr.s_addr
+		? std::string() : sipwire::addrToIpPort(data->getSource());
+	const std::string unverifiedTag = unverifiedSrc.empty()
+		? std::string() : pbx::e911UnverifiedTag(from, unverifiedSrc);
 
 	// Log BEFORE routing, so the attempt is on the record even if everything
 	// after this line fails. This is the honest floor of Kari's Law's
 	// notification requirement; the on-site notification hook itself is the
 	// companion half of #166 and lands separately.
-	queueLog("EMERGENCY: " + kind + " dialed by " + from + asDialed, true);
+	queueLog("EMERGENCY: " + kind + " dialed by " + from + asDialed + unverifiedTag, true);
 
 	// Issue #521: only a provider that places REAL calls is offered the call.
 	// The loopback simulator answers whatever it is handed, so giving it 911
@@ -5130,7 +5137,7 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 			// returned true. Telling the front desk a 911 call went through when
 			// it was refused for capacity is the worst error this feature could make.
 			notifyEmergency(emergency, from, dialed, /*routed=*/placed,
-				placed ? std::string_view() : kAnchorNotPlaced);
+				placed ? std::string_view() : kAnchorNotPlaced, /*callUp=*/false, unverifiedSrc);
 			return;
 		}
 	}
@@ -5182,11 +5189,11 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 		// Pool exhausted: drop and let the peer retransmit (#101A). The log line
 		// above already recorded the attempt, which is the part that matters.
 		queueLog("EMERGENCY: " + kind + " from " + from +
-			" NOT ROUTED and no message available to answer with", true);
+			" NOT ROUTED and no message available to answer with" + unverifiedTag, true);
 		// Still notify. A 911 attempt that produced neither a call nor even a
 		// failure response is the single most important thing to put in front of
 		// a human, and the notification path has its own pooled messages.
-		notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted);
+		notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted, /*callUp=*/false, unverifiedSrc);
 		return;
 	}
 	response->setHeader("SIP/2.0 503 Emergency Call Not Routable");
@@ -5197,10 +5204,10 @@ void RequestsHandler::routeEmergencyCall(std::shared_ptr<SipMessage> data,
 	_outbox.emplace_back(data->getSource(), std::move(response));
 
 	queueLog("EMERGENCY: " + kind + " from " + from + " COULD NOT BE ROUTED (" +
-		warningDetail + ") - answered 503", true);
+		warningDetail + ") - answered 503" + unverifiedTag, true);
 
 	// 503 is enqueued; notify after it, same ordering rule as the routed path.
-	notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted);
+	notifyEmergency(emergency, from, dialed, /*routed=*/false, notRouted, /*callUp=*/false, unverifiedSrc);
 }
 
 bool RequestsHandler::emergencyDialOf(const std::string& dialed, pbx::EmergencyDial& emergencyOut,
@@ -5295,12 +5302,12 @@ void RequestsHandler::flushUnknownEmergencyTallies(std::chrono::steady_clock::ti
 // response before reaching here, and nothing below can fail back into the call.
 void RequestsHandler::notifyEmergency(const pbx::EmergencyDial& emergency,
 	const std::string& fromExt, const std::string& dialed, bool routed,
-	std::string_view notRoutedReason, bool callUp)
+	std::string_view notRoutedReason, bool callUp, std::string_view unverifiedSource)
 {
 	const pbx::E911Config& cfg = _cfg.e911Config();
 
 	_e911Notifier.notify(cfg, emergency.isTest, fromExt, dialed,
-		emergency.hadTrunkPrefix, routed, notRoutedReason, callUp);
+		emergency.hadTrunkPrefix, routed, notRoutedReason, callUp, unverifiedSource);
 
 	// Make the notified phones audibly alert, on top of the MESSAGE text. The
 	// beep is the existing register-beep INVITE (auto-answer headers, no RTP),

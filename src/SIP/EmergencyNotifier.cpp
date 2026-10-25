@@ -15,9 +15,40 @@
 namespace pbx
 {
 
+namespace
+{
+	// Trim to a UTF-8 CODEPOINT boundary, not a byte one. `location` is operator
+	// free text and may be non-ASCII; a half-written multi-byte sequence renders
+	// as a replacement character or garbage in whatever reads the notification,
+	// which is the one thing this text must not do.
+	void capUtf8(std::string& out, std::size_t cap)
+	{
+		if (out.size() <= cap) return;
+		std::size_t cut = cap;
+		while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80)
+		{
+			--cut;   // inside a sequence: back up to its lead byte
+		}
+		out.resize(cut);
+	}
+}
+
+std::string e911UnverifiedTag(std::string_view claimedExt, std::string_view source)
+{
+	std::string t;
+	t.reserve(48 + claimedExt.size() + source.size());
+	t += " [CALLER UNVERIFIED: claimed ext ";
+	t += claimedExt;
+	t += ", source ";
+	t += source;
+	t += "]";
+	return t;
+}
+
 std::string formatE911Notification(bool isTest, std::string_view fromExt,
 	std::string_view dialed, bool hadTrunkPrefix, bool routed,
-	const E911Config& cfg, std::string_view note, bool callUp)
+	const E911Config& cfg, std::string_view note, bool callUp,
+	std::string_view unverifiedSource)
 {
 	std::string out;
 	out.reserve(200);
@@ -83,20 +114,13 @@ std::string formatE911Notification(bool isTest, std::string_view fromExt,
 	}
 
 	// The MESSAGE path caps a body at 512 bytes; trim here so the syslog line
-	// and the SIP body are the same text rather than diverging silently.
-	if (out.size() > 512)
-	{
-		// Trim to a UTF-8 CODEPOINT boundary, not a byte one. `location` is
-		// operator free text and may be non-ASCII; a half-written multi-byte
-		// sequence renders as a replacement character or garbage in whatever
-		// reads the notification, which is the one thing this text must not do.
-		std::size_t cut = 512;
-		while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80)
-		{
-			--cut;   // inside a sequence: back up to its lead byte
-		}
-		out.resize(cut);
-	}
+	// and the SIP body are the same text rather than diverging silently. #1127:
+	// the unverified marker is appended after the trim of everything else, so a
+	// long location can never cut it; a verified caller's text is untouched.
+	const std::string tag = unverifiedSource.empty()
+		? std::string() : e911UnverifiedTag(fromExt, unverifiedSource);
+	capUtf8(out, tag.size() < 512 ? 512 - tag.size() : 0);
+	out += tag;
 	return out;
 }
 
@@ -199,10 +223,11 @@ void EmergencyNotifier::flushStaged()
 
 std::size_t EmergencyNotifier::notify(const pbx::E911Config& cfg, bool isTest,
 	std::string_view fromExt, std::string_view dialed,
-	bool hadTrunkPrefix, bool routed, std::string_view note, bool callUp)
+	bool hadTrunkPrefix, bool routed, std::string_view note, bool callUp,
+	std::string_view unverifiedSource)
 {
-	const std::string text =
-		pbx::formatE911Notification(isTest, fromExt, dialed, hadTrunkPrefix, routed, cfg, note, callUp);
+	const std::string text = pbx::formatE911Notification(isTest, fromExt, dialed, hadTrunkPrefix,
+		routed, cfg, note, callUp, unverifiedSource);
 
 	// 1. The record. Unconditional and unconfigurable: an operator can leave
 	//    notifyExts empty, but they cannot turn off the fact that a 911 dial is
