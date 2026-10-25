@@ -1,6 +1,7 @@
 // RequestsHandler.cpp: Issues #24 and #28 resolved.
 #include "RequestsHandler.hpp"
 #include "SipMessageBuilder.hpp"
+#include "BootTaskSlots.hpp"   // #1126: the boot alert for an absent emergency-path task
 #include "SipMessagePool.hpp"
 #include <cassert>
 #include <atomic>
@@ -5288,6 +5289,22 @@ void RequestsHandler::flushUnknownEmergencyTallies(std::chrono::steady_clock::ti
 	char reason[112];
 	notifyEmergency(emergency, due.from, due.dialed, /*routed=*/false,
 		unknownAlertReason(reason, sizeof reason, due.overflow, due.held));
+}
+
+// #1126: an emergency-path task (tel_sweep) that has no worker since boot is reported once to the E911
+// notification list. Visibility only: a few atomic loads when nothing is wrong, no I/O here (the Alert is
+// staged and flushPass() sends it), and it never touches a call. A busy alert slot defers it a tick
+// rather than displace a 911 frame.
+void RequestsHandler::raiseBootSlotAlert()
+{
+	pd::BootTask task;
+	if (!pd::bootTaskSlots().alertDue(task)) return;
+	char text[160];
+	std::snprintf(text, sizeof text,
+		"DEGRADED: emergency-path task %s has no worker since boot (no stack); see /api/status telSweepWorker",
+		pd::BootTaskSlots::name(task));
+	if (_e911Notifier.notifyDegraded(_cfg.e911Config(), text))
+		pd::bootTaskSlots().markAlerted(task);
 }
 
 // Issue #166 part 2. Kept to this one small function so the compliance-relevant
@@ -11338,6 +11355,7 @@ void RequestsHandler::tick()
 
 		sweepExpired();
 		flushUnknownEmergencyTallies(now);   // #1115
+		raiseBootSlotAlert();                // #1126
 
 		// AnchorClient::tick(): "periodic, non-blocking maintenance pump ... (<=1 Hz)"
 		// per its doc comment. Loopback's is a no-op; a real anchor uses this for

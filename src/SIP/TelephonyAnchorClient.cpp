@@ -222,6 +222,7 @@ bool TelephonyAnchorClient::start()
 		{
 			_sweepHandle.store(h, std::memory_order_release);
 		}
+		pd::bootTaskSlots().setWorker(pd::BootTask::TelSweep, h != nullptr);   // #1126: telSweepWorker + the one boot alert
 	}
 
 	// 1. Fetch OAuth token

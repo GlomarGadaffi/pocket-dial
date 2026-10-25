@@ -1,0 +1,2 @@
+# HttpStatusAlloc_test.cpp: 4 (#1126: a missing tel_sweep worker is absent on /api/status with its failure count and one boot alert; a normal boot is running with 0 failures and 0 alerts; several ticks after a failed boot still send one alert; a non-emergency-path slot failure counts but sends none)
+4

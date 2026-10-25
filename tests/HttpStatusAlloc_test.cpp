@@ -18,8 +18,10 @@
 #include <thread>
 #include <vector>
 
+#include "AlertCapture.hpp"      // #1126: the pbx-911 frames a boot alert puts on the wire
 #include "AllocCounter.hpp"
 #include "ArpLookup.hpp"
+#include "BootTaskSlots.hpp"   // #1126: which boot-allocated task slots failed
 #include "DmaFramePool.hpp"     // #985: mediaTx.l2.poolMin
 #include "HttpServer.hpp"
 #include "MediaTxStats.hpp"     // #985: the mediaTx block
@@ -165,7 +167,7 @@ TEST(HttpStatusAlloc, TheDynamicTaskCreateCountIsOnStatus)
 	const uint32_t before = psram::dynamicTaskCreates().load();
 	psram::dynamicTaskCreates().fetch_add(3);
 	const std::string resp = b.serve(false);
-	EXPECT_NE(resp.find("\"dynamicTaskCreates\":" + std::to_string(before + 3) + "}"), std::string::npos)
+	EXPECT_NE(resp.find("\"dynamicTaskCreates\":" + std::to_string(before + 3) + ","), std::string::npos)
 		<< resp;
 	psram::dynamicTaskCreates().store(before);
 }
@@ -317,6 +319,78 @@ namespace
 	}
 }
 
+// #1126: a tel_sweep worker that never got its stack must be visible. The tests drive the same
+// noteAlloc() that StaticTaskSlot::alloc() calls on the board, so the host sees what the board would.
+namespace
+{
+	struct CleanBootSlots
+	{
+		CleanBootSlots() { pd::bootTaskSlots().resetForTest(); }
+		~CleanBootSlots() { pd::bootTaskSlots().resetForTest(); }
+	};
+
+	void tickTimes(RequestsHandler& h, int n)
+	{
+		for (int i = 0; i < n; ++i)
+		{
+			h.forceNextTickForTest();
+			h.tick();
+		}
+	}
+}
+
+TEST(HttpStatusAlloc, AFailedTelSweepSlotIsAbsentOnStatusCountedAndAlertedOnce)
+{
+	CleanBootSlots clean;
+	StatusBench b;
+	AlertCapture alerts;   // after the REGISTERs: a REGISTER pass ends in flushPass() too
+	pd::bootTaskSlots().noteAlloc("tel_sweep", false);
+	tickTimes(*b.handler, 1);
+	const std::string resp = b.serve(false);
+	EXPECT_NE(resp.find("\"telSweepWorker\":\"absent\""), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"bootSlotFailures\":{\"tel_sweep\":1,"), std::string::npos) << resp;
+	EXPECT_EQ(AlertCapture::frames().size(), 1u);
+	ASSERT_FALSE(AlertCapture::frames().empty());
+	EXPECT_NE(AlertCapture::frames()[0].find("tel_sweep"), std::string::npos) << AlertCapture::frames()[0];
+}
+
+TEST(HttpStatusAlloc, ANormalBootReportsTelSweepRunningWithNoFailuresAndNoAlert)
+{
+	CleanBootSlots clean;
+	StatusBench b;
+	AlertCapture alerts;
+	tickTimes(*b.handler, 3);
+	const std::string resp = b.serve(false);
+	EXPECT_NE(resp.find("\"telSweepWorker\":\"running\""), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"bootSlotFailures\":{\"tel_sweep\":0,\"tel_media_rx\":0,"
+	                    "\"rtp_media_rx\":0,\"rtp_media_tx\":0,\"conf_mix_tick\":0}"), std::string::npos) << resp;
+	EXPECT_EQ(AlertCapture::frames().size(), 0u);
+}
+
+TEST(HttpStatusAlloc, SeveralTicksAfterAFailedBootStillSendExactlyOneAlert)
+{
+	CleanBootSlots clean;
+	StatusBench b;
+	AlertCapture alerts;
+	pd::bootTaskSlots().noteAlloc("tel_sweep", false);
+	tickTimes(*b.handler, 6);
+	EXPECT_EQ(AlertCapture::frames().size(), 1u);
+	EXPECT_NE(b.serve(false).find("\"telSweepWorker\":\"absent\""), std::string::npos);
+}
+
+TEST(HttpStatusAlloc, AFailedSlotThatIsNotOnTheEmergencyPathCountsButRaisesNoAlert)
+{
+	CleanBootSlots clean;
+	StatusBench b;
+	AlertCapture alerts;
+	pd::bootTaskSlots().noteAlloc("rtp_media_tx", false);
+	tickTimes(*b.handler, 3);
+	const std::string resp = b.serve(false);
+	EXPECT_NE(resp.find("\"rtp_media_tx\":1,"), std::string::npos) << resp;
+	EXPECT_NE(resp.find("\"telSweepWorker\":\"running\""), std::string::npos) << resp;
+	EXPECT_EQ(AlertCapture::frames().size(), 0u);
+}
+
 TEST(HttpStatusAlloc, TheStatusKeyListIsPinnedAndTheDramAccountGuardAddsOnlyItsOwnKey)
 {
 	// #410/#328: POCKETDIAL_HTTP_DRAM_ACCOUNT is bench-only and defaults to 0.
@@ -338,7 +412,7 @@ TEST(HttpStatusAlloc, TheStatusKeyListIsPinnedAndTheDramAccountGuardAddsOnlyItsO
 		"freeHeapInternal", "largestFreeBlockInternal", "freeHeapDma", "largestFreeBlockDma", "resetReason",
 		"stackHwm_sip_server_task", "stackHwm_udp_receiver_task", "stackHwm_rtp_media_tx", "stackHwm_rtp_media_rx",
 		"stackHwm_conf_mix_tick", "stackHwm_tel_ctl0", "stackHwm_tel_ctl1", "stackHwm_tel_drop", "stackHwm_tel_sos",
-		"stackHwm_tel_sweep", "stackHwm_flash_writer", "stackHwm_http_conn", "httpConnWorstRoute", "coredump", "l2Tx", "memory", "mutexHold", "mediaTx",
+		"stackHwm_tel_sweep", "stackHwm_flash_writer", "stackHwm_http_conn", "telSweepWorker", "httpConnWorstRoute", "coredump", "l2Tx", "memory", "mutexHold", "mediaTx",
 	};
 #if POCKETDIAL_HTTP_DRAM_ACCOUNT
 	want.push_back("httpDramAccount");

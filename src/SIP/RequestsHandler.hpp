@@ -2123,6 +2123,7 @@ private:
 	// window ended with no further dial. Notices are coalesced per (source, number), so this
 	// is the "N more since" summary, not a repeat alert. Caller holds _mutex.
 	void flushUnknownEmergencyTallies(std::chrono::steady_clock::time_point now);
+	void raiseBootSlotAlert();   // #1126: the one boot alert for an absent emergency-path task
 
 	// #659: a call to `ext` is a PSAP callback (ext dialed 911/933 within
 	// pbx::kEmergencyCallbackWindow). Every path that creates a session for an
