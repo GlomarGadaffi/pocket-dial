@@ -49,6 +49,19 @@ public:
 
     int activePorts() const;
 
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+    // Test seam (#1136): ports in Free. activePorts() does not count a Draining port, and
+    // a Draining port only returns to Free on the next tick(), so "nothing active" does not
+    // mean "all reusable".
+    int freePortsForTest() const
+    {
+        int n = 0;
+        for (int p = 0; p < MAX_PORTS; ++p)
+            if (_ports[p].state.load(std::memory_order_acquire) == State::Free) ++n;
+        return n;
+    }
+#endif
+
 private:
     enum class State : uint8_t { Free = 0, Active = 1, Draining = 2 };
 

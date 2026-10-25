@@ -486,14 +486,16 @@ namespace
 		s.sin_family = AF_INET;
 		s.sin_addr.s_addr = inet_addr(srcIp.c_str());
 		s.sin_port = htons(5060);
+		static int infoSeq = 0;   // each digit is its own transaction, so none is taken for a retransmission
+		const std::string n = std::to_string(++infoSeq);
 		std::string body = std::string("Signal=") + digit + "\r\nDuration=100\r\n";
 		std::string head =
 			"INFO sip:server SIP/2.0\r\n"
-			"Via: SIP/2.0/UDP " + srcIp + ":5060;branch=z9hG4bKi\r\n"
+			"Via: SIP/2.0/UDP " + srcIp + ":5060;branch=z9hG4bKi" + n + "\r\n"
 			"From: <sip:" + from + "@server>;tag=it\r\n"
 			"To: <sip:server>\r\n"
 			"Call-ID: " + callId + "\r\n"
-			"CSeq: 1 INFO\r\n"
+			"CSeq: " + n + " INFO\r\n"
 			"Content-Type: application/dtmf-relay\r\n"
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
 		return RequestsHandler::getMessageFromPool(head + body, s);
@@ -534,13 +536,14 @@ namespace
 			resetjournal::resetForTest();
 		}
 
-		// One INFO per digit. Each call comes from its own source address: the engine rate-limits
-		// a source to a burst of 40 packets (Issue #38) and a test makes several entries in a
-		// moment, which a person at a keypad never does.
+		// One INFO per digit, from the admin's own address (an INFO is accepted only from a leg of
+		// its dialog). The engine rate-limits a source to a burst of 40 packets (Issue #38) and a
+		// test makes several entries in a moment, which a person at a keypad never does, so each
+		// entry starts with a fresh bucket.
 		void digits(const std::string& seq, const char* callId = kCallId)
 		{
-			const std::string ip = "192.168.9." + std::to_string(100 + (ipSeq++ % 100));
-			for (char c : seq) handler->handle(makeInfoDigit(kAdminExt, ip, callId, c));
+			handler->refillRateSourceForTest(inet_addr(kAdminIp));
+			for (char c : seq) handler->handle(makeInfoDigit(kAdminExt, kAdminIp, callId, c));
 		}
 		void tickOnce()
 		{
@@ -569,7 +572,6 @@ namespace
 		}
 
 		std::unique_ptr<RequestsHandler> handler;
-		int ipSeq = 0;
 		WipeSpySink sink;
 		cdrarchive::Sink* prevSink = nullptr;
 		std::mutex sentMutex;
@@ -601,7 +603,8 @@ TEST_F(AdminPinWiring, TheSipThreadAnswersWhileTheHashIsStillRunning)
 	EXPECT_TRUE(sawResponseTo("reg-1002-986", "SIP/2.0 200")) << "a REGISTER was not answered while the PIN hash runs";
 	EXPECT_GT(sentCount(), before);
 	tickOnce();   // a full tick pass too
-	digits("5", "other-call");   // and a digit from anywhere else is taken
+	startEchoCall(*handler, kAdminExt, kAdminIp, "other-call");
+	digits("5", "other-call");   // and a digit on another of the admin's live calls is taken
 	EXPECT_EQ(adminpin::phaseForTest(), adminpin::Phase::Running) << "still not applied";
 
 	worker.release();

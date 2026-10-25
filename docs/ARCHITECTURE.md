@@ -95,6 +95,8 @@ What the engine *is* instead is a forked UAC coupled to a UAS, what `docs/FEATUR
 
 On both shapes the caller's `Call-ID` spans both legs. That is deliberate: it is the `_sessions` key, which is how a mid-dialog request arriving from *either* leg resolves to the one session via `getSession(data->getCallID())`. Two legs are the exception. The blind-transfer leg to the target has its **own** Call-ID, linked to the kept A–B session by `setPeerCallID` (`RequestsHandler.cpp:8307` and `:8320`). The SIP-trunk carrier leg's Call-ID is minted by `SipTrunk` (`SipTrunk.cpp:659`).
 
+> **DEPRECATED (#1133):** the SIP trunk (`SipTrunk`, the inbound-trunk fork above) is deprecated. The anchor is the supported ITSP path. Existing trunk configurations are left in place and behaviour is unchanged by this release.
+
 Unlike a textbook B2BUA, it does not insert itself into the media path. SDP is relayed with only unsupported codecs filtered out, so an ordinary extension-to-extension call streams RTP directly phone-to-phone and the board never handles a media packet. The exceptions (`440`, `888`, `555` and outside lines) are listed in the README under "When the board does touch the audio". That list also covers a parked call with hold music. The park path answers the parked leg `sendonly` from the hold-music port (`ParkOrbit.cpp:64-84`), and `HoldMusic` then transmits to it every 20 ms. Park with no clip loaded (the default) still answers `a=inactive` and sources nothing.
 
 Three more media paths are not in the README list:

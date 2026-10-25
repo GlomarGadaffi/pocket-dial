@@ -83,6 +83,8 @@ add_executable(sip_parser_tests
     HotPathInPlace_test.cpp
     # The binary's one counting operator new, plus its own positive controls.
     support/AllocCounter.cpp
+    # #1136: the one WSAStartup of the process (empty off Windows).
+    support/WinsockInit.cpp
     AllocCounter_test.cpp
     PerCallHeap_test.cpp
     # #838: a hostile many-line or long-line datagram must not grow a pool slot.
@@ -257,6 +259,10 @@ add_executable(sip_parser_tests
     # ?Replaces= splice of a consult dialog the source is not on, and that a
     # genuine in-dialog transfer still completes.
     ReferSourceAuth_test.cpp
+    # Transferor binding: an in-dialog REFER must come from the leg of the party it names
+    # as the transferor (blind and attended), the shared-address fallback, the counter
+    # and rate-limited log, and the 911 / PSAP-callback controls (see also TrunkInbound_test).
+    ReferTransferorBinding_test.cpp
     # Issue #69: the bounded pattern -> action dial plan that generalizes the
     # ring-group mechanism. Pure grammar/precedence/cap coverage against
     # DialPlan.hpp, end-to-end routing (dispatch + fallthrough) driven through
@@ -488,6 +494,7 @@ add_executable(sip_parser_tests
     # dashboard snapshot the HTTP setters do, not bypass it by writing
     # _dnd/_forwards directly from inside onDtmfInfo's _mutex lock.
     DtmfClassCodes_test.cpp
+    InfoAuth_test.cpp
     # Issue #222: the DTMF admin factory reset (*<PIN>#999#1) must wipe the SD
     # CDR archive like the HTTP factory reset does. Drives the real INFO digit
     # path with a spy Sink installed via cdrarchive::setSinkForTest().
@@ -885,6 +892,11 @@ else()
 endif()
 
 if (WIN32)
+    # #1136: the product sockets this binary opens (HTTP listener, RTP, hold music) bind
+    # INADDR_ANY, which raises a Defender Firewall prompt on a fresh exe. This define makes
+    # those five bind sites use loopback, in this target only. SipServer and the firmware
+    # never see it.
+    target_compile_definitions(sip_parser_tests PRIVATE PD_TEST_LOOPBACK_BIND=1)
     target_link_libraries(sip_parser_tests PRIVATE wsock32 ws2_32)
 else()
     target_link_libraries(sip_parser_tests PRIVATE pthread)

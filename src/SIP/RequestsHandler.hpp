@@ -178,6 +178,8 @@ public:
 	bool forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
 	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
+	// INFO requests not acted on for want of a live dialog (answered 200) or a matching leg (403).
+	uint32_t getInfoRefused() const { return _infoRefused.load(std::memory_order_relaxed); }
 	// Issue #430: packetsDropped split by reason (their sum), and the probe
 	// itself for its recent-drop ring (read with window()/at(); thread-safe,
 	// allocation-free on both sides).
@@ -664,6 +666,14 @@ public:
 		std::lock_guard<std::mutex> rlock(_rateMutex);
 		_rateBuckets.erase(netIp);
 	}
+	// Refill a registered extension's reserved limiter bucket (network-order s_addr) to its burst.
+	// A test that sends several whole entries from the one address a dialog's INFO must come from
+	// would otherwise run out of the 40-packet burst, which a person at a keypad never does.
+	void refillRateSourceForTest(uint32_t netIp)
+	{
+		std::lock_guard<std::mutex> rlock(_rateMutex);
+		if (RateSource* r = findRateSource(netIp)) r->ordinary = { 40.0, std::chrono::steady_clock::now() };
+	}
 	// #986: hold _mutex for `d`, as a slow NVS commit or PIN hash would. Host builds
 	// only. Defined in the .cpp so every call is one site however the caller is inlined.
 	void holdMutexForTest(std::chrono::milliseconds d);
@@ -936,6 +946,16 @@ public:
 	{
 		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		return _tapiConfig.secretWrites();
+	}
+
+	// Test-only (#1136): the live in-RAM client secret of slot `idx`, "" when out of range.
+	// Where the host store does not persist (_WIN32) this is the only place to see that an
+	// import left the secret alone.
+	std::string telephonySecretForTest(size_t idx)
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		const TelephonyApiConfig::Slot* s = _tapiConfig.bootSlot(idx);
+		return s ? s->secret : std::string();
 	}
 
 	// Test-only: seed one CDR record directly (bypassing a real call flow) and
@@ -2205,6 +2225,11 @@ private:
 	// The RTP address an offer or answer names, only when its c= is a dotted
 	// quad that is neither 0.0.0.0 nor broadcast: a relay is never aimed at one.
 	bool trunkInboundRtp(const std::shared_ptr<SipMessage>& m, sockaddr_in& out);
+	// #873: trunkInboundRtp() for an ordinary call; a PSAP callback is taken at any dotted-quad address.
+	bool trunkCarrierRtp(const std::shared_ptr<SipMessage>& m, bool psapCallback, sockaddr_in& out);
+	// The fork INVITE to the handset, or the end of the call if it cannot be drawn.
+	void sendTrunkFork(Session& session, const std::shared_ptr<SipClient>& handset, int slot,
+		int dtmfPt, const std::string& callId, const std::string& caller);
 	// #398 part D. A request in the fork's own INVITE transaction (the INVITE,
 	// or its CANCEL, RFC 3261 s9.1): one Request-URI, Via branch, From and To.
 	std::shared_ptr<SipMessage> trunkForkRequest(const Session& s, const SipClient& handset,
@@ -2703,6 +2728,25 @@ private:
 	bool isDialogSourceAuthorized(const std::shared_ptr<Session>& session,
 		const sockaddr_in& source) const;
 
+	// SIP INFO is in-dialog (RFC 6086). Allow: the Call-ID names a live session and the source
+	// IP (never the port) is one of its legs, whose number is also From's; or it is the MoH
+	// preview dialog, from the phone being previewed. Ignored: no live session, or a live
+	// emergency session and a source that is not one of its legs (a carrier on a PSAP
+	// callback) -- answered 200 and acted on by no one: a 481 ends the dialog (RFC 3261
+	// s12.2.1.2) and a live emergency dialog is never refused at all. NotALeg: a live
+	// non-emergency session, but not this source or this From -- 403.
+	// Caller holds _mutex.
+	enum class InfoVerdict : uint8_t { Allow, Ignored, NotALeg };
+	struct InfoAuth
+	{
+		InfoVerdict verdict = InfoVerdict::Ignored;
+		std::shared_ptr<Session> session;   // the dialog's session, when it has one
+		std::string_view actingExt;         // Allow only: the extension the digits act for
+	};
+	InfoAuth authorizeInfo(const SipMessage& request);
+	// Count, log (rate-limited) and, for NotALeg, queue the 403.
+	void noteInfoRefused(const std::shared_ptr<SipMessage>& request, InfoVerdict why);
+
 	// A re-INVITE/UPDATE this PBX answers itself (555 anchor, inbound anchor, 997 page)
 	// must come from a leg of the dialog. False: a 403 was queued and the request is
 	// logged; the caller returns without touching bridge, state or session timer.
@@ -2711,6 +2755,16 @@ private:
 		const std::shared_ptr<Session>& session);
 	bool authorizeSplicedRefresh(const std::shared_ptr<SipMessage>& data,
 		const std::shared_ptr<Session>& session);
+	// True when `source` is the leg of `session` whose extension is `transferor` (IP only). With both
+	// legs at one IP the legs cannot be told apart, so the named party must be one of the two. A
+	// missing leg or no session: true, as isDialogSourceAuthorized() (tracked separately).
+	bool isReferSourceTransferorLeg(const std::shared_ptr<Session>& session, const sockaddr_in& source,
+		const std::string& transferor) const;
+	// The binding for a REFER's own dialog and, when attended, its consult dialog (its Call-ID key,
+	// empty when the REFER is not attended). False: a 403 was
+	// queued, the refusal counted and (rate-limited) logged; the caller returns. Caller holds _mutex.
+	bool authorizeReferTransferor(const std::shared_ptr<SipMessage>& data, const std::string& callID,
+		const std::string& replacesCallIdKey, const std::string& transferor);
 	// 403 + count + (rate-limited) log for a request from a non-dialog source.
 	void refuseNonLegRequest(const std::shared_ptr<SipMessage>& data);
 	// A fixed table of recent Call-IDs: due() is true at most once per kSeconds per Call-ID
@@ -2731,14 +2785,19 @@ private:
 	};
 	LogLimiter _refusalLog;
 	LogLimiter _resumeLog;
+	LogLimiter _referBindingLog;
+	uint32_t _referBindingRefusals = 0;    // every REFER refused by the transferor binding, logged or not
 	uint32_t _localReinviteRefusals = 0;   // every refused request, logged or not
 	uint32_t _localResumeAccepts = 0;      // every accepted non-leg emergency resume
 	void logNonLegRequest(const std::shared_ptr<SipMessage>& data, LogLimiter& limiter, const char* verdict,
 		bool isError);
 
 public:
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	uint32_t localReinviteRefusalsForTest() const { return _localReinviteRefusals; }
+	uint32_t referBindingRefusalsForTest() const { return _referBindingRefusals; }
 	uint32_t localResumeAcceptsForTest() const { return _localResumeAccepts; }
+#endif
 private:
 
 	// Server-side RTP media source (the 440 tone stream). One concurrent stream; the
@@ -3224,6 +3283,7 @@ private:
 	std::atomic<uint64_t> _headerRejected{0};         // #199 header admission refusals
 	std::atomic<uint64_t> _emergencyHeaderYields{0};  // #199 911 let through a violation
 	std::atomic<uint64_t> _headerLineCuts{0};         // #838 datagrams cut at 64 header lines
+	std::atomic<uint32_t> _infoRefused{0};   // getInfoRefused()
 	std::atomic<uint64_t> _vpeerRefusals{0};   // #409: allocateVirtualPeer() refusals
 	std::atomic<uint32_t> _emergencyRtpReaps{0};   // #741
 	std::atomic<uint64_t> _unboundCallerRefusals{0};   // #497: INVITE not from the caller's registered IP

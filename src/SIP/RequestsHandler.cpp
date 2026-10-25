@@ -1247,9 +1247,14 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 		// so it is never mistakenly forwarded by a catch-all entry.
 		if (handlerKey == "INFO")
 		{
+			// An INFO is in-dialog: it is acted on only from a leg of a live dialog (see
+			// authorizeInfo), so nothing below reads its body unless it is allowed.
+			const InfoAuth infoAuth = authorizeInfo(*request);
+			if (infoAuth.verdict != InfoVerdict::Allow) noteInfoRefused(request, infoAuth.verdict);
 			// Scan headers for Content-Type: application/dtmf-relay.
 			const std::string& rawMsg = request->toString();
 			bool isDtmfRelay = false;
+			if (infoAuth.verdict == InfoVerdict::Allow)
 			{
 				size_t pos = 0;
 				while (pos < rawMsg.size())
@@ -1278,7 +1283,8 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 					pos = next;
 				}
 			}
-			// Always 200 OK a SIP INFO (RFC 6086 §4.2.1).
+			// 200 OK a SIP INFO (RFC 6086 §4.2.1), except one from a non-leg source (403 above).
+			if (infoAuth.verdict != InfoVerdict::NotALeg)
 			{
 				auto infoOk = getMessageFromPool(*request);
 				if (!infoOk) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -1297,10 +1303,9 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				// only digit path this MVP's menu wires up (see
 				// answerVoicemailRetrieval()'s DtmfSink); SIP INFO support
 				// for it is an explicit follow-up, not an oversight.
-				auto infoSession = findSession(request->getCallID());
-				if (!infoSession || !infoSession->isVoicemail())
+				if (!infoAuth.session || !infoAuth.session->isVoicemail())
 				{
-					_dtmf.onInfo(request);
+					_dtmf.onInfo(request, infoAuth.actingExt);
 				}
 			}
 		}
@@ -8401,9 +8406,12 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// could still name any unrelated call A happens to be in as ?Replaces= and
 	// splice A out of it. A real transferor is a leg of both dialogs and passes
 	// both checks; anyone else fails one.
+	// The consult dialog's key is built once and shared by both checks and the splice below.
+	const std::string replacesCallIdKey =
+		replacesCallIdBare.empty() ? std::string() : "Call-ID: " + replacesCallIdBare;
 	if (!replacesCallIdBare.empty())
 	{
-		if (auto consult = getSession("Call-ID: " + replacesCallIdBare);
+		if (auto consult = getSession(replacesCallIdKey);
 			consult.has_value() &&
 			!isDialogSourceAuthorized(consult.value(), data->getSource()))
 		{
@@ -8414,6 +8422,10 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		}
 	}
 
+	// The sender must also be the leg of the party From names as the transferor, on this dialog and,
+	// for an attended transfer, on the consult dialog.
+	if (!authorizeReferTransferor(data, callID, replacesCallIdKey, transferor->getNumber())) return;
+
 	// ── Attended transfer (RFC 3891 Replaces), issue #131 ─────────────────────────
 	// A (transferor) has two active calls: A-B (this REFER's own dialog, callID)
 	// and A-C (the consult session, replacesCallIdBare). Splice B<->C via cross
@@ -8421,7 +8433,6 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// to the blind-transfer path below when Replaces is absent (or unusable).
 	if (!replacesCallIdBare.empty() || replacesMalformed)
 	{
-		const std::string replacesCallIdKey = "Call-ID: " + replacesCallIdBare;
 		bool canSplice = false;
 		std::shared_ptr<Session> ab, ac;
 		std::shared_ptr<SipClient> bClient, cClient;
@@ -12859,6 +12870,48 @@ void RequestsHandler::refuseNonLegRequest(const std::shared_ptr<SipMessage>& dat
 	_registrar.sendForbidden(data, "Forbidden");
 }
 
+bool RequestsHandler::isReferSourceTransferorLeg(const std::shared_ptr<Session>& session,
+	const sockaddr_in& source, const std::string& transferor) const
+{
+	if (!session) return true;
+	const auto src = session->getSrc();
+	const auto dest = session->getDest();
+	if (!src || !dest) return true;   // half-set-up dialog: same as isDialogSourceAuthorized()
+	const bool srcHit = source.sin_addr.s_addr == src->getAddress().sin_addr.s_addr;
+	const bool destHit = source.sin_addr.s_addr == dest->getAddress().sin_addr.s_addr;
+	const bool srcNamed = src->getNumber() == transferor;
+	const bool destNamed = dest->getNumber() == transferor;
+	if (srcHit && destHit) return srcNamed || destNamed;   // one shared address: From decides
+	if (srcHit) return srcNamed;
+	if (destHit) return destNamed;
+	return false;
+}
+
+bool RequestsHandler::authorizeReferTransferor(const std::shared_ptr<SipMessage>& data, const std::string& callID,
+	const std::string& replacesCallIdKey, const std::string& transferor)
+{
+	const sockaddr_in source = data->getSource();
+	bool ok = true;
+	if (auto own = getSession(callID); own.has_value())
+		ok = isReferSourceTransferorLeg(own.value(), source, transferor);
+	if (ok && !replacesCallIdKey.empty())
+	{
+		if (auto consult = getSession(replacesCallIdKey); consult.has_value())
+			ok = isReferSourceTransferorLeg(consult.value(), source, transferor);
+	}
+	if (ok) return true;
+	++_referBindingRefusals;
+	if (_referBindingLog.due(data->getCallID()))
+	{
+		char ip[INET_ADDRSTRLEN] = {};
+		if (inet_ntop(AF_INET, &source.sin_addr, ip, sizeof(ip)) == nullptr) ip[0] = '\0';
+		queueLog("REFER for " + std::string(data->getCallID()) + " from " + ip +
+			": source is not the named transferor's own leg, refused", true);
+	}
+	_registrar.sendForbidden(data, "Forbidden");
+	return false;
+}
+
 bool RequestsHandler::authorizeLocalDialogRequest(const std::shared_ptr<SipMessage>& data,
 	const std::shared_ptr<Session>& session)
 {
@@ -13261,6 +13314,56 @@ bool RequestsHandler::isDialogSourceAuthorized(const std::shared_ptr<Session>& s
 	const uint32_t fromIp = source.sin_addr.s_addr;
 	return fromIp == src->getAddress().sin_addr.s_addr ||
 	       fromIp == dest->getAddress().sin_addr.s_addr;
+}
+
+// ── INFO authorization ───────────────────────────────────────────────────────
+
+RequestsHandler::InfoAuth RequestsHandler::authorizeInfo(const SipMessage& request)
+{
+	InfoAuth out;
+	const uint32_t srcIp = request.getSource().sin_addr.s_addr;
+	out.session = findSession(request.getCallID());
+	if (!out.session)
+	{
+		// The MoH preview is a server-originated dialog with no Session: its phone's digits count,
+		// from the phone's own address and extension only.
+		if (mohPreviewOwnsCallID(request.getCallID()) && srcIp != 0 &&
+			srcIp == _mohPreview.addr.sin_addr.s_addr && request.getFromNumber() == _mohPreview.extension)
+		{
+			out.verdict = InfoVerdict::Allow;
+			out.actingExt = _mohPreview.extension;
+		}
+		return out;
+	}
+	out.verdict = InfoVerdict::NotALeg;
+	// IP only, as isDialogSourceAuthorized() does: a phone's source port changes. A leg with no
+	// address (the anchor stand-in, a carrier peer) matches nothing. The leg's address moves in
+	// place when its phone re-REGISTERs from a new IP, so a roaming handset keeps matching.
+	const std::array<std::shared_ptr<SipClient>, 2> legs = { out.session->getSrc(), out.session->getDest() };
+	for (const auto& leg : legs)
+	{
+		if (!leg || srcIp == 0 || leg->getAddress().sin_addr.s_addr != srcIp) continue;
+		if (leg->getNumber() != request.getFromNumber()) continue;
+		out.verdict = InfoVerdict::Allow;
+		out.actingExt = leg->getNumber();
+		break;
+	}
+	// A live emergency session is never ended or acted on by an INFO from outside it: a
+	// carrier's INFO on a PSAP callback (its PSTN leg has no address) is answered 200, nothing more.
+	if (out.verdict == InfoVerdict::NotALeg && out.session->isEmergency()) out.verdict = InfoVerdict::Ignored;
+	return out;
+}
+
+void RequestsHandler::noteInfoRefused(const std::shared_ptr<SipMessage>& request, InfoVerdict why)
+{
+	_infoRefused.fetch_add(1, std::memory_order_relaxed);
+	if (why == InfoVerdict::NotALeg)
+	{
+		logNonLegRequest(request, _refusalLog, "refused", true);
+		_registrar.sendForbidden(request, "Forbidden");
+		return;
+	}
+	logNonLegRequest(request, _refusalLog, "ignored, not acted on", false);
 }
 
 // ── BLF presence: FSM lives in BlfSubscriptions.cpp ──────────────────────────
@@ -14549,13 +14652,75 @@ bool RequestsHandler::trunkInboundRtp(const std::shared_ptr<SipMessage>& m, sock
 	return parseCallerRtp(m, ip, port) && rtpPeerFrom(ip, port, _localIp, out);
 }
 
+// The carrier's telephone-event number, offered to the handset too, so both legs
+// number DTMF alike and the relay copies it unchanged. Only at the 8000 Hz clock
+// buildMediaSdp() states; at any other, neither leg gets it (-1).
+static int carrierDtmfPayloadType(const SipMessage& data)
+{
+	const int dtmfPt = data.getTelephoneEventPayloadType();
+	if (dtmfPt < 0) return -1;
+	const std::string_view body = data.getBody();
+	const size_t map = body.find("a=rtpmap:" + std::to_string(dtmfPt) + " ");
+	const size_t slash = map == std::string_view::npos ? map : body.find('/', map);
+	if (slash == std::string_view::npos || body.substr(slash + 1, 4) != "8000" ||
+		(slash + 5 < body.size() && std::isdigit(static_cast<unsigned char>(body[slash + 5]))))
+	{
+		return -1;
+	}
+	return dtmfPt;
+}
+
+bool RequestsHandler::trunkCarrierRtp(const std::shared_ptr<SipMessage>& m, bool psapCallback, sockaddr_in& out)
+{
+	if (!psapCallback) return trunkInboundRtp(m, out);
+
+	// #873, as an outbound 911/933 (#861): audio goes to whatever address the
+	// carrier gave. Only an address that is not a strict dotted quad, or an offer
+	// with no media port, leaves no peer to send to; that stays the 488 it was,
+	// since a call with no peer would connect with one-way audio.
+	std::string ip;
+	uint16_t    port = 0;
+	uint32_t    addr = 0;
+	if (!parseCallerRtp(m, ip, port) || !TrunkResolver::parseDottedQuad(ip, addr)) return false;
+	out = sockaddr_in{};
+	out.sin_family = AF_INET;
+	out.sin_addr.s_addr = addr;
+	out.sin_port = htons(port);
+	sockaddr_in checked{};
+	if (!rtpPeerFrom(ip, port, _localIp, checked))
+	{
+		queueLog("trunk: PSAP callback " + std::string(m->getCallID()) + " offers RTP address " + ip + ":" +
+			std::to_string(port) + ", used as given (#873)");
+	}
+	return true;
+}
+
+void RequestsHandler::sendTrunkFork(Session& session, const std::shared_ptr<SipClient>& handset, int slot,
+	int dtmfPt, const std::string& callId, const std::string& caller)
+{
+	const std::string dn = handset->getNumber();
+	auto invite = trunkForkRequest(session, *handset, "INVITE",
+		buildMediaSdp(_localIp, _handsetRx[slot].localPort(), /*sendrecv=*/true, dtmfPt));
+	if (!invite)
+	{
+		// endCall() answers the carrier 480 (SipTrunk::hangup) and frees the relay.
+		endCall(callId, caller, dn, "message pool exhausted forking a carrier call");
+		return;
+	}
+	_outbox.emplace_back(handset->getAddress(), std::move(invite));
+	queueLog("trunk: inbound call ringing ext " + dn + " (relay pair " + std::to_string(slot) + ")");
+}
+
 int RequestsHandler::forkInboundTrunkCall(const std::shared_ptr<SipMessage>& data,
 	const std::shared_ptr<SipClient>& handset)
 {
 	// Where the carrier wants its audio. An INVITE without an offer would need
 	// its answer in our 200 and the carrier's in its ACK; not handled yet.
+	// #873: a PSAP callback is classified first and never refused for an unusual
+	// media address (Rule 5); an ordinary call keeps the 488.
+	const bool psapCallback = isEmergencyCallback(handset->getNumber());   // #659
 	sockaddr_in carrierRtp{};
-	if (!trunkInboundRtp(data, carrierRtp)) return 488;
+	if (!trunkCarrierRtp(data, psapCallback, carrierRtp)) return 488;
 
 	// The fork's own Call-ID, never the carrier's: SipTrunk owns that one, and a
 	// handset BYE on it would be taken for the carrier's (#386). A zeroed peer
@@ -14584,21 +14749,7 @@ int RequestsHandler::forkInboundTrunkCall(const std::shared_ptr<SipMessage>& dat
 		releaseTrunkRelay(slot);
 		return refused;
 	}
-	// The carrier's telephone-event number is offered to the handset too, so
-	// both legs number DTMF alike and the relay copies it unchanged. Only at the
-	// 8000 Hz clock buildMediaSdp() states; at any other, neither leg gets it.
-	int dtmfPt = data->getTelephoneEventPayloadType();
-	if (dtmfPt >= 0)
-	{
-		const std::string_view body = data->getBody();
-		const size_t map = body.find("a=rtpmap:" + std::to_string(dtmfPt) + " ");
-		const size_t slash = map == std::string_view::npos ? map : body.find('/', map);
-		if (slash == std::string_view::npos || body.substr(slash + 1, 4) != "8000" ||
-			(slash + 5 < body.size() && std::isdigit(static_cast<unsigned char>(body[slash + 5]))))
-		{
-			dtmfPt = -1;
-		}
-	}
+	const int dtmfPt = carrierDtmfPayloadType(*data);
 	_trunkInbound[slot] = { true, dtmfPt };
 	session->setDest(handset);
 	session->setTrunk(true);   // endCall() then ends the carrier leg and frees the relay
@@ -14606,23 +14757,13 @@ int RequestsHandler::forkInboundTrunkCall(const std::shared_ptr<SipMessage>& dat
 	session->setState(Session::State::Invited);
 	session->setLocalTag(IDGen::GenerateID(9));
 	session->setUacBranch("z9hG4bK" + IDGen::GenerateID(12));
-	session->setEmergency(isEmergencyCallback(handset->getNumber()));   // #659: a PSAP calling back
+	session->setEmergency(psapCallback);   // #659: a PSAP calling back, classified above (#873)
 	// Decision 5: 20 s to answer (a ringing PSAP callback is exempt, as a ringing 911 is: #712).
 	session->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
 	_sessions.emplace(callId, session);
 	(void)_sipTrunk.respond(callId, 100);
 
-	const std::string dn = handset->getNumber();
-	auto invite = trunkForkRequest(*session, *handset, "INVITE",
-		buildMediaSdp(_localIp, _handsetRx[slot].localPort(), /*sendrecv=*/true, dtmfPt));
-	if (!invite)
-	{
-		// endCall() answers the carrier 480 (SipTrunk::hangup) and frees the relay.
-		endCall(callId, caller, dn, "message pool exhausted forking a carrier call");
-		return 0;
-	}
-	_outbox.emplace_back(handset->getAddress(), std::move(invite));
-	queueLog("trunk: inbound call ringing ext " + dn + " (relay pair " + std::to_string(slot) + ")");
+	sendTrunkFork(*session, handset, slot, dtmfPt, callId, caller);
 	return 0;
 }
 
