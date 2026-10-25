@@ -1234,22 +1234,6 @@ TEST(TrunkInbound, APsapCallbackWithAnUnusableCarrierAddressStillRingsTheHandset
 	}
 }
 
-TEST(TrunkInbound, AnOrdinaryCallWithTheSameUnusableAddressIsStillRefused488)
-{
-	const MockedInterface net;
-	for (const char* ip : { "127.0.0.1", "224.0.0.1", "192.168.50.1" })
-	{
-		Bench b;
-		ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
-		b.handler.handle(RequestsHandler::getMessageFromPool(
-			withConnection(makeInvite(kDid, kDid, "in-873-ord", kSbcIp, true, "+12025550177", 100)->toString(), ip),
-			addrFor(kSbcIp)));
-		EXPECT_EQ(b.carrierStatus(), "SIP/2.0 488 Not Acceptable Here") << ip;
-		EXPECT_EQ(b.countTo(kSbcIp), 1u) << ip;
-		EXPECT_TRUE(b.firstTo("INVITE", kPhoneIp).empty()) << ip;
-	}
-}
-
 TEST(TrunkInbound, APsapCallbackWithANormalOfferIsUnchanged)
 {
 	Bench b;
@@ -1263,10 +1247,20 @@ TEST(TrunkInbound, APsapCallbackWithANormalOfferIsUnchanged)
 	EXPECT_TRUE(s.value()->isEmergency());
 }
 
-TEST(TrunkInbound, APsapCallbackWithNoOfferStillRingsTheHandset)
+TEST(TrunkInbound, APsapCallbackWhoseAddressIsNotADottedQuadHasNoPeerAndIsRefused488)
 {
-	// #873: with no address to read at all, a PSAP callback rings; the audio waits
-	// on the handset's answer. An ordinary call without an offer keeps its 488.
+	const MockedInterface net;
+	Bench b;
+	const std::string fork = psapCallbackWithOfferAt(b, "999.0.0.1", "in-873-badquad");
+	EXPECT_TRUE(fork.empty());
+	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 488 Not Acceptable Here");
+	EXPECT_EQ(b.countTo(kSbcIp), 1u);
+}
+
+TEST(TrunkInbound, ACallWithNoOfferIsRefused488EvenFromAPsapCallback)
+{
+	// #873: with no media address there is no peer to send to, and a call
+	// connected without one has one-way audio; the 488 stays, as on main.
 	const MockedInterface net;
 	auto noOffer = [](std::string raw) {
 		raw.erase(raw.find("\r\n\r\n") + 4);
@@ -1274,21 +1268,22 @@ TEST(TrunkInbound, APsapCallbackWithNoOfferStillRingsTheHandset)
 		return RequestsHandler::getMessageFromPool(
 			std::regex_replace(raw, std::regex("Content-Length: [0-9]+"), "Content-Length: 0"), addrFor(kSbcIp));
 	};
-	Bench b;
-	ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
-	b.handler.setAnchorPlacesRealCallsForTest(true);
-	b.handler.handle(makeInvite("911", "911", "in-873-no-911", kPhoneIp, true, kExt));
-	ASSERT_FALSE(b.firstTo("SIP/2.0 200", kPhoneIp).empty()) << "precondition: the anchor placed 2001's 911";
-	b.sent.clear();
-	b.handler.handle(noOffer(makeInvite(kDid, kDid, "in-873-no", kSbcIp, true, "+12025550177", 100)->toString()));
-	const std::string fork = b.firstTo("INVITE sip:2001@", kPhoneIp);
-	EXPECT_FALSE(fork.empty());
-	EXPECT_EQ(b.countTo(kPhoneIp), 1u);
-	EXPECT_TRUE(b.firstTo("SIP/2.0 4", kSbcIp).empty());
-	if (fork.empty()) return;
-	auto s = b.handler.getSession("Call-ID: " + field(fork, "Call-ID: "));
-	ASSERT_TRUE(s.has_value());
-	EXPECT_TRUE(s.value()->isEmergency());
+	for (const bool psap : { false, true })
+	{
+		Bench b;
+		ASSERT_EQ(b.handler.setDidMapping(kDid, kExt), "");
+		if (psap)
+		{
+			b.handler.setAnchorPlacesRealCallsForTest(true);
+			b.handler.handle(makeInvite("911", "911", "in-873-no-911", kPhoneIp, true, kExt));
+			ASSERT_FALSE(b.firstTo("SIP/2.0 200", kPhoneIp).empty()) << "precondition: the anchor placed 2001's 911";
+			b.sent.clear();
+		}
+		b.handler.handle(noOffer(makeInvite(kDid, kDid, "in-873-no", kSbcIp, true, "+12025550177", 100)->toString()));
+		EXPECT_EQ(b.carrierStatus(), "SIP/2.0 488 Not Acceptable Here") << (psap ? "PSAP callback" : "ordinary call");
+		EXPECT_EQ(b.countTo(kSbcIp), 1u);
+		EXPECT_TRUE(b.firstTo("INVITE", kPhoneIp).empty());
+	}
 }
 
 TEST(TrunkInbound, TheHandsetsOkToOurCancelIsAbsorbed)

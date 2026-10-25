@@ -14660,24 +14660,22 @@ bool RequestsHandler::trunkCarrierRtp(const std::shared_ptr<SipMessage>& m, bool
 	if (!psapCallback) return trunkInboundRtp(m, out);
 
 	// #873, as an outbound 911/933 (#861): audio goes to whatever address the
-	// carrier gave, unchecked. A zeroed `out` means no peer could be read; the
-	// caller rings anyway. Never false.
-	out = sockaddr_in{};
+	// carrier gave. Only an address that is not a strict dotted quad, or an offer
+	// with no media port, leaves no peer to send to; that stays the 488 it was,
+	// since a call with no peer would connect with one-way audio.
 	std::string ip;
 	uint16_t    port = 0;
-	if (parseCallerRtp(m, ip, port))
+	uint32_t    addr = 0;
+	if (!parseCallerRtp(m, ip, port) || !TrunkResolver::parseDottedQuad(ip, addr)) return false;
+	out = sockaddr_in{};
+	out.sin_family = AF_INET;
+	out.sin_addr.s_addr = addr;
+	out.sin_port = htons(port);
+	sockaddr_in checked{};
+	if (!rtpPeerFrom(ip, port, _localIp, checked))
 	{
-		out.sin_family = AF_INET;
-		out.sin_addr.s_addr = inet_addr(ip.c_str());
-		out.sin_port = htons(port);
-		sockaddr_in checked{};
-		if (!rtpPeerFrom(ip, port, _localIp, checked))
-			queueLog("trunk: PSAP callback " + std::string(m->getCallID()) + " offers RTP address " + ip + ":" +
-				std::to_string(port) + ", used as given (#873)");
-	}
-	else
-	{
-		queueLog("trunk: PSAP callback " + std::string(m->getCallID()) + " offers no usable RTP address, ringing anyway (#873)");
+		queueLog("trunk: PSAP callback " + std::string(m->getCallID()) + " offers RTP address " + ip + ":" +
+			std::to_string(port) + ", used as given (#873)");
 	}
 	return true;
 }
@@ -14703,8 +14701,8 @@ int RequestsHandler::forkInboundTrunkCall(const std::shared_ptr<SipMessage>& dat
 {
 	// Where the carrier wants its audio. An INVITE without an offer would need
 	// its answer in our 200 and the carrier's in its ACK; not handled yet.
-	// #873: a PSAP callback is classified first and never refused on its media
-	// address (Rule 5); an ordinary call keeps the 488.
+	// #873: a PSAP callback is classified first and never refused for an unusual
+	// media address (Rule 5); an ordinary call keeps the 488.
 	const bool psapCallback = isEmergencyCallback(handset->getNumber());   // #659
 	sockaddr_in carrierRtp{};
 	if (!trunkCarrierRtp(data, psapCallback, carrierRtp)) return 488;
@@ -14725,9 +14723,7 @@ int RequestsHandler::forkInboundTrunkCall(const std::shared_ptr<SipMessage>& dat
 	// bound port is what one side's SDP advertises.
 	_trunkRx[slot].setRawSink(&trunkRelayForward, &_handsetRx[slot]);
 	_handsetRx[slot].setRawSink(&trunkRelayForward, &_trunkRx[slot]);
-	// A PSAP callback with no peer to aim at still rings (#873); an ordinary call is 503.
-	const bool peered = _trunkRx[slot].setRawPeer(carrierRtp);
-	if ((!peered && !psapCallback) || !_trunkRx[slot].start(0, nullptr) ||
+	if (!_trunkRx[slot].setRawPeer(carrierRtp) || !_trunkRx[slot].start(0, nullptr) ||
 		!_handsetRx[slot].start(0, nullptr))
 	{
 		releaseTrunkRelay(slot);

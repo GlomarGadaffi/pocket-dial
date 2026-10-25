@@ -2225,7 +2225,7 @@ private:
 	// The RTP address an offer or answer names, only when its c= is a dotted
 	// quad that is neither 0.0.0.0 nor broadcast: a relay is never aimed at one.
 	bool trunkInboundRtp(const std::shared_ptr<SipMessage>& m, sockaddr_in& out);
-	// #873: trunkInboundRtp() for an ordinary call; a PSAP callback is never refused (always true).
+	// #873: trunkInboundRtp() for an ordinary call; a PSAP callback is taken at any dotted-quad address.
 	bool trunkCarrierRtp(const std::shared_ptr<SipMessage>& m, bool psapCallback, sockaddr_in& out);
 	// The fork INVITE to the handset, or the end of the call if it cannot be drawn.
 	void sendTrunkFork(Session& session, const std::shared_ptr<SipClient>& handset, int slot,
