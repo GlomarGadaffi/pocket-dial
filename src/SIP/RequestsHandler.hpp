@@ -951,6 +951,16 @@ public:
 		return _tapiConfig.secretWrites();
 	}
 
+	// Test-only (#1136): the live in-RAM client secret of slot `idx`, "" when out of range.
+	// Where the host store does not persist (_WIN32) this is the only place to see that an
+	// import left the secret alone.
+	std::string telephonySecretForTest(size_t idx)
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		const TelephonyApiConfig::Slot* s = _tapiConfig.bootSlot(idx);
+		return s ? s->secret : std::string();
+	}
+
 	// Test-only: seed one CDR record directly (bypassing a real call flow) and
 	// read the ring back, so a factory-reset test can assert clearAllCallHistory()
 	// actually empties it without driving a full INVITE/BYE sequence just to
@@ -2232,6 +2242,11 @@ private:
 	// The RTP address an offer or answer names, only when its c= is a dotted
 	// quad that is neither 0.0.0.0 nor broadcast: a relay is never aimed at one.
 	bool trunkInboundRtp(const std::shared_ptr<SipMessage>& m, sockaddr_in& out);
+	// #873: trunkInboundRtp() for an ordinary call; a PSAP callback is taken at any dotted-quad address.
+	bool trunkCarrierRtp(const std::shared_ptr<SipMessage>& m, bool psapCallback, sockaddr_in& out);
+	// The fork INVITE to the handset, or the end of the call if it cannot be drawn.
+	void sendTrunkFork(Session& session, const std::shared_ptr<SipClient>& handset, int slot,
+		int dtmfPt, const std::string& callId, const std::string& caller);
 	// #398 part D. A request in the fork's own INVITE transaction (the INVITE,
 	// or its CANCEL, RFC 3261 s9.1): one Request-URI, Via branch, From and To.
 	std::shared_ptr<SipMessage> trunkForkRequest(const Session& s, const SipClient& handset,
