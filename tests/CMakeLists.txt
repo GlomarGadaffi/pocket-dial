@@ -83,6 +83,8 @@ add_executable(sip_parser_tests
     HotPathInPlace_test.cpp
     # The binary's one counting operator new, plus its own positive controls.
     support/AllocCounter.cpp
+    # #1136: the one WSAStartup of the process (empty off Windows).
+    support/WinsockInit.cpp
     AllocCounter_test.cpp
     PerCallHeap_test.cpp
     # #838: a hostile many-line or long-line datagram must not grow a pool slot.

@@ -8,7 +8,7 @@
 #include <vector>
 #include "RequestsHandler.hpp"
 #include "Session.hpp"
-#include <arpa/inet.h>
+#include "net_compat.h"
 
 namespace
 {

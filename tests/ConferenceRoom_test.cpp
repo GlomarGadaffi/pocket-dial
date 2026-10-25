@@ -911,6 +911,12 @@ TEST(ConferenceReap, FourHarnessUasThatDieWithoutByeAreAllReapedAndTheRoomIsReus
 			<< "leg " << i << " must not keep an RTP sender streaming";
 	}
 
+#if defined(_WIN32)
+	// The mix driver thread returns the reaped ports to Free on its 20 ms tick. Windows
+	// timers run coarser than Linux's, so the re-dial below can beat it (#1136).
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+#endif
+
 	// Nothing leaked: the whole room can be filled again.
 	for (int i = 0; i < kLegs; ++i)
 	{
