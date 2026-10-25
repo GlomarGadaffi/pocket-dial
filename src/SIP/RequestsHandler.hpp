@@ -2740,6 +2740,16 @@ private:
 		const std::shared_ptr<Session>& session);
 	bool authorizeSplicedRefresh(const std::shared_ptr<SipMessage>& data,
 		const std::shared_ptr<Session>& session);
+	// True when `source` is the leg of `session` whose extension is `transferor` (IP only). With both
+	// legs at one IP the legs cannot be told apart, so the named party must be one of the two. A
+	// missing leg or no session: true, as isDialogSourceAuthorized() (tracked separately).
+	bool isReferSourceTransferorLeg(const std::shared_ptr<Session>& session, const sockaddr_in& source,
+		const std::string& transferor) const;
+	// The binding for a REFER's own dialog and, when attended, its consult dialog (its Call-ID key,
+	// empty when the REFER is not attended). False: a 403 was
+	// queued, the refusal counted and (rate-limited) logged; the caller returns. Caller holds _mutex.
+	bool authorizeReferTransferor(const std::shared_ptr<SipMessage>& data, const std::string& callID,
+		const std::string& replacesCallIdKey, const std::string& transferor);
 	// 403 + count + (rate-limited) log for a request from a non-dialog source.
 	void refuseNonLegRequest(const std::shared_ptr<SipMessage>& data);
 	// A fixed table of recent Call-IDs: due() is true at most once per kSeconds per Call-ID
@@ -2760,14 +2770,19 @@ private:
 	};
 	LogLimiter _refusalLog;
 	LogLimiter _resumeLog;
+	LogLimiter _referBindingLog;
+	uint32_t _referBindingRefusals = 0;    // every REFER refused by the transferor binding, logged or not
 	uint32_t _localReinviteRefusals = 0;   // every refused request, logged or not
 	uint32_t _localResumeAccepts = 0;      // every accepted non-leg emergency resume
 	void logNonLegRequest(const std::shared_ptr<SipMessage>& data, LogLimiter& limiter, const char* verdict,
 		bool isError);
 
 public:
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 	uint32_t localReinviteRefusalsForTest() const { return _localReinviteRefusals; }
+	uint32_t referBindingRefusalsForTest() const { return _referBindingRefusals; }
 	uint32_t localResumeAcceptsForTest() const { return _localResumeAccepts; }
+#endif
 private:
 
 	// Server-side RTP media source (the 440 tone stream). One concurrent stream; the
