@@ -6792,8 +6792,9 @@ void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 	// Attended-transfer splice (#1124): the PBX is the UAC of the re-INVITE that is
 	// still awaiting its 200 (_transferPendingAcks), so its 100 is the PBX's, not the
 	// dropped transferor's.
-	if (std::find(_transferPendingAcks.begin(), _transferPendingAcks.end(),
-	              std::string(data->getCallID())) != _transferPendingAcks.end())
+	const std::string_view tryingCallId = data->getCallID();
+	if (std::any_of(_transferPendingAcks.begin(), _transferPendingAcks.end(),
+	                [tryingCallId](const std::string& id) { return id == tryingCallId; }))
 	{
 		return;
 	}
