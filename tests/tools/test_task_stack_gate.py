@@ -1186,10 +1186,20 @@ class Gate(unittest.TestCase):
     def test_checked_in_known_findings_cap_the_two_911_tasks_at_their_totals(self):
         table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
         kf = table["known_findings"]
-        for name, cap in (("sip_server", 9616), ("tel_ctl", 12944)):
-            with self.subTest(name):
-                self.assertEqual(kf.get(name, {}).get("max_total"), cap)
-                self.assertIn("#1116", kf[name]["reason"])
+        # #1117: one row per image, as the CI runs of the four esp_main images measured them.
+        want = {("sip_server", "main/esp_main_eth.cpp"): 9616,
+                ("sip_server", "main/esp_main_eth_lan8720.cpp"): 9408,
+                ("tel_ctl", "main/esp_main_eth.cpp"): 12944,
+                ("tel_ctl", "main/esp_main.cpp"): 12944,
+                ("tel_ctl", "main/esp_main_eth_lan8720.cpp"): 12736,
+                ("sip_server_task", "main/esp_main.cpp"): 9616,
+                ("sip_server_task", "main/esp_main_display.cpp"): 8416}
+        for (name, image), cap in want.items():
+            with self.subTest(name=name, image=image):
+                rows = kf[name] if isinstance(kf[name], list) else [kf[name]]
+                rows = [r for r in rows if image in (r.get("image") or [image])]
+                self.assertEqual([r["max_total"] for r in rows], [cap])
+                self.assertIn("#1116", rows[0]["reason"])
 
     def test_a_known_cap_passes_at_its_total_fails_one_byte_over_and_hides_no_unbounded_site(self):
         self.indirect_fixture()
