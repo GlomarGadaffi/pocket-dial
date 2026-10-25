@@ -1792,6 +1792,7 @@ TEST(TrunkInbound, ADeprecatedTrunkStillRingsAPsapCallbackWithTheSameMessageCoun
 	const auto os = b.handler.getSession("Call-ID: " + field(other, "Call-ID: "));
 	ASSERT_TRUE(os.has_value());
 	EXPECT_FALSE(os.value()->isEmergency()) << "an ordinary inbound call is not flagged";
+}
 
 // ── REFER on an inbound trunk call or a PSAP callback (transferor binding) ───
 // Rule 5: what a REFER on these sessions draws must not change. The handset's own
