@@ -569,7 +569,11 @@ bool RtpReceiver::start(uint16_t localPort, Sink sink)
 
 	sockaddr_in local{};
 	local.sin_family      = AF_INET;
+#if defined(PD_TEST_LOOPBACK_BIND)   // host test target on Windows only (#1136): keep test sockets off the LAN
+	local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#else
 	local.sin_addr.s_addr = htonl(INADDR_ANY);
+#endif
 	local.sin_port        = htons(localPort);   // 0 → OS picks an ephemeral port
 	if (bind(sock, reinterpret_cast<sockaddr*>(&local), sizeof(local)) < 0)
 	{
