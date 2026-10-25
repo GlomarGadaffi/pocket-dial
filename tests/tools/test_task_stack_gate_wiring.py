@@ -30,7 +30,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 JOB = "stack-depth-gate"
 FLAGS = "-fcallgraph-info=su -fstack-usage"
 IF = "${{ !cancelled() && needs.site-gate.outputs.code != 'false' }}"
-GATE_CMD = 'python3 tools/ci/task_stack_gate.py --ci-dir build/esp-idf --project-root "$GITHUB_WORKSPACE"'
+GATE_CMD = 'python3 tools/ci/task_stack_gate.py --ci-dir build/esp-idf --project-root "$GITHUB_WORKSPACE" --main ${{ matrix.main }} ${{ matrix.gate-args }}'
 
 
 def code(path):
@@ -121,10 +121,10 @@ class StackGateWiring(unittest.TestCase):
         # IDF reads EXTRA_C*FLAGS in project.cmake when CMake configures, and set-target is the
         # first configure of this job's build dir (also with a restored cache: it always reruns CMake).
         run = self.build[self.build.index("run: |"):] + "\n"
-        lines = ["          . $IDF_PATH/export.sh", "          idf.py set-target esp32s3",
-                 "          idf.py -D SIP_TRANSPORT=eth build"]
+        lines = ["          . $IDF_PATH/export.sh", "          idf.py ${{ matrix.args }} set-target ${{ matrix.chip }}",
+                 "          idf.py -D SIP_TRANSPORT=${{ matrix.transport }} ${{ matrix.args }} build"]
         at = [run.find("\n" + ln + "\n") for ln in lines]
-        self.assertNotIn(-1, at, "export.sh, set-target esp32s3 and the eth build, each on a line of its own")
+        self.assertNotIn(-1, at, "export.sh, set-target and the build, each on a line of its own")
         self.assertEqual(at, sorted(at))
 
     def test_the_gate_follows_the_build_and_reads_the_app_image_with_the_checkout_as_project_root(self):
@@ -136,9 +136,10 @@ class StackGateWiring(unittest.TestCase):
         self.assertNotRegex(self.gate, r"--ci-dir build(\s|$)")
         self.assertNotIn("env:", self.gate)
 
-    def test_the_gate_takes_the_eth_image_by_default(self):
-        # The job builds esp32s3/eth and the step passes no --main, so the default must be the eth image.
-        self.assertNotIn("--main", self.gate)
+    def test_the_gate_takes_the_legs_image(self):
+        # #1117: each matrix leg builds its own image and hands the gate its esp_main file. The default
+        # (eth) is kept for a by-hand run; the step must not lean on it.
+        self.assertIn("--main ${{ matrix.main }}", self.gate)
         with open(os.path.join(ROOT, "tools", "ci", "task_stack_gate.py"), encoding="utf-8") as f:
             m = re.search(r'"--main",\s*default="([^"]+)"', f.read())
         self.assertIsNotNone(m)

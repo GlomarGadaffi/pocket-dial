@@ -136,7 +136,7 @@ class AnchorOrphanSweepTest(unittest.TestCase):
         slots = read("RtpTaskSlots.hpp")
         budget = slots[slots.index("#if !defined(CONFIG_SPIRAM)"):]
         self.assertIn("kSweepStackBytes", budget, "the no-PSRAM assert leaves out tel_sweep's stack")
-        self.assertRegex(slots, r"kSweepStackBytes\s*=\s*13376")
+        self.assertRegex(slots, r"kSweepStackBytes\s*=\s*13392")
         self.assertRegex(self.hpp, r"kSweepStackBytes\s*=\s*pd::rtpslots::kSweepStackBytes")
 
     def test_tel_sweep_is_a_static_task_on_a_boot_allocated_psram_stack(self):

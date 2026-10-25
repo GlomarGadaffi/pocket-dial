@@ -1069,6 +1069,21 @@ class Gate(unittest.TestCase):
 
     # A target pattern of the form `X::(?:a|b)\(` names several functions: each alternative is checked on
     # its own, so one that is not in the image fails the gate instead of riding on its siblings.
+    def test_an_alternative_listed_absent_on_this_image_is_not_required(self):
+        self.indirect_fixture()
+        row = {"targets": [r"SlowSink::(?:write|gone)\("], "reason": "fixture",
+               "absent": {self.DISP: ["gone"]}}
+        self.table["indirect_allowlist"] = {r"void mid\(\)": row}
+        rc, out = self.run_gate(main=self.DISP)
+        self.assertEqual(rc, 0, out)                    # gone is not linked into this image
+        rc, out = self.run_gate(main=self.ETH)          # absent names display only: eth still requires it
+        self.assertEqual(rc, 1, out)
+        self.assertIn("alternative 'gone'", out)
+        self.add_ci(node("gone", "void SlowSink::gone()", 10))
+        rc, out = self.run_gate(main=self.DISP)         # linked after all: the absent entry is stale
+        self.assertEqual(rc, 1, out)
+        self.assertIn("listed absent", out)
+
     def test_every_alternative_of_a_target_pattern_must_match_a_function(self):
         self.indirect_fixture()
         self.table["indirect_allowlist"] = {r"void mid\(\)": {
@@ -1171,10 +1186,23 @@ class Gate(unittest.TestCase):
     def test_checked_in_known_findings_cap_the_two_911_tasks_at_their_totals(self):
         table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
         kf = table["known_findings"]
-        for name, cap in (("sip_server", 9616), ("tel_ctl", 12816)):
-            with self.subTest(name):
-                self.assertEqual(kf.get(name, {}).get("max_total"), cap)
-                self.assertIn("#1116", kf[name]["reason"])
+        # #1117: one row per image, as the CI runs of the four esp_main images measured them.
+        want = {("sip_server", "main/esp_main_eth.cpp"): 9616,
+                ("sip_server", "main/esp_main_eth_lan8720.cpp"): 9408,
+                ("tel_ctl", "main/esp_main_eth.cpp"): 12816,
+                ("tel_ctl", "main/esp_main.cpp"): 12816,
+                ("tel_ctl", "main/esp_main_eth_lan8720.cpp"): 12608,
+                ("sip_server_task", "main/esp_main.cpp"): 9616,
+                ("sip_server_task", "main/esp_main_display.cpp"): 9632,
+                ("tel_ctl", "main/esp_main_display.cpp"): 12832,
+                ("tel_ctl", "main/esp_main_eth_lan8720.cpp@constrained"): 12112,
+                ("sip_server", "main/esp_main_eth_lan8720.cpp@constrained"): 9264}
+        for (name, image), cap in want.items():
+            with self.subTest(name=name, image=image):
+                rows = kf[name] if isinstance(kf[name], list) else [kf[name]]
+                rows = [r for r in rows if image in (r.get("image") or [image])]
+                self.assertEqual([r["max_total"] for r in rows], [cap])
+                self.assertIn("#1116", rows[0]["reason"])
 
     def test_a_known_cap_passes_at_its_total_fails_one_byte_over_and_hides_no_unbounded_site(self):
         self.indirect_fixture()
@@ -1214,6 +1242,27 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("FAIL big: known finding cap 2500 B is above the total 1900 B: lower max_total to 1900", out)
 
+    def test_an_image_that_shares_the_spi1_bus_fails_the_checked_in_asserts(self):
+        # #1117: the constrained image's bg_enable rows leave cache_enable/cache_disable out because IDF installs
+        # them only under CONFIG_SPI_FLASH_SHARE_SPI1_BUS. The checked-in asserts are run against a fixture
+        # sdkconfig.h, on the default image and on the constrained profile.
+        real = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
+        self.table["sdkconfig_asserts"] = real["sdkconfig_asserts"]
+        cfg = os.path.join(self.tmp.name, "build", "config")
+        os.makedirs(cfg)
+        h = os.path.join(cfg, "sdkconfig.h")
+        for profile in (None, "constrained"):
+            with self.subTest(profile=profile):
+                with open(h, "w") as f:
+                    f.write("#define CONFIG_LOG_VERSION_1 1\n")
+                rc, out = self.run_profile(profile)
+                self.assertEqual(rc, 0, out)
+                with open(h, "w") as f:
+                    f.write("#define CONFIG_LOG_VERSION_1 1\n#define CONFIG_SPI_FLASH_SHARE_SPI1_BUS 1\n")
+                rc, out = self.run_profile(profile)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("CONFIG_SPI_FLASH_SHARE_SPI1_BUS is defined", out)
+
     def test_a_smaller_budget_than_the_known_row_recorded_fails(self):
         for t in self.table["tasks"]:
             if t["name"] == "big":
@@ -1231,6 +1280,133 @@ class Gate(unittest.TestCase):
         rc, out = self.run_gate()
         self.assertEqual(rc, 1, out)                     # the task is at src/SIP/X.cpp: not covered
         self.assertIn("FAIL big: 1900 B", out)
+
+    # #1117: rows scoped to one esp_main image.
+    ETH, DISP = "main/esp_main_eth.cpp", "main/esp_main_display.cpp"
+
+    def known_big(self, rows):
+        for t in self.table["tasks"]:
+            if t["name"] == "big":
+                t["bytes"] = 2000
+        self.table["known_findings"] = {"big": rows}
+
+    def test_an_image_scoped_known_row_covers_only_its_image(self):
+        self.known_big({"max_total": 1900, "bytes": 2000, "image": self.DISP, "reason": "#1116"})
+        rc, out = self.run_gate(main=self.DISP)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("KNOWN big: 1900 B", out)
+        rc, out = self.run_gate(main=self.ETH)          # not its image: no cover, and no stale complaint
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL big: 1900 B", out)
+        self.assertNotIn("stale", out)
+
+    def test_an_image_scoped_row_does_not_go_stale_on_another_image(self):
+        # fits on eth (4096 B): the row for display must not say "remove the row" there
+        self.table["known_findings"] = {"big": {"max_total": 1900, "bytes": 2000, "image": self.DISP, "reason": "#1116"}}
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("stale", out)
+
+    def test_a_per_image_cap_passes_at_its_total_and_fails_one_over(self):
+        self.known_big([{"max_total": 1900, "bytes": 2000, "image": self.ETH, "reason": "#1116"},
+                        {"max_total": 1899, "bytes": 2000, "image": self.DISP, "reason": "#1116"}])
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 0, out)                    # at its total
+        rc, out = self.run_gate(main=self.DISP)
+        self.assertEqual(rc, 1, out)                    # cap 1899 < total 1900
+        self.assertIn("FAIL big: 1900 B", out)
+        self.assertIn("deeper than the known finding's 1899 B", out)
+
+    def test_two_rows_for_one_image_are_ambiguous(self):
+        self.known_big([{"max_total": 1900, "bytes": 2000, "image": self.ETH, "reason": "#1116"},
+                        {"max_total": 1900, "bytes": 2000, "reason": "#1116"}])
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ambiguous", out)
+
+    def test_a_row_with_an_unknown_image_is_refused(self):
+        self.known_big({"max_total": 1900, "bytes": 2000, "image": "main/esp_main_nope.cpp", "reason": "#1116"})
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not a list of existing main/esp_main*.cpp files", out)
+        self.table["known_findings"] = {}
+        self.table["indirect_allowlist"] = {r"nothing\(": {"targets": [], "reason": "x", "image": "nope"}}
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not a list of existing", out)
+        # an `absent` key is an image name too: a typo there would silently drop the exclusion
+        self.table["indirect_allowlist"] = {r"nothing\(": {"targets": [], "reason": "x",
+                                                               "absent": {"main/esp_main_eth_lan8702.cpp": ["a"]}}}
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not a list of existing", out)
+
+    def test_a_whole_target_pattern_can_be_listed_absent_on_one_image(self):
+        self.indirect_fixture()
+        row = {"targets": [r"SlowSink::write\(", r"Missing::here\("], "reason": "fixture",
+               "absent": {self.DISP: [r"Missing::here\("]}}
+        self.table["indirect_allowlist"] = {r"void mid\(\)": row}
+        rc, out = self.run_gate(main=self.DISP)
+        self.assertEqual(rc, 0, out)                    # the other target still bounds the site
+        rc, out = self.run_gate(main=self.ETH)          # not listed for eth: still required there
+        self.assertEqual(rc, 1, out)
+        self.assertIn("Missing::here", out)
+        self.add_ci(node("here", "void Missing::here()", 10))
+        rc, out = self.run_gate(main=self.DISP)         # linked after all: stale
+        self.assertEqual(rc, 1, out)
+        self.assertIn("listed absent", out)
+
+    def test_absent_values_must_be_lists_of_alternatives_the_row_spells(self):
+        self.indirect_fixture()
+        for bad in ("gone", ["gon"], [], ["gone", 7], {"gone": 1}):
+            with self.subTest(bad=bad):
+                self.table["indirect_allowlist"] = {r"void mid\(\)": {
+                    "targets": [r"SlowSink::(?:write|gone)\("], "reason": "fixture", "absent": {self.DISP: bad}}}
+                rc, out = self.run_gate(main=self.DISP)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("absent must map each image to a non-empty list", out)
+
+    CON = "main/esp_main_eth_lan8720.cpp"
+
+    def run_profile(self, profile):
+        p = os.path.join(self.tmp.name, "t.json")
+        json.dump(self.table, open(p, "w"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = g.run(self.ci, p, self.tmp.name, self.CON, (), None, profile)
+        return rc, out.getvalue()
+
+    def test_a_profile_is_its_own_image_for_scoped_rows(self):
+        self.known_big([{"max_total": 1900, "bytes": 2000, "image": [self.CON], "reason": "#1116"},
+                        {"max_total": 1900, "bytes": 2000, "image": [self.CON + "@constrained"], "reason": "#1116"}])
+        for profile in (None, "constrained"):
+            rc, out = self.run_profile(profile)
+            self.assertEqual(rc, 0, out)                 # each image meets exactly one row: not ambiguous
+        self.table["known_findings"]["big"][1]["max_total"] = 1899
+        rc, out = self.run_profile("constrained")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.run_profile(None)[0], 0)   # the default image is untouched by the constrained row
+
+    def test_an_unknown_profile_is_refused(self):
+        rc, out = self.run_profile("tiny")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("--profile tiny", out)
+        self.known_big({"max_total": 1900, "bytes": 2000, "image": [self.CON + "@tiny"], "reason": "#1116"})
+        rc, out = self.run_profile(None)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not a list of existing", out)
+
+    def test_an_image_scoped_indirect_row_is_not_checked_on_another_image(self):
+        row = {"targets": [], "reason": "nothing installed"}
+        self.table["indirect_allowlist"] = {r"nothing_here\(": dict(row)}
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 1, out)                    # unscoped: matches no indirect-call function
+        self.assertIn("matches no function that makes an indirect call", out)
+        self.table["indirect_allowlist"] = {r"nothing_here\(": dict(row, image=self.DISP)}
+        rc, out = self.run_gate(main=self.ETH)
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_gate(main=self.DISP)
+        self.assertEqual(rc, 1, out)                    # on its own image it still fails closed
 
     def test_a_known_row_without_a_recorded_budget_is_refused(self):
         self.table["known_findings"] = {"big": {"max_total": 1900, "reason": "#1116"}}
