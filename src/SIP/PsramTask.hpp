@@ -75,6 +75,7 @@
 #include "esp_log.h"
 #include "PsramAllocator.hpp"   // psram::internalFallbacks() -- the one PSRAM-fallback counter
 #include "ParkedTaskReap.hpp"   // pd::reapDecision (#479 static-slot reap)
+#include "BootTaskSlots.hpp"     // #1126: boot allocation failures, visible on /api/status
 #include <atomic>
 
 namespace pd
@@ -159,9 +160,11 @@ namespace pd
 				heap_caps_free(stack);
 				tcb = nullptr;
 				stack = nullptr;
+				bootTaskSlots().noteAlloc(name, false);   // #1126: counted, never silent
 				return false;
 			}
 			bytes = stackBytes;
+			bootTaskSlots().noteAlloc(name, true);
 			return true;
 		}
 	};

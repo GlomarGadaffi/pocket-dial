@@ -33,6 +33,7 @@
 #include "RtpSender.hpp"       // Issue #479: txPoolRefusals() on /api/status
 #include "HoldMusic.hpp"       // Issue #466: clipRefusals() on /api/status
 #include "PsramAllocator.hpp"  // Issue #466: psram::internalFallbacks() on /api/status
+#include "BootTaskSlots.hpp"   // #1126: telSweepWorker + bootSlotFailures
 #include "index_html.h"
 #include "IPHelper.hpp"
 #include "UrlEncode.hpp"
@@ -2891,6 +2892,10 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	       "\"stackHwm_tel_drop\":null,\"stackHwm_tel_sos\":null,\"stackHwm_tel_sweep\":null,\"stackHwm_flash_writer\":null,"
 	       "\"stackHwm_http_conn\":null");
 #endif
+	// #1126: whether the 911 orphan sweep has a worker. "absent" is a board with no sweep (its stack
+	// allocation or create failed); stackHwm_tel_sweep reads null for that and for "not started yet".
+	json.s(",\"telSweepWorker\":\"")
+	    .s(pd::bootTaskSlots().workerAbsent(pd::BootTask::TelSweep) ? "absent" : "running").s("\"");
 	// Issue #405: the route class that produced the stackHwm_http_conn minimum
 	// (never the raw path, see routeLabel). null on the host build and until a
 	// connection has finished. Written straight into the buffer: no frame here,
@@ -2958,7 +2963,14 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	    .s(",\"greetingRefused\":").b(handler && handler->voicemailGreetingRefused())
 	    .s(",\"psramFallbacks\":").n(psram::internalFallbacks().load(std::memory_order_relaxed))
 	    .s(",\"dynamicTaskCreates\":").n(psram::dynamicTaskCreates().load(std::memory_order_relaxed))   // #479
-	    .s("}");
+	    .s(",\"bootSlotFailures\":{");
+	// #1126: boot-time static task slot allocation failures, one count per slot kind.
+	for (std::size_t i = 0; i < pd::BootTaskSlots::kCount; ++i)
+	{
+		const pd::BootTask t = static_cast<pd::BootTask>(i);
+		json.s(i == 0 ? "\"" : ",\"").s(pd::BootTaskSlots::name(t)).s("\":").n(pd::bootTaskSlots().failures(t));
+	}
+	json.s("}}");
 
 	// #986 slice 0: how long RequestsHandler::_mutex has been held since boot, in
 	// microseconds. `over` counts holds above 20 ms; `maxPc` is the lock site of the

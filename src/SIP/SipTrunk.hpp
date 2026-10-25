@@ -562,6 +562,9 @@ public:
 	void expireDeadlinesForTest();
 #endif
 	const Dialog* findByCallID(std::string_view callID) const;
+	// The dotted-quad host of the dialog's remote target (the Contact its in-dialog requests may come
+	// from, see handleBye()), in network order. False for a name or an unset target. No allocation.
+	static bool remoteTargetIpv4(const Dialog& d, uint32_t& out);
 
 private:
 	// Either leg's Call-ID: the trunk's own, or the bridged handset's. For
@@ -777,6 +780,7 @@ public:
 	size_t activeDialogs() const { return 0; }
 	void expireDeadlinesForTest() {}
 	const Dialog* findByCallID(std::string_view) const { return nullptr; }
+	static bool remoteTargetIpv4(const Dialog&, uint32_t&) { return false; }
 };
 #endif // POCKETDIAL_HAS_TRUNK
 

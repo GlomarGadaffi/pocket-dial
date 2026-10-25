@@ -3052,3 +3052,100 @@ TEST(EmergencyUnknownCoalesce, A933OverflowNeverSwallowsOrRelabelsAForged911)
 	EXPECT_EQ(testSummaries, 1u) << b.dump();
 	EXPECT_EQ(liveSummaries, 1u) << b.dump();
 }
+
+// ── The rate exemption on a ring-all PSAP callback ────────────────────────────
+//
+// 101 dialed 911; a callback then rings every registered extension (the anchor's ring-all). The
+// session's ringing targets, not only its dest, are the dialog's endpoints: a member other than
+// the one that dialed answers, and its packets on the callback's Call-ID stay exempt.
+
+namespace
+{
+	std::string ringField(const std::string& m, const std::string& name)
+	{
+		const size_t p = m.find("\r\n" + name);
+		if (p == std::string::npos) return {};
+		const size_t s = p + 2 + name.size();
+		return m.substr(s, m.find("\r\n", s) - s);
+	}
+
+	// `n` OPTIONS carrying `callId`, from `ip`. Returns how many the limiter let through.
+	uint32_t ringOptions(Bench& b, const std::string& ip, const std::string& callId, size_t n)
+	{
+		const uint32_t before = b.handler->getDropProbe().rateCount();
+		for (size_t i = 0; i < n; ++i)
+		{
+			b.handler->handle(RequestsHandler::getMessageFromPool(
+				"OPTIONS sip:server SIP/2.0\r\n"
+				"Via: SIP/2.0/UDP " + ip + ":5060;branch=z9hG4bKrg" + std::to_string(i) + "\r\n"
+				"From: <sip:probe@" + ip + ">;tag=rg\r\nTo: <sip:server>\r\n"
+				"Call-ID: " + callId + "\r\nCSeq: " + std::to_string(i + 1) + " OPTIONS\r\n"
+				"Content-Length: 0\r\n\r\n", addrFor(ip)));
+			b.sent.clear();
+		}
+		return static_cast<uint32_t>(n) - (b.handler->getDropProbe().rateCount() - before);
+	}
+}
+
+TEST(EmergencyRateExemption, ARingAllCallbackMemberOtherThanTheDialerStaysExemptWhileItRingsAndAfterItAnswers)
+{
+	Bench b;
+	b.handler->handle(makeRegister("102", kOtherIp));
+	b.handler->handle(makeRegister("103", kThirdIp));
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+	b.sent.clear();
+	const std::string id = b.handler->routeInboundAnchorCallForTest("800", "psap-rg", "PSAP");
+	const auto s = b.handler->getSession(id);
+	ASSERT_TRUE(s.has_value() && s.value()->isEmergency()) << "precondition: the callback is an emergency session";
+	// The forks leave through the async outbox, which the next handled packet flushes.
+	b.handler->handle(RequestsHandler::getMessageFromPool(
+		"OPTIONS sip:server SIP/2.0\r\nVia: SIP/2.0/UDP " + std::string(kOtherIp) + ":5060;branch=z9hG4bKrgflush\r\n"
+		"From: <sip:102@server>;tag=rgf\r\nTo: <sip:server>\r\nCall-ID: rg-flush\r\nCSeq: 1 OPTIONS\r\n"
+		"Content-Length: 0\r\n\r\n", addrFor(kOtherIp)));
+	std::string fork;
+	for (const auto& [addr, raw] : b.sent)
+	{
+		if (addr.sin_addr.s_addr == inet_addr(kThirdIp) && raw.rfind("INVITE ", 0) == 0) fork = raw;
+	}
+	ASSERT_FALSE(fork.empty()) << "precondition: 103 rings too:\n" << b.dump();
+	const std::string callId = ringField(fork, "Call-ID: ");
+	for (const char* ip : {kThirdIp, "192.168.79.99"})   // 103's bucket, and a host that is no leg
+	{
+		(void)ringOptions(b, ip, "rg-drain", 100);
+	}
+
+	// While it rings: the member's own packets are exempt, a third host's are not.
+	EXPECT_EQ(ringOptions(b, kThirdIp, callId, 50), 50u) << "a ringing member of the fork";
+	EXPECT_EQ(ringOptions(b, "192.168.79.99", callId, 50), 8u) << "a host that is no leg gets the dialog's budget only";
+
+	// It answers (103, not the dialer); the same holds once it is the dest.
+	const std::string sdp =
+		"v=0\r\no=- 0 0 IN IP4 " + std::string(kThirdIp) + "\r\ns=-\r\nc=IN IP4 " + std::string(kThirdIp) + "\r\nt=0 0\r\n"
+		"m=audio 40004 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+	b.handler->handle(RequestsHandler::getMessageFromPool(
+		"SIP/2.0 200 OK\r\nVia: " + ringField(fork, "Via: ") + "\r\nFrom: " + ringField(fork, "From: ") +
+		"\r\nTo: " + ringField(fork, "To: ") + ";tag=t103\r\nCall-ID: " + callId + "\r\nCSeq: 1 INVITE\r\n"
+		"Contact: <sip:103@" + std::string(kThirdIp) + ":5060>\r\nContent-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp, addrFor(kThirdIp)));
+	ASSERT_TRUE(s.value()->getDest() && s.value()->getDest()->getNumber() == "103") << "precondition: 103 won\n" << b.dump();
+	(void)ringOptions(b, kThirdIp, "rg-drain2", 100);
+	EXPECT_EQ(ringOptions(b, kThirdIp, callId, 50), 50u) << "the member that answered";
+	EXPECT_EQ(ringOptions(b, "192.168.79.99", callId, 50), 0u) << "its budget is spent, and it was never exempt";
+}
+
+TEST(EmergencyRateExemption, APacketFromTheZeroAddressOnALiveCallbackIsNotExempt)
+{
+	// The callback's caller leg is the PSTN peer, whose address is zero. A zero address names no host:
+	// it must not be stored as an endpoint, and a packet from 0.0.0.0 must not match one.
+	Bench b;
+	ASSERT_NO_FATAL_FAILURE(dial911AndHangUp(b));
+	b.sent.clear();
+	const std::string id = b.handler->routeInboundAnchorCallForTest("800", "psap-zero", "PSAP");
+	const auto s = b.handler->getSession(id);
+	ASSERT_TRUE(s.has_value() && s.value()->isEmergency()) << "precondition: the callback is an emergency session";
+	ASSERT_TRUE(s.value()->getSrc() && s.value()->getSrc()->getAddress().sin_addr.s_addr == 0)
+		<< "precondition: the caller leg has no address";
+	const std::string callId = id.substr(std::string("Call-ID: ").size());
+	(void)ringOptions(b, "0.0.0.0", "zero-drain", 100);
+	EXPECT_EQ(ringOptions(b, "0.0.0.0", callId, 50), 8u) << "zero is not an endpoint: the dialog's budget only";
+}

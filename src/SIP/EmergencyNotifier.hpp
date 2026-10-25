@@ -109,6 +109,10 @@ struct E911Config
 //   EMERGENCY: 911 dialed by ext 101 - ROUTED TO TRUNK - callback 5550100 - Front desk
 //   TEST: 933 dialed by ext 101 - NOT ROUTED (the trunk refused it) - callback not configured
 //
+// `unverifiedSource` (#1127), "ip:port", is empty for a verified caller, whose text
+// is unchanged. When set, " [CALLER UNVERIFIED: claimed ext X, source ip:port]" is
+// appended, after the 512-byte cap has been applied to the rest so it is never cut.
+//
 // `routed` false produces the NOT ROUTED wording, which is the case that most
 // needs a human. A test asserts the two are never confusable. `note` names
 // what failed (desmo, #878): the route for NOT ROUTED, where empty keeps "no
@@ -117,7 +121,14 @@ struct E911Config
 // is ignored).
 std::string formatE911Notification(bool isTest, std::string_view fromExt,
 	std::string_view dialed, bool hadTrunkPrefix, bool routed,
-	const E911Config& cfg, std::string_view note = {}, bool callUp = false);
+	const E911Config& cfg, std::string_view note = {}, bool callUp = false,
+	std::string_view unverifiedSource = {});
+
+// #1127: the marker appended to a 911/933 notification and to its EMERGENCY log
+// lines when the INVITE's source IP is not the address the named extension
+// registered from. Reporting only: the call is routed and answered as ever.
+// Starts with a space so it can be appended as is.
+std::string e911UnverifiedTag(std::string_view claimedExt, std::string_view source);
 
 } // namespace pbx
 
@@ -158,7 +169,8 @@ public:
 	// log line — NOT as a success/failure signal.
 	std::size_t notify(const pbx::E911Config& cfg, bool isTest,
 		std::string_view fromExt, std::string_view dialed,
-		bool hadTrunkPrefix, bool routed, std::string_view note = {}, bool callUp = false);
+		bool hadTrunkPrefix, bool routed, std::string_view note = {}, bool callUp = false,
+		std::string_view unverifiedSource = {});
 
 	// Send the staged Alert, if any. Call it with the engine lock RELEASED: this is
 	// the blocking syslog send. Safe from any thread, against notify() and against
@@ -169,7 +181,25 @@ public:
 	// atomic load when nothing is staged.
 	void flushStaged();
 
+	// #1126: an operator alert that is not a 911 dial (an emergency-path task is absent). Same record and
+	// the same notify list as notify(), but it never replaces a frame already staged, so it can never
+	// displace a 911 alert. False: the slot was busy, nothing was sent, try again next tick. Never gates
+	// anything. `enqueued` is how many MESSAGEs went out with it (0 when no notify phone is registered yet).
+	bool notifyDegraded(const pbx::E911Config& cfg, std::string_view text, std::size_t& enqueued);
+	// The MESSAGE half again, for a retry: no syslog frame, no log line. Allocates, so call it only once
+	// anyNotifyRegistered() says a phone can take it.
+	std::size_t resendDegraded(const pbx::E911Config& cfg, std::string_view text);
+	// Is any configured notify extension registered right now? Allocates nothing.
+	bool anyNotifyRegistered(const pbx::E911Config& cfg);
+	// Does the notify list name any extension at all?
+	static bool hasNotifyExts(const pbx::E911Config& cfg);
+
 private:
+	// notify()'s two halves: stage the Alert (onlyIfEmpty: leave an already staged frame alone), and
+	// fan the text out to the notify extensions.
+	bool stageAlert(const std::string& text, bool onlyIfEmpty);
+	std::size_t fanOut(const pbx::E911Config& cfg, const std::string& text);
+
 	// formatE911Notification()'s 512-byte cap, plus the NUL.
 	static constexpr std::size_t kAlertBytes = 513;
 

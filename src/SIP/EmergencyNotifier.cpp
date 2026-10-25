@@ -15,9 +15,40 @@
 namespace pbx
 {
 
+namespace
+{
+	// Trim to a UTF-8 CODEPOINT boundary, not a byte one. `location` is operator
+	// free text and may be non-ASCII; a half-written multi-byte sequence renders
+	// as a replacement character or garbage in whatever reads the notification,
+	// which is the one thing this text must not do.
+	void capUtf8(std::string& out, std::size_t cap)
+	{
+		if (out.size() <= cap) return;
+		std::size_t cut = cap;
+		while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80)
+		{
+			--cut;   // inside a sequence: back up to its lead byte
+		}
+		out.resize(cut);
+	}
+}
+
+std::string e911UnverifiedTag(std::string_view claimedExt, std::string_view source)
+{
+	std::string t;
+	t.reserve(48 + claimedExt.size() + source.size());
+	t += " [CALLER UNVERIFIED: claimed ext ";
+	t += claimedExt;
+	t += ", source ";
+	t += source;
+	t += "]";
+	return t;
+}
+
 std::string formatE911Notification(bool isTest, std::string_view fromExt,
 	std::string_view dialed, bool hadTrunkPrefix, bool routed,
-	const E911Config& cfg, std::string_view note, bool callUp)
+	const E911Config& cfg, std::string_view note, bool callUp,
+	std::string_view unverifiedSource)
 {
 	std::string out;
 	out.reserve(200);
@@ -83,20 +114,13 @@ std::string formatE911Notification(bool isTest, std::string_view fromExt,
 	}
 
 	// The MESSAGE path caps a body at 512 bytes; trim here so the syslog line
-	// and the SIP body are the same text rather than diverging silently.
-	if (out.size() > 512)
-	{
-		// Trim to a UTF-8 CODEPOINT boundary, not a byte one. `location` is
-		// operator free text and may be non-ASCII; a half-written multi-byte
-		// sequence renders as a replacement character or garbage in whatever
-		// reads the notification, which is the one thing this text must not do.
-		std::size_t cut = 512;
-		while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80)
-		{
-			--cut;   // inside a sequence: back up to its lead byte
-		}
-		out.resize(cut);
-	}
+	// and the SIP body are the same text rather than diverging silently. #1127:
+	// the unverified marker is appended after the trim of everything else, so a
+	// long location can never cut it; a verified caller's text is untouched.
+	const std::string tag = unverifiedSource.empty()
+		? std::string() : e911UnverifiedTag(fromExt, unverifiedSource);
+	capUtf8(out, tag.size() < 512 ? 512 - tag.size() : 0);
+	out += tag;
 	return out;
 }
 
@@ -199,12 +223,13 @@ void EmergencyNotifier::flushStaged()
 
 std::size_t EmergencyNotifier::notify(const pbx::E911Config& cfg, bool isTest,
 	std::string_view fromExt, std::string_view dialed,
-	bool hadTrunkPrefix, bool routed, std::string_view note, bool callUp)
+	bool hadTrunkPrefix, bool routed, std::string_view note, bool callUp,
+	std::string_view unverifiedSource)
 {
-	const std::string text =
-		pbx::formatE911Notification(isTest, fromExt, dialed, hadTrunkPrefix, routed, cfg, note, callUp);
+	const std::string text = pbx::formatE911Notification(isTest, fromExt, dialed, hadTrunkPrefix,
+		routed, cfg, note, callUp, unverifiedSource);
 
-	// 1. The record. Unconditional and unconfigurable: an operator can leave
+	// 1. The record (stageAlert). Unconditional and unconfigurable: an operator can leave
 	//    notifyExts empty, but they cannot turn off the fact that a 911 dial is
 	//    written down. Alert (severity 1) rather than Emergency (0) -- 0 is
 	//    "system is unusable", which this is not; Alert is "action must be taken
@@ -215,26 +240,73 @@ std::size_t EmergencyNotifier::notify(const pbx::E911Config& cfg, bool isTest,
 	//    under the engine mutex. flushStaged() sends it after the lock is
 	//    released. One slot: a second notify() before the flush replaces this
 	//    text, and flushStaged() says so; the text below is the record of it.
-	{
-		std::lock_guard<std::mutex> lock(_slotMutex);
-		if (_staged.load() && _slotOverwritten < UINT8_MAX)
-		{
-			++_slotOverwritten;
-		}
-		const std::size_t n = std::min(text.size(), sizeof(_slot) - 1);
-		std::memcpy(_slot, text.data(), n);
-		_slot[n] = '\0';
-		_staged.store(true);
-	}
+	stageAlert(text, /*onlyIfEmpty=*/false);
 
 	// 1b. Also into the engine's own log so it lands in the UART/dashboard record
 	//     for a deployment with no syslog collector configured, and so a text the
 	//     slot replaces is still on record.
 	_env.log(text, true);
 
-	// 2. The notifications. Every one is independent and every failure is
-	//    swallowed: an unregistered extension or an exhausted pool costs that
-	//    one notification and nothing else.
+	// 2. The notifications (fanOut).
+	return fanOut(cfg, text);
+}
+
+bool EmergencyNotifier::stageAlert(const std::string& text, bool onlyIfEmpty)
+{
+	std::lock_guard<std::mutex> lock(_slotMutex);
+	if (_staged.load())
+	{
+		if (onlyIfEmpty) return false;
+		if (_slotOverwritten < UINT8_MAX) ++_slotOverwritten;
+	}
+	const std::size_t n = std::min(text.size(), sizeof(_slot) - 1);
+	std::memcpy(_slot, text.data(), n);
+	_slot[n] = '\0';
+	_staged.store(true);
+	return true;
+}
+
+bool EmergencyNotifier::notifyDegraded(const pbx::E911Config& cfg, std::string_view text, std::size_t& enqueued)
+{
+	enqueued = 0;
+	const std::string t(text.substr(0, 512));
+	if (!stageAlert(t, /*onlyIfEmpty=*/true)) return false;
+	_env.log(t, true);
+	enqueued = fanOut(cfg, t);
+	return true;
+}
+
+std::size_t EmergencyNotifier::resendDegraded(const pbx::E911Config& cfg, std::string_view text)
+{
+	return fanOut(cfg, std::string(text.substr(0, 512)));
+}
+
+bool EmergencyNotifier::hasNotifyExts(const pbx::E911Config& cfg)
+{
+	std::size_t considered = 0;
+	for (const std::string& ext : cfg.notifyExts)
+	{
+		if (considered++ >= pbx::kMaxE911NotifyExts) break;
+		if (!ext.empty()) return true;
+	}
+	return false;
+}
+
+bool EmergencyNotifier::anyNotifyRegistered(const pbx::E911Config& cfg)
+{
+	std::size_t considered = 0;
+	for (const std::string& ext : cfg.notifyExts)
+	{
+		if (considered++ >= pbx::kMaxE911NotifyExts) break;
+		if (!ext.empty() && _env.findRegistered(ext)) return true;
+	}
+	return false;
+}
+
+// Every notification is independent and every failure is swallowed: an unregistered extension or an
+// exhausted pool costs that one notification and nothing else.
+std::size_t EmergencyNotifier::fanOut(const pbx::E911Config& cfg, const std::string& text)
+{
 	std::size_t enqueued = 0;
 	std::size_t considered = 0;
 	for (const std::string& ext : cfg.notifyExts)
