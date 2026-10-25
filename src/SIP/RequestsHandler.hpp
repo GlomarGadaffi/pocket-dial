@@ -230,12 +230,6 @@ public:
 	// full (they notify rather than drop), and refusals folded into an earlier one.
 	uint32_t getE911UnknownAlertOverflow() const { return _unknownAlertOverflow.load(std::memory_order_relaxed); }
 	uint32_t getE911UnknownAlertSuppressed() const { return _unknownAlertSuppressed.load(std::memory_order_relaxed); }
-	// Test-only (#1115): move every coalescing window `d` into the past.
-	void ageUnknownEmergencyAlertsForTest(std::chrono::steady_clock::duration d)
-	{
-		std::lock_guard<pd::TimedMutex> lock(_mutex);
-		_unknownAlerts.ageForTest(d);
-	}
 	// OPTIONS keep-alive pings refused because they would not fit their stack
 	// buffer (#463). Not reachable with a real AOR and IPv4 address; counted so
 	// a clipped request can never go out silently.
@@ -589,6 +583,12 @@ public:
 	{
 		std::lock_guard<pd::TimedMutex> lock(_mutex);
 		_emergencyCallbacks.ageForTest(d);
+	}
+	// Test-only (#1115): move every unknown-caller coalescing window `d` into the past.
+	void ageUnknownEmergencyAlertsForTest(std::chrono::steady_clock::duration d)
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		_unknownAlerts.ageForTest(d);
 	}
 	// Test-only (#726): move every armed client give-up timer (Timer B/F) into
 	// the past, so the next tick() fires it. The trunk's own deadline is left
