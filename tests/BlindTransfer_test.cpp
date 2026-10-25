@@ -1524,3 +1524,71 @@ TEST(Trying, AnOrdinaryCalleesHundredTryingStillReachesTheCaller)
 	}
 	EXPECT_EQ(n, 1u);
 }
+
+// ── #1124, Rule 5: a 911 call's provisionals are untouched by the new claims ──
+// The claims match a blind-transfer leg or a Call-ID pending a transfer splice.
+// An emergency-flagged session is neither, even while an unrelated blind transfer
+// is in flight: its callee's 100 and 180 reach the caller exactly once each.
+TEST(BlindTransfer, AnEmergencyCallsProvisionalsStillReachTheCallerDuringAnUnrelatedTransfer)
+{
+	SentList sent;
+	RequestsHandler handler("192.168.33.1", 5060,
+		[&sent](const sockaddr_in& addr, std::shared_ptr<SipMessage> msg) {
+			sent.emplace_back(addr, std::move(msg));
+		});
+	const sockaddr_in callerAddr = addrFor("192.168.33.10");
+	const sockaddr_in calleeAddr = addrFor("192.168.33.20");
+	const sockaddr_in xferorAddr = addrFor("192.168.33.40");
+	const sockaddr_in xfereeAddr = addrFor("192.168.33.50");
+	handler.handle(makeRegister("100", "192.168.33.10", "reg-100e"));
+	handler.handle(makeRegister("106", "192.168.33.20", "reg-106e"));
+	handler.handle(makeRegister("108", "192.168.33.40", "reg-108e"));
+	handler.handle(makeRegister("109", "192.168.33.50", "reg-109e"));
+	handler.handle(makeRegister("107", "192.168.33.30", "reg-107e"));
+
+	// An unrelated blind transfer in flight (108 moves 109 to 107).
+	connectCall(handler, sent, "xfer-unrelated-1124",
+		"108", xferorAddr, "xtag", sdpBodyFor("10.4.4.4", 40004),
+		"109", xfereeAddr, "ytag", sdpBodyFor("10.5.5.5", 50005));
+	handler.handle(makeRefer("xfer-unrelated-1124", "108", xferorAddr, "xtag", "109", "ytag", "107"));
+
+	// The emergency-flagged call, still ringing.
+	const std::string sdp = sdpBodyFor("10.1.1.1", 10001);
+	const std::string inv =
+		"INVITE sip:106@server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.33.10:5060;branch=z9hG4bKiemg\r\n"
+		"From: <sip:100@server>;tag=etag\r\n"
+		"To: <sip:106@server>\r\n"
+		"Call-ID: emergency-1124\r\n"
+		"CSeq: 1 INVITE\r\n"
+		"Max-Forwards: 70\r\n"
+		"Contact: <sip:100@192.168.33.10:5060>\r\n"
+		"Content-Type: application/sdp\r\n"
+		"Content-Length: " + std::to_string(sdp.size()) + "\r\n\r\n" + sdp;
+	handler.handle(RequestsHandler::getMessageFromPool(inv, callerAddr));
+	const std::string fork = findSentTo(sent, calleeAddr, "INVITE sip:106@");
+	ASSERT_FALSE(fork.empty());
+	auto sess = handler.getSession("Call-ID: emergency-1124");
+	ASSERT_TRUE(sess.has_value());
+	sess.value()->setEmergency(true);
+
+	const std::string head =
+		extractHeaderLine(fork, "Via:") + "\r\n" + extractHeaderLine(fork, "From:") + "\r\n"
+		"To: <sip:106@server>\r\nCall-ID: emergency-1124\r\nCSeq: 1 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n";
+	const size_t before = sent.size();
+	handler.handle(RequestsHandler::getMessageFromPool("SIP/2.0 100 Trying\r\n" + head, calleeAddr));
+	handler.handle(RequestsHandler::getMessageFromPool("SIP/2.0 180 Ringing\r\n" + head, calleeAddr));
+	size_t trying = 0, ringing = 0, other = 0;
+	for (size_t i = before; i < sent.size(); ++i)
+	{
+		if (sent[i].first.sin_addr.s_addr != callerAddr.sin_addr.s_addr) continue;
+		const std::string raw = sent[i].second->toString();
+		if (raw.rfind("SIP/2.0 100", 0) == 0) ++trying;
+		else if (raw.rfind("SIP/2.0 180", 0) == 0) ++ringing;
+		else ++other;
+	}
+	EXPECT_EQ(trying, 1u);
+	EXPECT_EQ(ringing, 1u);
+	EXPECT_EQ(other, 0u);
+}
