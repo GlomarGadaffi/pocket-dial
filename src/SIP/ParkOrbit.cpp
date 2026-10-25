@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <sstream>
 
+#include "EthAccess.hpp"
 #include "IDGen.hpp"
 #include "RefillVector.hpp"   // #463: in-place snapshot refill
 #include "Session.hpp"
@@ -69,8 +70,10 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 		{
 			std::string rtpIp;
 			uint16_t    rtpPort = 0;
+			uint32_t ifIp = 0, ifGw = 0, ifMask = 0;
+			if (!EthAccess::getLocalIpInfo(ifIp, ifGw, ifMask)) ifMask = 0;
 			if (sipwire::parseRtpTarget(std::string(data->getBody()), data->getSource(),
-			                            rtpIp, rtpPort))
+			                            rtpIp, rtpPort, activeIp, ifMask))
 			{
 				mohListener = _moh->addListener(rtpIp, rtpPort);
 			}

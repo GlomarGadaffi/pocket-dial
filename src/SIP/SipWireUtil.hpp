@@ -95,6 +95,19 @@ namespace sipwire
 			(addr & ownMask) != (ownAddr & ownMask) || (addr & ~ownMask) != ~ownMask;
 	}
 
+	// True when a dotted-quad string has an octet written with a leading zero
+	// ("011", "0177"). inet_addr()/lwIP read that as octal, other parsers as
+	// decimal, so the address checked need not be the address used. Such a
+	// string is treated as not strict. A lone "0" is fine.
+	inline bool hasLeadingZeroOctet(const std::string& s)
+	{
+		for (size_t i = 0; i + 1 < s.size(); ++i)
+		{
+			if (s[i] == '0' && s[i + 1] >= '0' && s[i + 1] <= '9' && (i == 0 || s[i - 1] == '.')) return true;
+		}
+		return false;
+	}
+
 	// Minimal, well-formed a=inactive offer: the server sources no RTP, so the
 	// far end holds the stream. Used by the park hold answer and by the register
 	// beep INVITE — they must not drift apart, or a phone that tolerates one
@@ -194,8 +207,12 @@ namespace sipwire
 	//
 	// Returns false when no usable port was found, which the caller must treat as
 	// "no audio for this leg" rather than an error.
+	//
+	// `localIp` and `ownMask` (host order, 0 = unknown) let isUsableRtpPeer() also
+	// refuse this host's own address and its subnet broadcast.
 	inline bool parseRtpTarget(const std::string& sdp, const sockaddr_in& from,
-	                           std::string& outIp, uint16_t& outPort)
+	                           std::string& outIp, uint16_t& outPort,
+	                           const std::string& localIp = std::string(), uint32_t ownMask = 0)
 	{
 		outPort = 0;
 		outIp.clear();
@@ -224,7 +241,19 @@ namespace sipwire
 			size_t e = s;
 			while (e < sdp.size() && sdp[e] != '\r' && sdp[e] != '\n' && sdp[e] != ' ') ++e;
 			const std::string addr = sdp.substr(s, e - s);
-			if (!addr.empty() && addr != "0.0.0.0") outIp = addr;
+			// Only an address a stream may go to: a strict dotted quad that is not
+			// loopback, multicast, reserved or broadcast. Anything else takes the
+			// source below, as 0.0.0.0 does (inet_addr() would read "300.1.1.1" as
+			// broadcast). The caller is never refused for it.
+			in_addr parsed{};
+			in_addr own{};
+			if (inet_pton(AF_INET, localIp.c_str(), &own) != 1) own.s_addr = 0;
+			if (!addr.empty() && addr != "0.0.0.0" && !hasLeadingZeroOctet(addr) &&
+				inet_pton(AF_INET, addr.c_str(), &parsed) == 1 &&
+				isUsableRtpPeer(ntohl(parsed.s_addr), ntohl(own.s_addr), ownMask))
+			{
+				outIp = addr;
+			}
 		}
 
 		if (outIp.empty())

@@ -264,6 +264,45 @@ namespace
 		out.sin_port = htons(port);
 		return true;
 	}
+
+	// A board-sourced stream (the 440 tone, a voicemail prompt, a conference
+	// leg's mix) goes to the address the caller's SDP names only when that is a
+	// strict dotted quad rtpPeerFrom() allows. Anything else (loopback,
+	// multicast, broadcast, this host, a malformed string) is replaced by the
+	// INVITE's source, which is what parseCallerRtp() already does for 0.0.0.0.
+	// The call is never refused for it. Not used on the anchor, 911/933 or
+	// PSAP-callback paths, which keep the offered address (Rule 5).
+	void usableStreamDest(std::string& ip, uint16_t port, const std::string& localIp, const SipMessage& invite)
+	{
+		sockaddr_in peer{};
+		char ipBuf[INET_ADDRSTRLEN]{};
+		// A leading-zero octet is read as octal by lwIP and as decimal by the
+		// parser that checked it: not strict. The destination handed on is the
+		// checked sockaddr rendered back, so what is checked is what is used.
+		if (!sipwire::hasLeadingZeroOctet(ip) && rtpPeerFrom(ip, port, localIp, peer) &&
+			inet_ntop(AF_INET, &peer.sin_addr, ipBuf, sizeof(ipBuf)) != nullptr)
+		{
+			ip = ipBuf;
+			return;
+		}
+		const sockaddr_in src = invite.getSource();
+		if (inet_ntop(AF_INET, &src.sin_addr, ipBuf, sizeof(ipBuf)) != nullptr)
+		{
+			ip = ipBuf;
+		}
+		else
+		{
+			ip.clear();   // never leave the unchecked string: the sender then refuses to start
+		}
+	}
+
+	// The one guard for every site that may carry an emergency: a 911/933 or a
+	// PSAP callback keeps the offered address (Rule 5), anything else is checked.
+	void usableStreamDestUnlessEmergency(bool emergency, std::string& ip, uint16_t port,
+		const std::string& localIp, const SipMessage& invite)
+	{
+		if (!emergency) usableStreamDest(ip, port, localIp, invite);
+	}
 }
 
 RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
@@ -558,6 +597,7 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 						auto inviteMsg = session->getInviteMessage();
 						if (caller && inviteMsg && parseCallerRtp(inviteMsg, handsetIp, handsetPort))
 						{
+							usableStreamDestUnlessEmergency(session->isEmergency(), handsetIp, handsetPort, _localIp, *inviteMsg);
 							const std::string activeIp = _localIp;
 							// Reuse the To-tag from the 180 Ringing so the 200 OK lands in
 							// the SAME dialog the phone is already ringing (a fresh tag
@@ -3200,6 +3240,8 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 		return;
 	}
 
+	usableStreamDest(destIp, destPort, _localIp, *data);
+
 	// Start the RTP tone stream FIRST. Sending 200 OK before the stream is up risks
 	// answering the call (caller hears nothing) when the socket/task fails to start,
 	// recoverable only by the caller hanging up. On failure answer 500 instead.
@@ -3456,6 +3498,8 @@ void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
 		refuse("SIP/2.0 503 Service Unavailable", "conference mix tick could not be started");
 		return;
 	}
+
+	usableStreamDest(destIp, destPort, _localIp, *data);
 
 	// Join first: a full room must not consume a session slot. The leg index is also
 	// the proof the media actually came up, so nothing is answered on a dead leg.
@@ -3834,6 +3878,8 @@ void RequestsHandler::answerVoicemailDeposit(const std::shared_ptr<SipMessage>& 
 		return;
 	}
 
+	usableStreamDestUnlessEmergency(isEmergencyTraffic(*invite), destIp, destPort, _localIp, *invite);
+
 	// Find a free leg -- see findFreeVoicemailSlot()'s doc comment.
 	const int slot = findFreeVoicemailSlot();
 	if (slot < 0)
@@ -4070,6 +4116,8 @@ void RequestsHandler::answerVoicemailRetrieval(const std::shared_ptr<SipMessage>
 		refuse(SipMessageTypes::BAD_REQUEST, "no usable RTP destination in invite");
 		return;
 	}
+
+	usableStreamDest(destIp, destPort, _localIp, *invite);
 
 	// Same free-slot rules a deposit uses -- a slot mid-flush or mid-job is
 	// exactly as unavailable to a retrieval as to a new deposit.
@@ -4661,8 +4709,10 @@ bool RequestsHandler::handleMohPreviewOk(const std::shared_ptr<SipMessage>& data
 	{
 		std::string rtpIp;
 		uint16_t    rtpPort = 0;
+		uint32_t ifIp = 0, ifGw = 0, ifMask = 0;
+		if (!EthAccess::getLocalIpInfo(ifIp, ifGw, ifMask)) ifMask = 0;
 		if (sipwire::parseRtpTarget(std::string(data->getBody()), data->getSource(),
-		                            rtpIp, rtpPort))
+		                            rtpIp, rtpPort, _localIp, ifMask))
 		{
 			_mohPreview.listener = _holdMusic.addListener(rtpIp, rtpPort);
 		}
@@ -5636,6 +5686,8 @@ bool RequestsHandler::originateAnchorCall(std::shared_ptr<SipMessage> data,
 		refuse(SipMessageTypes::BAD_REQUEST, "no usable RTP destination in INVITE");
 		return true;
 	}
+	// Rule 5: a 911/933 bridges to the offered address, as before.
+	usableStreamDestUnlessEmergency(emergency, destIp, destPort, _localIp, *data);
 
 	if (emergency) preemptAnchorCallForEmergency();   // #624: no-op unless the anchor is full
 
@@ -6738,6 +6790,7 @@ void RequestsHandler::onInboundAnchorOk(const std::shared_ptr<SipMessage>& ok, c
 	}
 	else if (parseCallerRtp(ok, handsetIp, handsetPort))
 	{
+		usableStreamDestUnlessEmergency(session->isEmergency(), handsetIp, handsetPort, _localIp, *ok);
 		// Claim a free media bridge for this inbound call.
 		MediaBridge* b = bridgeForParticipant(inPart);
 		if (!b) b = acquireFreeAnchorBridge();
