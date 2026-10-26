@@ -85,13 +85,13 @@ namespace
 	// strips; 101 is the telephone-event payload type the answer must echo.
 	std::shared_ptr<SipMessage> makeTrunkDial(const std::string& fromExt,
 		const std::string& dialed, const std::string& callId, int rtpPort = 40000,
-		const std::string& extraHeaders = "")
+		const std::string& extraHeaders = "", const std::string& cAddr = "")
 	{
 		const std::string body =
 			"v=0\r\n"
 			"o=- 0 0 IN IP4 " + std::string(kHandsetIp) + "\r\n"
 			"s=-\r\n"
-			"c=IN IP4 " + std::string(kHandsetIp) + "\r\n"
+			"c=IN IP4 " + (cAddr.empty() ? std::string(kHandsetIp) : cAddr) + "\r\n"
 			"t=0 0\r\n"
 			"m=audio " + std::to_string(rtpPort) + " RTP/AVP 0 101\r\n"
 			"a=rtpmap:0 PCMU/8000\r\n"
@@ -1989,4 +1989,184 @@ TEST(TrunkWiring, ADeprecatedTrunkStillPlacesACallWithTheSameMessageCounts)
 	EXPECT_EQ(b.countWithTo("SIP/2.0 180", kHandsetIp), 1u);
 	EXPECT_EQ(b.countWithTo("SIP/2.0 4", kHandsetIp), 0u) << "no refusal";
 	EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+}
+
+// -- Media address that is not a dotted quad (carrier answer or handset offer) --
+//
+// inet_addr() turns "300.1.1.1" into 255.255.255.255 and "1.2.3" into 1.2.0.3, and
+// setRawPeer() accepted either as a peer. An ordinary call is refused 502 for such
+// an answer (above). The paths below never refuse: a 911/933 relay keeps its
+// signalling and sends its media to the carrier's signalling source with the
+// offered port, and a handset offer that is not a dotted quad is replaced by the
+// INVITE's source.
+namespace
+{
+	const char* const kOddQuads[] = { "300.1.1.1", "1.2.3", "999.0.113.9", "1.2.3.4.5", "00.0.0.0", "000.000.000.000", "0.0.0.00" };
+
+	// A trunk call from 1001 whose session is marked emergency (a 911/933 never
+	// goes over a real trunk, but the relay keeps its own exemption, #861).
+	void dialAndMarkEmergency(Bench& b, const char* callId)
+	{
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "92025550123", callId));
+		auto s = b.handler.getSession(std::string("Call-ID: ") + callId);
+		ASSERT_TRUE(s.has_value());
+		s.value()->setEmergency(true);
+	}
+}
+
+TEST(TrunkWiring, AnEmergencyAnswerNamingNoHostIsAnsweredAndRelayedToTheCarriersSource)
+{
+	for (const char* ip : kOddQuads)
+	{
+		Bench b;
+		dialAndMarkEmergency(b, "call-873-q");
+		const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+		b.sent.clear();
+
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			carrier.response("SIP/2.0 200 OK", /*withSdp=*/true, ip), addrFor(kSbcIp)));
+
+		EXPECT_EQ(b.countWithTo("SIP/2.0 200", kHandsetIp), 1u) << ip << ": the handset is answered";
+		EXPECT_EQ(b.countWithTo("SIP/2.0 502", kHandsetIp), 0u) << ip << ": never refused";
+		EXPECT_EQ(b.countWithTo("BYE", kSbcIp), 0u) << ip << ": the carrier leg stays up";
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << ip;
+		sockaddr_in peer{};
+		ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-873-q", peer)) << ip;
+		EXPECT_EQ(peer.sin_addr.s_addr, inet_addr(kSbcIp)) << ip << ": the carrier's source, never broadcast or zero";
+		EXPECT_EQ(ntohs(peer.sin_port), 41000) << ip;
+	}
+}
+
+TEST(TrunkWiring, AnEmergencyAnswerStillRelaysToAnyDottedQuadAsGiven)
+{
+	// Rule 5 control: unchanged. Loopback is a strict quad and a 911/933 relays
+	// to wherever the carrier says (desmo, 2026-10-03).
+	for (const char* ip : { "203.0.113.9", "127.0.0.1", "192.0.2.77" })
+	{
+		Bench b;
+		dialAndMarkEmergency(b, "call-873-ok");
+		const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+		b.sent.clear();
+
+		b.handler.handle(RequestsHandler::getMessageFromPool(
+			carrier.response("SIP/2.0 200 OK", /*withSdp=*/true, ip), addrFor(kSbcIp)));
+
+		EXPECT_EQ(b.countWithTo("SIP/2.0 200", kHandsetIp), 1u) << ip;
+		sockaddr_in peer{};
+		ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-873-ok", peer)) << ip;
+		EXPECT_EQ(peer.sin_addr.s_addr, inet_addr(ip)) << ip;
+		EXPECT_EQ(ntohs(peer.sin_port), 41000) << ip;
+	}
+}
+
+TEST(TrunkWiring, AnEmergencyEarlyMediaNonDottedQuadThenAGoodAnswerSetsTheGoodPeer)
+{
+	Bench b;
+	dialAndMarkEmergency(b, "call-873-e");
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 183 Session Progress", /*withSdp=*/true, "300.1.1.1"), addrFor(kSbcIp)));
+	EXPECT_EQ(b.countWithTo("SIP/2.0 183", kHandsetIp), 1u) << "early media is relayed, call untouched";
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-873-e", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr(kSbcIp)) << "but toward the carrier's own source";
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true), addrFor(kSbcIp)));
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-873-e", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("203.0.113.9"));
+}
+
+TEST(TrunkWiring, AHandsetOfferWithANonDottedQuadAddressIsRelayedToItsSourceNotToBroadcast)
+{
+	for (const char* ip : kOddQuads)
+	{
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "92025550123", "call-873-h", 40000, "", ip));
+
+		EXPECT_EQ(b.countWithTo("INVITE", kSbcIp), 1u) << ip << ": the call is placed, not refused";
+		sockaddr_in peer{};
+		ASSERT_TRUE(b.handler.trunkHandsetPeerForTest("Call-ID: call-873-h", peer)) << ip;
+		EXPECT_EQ(peer.sin_addr.s_addr, inet_addr(kHandsetIp)) << ip << ": the INVITE's source stands in";
+		EXPECT_EQ(ntohs(peer.sin_port), 40000) << ip;
+	}
+}
+
+TEST(TrunkWiring, AHandsetOfferWithADottedQuadAddressIsRelayedAsOffered)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-873-g", 40000, "", "192.168.77.9"));
+
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkHandsetPeerForTest("Call-ID: call-873-g", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("192.168.77.9"));
+}
+
+// Leading-zero octets: inet_addr() and lwIP read "011" as octal 9, the strict
+// parser as decimal 11. The peer is built from the parsed value and never
+// re-parsed, so what is checked is what is used.
+TEST(TrunkWiring, AnEmergencyAnswerWithLeadingZeroOctetsRelaysToTheDecimalReading)
+{
+	// Rule 5: not refused and not left without a peer; "009" is not even valid octal.
+	Bench b;
+	dialAndMarkEmergency(b, "call-873-z");
+	const auto carrier = CarrierView::from(b.firstWith("INVITE sip:+1"));
+	b.sent.clear();
+
+	b.handler.handle(RequestsHandler::getMessageFromPool(
+		carrier.response("SIP/2.0 200 OK", /*withSdp=*/true, "203.000.113.009"), addrFor(kSbcIp)));
+
+	EXPECT_EQ(b.countWithTo("SIP/2.0 200", kHandsetIp), 1u);
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkCarrierPeerForTest("Call-ID: call-873-z", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("203.0.113.9"));
+}
+
+TEST(TrunkWiring, AHandsetOfferWithLeadingZeroOctetsIsRelayedToItsSource)
+{
+	for (const char* ip : { "192.168.011.001", "192.168.077.009", "0177.0.0.1" })
+	{
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "92025550123", "call-873-lz", 40000, "", ip));
+
+		EXPECT_EQ(b.countWithTo("INVITE", kSbcIp), 1u) << ip << ": the call is placed, not refused";
+		sockaddr_in peer{};
+		ASSERT_TRUE(b.handler.trunkHandsetPeerForTest("Call-ID: call-873-lz", peer)) << ip;
+		EXPECT_EQ(peer.sin_addr.s_addr, inet_addr(kHandsetIp)) << ip << ": the INVITE's source stands in";
+	}
+}
+
+// An outbound trunk call: a handset offering an address no stream may go to
+// (loopback, multicast, broadcast, this board) is relayed to its own source,
+// not to that address, and the call is placed all the same.
+TEST(TrunkWiring, AHandsetOfferNamingLoopbackMulticastBroadcastOrThisHostIsRelayedToItsSource)
+{
+	for (const char* ip : { "127.0.0.1", "224.0.0.251", "255.255.255.255", "240.0.0.1", kServerIp })
+	{
+		Bench b;
+		b.handler.setTrunkConfig(trunkConfig());
+		b.handler.handle(makeTrunkDial("1001", "92025550123", "call-873-u", 40000, "", ip));
+
+		EXPECT_EQ(b.countWithTo("INVITE", kSbcIp), 1u) << ip << ": the call is placed, not refused";
+		sockaddr_in peer{};
+		ASSERT_TRUE(b.handler.trunkHandsetPeerForTest("Call-ID: call-873-u", peer)) << ip;
+		EXPECT_EQ(peer.sin_addr.s_addr, inet_addr(kHandsetIp)) << ip << ": the INVITE's source stands in";
+	}
+}
+
+TEST(TrunkWiring, Control_AHandsetOfferNamingAPublicAddressIsRelayedAsOffered)
+{
+	Bench b;
+	b.handler.setTrunkConfig(trunkConfig());
+	b.handler.handle(makeTrunkDial("1001", "92025550123", "call-873-p", 40000, "", "198.51.100.20"));
+
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkHandsetPeerForTest("Call-ID: call-873-p", peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("198.51.100.20"));
 }

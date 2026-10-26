@@ -1089,11 +1089,53 @@ TEST(TrunkInbound, AnRtpAddressThatIsNotAUnicastDottedQuadIsNeverARelayPeer)
 		b.sent.clear();
 		b.handler.handle(handsetReply(fork, "SIP/2.0 200 OK", answer));
 
-		EXPECT_EQ(b.carrierStatus(), "SIP/2.0 488 Not Acceptable Here") << "the handset's answer";
+		// A handset that answers with an address no stream may go to is connected
+		// to its own source, not hung up on (and never aimed at broadcast).
+		EXPECT_EQ(b.carrierStatus(), "SIP/2.0 200 OK") << "the handset's answer";
 		EXPECT_EQ(b.countTo(kSbcIp), 1u);
-		EXPECT_FALSE(b.firstTo("BYE ", kPhoneIp).empty());
-		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 0u);
+		EXPECT_TRUE(b.firstTo("BYE ", kPhoneIp).empty());
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u);
+		sockaddr_in peer{};
+		ASSERT_TRUE(b.handler.trunkHandsetPeerForTest("Call-ID: " + field(fork, "Call-ID: "), peer));
+		EXPECT_EQ(peer.sin_addr.s_addr, inet_addr(kPhoneIp));
 	}
+}
+
+TEST(TrunkInbound, AHandsetAnswerNamingAnUnusableAddressIsConnectedToItsSourceNotHungUp)
+{
+	const std::string c = "c=IN IP4 192.168.50.21";
+	for (const char* ip : { "127.0.0.1", "224.0.0.1", "255.255.255.255", "192.168.50.1", "1.2.3", "192.168.050.021" })
+	{
+		Bench b;
+		const std::string fork = ringFork(b, "in-odd-answer");
+		ASSERT_FALSE(fork.empty());
+		std::string answer = kHandsetAnswer;
+		answer.replace(answer.find(c), c.size(), std::string("c=IN IP4 ") + ip);
+		b.sent.clear();
+		b.handler.handle(handsetReply(fork, "SIP/2.0 200 OK", answer));
+
+		EXPECT_EQ(b.carrierStatus(), "SIP/2.0 200 OK") << ip;
+		EXPECT_TRUE(b.firstTo("BYE ", kPhoneIp).empty()) << ip;
+		sockaddr_in peer{};
+		ASSERT_TRUE(b.handler.trunkHandsetPeerForTest("Call-ID: " + field(fork, "Call-ID: "), peer)) << ip;
+		EXPECT_EQ(peer.sin_addr.s_addr, inet_addr(kPhoneIp)) << ip << ": its own source";
+	}
+}
+
+TEST(TrunkInbound, Control_AHandsetAnswerNamingALanAddressIsRelayedThereAsOffered)
+{
+	Bench b;
+	const std::string fork = ringFork(b, "in-lan-answer");
+	ASSERT_FALSE(fork.empty());
+	std::string answer = kHandsetAnswer;
+	answer.replace(answer.find("c=IN IP4 192.168.50.21"), 22, "c=IN IP4 192.168.50.77");
+	b.sent.clear();
+	b.handler.handle(handsetReply(fork, "SIP/2.0 200 OK", answer));
+
+	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 200 OK");
+	sockaddr_in peer{};
+	ASSERT_TRUE(b.handler.trunkHandsetPeerForTest("Call-ID: " + field(fork, "Call-ID: "), peer));
+	EXPECT_EQ(peer.sin_addr.s_addr, inet_addr("192.168.50.77"));
 }
 
 TEST(TrunkInbound, ATelephoneEventOffNot8000HzIsNotOfferedOnAsIf8000)
@@ -1247,14 +1289,49 @@ TEST(TrunkInbound, APsapCallbackWithANormalOfferIsUnchanged)
 	EXPECT_TRUE(s.value()->isEmergency());
 }
 
-TEST(TrunkInbound, APsapCallbackWhoseAddressIsNotADottedQuadHasNoPeerAndIsRefused488)
+TEST(TrunkInbound, APsapCallbackWhoseAddressNamesNoHostIsTakenAtTheCarriersSourceNotRefused)
 {
+	// Rule 5: an address that names no host (malformed, or all zeros written with
+	// extra zeros) still rings the handset and is never a 488 or a 503, and its
+	// audio goes to the carrier's signalling source, not to silence.
+	const MockedInterface net;
+	for (const char* ip : { "999.0.0.1", "1.2.3", "1.2.3.4.5", "00.0.0.0", "000.000.000.000", "0.0.0.00" })
+	{
+		Bench b;
+		const std::string fork = psapCallbackWithOfferAt(b, ip, "in-873-badquad");
+		EXPECT_FALSE(fork.empty()) << ip << ": the handset must ring";
+		EXPECT_EQ(b.countTo(kPhoneIp), 1u) << ip;
+		EXPECT_TRUE(b.firstTo("SIP/2.0 4", kSbcIp).empty()) << ip << ": not refused";
+		EXPECT_TRUE(b.firstTo("SIP/2.0 5", kSbcIp).empty()) << ip << ": not a 503";
+		if (fork.empty()) continue;
+		const std::string forkId = "Call-ID: " + field(fork, "Call-ID: ");
+		sockaddr_in peer{};
+		ASSERT_TRUE(b.handler.trunkCarrierPeerForTest(forkId, peer)) << ip << ": a media peer is set";
+		EXPECT_EQ(peer.sin_addr.s_addr, inet_addr(kSbcIp)) << ip << ": at the carrier's source";
+		EXPECT_EQ(ntohs(peer.sin_port), 41000) << ip << ": with the offered port";
+		auto s = b.handler.getSession(forkId);
+		ASSERT_TRUE(s.has_value()) << ip;
+		EXPECT_TRUE(s.value()->isEmergency()) << ip;
+		EXPECT_EQ(b.handler.trunkRelaysInUseForTest(), 1u) << ip;
+	}
+}
+
+TEST(TrunkInbound, APsapCallbackAnsweredWithAnUnusableAddressIsNeverHungUp)
+{
+	// Rule 5: the callback's own handset answers with a loopback c=; the call
+	// connects to the handset's source instead of being ended.
 	const MockedInterface net;
 	Bench b;
-	const std::string fork = psapCallbackWithOfferAt(b, "999.0.0.1", "in-873-badquad");
-	EXPECT_TRUE(fork.empty());
-	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 488 Not Acceptable Here");
-	EXPECT_EQ(b.countTo(kSbcIp), 1u);
+	const std::string fork = psapCallbackWithOfferAt(b, kSbcIp, "in-873-cb-ans");
+	ASSERT_FALSE(fork.empty());
+	std::string answer = kHandsetAnswer;
+	answer.replace(answer.find("c=IN IP4 192.168.50.21"), 22, "c=IN IP4 127.0.0.1");
+	b.sent.clear();
+	b.handler.handle(handsetReply(fork, "SIP/2.0 200 OK", answer));
+
+	EXPECT_EQ(b.carrierStatus(), "SIP/2.0 200 OK");
+	EXPECT_TRUE(b.firstTo("BYE ", kPhoneIp).empty());
+	EXPECT_EQ(b.firstTo("SIP/2.0 4", kSbcIp), "");
 }
 
 TEST(TrunkInbound, ACallWithNoOfferIsRefused488EvenFromAPsapCallback)

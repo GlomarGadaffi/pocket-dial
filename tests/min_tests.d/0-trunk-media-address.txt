@@ -1,0 +1,2 @@
+# TrunkWiring_test.cpp: 9 + TrunkInbound_test.cpp: 3 (a media address that is not a dotted quad: a 911/933 relay and a PSAP callback keep the call with media at the carrier's source and the offered port, a handset offer or answer falls back to its source; controls for strict quads)
+12

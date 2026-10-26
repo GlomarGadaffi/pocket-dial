@@ -761,6 +761,16 @@ public:
 		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_TRUNK_CALLS)) return false;
 		return _trunkRx[slot].rawPeerForTest(out);
 	}
+	// The handset-facing half of the same relay: where the carrier's audio goes.
+	bool trunkHandsetPeerForTest(const std::string& callID, sockaddr_in& out)
+	{
+		std::lock_guard<pd::TimedMutex> lock(_mutex);
+		auto sit = _sessions.find(callID);
+		if (sit == _sessions.end() || !sit->second->isTrunk()) return false;
+		const int slot = sit->second->getTrunkRelaySlot();
+		if (slot < 0 || slot >= static_cast<int>(POCKETDIAL_MAX_TRUNK_CALLS)) return false;
+		return _handsetRx[slot].rawPeerForTest(out);
+	}
 
 	// What the resolver currently knows about the configured SBC host. Refused
 	// means nothing is known and nothing is in flight; anything else means a
@@ -2248,8 +2258,11 @@ private:
 	// The RTP address an offer or answer names, only when its c= is a dotted
 	// quad that is neither 0.0.0.0 nor broadcast: a relay is never aimed at one.
 	bool trunkInboundRtp(const std::shared_ptr<SipMessage>& m, sockaddr_in& out);
-	// #873: trunkInboundRtp() for an ordinary call; a PSAP callback is taken at any dotted-quad address.
+	// #873: trunkInboundRtp() for an ordinary call. A PSAP callback is taken at any strict dotted-quad
+	// address as given; one that names no host gets the carrier's source with the offered port.
 	bool trunkCarrierRtp(const std::shared_ptr<SipMessage>& m, bool psapCallback, sockaddr_in& out);
+	// The handset's answer to a carrier call: its own source stands in for an unusable c=.
+	bool handsetAnswerRtp(const std::shared_ptr<SipMessage>& m, sockaddr_in& out);
 	// The fork INVITE to the handset, or the end of the call if it cannot be drawn.
 	void sendTrunkFork(Session& session, const std::shared_ptr<SipClient>& handset, int slot,
 		int dtmfPt, const std::string& callId, const std::string& caller);

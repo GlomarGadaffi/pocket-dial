@@ -270,8 +270,9 @@ namespace
 	// strict dotted quad rtpPeerFrom() allows. Anything else (loopback,
 	// multicast, broadcast, this host, a malformed string) is replaced by the
 	// INVITE's source, which is what parseCallerRtp() already does for 0.0.0.0.
-	// The call is never refused for it. Not used on the anchor, 911/933 or
-	// PSAP-callback paths, which keep the offered address (Rule 5).
+	// The call is never refused for it. Not used on the anchor or the 911/933
+	// media legs, which keep the offered address (Rule 5); a PSAP callback's
+	// handset answer does use it (never a hang-up for an odd address).
 	void usableStreamDest(std::string& ip, uint16_t port, const std::string& localIp, const SipMessage& invite)
 	{
 		sockaddr_in peer{};
@@ -294,6 +295,18 @@ namespace
 		{
 			ip.clear();   // never leave the unchecked string: the sender then refuses to start
 		}
+	}
+
+	// A media peer at the carrier's signalling source with the offered port, for an
+	// emergency offer whose c= names no host (not a strict quad, or all zeros). A
+	// peer-less relay would connect the call to silence, so it is never left empty.
+	bool carrierSourcePeer(const SipMessage& m, uint16_t port, sockaddr_in& out)
+	{
+		out = sockaddr_in{};
+		out.sin_family = AF_INET;
+		out.sin_addr = m.getSource().sin_addr;
+		out.sin_port = htons(port);
+		return out.sin_addr.s_addr != 0 && port != 0;
 	}
 
 	// The one guard for every site that may carry an emergency: a 911/933 or a
@@ -14945,19 +14958,46 @@ static int carrierDtmfPayloadType(const SipMessage& data)
 	return dtmfPt;
 }
 
+// The handset's answer to a carrier call: where its audio goes. An address no
+// stream may go to (loopback, multicast, this host, malformed, leading zeros)
+// is replaced by the handset's own source, so a handset that answers with an odd
+// c= is connected rather than hung up on (and a PSAP callback never is).
+bool RequestsHandler::handsetAnswerRtp(const std::shared_ptr<SipMessage>& m, sockaddr_in& out)
+{
+	std::string ip;
+	uint16_t    port = 0;
+	uint32_t    addr = 0;
+	if (!parseCallerRtp(m, ip, port)) return false;
+	usableStreamDest(ip, port, _localIp, *m);
+	if (!TrunkResolver::parseDottedQuad(ip, addr)) return false;
+	out = sockaddr_in{};
+	out.sin_family = AF_INET;
+	out.sin_addr.s_addr = addr;
+	out.sin_port = htons(port);
+	return true;
+}
+
 bool RequestsHandler::trunkCarrierRtp(const std::shared_ptr<SipMessage>& m, bool psapCallback, sockaddr_in& out)
 {
 	if (!psapCallback) return trunkInboundRtp(m, out);
 
 	// #873, as an outbound 911/933 (#861): audio goes to whatever address the
-	// carrier gave. Only an address that is not a strict dotted quad, or an offer
-	// with no media port, leaves no peer to send to; that stays the 488 it was,
-	// since a call with no peer would connect with one-way audio.
+	// carrier gave. An offer with no media port stays the 488 it was. An address
+	// that names no host (not a strict dotted quad, or all zeros however written)
+	// is replaced by the carrier's signalling source with the offered port, as
+	// parseCallerRtp() does for 0.0.0.0: the callback is taken, never refused, and
+	// never left with a peer-less relay (which would connect it to silence).
 	std::string ip;
 	uint16_t    port = 0;
 	uint32_t    addr = 0;
-	if (!parseCallerRtp(m, ip, port) || !TrunkResolver::parseDottedQuad(ip, addr)) return false;
+	if (!parseCallerRtp(m, ip, port)) return false;
 	out = sockaddr_in{};
+	if (!TrunkResolver::parseDottedQuad(ip, addr) || addr == 0)
+	{
+		queueLog("trunk: PSAP callback " + std::string(m->getCallID()) + " offers RTP address " + ip +
+			", which names no host; media goes to the carrier's source (#873)");
+		return carrierSourcePeer(*m, port, out);
+	}
 	out.sin_family = AF_INET;
 	out.sin_addr.s_addr = addr;
 	out.sin_port = htons(port);
@@ -15013,7 +15053,11 @@ int RequestsHandler::forkInboundTrunkCall(const std::shared_ptr<SipMessage>& dat
 	// bound port is what one side's SDP advertises.
 	_trunkRx[slot].setRawSink(&trunkRelayForward, &_handsetRx[slot]);
 	_handsetRx[slot].setRawSink(&trunkRelayForward, &_trunkRx[slot]);
-	if (!_trunkRx[slot].setRawPeer(carrierRtp) || !_trunkRx[slot].start(0, nullptr) ||
+	// setRawPeer() refuses a zero peer, which must never turn a PSAP callback into
+	// a 503; trunkCarrierRtp() hands a callback a peer in every case, so this is
+	// a guard, not a path.
+	const bool carrierHasPeer = carrierRtp.sin_addr.s_addr != 0;
+	if ((carrierHasPeer && !_trunkRx[slot].setRawPeer(carrierRtp)) || !_trunkRx[slot].start(0, nullptr) ||
 		!_handsetRx[slot].start(0, nullptr))
 	{
 		releaseTrunkRelay(slot);
@@ -15093,7 +15137,7 @@ bool RequestsHandler::handleTrunkInboundReply(const std::shared_ptr<SipMessage>&
 	sockaddr_in rtp{};
 	const bool relayable = data->hasSdp() &&
 		data->offersSupportedAudio(/*allowWideband=*/false, /*allowPcma=*/false) &&
-		trunkInboundRtp(data, rtp) && _handsetRx[slot].setRawPeer(rtp);
+		handsetAnswerRtp(data, rtp) && _handsetRx[slot].setRawPeer(rtp);
 	if (!relayable || !_sipTrunk.respond(callId, 200,
 		buildMediaSdp(_localIp, _trunkRx[slot].localPort(), /*sendrecv=*/true, _trunkInbound[slot].dtmfPt)))
 	{
@@ -15267,9 +15311,22 @@ bool RequestsHandler::placeSipTrunkCall(const std::shared_ptr<SipMessage>& data,
 		return true;
 	}
 
+	// Loopback, multicast, reserved, broadcast, this host, the subnet broadcast,
+	// a malformed string or a leading-zero octet (inet_addr() reads "300.1.1.1"
+	// as broadcast and "011" as octal): the INVITE's source stands in, as
+	// parseCallerRtp() does for 0.0.0.0. The call is not refused for it. The
+	// peer is built from the parsed value, never re-parsed from the string.
+	// A 911/933 never goes over a trunk (backstop above), so no Rule 5 branch.
+	usableStreamDest(handsetIp, handsetPort, _localIp, *data);
+	uint32_t handsetAddr = 0;
+	if (!TrunkResolver::parseDottedQuad(handsetIp, handsetAddr))
+	{
+		refuse(SipMessageTypes::BAD_REQUEST, "no usable RTP destination in INVITE");
+		return true;
+	}
 	sockaddr_in handsetRtp{};
 	handsetRtp.sin_family = AF_INET;
-	handsetRtp.sin_addr.s_addr = inet_addr(handsetIp.c_str());
+	handsetRtp.sin_addr.s_addr = handsetAddr;
 	handsetRtp.sin_port = htons(handsetPort);
 
 	// Bring up the carrier-facing half only. It needs to be bound before the
@@ -15368,21 +15425,39 @@ int RequestsHandler::bringUpTrunkRelay(int slot, const std::shared_ptr<SipMessag
 
 	// #861: an address no relay may send to (loopback, multicast, this host, a
 	// malformed one) fails an ordinary call. A 911/933 relays wherever the
-	// carrier says, unchecked, as before (desmo, 2026-10-03): refusing the
-	// answer would drop the emergency call.
+	// carrier says, as before (desmo, 2026-10-03): refusing the answer would
+	// drop the emergency call. A string that is not a strict dotted quad, or is
+	// all zeros however written, names no host (inet_addr() reads "300.1.1.1" as
+	// broadcast and "1.2.3" as 1.2.0.3): the carrier's signalling source with
+	// the offered port stands in, nothing is refused and the leg is not left
+	// to silence (#873).
 	sockaddr_in carrierRtp{};
 	if (emergency)
 	{
-		carrierRtp.sin_family = AF_INET;
-		carrierRtp.sin_addr.s_addr = inet_addr(carrierIp.c_str());
-		carrierRtp.sin_port = htons(carrierPort);
+		uint32_t addr = 0;
+		if (TrunkResolver::parseDottedQuad(carrierIp, addr) && addr != 0)
+		{
+			carrierRtp.sin_family = AF_INET;
+			carrierRtp.sin_addr.s_addr = addr;
+			carrierRtp.sin_port = htons(carrierPort);
+		}
+		else
+		{
+			queueLog("trunk: emergency call " + std::string(carrier->getCallID()) + " offers RTP address " +
+				carrierIp + ", which names no host; media goes to the carrier's source (#873)");
+			if (!carrierSourcePeer(*carrier, carrierPort, carrierRtp)) return 502;
+		}
+		if (!_trunkRx[slot].setRawPeer(carrierRtp)) return 502;
 	}
-	else if (!rtpPeerFrom(carrierIp, carrierPort, _localIp, carrierRtp))
+	else
 	{
-		queueLog("trunk: carrier RTP address " + carrierIp + ":" + std::to_string(carrierPort) + " is not usable (#861)");
-		return 502;
+		if (!rtpPeerFrom(carrierIp, carrierPort, _localIp, carrierRtp))
+		{
+			queueLog("trunk: carrier RTP address " + carrierIp + ":" + std::to_string(carrierPort) + " is not usable (#861)");
+			return 502;
+		}
+		if (!_trunkRx[slot].setRawPeer(carrierRtp)) return 502;
 	}
-	if (!_trunkRx[slot].setRawPeer(carrierRtp)) return 502;
 
 	// Bring up the handset-facing half and complete the cross-wiring. Its bound
 	// port is what the 183/200 advertises. Already up after early media (#400):
