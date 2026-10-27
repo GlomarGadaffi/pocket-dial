@@ -305,7 +305,8 @@ once because someone carried forward the previous one — 310, then 506, then
 521 — and a stale figure in the contributing guide teaches every future commit
 message to be wrong too.
 
-The same three commands CI runs, from a WSL shell:
+The same three commands CI runs, from a WSL shell or natively on Windows (the
+host suite builds natively since #1140):
 
 ```bash
 unset IDF_PATH                                        # see below
@@ -319,8 +320,12 @@ ctest --test-dir build/tests --output-on-failure
   configures an ESP-IDF cross-build, so the host tests are never generated.
 * **`--test-dir build/tests` is required.** Testing is enabled only inside the
   `tests/` subdirectory, so the CTest set lives there, not at the build root.
-* **Run it from WSL, not natively.** Several suites open real sockets; running
-  them on Windows triggers firewall authorisation prompts.
+* **WSL and native Windows both work.** Since #1140 the host suite builds
+  natively, and on Windows the test binary binds loopback only
+  (`PD_TEST_LOOPBACK_BIND`, #1136), so it should not raise firewall prompts.
+  WSL remains a supported option.
+* **Multi-config generators (Visual Studio) need `-C Release`.** Use
+  `ctest --test-dir build/tests -C Release --output-on-failure`.
 * **OpenSSL is optional, and only affects one thing.** Issue #159 added RS256
   JWT signing for the Workspace service-account path; on the host build that
   uses OpenSSL's `EVP_DigestSign` (the device uses mbedTLS, and IDF ships only

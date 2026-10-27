@@ -630,8 +630,10 @@ ESP-IDF cross-build, and the host tests are never generated. The `--test-dir bui
 is not optional either, testing is enabled only inside the `tests/` subdirectory, so the
 CTest set lives there and not at the build root.
 
-Run it from WSL rather than natively on Windows: several suites open real sockets, which
-triggers firewall authorisation prompts on a native run.
+The suite runs from WSL or natively on Windows (since #1140; the Windows test binary binds
+loopback only, #1136, so it should not raise firewall prompts). With a multi-config
+generator such as Visual Studio, pass the configuration to ctest:
+`ctest --test-dir build/tests -C Release --output-on-failure`.
 
 ### 6.1 What the host suite does **not** cover
 

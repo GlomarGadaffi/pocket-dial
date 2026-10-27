@@ -89,7 +89,7 @@ Some features need a party that can play, record or mix sound. For those the boa
 flowchart LR
     D["Dialled number,<br/>checked in this order"] --> X{"What is it?"}
     X -- "911 or 933" --> SOS["Emergency lane,<br/>see below"]
-    X -- "777" --> E["Echo test"]
+    X -- "777" --> E["Echo test,<br/>SDP loopback"]
     X -- "999" --> G["Page every phone,<br/>auto-answer"]
     X -- "980 to 989" --> Z["Page a zone"]
     X -- "440" --> T["Test tone"]
@@ -105,10 +105,10 @@ flowchart LR
     R -- "no answer" --> VM["Forward on no answer,<br/>or voicemail"]
 
     classDef media stroke-width:3px;
-    class SOS,E,T,C,MP,M,VR,K,VM media;
+    class SOS,T,C,MP,M,VR,K,VM media;
 ```
 
-Heavy outlines mark the legs where the board terminates the media. Everything else stays peer to peer.
+Heavy outlines mark the legs where the board terminates the media. Everything else stays peer to peer. The `777` echo test is not one of them: the board answers with the caller's own offer, so the caller's audio goes back to itself and the board handles no RTP.
 
 A 911 or 933 is caught before every routing and policy check, including one dialled with a trunk prefix (9911) or produced by a dial-plan rule. Only two capability checks come first: the caller must be a registered phone, and its offer must carry a codec the board can relay. Nothing an operator configures can delay, gate or misroute the call, and the only route is the 3CX anchor:
 
@@ -151,7 +151,7 @@ sequenceDiagram
 | Paging | Zones `980`–`989`, `999` for everyone, with auto-answer headers |
 | Per extension | Forward always, on busy or on no answer; do-not-disturb; star codes from the handset |
 | Lamps | BLF through the `dialog` event package (RFC 4235) |
-| Board-terminated | Echo `777`, tone `440`, conference `888`, voicemail, hold music |
+| Board-terminated | Tone `440`, conference `888`, voicemail, hold music |
 | Routing | Ordered dial plan, up to 16 rules, first match wins |
 | Outside lines | Cloud media anchors (3CX, Apidaze). The direct carrier SIP trunk is DEPRECATED and shelved; the anchor is the supported ITSP path ([ADR-002](docs/ADR-002-PROGRAMMABLE-MEDIA-ANCHOR.md)) |
 | Admin | Web dashboard, HTTP API, phone provisioning, OTA updates, outbound email |

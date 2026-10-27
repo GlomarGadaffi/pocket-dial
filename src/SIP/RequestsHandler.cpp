@@ -2664,10 +2664,10 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 
 	if (destNumber == "777")
 	{
-		// The echo leg is SERVER-terminated and speaks G.711 only, so it is
-		// narrower than the relay-level gate at the top of this function (which
-		// admits G.722 because a peer-to-peer pair may negotiate wideband between
-		// themselves). A caller offering nothing but wideband gets 488 here rather
+		// The echo answer is an SDP loopback (the board handles no RTP) limited to
+		// G.711, so it is narrower than the relay-level gate at the top of this
+		// function (which admits G.722 because a peer-to-peer pair may negotiate
+		// wideband between themselves). A caller offering nothing but wideband gets 488 here rather
 		// than an answer advertising a codec this leg will never encode.
 		//
 		// Issue #304: PCMA is rejected too. Nothing in this codebase decodes
