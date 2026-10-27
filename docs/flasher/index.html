@@ -450,11 +450,13 @@ const VARIANTS = {
   },
   "esp32s3-wifi": {
     name: "Wi-Fi access point",
-    desc: "Any plain ESP32-S3 dev board. Runs its own SoftAP; no Ethernet or screen needed.",
+    desc: "An ESP32-S3 dev board with octal PSRAM (for example an N16R8 module). Runs its own SoftAP; no Ethernet or screen needed.",
     art: { body: "#1f4f8f", chip: "#1d2733", label: "ESP32-S3", antenna: true },
     after: `<p style="margin-bottom:8px">Look for a Wi-Fi network named <strong>esp32-sipserver</strong> and join it.
             The dashboard is at <strong>http://192.168.4.1/</strong>, and SIP phones register to
-            <code>192.168.4.1:5060</code>. The dashboard lets you point the board at your own Wi-Fi instead.</p>`
+            <code>192.168.4.1:5060</code>. The dashboard lets you point the board at your own Wi-Fi instead.</p>
+            <p style="margin-bottom:8px">On this build the SIP registrar does not start until you replace the default
+            admin credential in the dashboard, so phones cannot register before that.</p>`
   }
 };
 const DEFAULT_VARIANT = "esp32s3-eth";
