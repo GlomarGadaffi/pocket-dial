@@ -779,6 +779,8 @@ add_executable(sip_parser_tests
     CdrRing_test.cpp
     # Issue #496 / #509 review: the IPv4 input guard (Ip4InputGuard.h).
     Ip4InputGuard_test.cpp
+    # Issue #1145: the pure L2 ingress verdict (L2IngressVerdict.h).
+    L2IngressVerdict_test.cpp
     # Issue #535 / #572 review: when a parked media task may be deleted.
     ParkedTaskReap_test.cpp
     # Issue #667: a ringing anchor leg is not a #100 wedge.

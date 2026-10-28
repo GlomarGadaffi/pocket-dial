@@ -1,0 +1,2 @@
+# L2IngressVerdict_test.cpp: L2Ingress/L2IngressVerdict.Row/* (34). One table row per case of the pure L2 ingress verdict: unknown state, emergency, callback window and trunk rows first, then broadcast, martian, on-link gateway MAC and off-link service-port rows.
+34
