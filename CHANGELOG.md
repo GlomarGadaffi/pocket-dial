@@ -1,8 +1,100 @@
 # Changelog
 
-## Unreleased
+## v1.7.0 — 2026-10-28
 
-- Enabling or activating a telephony slot now needs an explicit acceptance of the limitations, stored with the slot (who, when, which text version); the API refuses it with 409 without one, an import cannot enable an unaccepted slot, and a slot enabled before this keeps working and shows a banner (see #1073). 911 and 933 routing is unchanged.
+55 PRs since `v1.6.0`, on one theme: every call leg is torn down exactly once. The post-merge pass on `a9eb4fd7` ran on both Ethernet boards (LilyGO T-ETH-Elite over serial, Waveshare ESP32-S3-ETH over OTA) and passed. The Stack Depth Gate bounds `tel_sweep` with at least 512 B free on every firmware variant, and #1116 was closed on that static figure, not on a measured high-water mark. Hardware evidence is the `a9eb4fd7` post-merge pass only; everything else was covered by host tests and the interop suite.
+
+### Highlights
+
+- A call leg is ended once: a de-registering phone's calls (other than a live 911, 933 or PSAP callback) end before the phone is released, a leg 3CX removed is freed locally, and a spliced park or pickup pair ends on its own dialogs.
+- A caller's CANCEL gets the PBX's own 200, and a CANCEL after a call forward reaches the forward target.
+- A 911 or 933 that a codec check refuses now gets the emergency lane's own refusal (503, the EMERGENCY log line and the E911 notification) instead of a generic 488, and a registered handset has a reserved rate-limiter slot and a small separate budget for its 911 and 933 INVITEs.
+- An inbound PSAP callback ends one non-emergency call instead of being dropped when the anchor is full, unless every call in the way is an emergency call or no single call makes room, in which case it is still dropped.
+- The dashboard is rebuilt as an operator console.
+- The SIP trunk is deprecated, and the no-inbound-ports rule is written down.
+
+### Emergency (911 and 933)
+
+- A 911 or 933 refused before the emergency lane (codec refusal) now logs the EMERGENCY line, sends the E911 notification and gets the emergency lane's own refusal (#1113).
+- The configured trunk peer gets its own rate-limiter bucket that a full table never refuses, and the in-dialog traffic of a live 911 or 933 skips the limiter (#1108). A registered handset gets a reserved limiter slot and a small separate budget for 911 and 933 INVITEs (#1114).
+- Unknown-caller 911 and 933 notices are coalesced per source and number. Every refusal is still logged and the held count is announced exactly once (#1129).
+- A 911 or 933 whose INVITE source differs from the registered address of its extension is marked `[CALLER UNVERIFIED ...]` in the notification and the log. This is reporting only: routing, answers and timing are unchanged (#1138).
+- The 911 leg status is read on its own lane in the WebSocket worker, off the shared status lock (#1088).
+- An inbound PSAP callback that finds the anchor full ends one non-emergency anchored call and is routed; it never ends an emergency call, and when the original 911, an earlier callback or no single call is in the way it is still dropped (#1065). On the deprecated SIP trunk, a PSAP callback whose carrier c= address is unusual is taken at that address instead of being refused 488; with no offer, no media port or a malformed address it is still refused 488 (#1142).
+- When every participant-list read fails, a 911 or 933 still gets `503 Emergency Call Not Routable` at the end of the 4 s window, and a bounded background retry drops the orphaned leg when exactly one candidate shows (two or more are left alone); host tests only (#1040).
+- A stored telephony slot with an emergency `routeDn` is disabled on load, and a settings import reports the refusal (#1066).
+- A missing `tel_sweep` worker is reported on `/api/status` and raises an E911 notification-list alert (#1137). `tel_sweep`'s stack is sized for a fresh TLS connect (#1119).
+- A 911 or 933 with the anchor down or no E911 route is answered `503 Emergency Call Not Routable` with the on-site notification; the trunk is not a supported emergency path (see `docs/DEMARCATION.md` and ADR-002, under Docs).
+
+### Call legs and teardown
+
+- REGISTER `Expires: 0` ends that client's calls, BYEs the peer and writes the CDR before the client is released (#1094). A live 911, 933 or PSAP callback is not torn down; the binding is kept with its lease lapsed and pruned after the call. A ringing handset of an inbound anchored call counts as a party to it, so its de-REGISTER cannot release it from under the call (#1100).
+- An anchor call whose leg 3CX removed before the call was bound fails instead of ringing on (#1096). A removed leg is freed locally with no drop POST (#1104). A WebSocket Remove that names no slot ends no call (#1099).
+- The PBX answers the caller's CANCEL with its own 200 (#1064). A CANCEL after a CFU, CFB or CFNA forward reaches the forward target (#1082). A BYE for an unknown dialog gets 481 and is not relayed (#1083).
+- The ring-expiry reap's 480 carries the To tag of the 180 the caller saw (#1062).
+- An ordinary call matches the 200 OK to the callee's registered address, a ring group to a pending member, and a callee's 200 without SDP gives the caller a 502 (#1128). A callee 2xx whose From or To line the server BYE could not carry is refused (#1072).
+- A transfer leg's 100 Trying is swallowed, not relayed to the transferee (#1139). An admin kill or session timer on a park retrieve or pickup ends both sessions on their own dialogs (#1141).
+- A recycled session slot no longer carries the previous call's forward target, cancelled-leg extension, forward INVITE or degraded-report flag (#1130).
+- A caller that sends `Require: timer` gets the timer echoed on every no-grant answer (#1068), and the 440 tone and call-pickup answers strip `Session-Expires` only for callers that do not require it (#1034).
+- Every voicemail tombstone is honoured, not just the first 20 (#1063).
+
+### Telephony slots, config and dashboard
+
+- Enabling or activating a telephony slot needs an explicit acceptance of the limitations, stored with the slot (who, when, which text version); the API refuses it with 409 without one, an import cannot enable an unaccepted slot, and a slot enabled before this keeps working and shows a banner (#1078). 911 and 933 routing is unchanged.
+- A disabled selected telephony slot is no longer reported Active (#1087). A telephony-config save that sends no `type` keeps the stored provider type (#1091).
+- An Owner, password-encrypted config export restores MAC bindings all-or-nothing. A plaintext or sysop-level import adopts none (#1036).
+- The dashboard is rebuilt as an ISA-101 operator console, generated from `web/` sources (#1061).
+
+### Trunk, network and build
+
+- The SIP trunk is deprecated. No code is removed and a configured trunk does not change. The supported carrier path is the anchor, which is outbound HTTPS only. Nothing is opened or forwarded from the WAN side to the board or the phones; phone RTP stays on the LAN. See Network requirements in `SETUP_GUIDE.md` (#1135).
+- The constrained 4 MB profile drops lwIP IPv6 to keep its app-slot margin (#1147).
+
+### Security hardening
+
+- Security hardening in SIP request handling (details in a forthcoming advisory). Merge commit 2054f7fd.
+- Security hardening in SIP request handling (details in a forthcoming advisory). Merge commit ad24677d.
+- Security hardening in SIP request handling (details in a forthcoming advisory). Merge commit 66b36d8e.
+- Security hardening in SIP request handling (details in a forthcoming advisory). Merge commit 0928a6e0.
+- Security hardening in SIP request handling (details in a forthcoming advisory). Merge commit e5584b23.
+- Security hardening in SIP request handling (details in a forthcoming advisory). Merge commit e2af846e.
+- Security hardening in SIP request handling (details in a forthcoming advisory). Merge commit 243202c6.
+
+### CI and tools
+
+- The task stack-depth gate runs in CI (#1031) on every firmware image: eth, lan8720, wifi, display and the constrained profile (#1134).
+- Commit hygiene rejects a disallowed attribution address (#1106). `README.md` and `tools/site` count as site-only files (#1110).
+- The host suite builds and runs natively on Windows (#1140; #1143 restores a test's closing brace). The interop harness takes an optional `BARESIP_MODULES` directory (#1084).
+
+### Docs
+
+- Design records: the pending-makeCall window for PSAP callbacks (#1069), Rule 5 sibling lock holds on the 911 path (#1071), and the `endHandle` routing audit (#1077).
+- `docs/DEMARCATION.md` for E911 and anchor deployment (#1080); the ADR-002 fallback-routing claim corrected (#1085); an Origins section crediting BarGabriel/SipServer (#1081).
+- Site and README: exact and readable diagrams (#1105, #1109), a sitemap and the 32 s CANCEL bound in ARCHITECTURE (#1067), flasher, README and contributing docs synced with main (#1152), and the v1.6.0 site and changelog evidence (#1058, #1059).
+
+### Fixed since the v1.6.0 gaps
+
+- An inbound PSAP callback via the anchor that finds the media bridge busy now ends one non-emergency call and is routed; it is still dropped when only emergency calls are in the way (#967; #1065).
+- A `Require: timer` caller no longer hangs up on the 440 and call-pickup answers or the other no-grant answers (#1042, #739; #1068, #1034).
+- The PBX answers a caller's CANCEL with its own 200 (#1057; #1064).
+- A stored emergency `routeDn` no longer loads at boot (#1060; #1066). The voicemail tombstone cap no longer lights phantom messages (#1043; #1063).
+- A trunk-leg 100 Trying relay (#1124), a wrong-dialog BYE on a park-retriever kill (#1123), a missing `tel_sweep` worker report (#1126) and a missing source-address note on a 911 (#1127) are fixed above.
+
+### Known limitations
+
+- Ring groups are not a DID target on the anchor: a DID mapped to a ring-group number rings every registered handset instead of the group, and a PSAP callback on that DID does the same. Map callback DIDs to a single extension.
+- The SIP trunk is deprecated and experimental, and is not a supported way to reach a PSAP. No SIP trunk carries 911 or 933. On the trunk, a PSAP callback whose codec negotiation fails is still refused 488 (#1146, closed not planned; #873).
+- A far-side or loopback-only board has no 911 route: 911 and 933 get `503 Emergency Call Not Routable` and the Kari's Law notification (#1046).
+- The config export does not carry a telephony slot's client secret (on purpose: two boards with one secret fight for the control WebSocket), and the constrained 4 MB image does not export or import the trunk, SMTP, E911, admin_ext or MAC-binding sections (#483).
+- An inbound PSAP callback on the anchor can wait behind another call's status GET for its caller-ID lookup, and the emergency no-slot drop holds the control lock across its POST (#949 items 2 and 3, planned for v1.8.0).
+- If 3CX ends a call by removing only a far leg whose id was never recorded, the call stays up until the phone hangs up; no recovery path covers it (#1101).
+- `http_conn` has 128 B of stack headroom on `GET /api/config/export` (#1044). A TASK_WDT was seen under an OTA upload with orphaned 888 legs (#1016). The heap audit lists 85 high-severity allocation sites on call paths (#1048).
+- `tel_sweep`'s stack bound is a static figure from the gate, not a measured high-water mark (#1116).
+- Hardware evidence is two boards: LilyGO T-ETH-Elite and Waveshare ESP32-S3-ETH. There is no Waveshare release image; build it from source with `PD_ETH_BOARD=waveshare`.
+
+### Planned
+
+- A pre-lwIP ingress filter, count-only first, with nothing armed, is planned for v1.8.0 (#1145). It is not part of this release.
 
 ## v1.6.0 — 2026-10-20
 
