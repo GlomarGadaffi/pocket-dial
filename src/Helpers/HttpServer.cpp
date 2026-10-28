@@ -99,6 +99,7 @@
 #include "esp_heap_caps.h"
 // Issue #496 / #509 review: the IPv4 input guard's counts for /api/status.
 #include "Ip4InputGuard.h"
+#include "L2IngressParse.h"   // #1145: the hook's would-drop counts
 // Issue #366: esp_pthread_set_cfg() to size the per-connection thread stack
 // independently of CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT.
 #include "esp_pthread.h"
@@ -2301,6 +2302,14 @@ static long pdSipServerStackHwmBytes()
 	return static_cast<long>(uxTaskGetStackHighWaterMark(h)) * static_cast<long>(sizeof(StackType_t));
 }
 
+// #1145: the Ethernet RX task, "w5500_tsk" (espressif/w5500 driver) or
+// "emac_rx" (IDF's ESP32 EMAC, lan8720). The Wi-Fi build has neither: -1.
+static long pdEthRxStackHwmBytes()
+{
+	const long w5500 = pdStackHwmBytes("w5500_tsk");
+	return w5500 >= 0 ? w5500 : pdStackHwmBytes("emac_rx");
+}
+
 static const char* pdResetReasonString(esp_reset_reason_t reason)
 {
 	switch (reason)
@@ -2546,6 +2555,14 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 		pd_ip4_guard_counts(g);
 		json.s("\"ip4Guard\":{\"padded\":").n(g[0]).s(",\"tinyFragments\":").n(g[1])
 		    .s(",\"mdnsFragments\":").n(g[2]).s("},");
+	}
+	// #1145: frames the same hook would count as would-drop. Counted only, never
+	// dropped; taken before lwIP's checksum check, hence preChecksum.
+	{
+		uint32_t c[PD_L2_INGRESS_COUNTS] = {0, 0};
+		pd_l2_ingress_counts(c);
+		json.s("\"l2Ingress\":{\"preChecksum\":true,\"martian\":").n(c[0])
+		    .s(",\"wanService\":").n(c[1]).s("},");
 	}
 #endif
 	// #470: CDR ring persist health. A non-zero failure count means call history
@@ -2871,6 +2888,9 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	// #991: the one NVS-writing task (CDR ring + device table, forwards, DIDs);
 	// 6144 B kept from the two it replaced, this reading is what sizes it.
 	pdAppendHwmField(json, "stackHwm_flash_writer", pdStackHwmBytes("flash_writer"));
+	pdAppendHwmField(json, "stackHwm_eth_rx", pdEthRxStackHwmBytes());   // #1145
+	// #1145: lwIP's thread (TCPIP_THREAD_NAME), where the IPv4 input hook runs.
+	pdAppendHwmField(json, "stackHwm_tcpip", pdStackHwmBytes("tcpip"));
 	// Issue #366: not a live-task lookup like the others -- a connection thread is
 	// gone by the time anyone reads this -- but the worst figure recorded by any
 	// of them since boot. null until the first request has completed, which in
@@ -2890,7 +2910,7 @@ void HttpServer::sendApiStatus(int sock, bool authenticated)
 	       "\"stackHwm_rtp_media_tx\":null,\"stackHwm_rtp_media_rx\":null,"
 	       "\"stackHwm_conf_mix_tick\":null,\"stackHwm_tel_ctl0\":null,\"stackHwm_tel_ctl1\":null,"
 	       "\"stackHwm_tel_drop\":null,\"stackHwm_tel_sos\":null,\"stackHwm_tel_sweep\":null,\"stackHwm_flash_writer\":null,"
-	       "\"stackHwm_http_conn\":null");
+	       "\"stackHwm_eth_rx\":null,\"stackHwm_tcpip\":null,\"stackHwm_http_conn\":null");
 #endif
 	// #1126: whether the 911 orphan sweep has a worker. "absent" is a board with no sweep (its stack
 	// allocation or create failed); stackHwm_tel_sweep reads null for that and for "not started yet".
