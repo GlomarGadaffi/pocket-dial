@@ -191,8 +191,46 @@ class Gate(unittest.TestCase):
         table = json.load(open(os.path.join(os.path.dirname(GATE), "task_stacks.json")))
         want = {}
         for t in table["tasks"]:
-            want[t["file"]] = want.get(t["file"], 0) + 1
+            if not t.get("external"):       # #1145: created outside src/ and main/, not a site here
+                want[t["file"]] = want.get(t["file"], 0) + 1
         self.assertEqual(want, g.count_sites(g.REPO))
+
+    def external_row(self, **kw):
+        """#1145: our callback (hook -> leaf, 150 + 300 B) on a task IDF creates; main/hook.c has no site."""
+        self.put(os.path.join(self.ci, "hook.ci"),
+                 node("hook", "int hook(void*)", 150, loc="@ROOT@/main/hook.c:1:1") + edge("hook", "leaf"))
+        row = {"name": "rx_hook", "entry": r"\bhook\(", "bytes": 2048, "file": "main/hook.c", "line": 1,
+               "external": True, "variants": ["main/esp_main_eth.cpp"], "caller_bytes": 600,
+               "caller_reason": "fixture: the creating task's frame and the indirect call"}
+        row.update(kw)
+        self.table["tasks"].append(row)
+
+    def test_an_external_row_is_walked_with_its_caller_reserve_and_counts_no_site(self):
+        self.external_row()                 # 450 + 600 + 512 = 1562 <= 2048
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok   rx_hook: 450 B + 600 caller + 512 margin <= 2048 B (main/hook.c:1)", out)
+        self.assertNotIn("FAIL table", out)
+
+    def test_an_external_row_fails_when_the_caller_reserve_tips_it_over(self):
+        self.external_row(caller_bytes=1200)    # 450 + 1200 + 512 = 2162 > 2048; without the reserve it fits
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL rx_hook: 450 B + 1200 caller + 512 margin > 2048 B", out)
+
+    def test_an_external_row_must_state_its_reserve_reason_and_variants(self):
+        for bad in ({"caller_bytes": None}, {"caller_bytes": -1}, {"caller_reason": " "}, {"variants": []}):
+            self.table["tasks"] = self.table["tasks"][:2]
+            self.external_row(**bad)
+            rc, out = self.run_gate()
+            self.assertEqual(rc, 1, bad)
+            self.assertIn("FAIL table: external row 'rx_hook' needs", out)
+
+    def test_a_row_without_external_still_needs_a_site(self):
+        self.external_row(external=False)
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL table: main/hook.c has 0 task-creation site(s), task_stacks.json lists 1", out)
 
     def test_nested_ci_tree_is_walked(self):
         # IDF writes .ci files under build/esp-idf/<component>/CMakeFiles/...
