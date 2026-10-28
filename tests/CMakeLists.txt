@@ -781,6 +781,8 @@ add_executable(sip_parser_tests
     Ip4InputGuard_test.cpp
     # Issue #1145: the pure L2 ingress verdict (L2IngressVerdict.h).
     L2IngressVerdict_test.cpp
+    # Issue #1145: the esp_eth input hook's pure parts (L2FrameFacts.h, L2GwPin.h).
+    L2EthIngress_test.cpp
     # Issue #535 / #572 review: when a parked media task may be deleted.
     ParkedTaskReap_test.cpp
     # Issue #667: a ringing anchor leg is not a #100 wedge.

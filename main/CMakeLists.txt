@@ -29,6 +29,8 @@ set(IDF_V6_DRIVERS esp_driver_gpio esp_driver_spi esp_driver_i2c)
 
 if(SIP_TRANSPORT STREQUAL "eth")
     set(MAIN_SRC "esp_main_eth.cpp")
+    # Issue #1145: the count-only esp_eth input hook (both Ethernet transports).
+    list(APPEND ADDITIONAL_SRCS "pd_eth_ingress.c")
     set(EXTRA_REQUIRES esp_eth espressif__w5500 ${IDF_V6_DRIVERS})
     # W5500 boards differ only in their SPI pin map. Select with -D PD_ETH_BOARD=<board>:
     #   elite     → LilyGO T-ETH-ELITE S3 (default; the board on the bench)
@@ -77,6 +79,7 @@ elseif(SIP_TRANSPORT STREQUAL "lan8720")
             "or set-target esp32 for the internal-EMAC LAN8720 board.")
     endif()
     set(MAIN_SRC "esp_main_eth_lan8720.cpp")
+    list(APPEND ADDITIONAL_SRCS "pd_eth_ingress.c")   # Issue #1145, see the eth branch
     set(EXTRA_REQUIRES esp_eth espressif__lan87xx ${IDF_V6_DRIVERS})
     message(STATUS "SipServer transport: LAN8720 Ethernet (internal EMAC / RMII, classic ESP32)")
 elseif(SIP_TRANSPORT STREQUAL "display")
