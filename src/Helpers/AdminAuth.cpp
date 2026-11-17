@@ -1545,7 +1545,7 @@ namespace AdminAuth
 		return b != nullptr && b->lockoutUntilMs != 0 && now < b->lockoutUntilMs;
 	}
 
-	Role sessionRole(const std::string& token)
+	Role sessionRole(std::string_view token)
 	{
 		if (token.empty())
 		{
@@ -1568,7 +1568,7 @@ namespace AdminAuth
 		return Role::None;
 	}
 
-	bool sessionSatisfiesRole(const std::string& token, Role need)
+	bool sessionSatisfiesRole(std::string_view token, Role need)
 	{
 		Role got = sessionRole(token);
 		if (got == Role::None)
@@ -1750,7 +1750,7 @@ namespace AdminAuth
 		return token;
 	}
 
-	bool validateSession(const std::string& token)
+	bool validateSession(std::string_view token)
 	{
 		if (token.empty())
 		{
@@ -1789,7 +1789,7 @@ namespace AdminAuth
 		return false;
 	}
 
-	void destroySession(const std::string& token)
+	void destroySession(std::string_view token)
 	{
 		if (token.empty())
 		{
@@ -1859,7 +1859,7 @@ namespace AdminAuth
 		return erased;
 	}
 
-	std::string sessionCsrf(const std::string& token)
+	std::string sessionCsrf(std::string_view token)
 	{
 		if (token.empty())
 		{
@@ -1888,21 +1888,37 @@ namespace AdminAuth
 		return "";
 	}
 
-	bool validateCsrf(const std::string& token, const std::string& csrf)
+	bool validateCsrf(std::string_view token, std::string_view csrf)
 	{
-		if (csrf.empty())
+		if (csrf.empty() || token.empty())
 		{
 			return false;
 		}
-		const std::string want = sessionCsrf(token);
-		if (want.empty())
+
+		AuthState& s = state();
+		std::lock_guard<std::mutex> lock(s.mutex);
+
+		// Same walk as sessionCsrf(), compared in place: no copy of the stored token.
+		const uint64_t now = nowMs();
+		for (auto& sess : s.sessions)
 		{
-			return false;
+			if (!sess.used)
+			{
+				continue;
+			}
+			if (sess.expiresAtMs != 0 && now >= sess.expiresAtMs)
+			{
+				continue;
+			}
+			if (constantTimeEquals(sess.token, token))
+			{
+				return !sess.csrf.empty() && constantTimeEquals(sess.csrf, csrf);
+			}
 		}
-		return constantTimeEquals(want, csrf);
+		return false;
 	}
 
-	uint64_t sessionRemainingMs(const std::string& token)
+	uint64_t sessionRemainingMs(std::string_view token)
 	{
 		if (token.empty())
 		{

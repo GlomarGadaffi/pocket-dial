@@ -78,7 +78,7 @@ public:
 	// "other") into out[cap], NUL-terminated and truncated to fit. Never the raw
 	// path: the label is served unauthenticated and a provisioning fetch carries a
 	// phone's MAC. Public/static so it is host-testable on its own.
-	static void routeLabel(const std::string& method, const std::string& path,
+	static void routeLabel(std::string_view method, std::string_view path,
 	                       char* out, size_t cap);
 	// Issue #368: ceiling on simultaneously-running connection handler threads.
 	//
@@ -183,7 +183,7 @@ public:
 	// /config/<12 hex>-phone.cfg (Polycom per-phone), /config/000000000000.cfg (Polycom master),
 	// /config/spa<12 hex>.cfg or /config/spa<model>.cfg (Cisco SPA), /config/snom<12 hex>.xml (snom).
 	// Pure string-shape check; public/static so it's host-testable on its own.
-	static bool isProvisioningConfigPath(const std::string& path);
+	static bool isProvisioningConfigPath(std::string_view path);
 	static ProvisioningPathType parseProvisioningPath(const std::string& path, std::string& outKey);
 
 	// #410 phase 2: one byte range to be sent in place (see sendAllPieces()).
@@ -275,22 +275,32 @@ private:
 	void recordConnStackHwm(const char* route);
 
 	// HTTP request parsing
+	//
+	// #1048: the request line and the headers the server reads are views into the
+	// text parseRequest() was given (the connection's read buffer, or the body
+	// accumulator for a request that spans several reads). They are valid only
+	// while that text is untouched, i.e. for the one request handleClient() is
+	// serving, and nothing may keep one past it: whatever outlives the request
+	// (a log line, a stored value) must be copied where it is stored. The body
+	// stays a std::string: the form handlers take it by const reference and keep
+	// slices of it.
 	struct HttpRequest {
-		std::string method;
-		std::string path;
+		std::string_view method;
+		std::string_view path;
 		std::string body;
-		std::string origin;    // value of the Origin: header, if present
-		std::string host;      // value of the Host: header, if present
-		std::string cookie;    // value of the Cookie: header, if present
-		std::string csrf;      // value of the X-CSRF: header, if present
-		std::string userAgent; // value of the User-Agent: header, if present (Issue #234)
+		std::string_view origin;    // value of the Origin: header, if present
+		std::string_view host;      // value of the Host: header, if present
+		std::string_view cookie;    // value of the Cookie: header, if present
+		std::string_view csrf;      // value of the X-CSRF: header, if present
+		std::string_view userAgent; // value of the User-Agent: header, if present (Issue #234)
 		// Peer address, filled from getpeername() in handleClient(). Used only as
 		// the brute-force accounting key for /api/admin/login, never for authz:
 		// a source address is trivially spoofable on the shared link (see
 		// docs/THREAT_MODEL.md), so it buys fairness between clients, not trust.
+		// At most 15 characters, so it never leaves the string's own buffer.
 		std::string clientIp;
 	};
-	HttpRequest parseRequest(const std::string& raw);
+	HttpRequest parseRequest(std::string_view raw);
 
 	// The single admission gate for every non-public endpoint. Replaces the
 	// same-origin/auth block that used to be copy-pasted at each route — two
@@ -319,7 +329,8 @@ private:
 	bool requireSameOrigin(int sock, const HttpRequest& req);
 
 	// The pd_session cookie value, or "" if absent.
-	std::string sessionToken(const HttpRequest& req) const;
+	// A view into req (see HttpRequest); empty when there is no such cookie.
+	std::string_view sessionToken(const HttpRequest& req) const;
 
 	// Response builders
 	// string_view throughout (#410 phase 2): a literal status, content type or
@@ -592,7 +603,7 @@ private:
 
 	// Extract the value of a named cookie (e.g. "pd_session") from the request's
 	// Cookie header, or "" if absent.
-	static std::string cookieValue(const HttpRequest& req, const std::string& name);
+	static std::string_view cookieValue(const HttpRequest& req, std::string_view name);
 
 	// True iff the request carries a valid (live) pd_session cookie. Used to gate
 	// the state-changing endpoints once a PIN has been provisioned.

@@ -115,25 +115,17 @@ namespace
 	// go DOWN: lower it when the printed count drops, remove the route at zero.
 	// The list shrinking to empty is #410 done.
 	const std::map<std::string, long> kAllocCeiling = {
-		{"GET /api/status", 1}, {"GET /api/sbc-mode", 2}, {"GET /api/multicast-paging", 2},
-		{"GET /", 2}, {"GET /index.html", 2}, {"GET /setup/email", 2}, {"GET /setup/trunk", 2},
-		{"GET /api/cdr", 2}, {"GET /api/trace", 2}, {"GET /api/did-mapping", 2},
-		{"GET /api/pcap", 3}, {"GET /api/coredump", 3}, {"GET /api/diagnostics/pcap", 3},
-		{"GET /api/ota/status", 3}, {"POST /api/dnd", 3}, {"POST /api/voicemail", 3},
-		{"POST /api/forward", 3}, {"POST /api/group", 3}, {"POST /api/syslog", 3},
-		{"POST /api/kill", 3}, {"POST /api/media-tx", 3},
-		{"GET /api/syslog", 4}, {"GET /api/trunk", 4}, {"GET /api/moh", 4},
-		{"GET /api/coredump/info", 4}, {"GET /api/e911-config", 4},
-		{"GET /api/registrar", 4},
-		// #826: both allocations happen before sendApiPnp() runs (measured with
-		// its body stubbed to a fixed reply: still 2), i.e. in requireAdmin(),
-		// which copies the session token into a std::string. The handler itself
-		// writes into a leased fixed buffer.
-		{"GET /api/pnp", 2},
-		{"GET /api/zero-touch", 2},   // #826 part B: same two, requireAdmin(); the body is a fixed buffer
-		{"GET /api/email", 5}, {"GET /api/admin/status", 5},
-		{"GET /api/ap-security", 6}, {"POST /api/dialplan", 9}, {"GET /api/config/export", 5},
-		{"GET /api/telephony-config", 14},
+		// #1048: the session token and the CSRF check no longer copy into strings, so
+		// every gated route lost its two requireAdmin() allocations and a page that
+		// renders the CSRF token keeps just that one string.
+		{"GET /", 1}, {"GET /index.html", 1}, {"GET /setup/email", 1}, {"GET /setup/trunk", 1},
+		{"GET /api/pcap", 1}, {"GET /api/coredump", 1}, {"GET /api/diagnostics/pcap", 1},
+		{"GET /api/syslog", 2}, {"GET /api/trunk", 2}, {"GET /api/moh", 2},
+		{"GET /api/coredump/info", 2}, {"GET /api/e911-config", 2},
+		{"GET /api/registrar", 2},
+		{"GET /api/email", 3},
+		{"GET /api/ap-security", 4}, {"POST /api/dialplan", 6}, {"GET /api/config/export", 3},
+		{"GET /api/telephony-config", 12},
 	};
 
 	struct RouteBench
@@ -230,14 +222,14 @@ TEST(HttpRouteAlloc, EveryRouteOffTheAllowlistAllocatesNothing)
 
 TEST(HttpRouteAlloc, TheGateSeesAnAllocatingRoute)
 {
-	// Positive control: the authenticated /api/cdr still allocates (its ceiling
-	// is 2), so the gate must count something for it. A gate that counted zero
-	// here would pass every route vacuously. (/metrics was the control until
-	// #630 made it allocation-free.)
+	// Positive control: the authenticated /api/telephony-config still allocates
+	// (its ceiling is 12), so the gate must count something for it. A gate that
+	// counted zero here would pass every route vacuously. (/metrics was the
+	// control until #630 made it allocation-free, then /api/cdr until #1048.)
 	RouteBench b;
-	const Route cdr{"GET /api/cdr", "GET", "/api/cdr", "", true};
-	b.serve(cdr);
-	EXPECT_GT(b.serve(cdr), 0);
+	const Route tel{"GET /api/telephony-config", "GET", "/api/telephony-config", "", true};
+	b.serve(tel);
+	EXPECT_GT(b.serve(tel), 0);
 }
 
 TEST(HttpRouteAlloc, TheConfigExportCountDoesNotDependOnAWifiSsidAnEarlierTestLeft)
@@ -245,7 +237,7 @@ TEST(HttpRouteAlloc, TheConfigExportCountDoesNotDependOnAWifiSsidAnEarlierTestLe
 	// The host's WiFi station mirror is process-global and DeviceConfig::clearAll()
 	// leaves it alone, so ConfigExportImportTest.PasswordGatedRoundTrip... once left
 	// "TestOfficeWifi" in it for every later test. jsonEscape() reserves for any
-	// value of 8+ characters, and /api/config/export then escaped the SSID into a new string: one more
+	// value of 8+ characters, and /api/config/export escapes the SSID: one more
 	// allocation than the ceiling, in the shuffled orders that ran that test first.
 	struct CleanUp { ~CleanUp() { DeviceConfig::resetWifiForTest(); } } cleanUp;
 	ASSERT_TRUE(DeviceConfig::setWifiConfig("TestOfficeWifi", 1));
