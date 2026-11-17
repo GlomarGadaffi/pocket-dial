@@ -69,6 +69,7 @@
 #include "Syslog.hpp"
 #include "SmtpClient.hpp"
 #include "HeapLeakProbe.hpp"   // issue #273 leak probe (no-op unless CONFIG_HEAP_TRACING)
+#include "pd_eth_ingress.h"    // issue #1145: count-only esp_eth input hook
 
 // ── Tag for ESP_LOG ────────────────────────────────────────────────────────
 static const char* TAG = "SipServerLAN8720";
@@ -163,11 +164,13 @@ static void eth_event_handler(void* arg, esp_event_base_t event_base,
     {
         case ETHERNET_EVENT_CONNECTED:
             ESP_LOGI(TAG, "Ethernet link UP");
+            pd_eth_ingress_link_event();   // #1145: learn the gateway MAC again
             xEventGroupSetBits(s_eth_event_group, ETH_CONNECTED_BIT);
             break;
 
         case ETHERNET_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "Ethernet link DOWN");
+            pd_eth_ingress_link_event();
             xEventGroupClearBits(s_eth_event_group, ETH_CONNECTED_BIT | ETH_GOT_IP_BIT);
             break;
 
@@ -182,6 +185,7 @@ static void ip_event_handler(void* arg, esp_event_base_t event_base,
     if (event_id == IP_EVENT_ETH_GOT_IP)
     {
         ip_event_got_ip_t* event = static_cast<ip_event_got_ip_t*>(event_data);
+        pd_eth_ingress_set_ip(&event->ip_info);   // #1145: the RX task never reads the netif
         char buf[16];
         esp_ip4addr_ntoa(&event->ip_info.ip, buf, sizeof(buf));
         s_ip_addr = buf;
@@ -193,6 +197,10 @@ static void ip_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Netmask: %s", buf);
 
         xEventGroupSetBits(s_eth_event_group, ETH_GOT_IP_BIT);
+    }
+    else if (event_id == IP_EVENT_ETH_LOST_IP)
+    {
+        pd_eth_ingress_set_ip(nullptr);   // #1145: unknown again, the hook defers
     }
 }
 
@@ -485,6 +493,8 @@ extern "C" void app_main(void)
                                                &eth_event_handler, nullptr, nullptr));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_ETH_GOT_IP,
                                                &ip_event_handler, nullptr, nullptr));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_ETH_LOST_IP,
+                                               &ip_event_handler, nullptr, nullptr));
 
     // ── Create default netif for Ethernet ───────────────────────────────
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
@@ -504,6 +514,9 @@ extern "C" void app_main(void)
         return;
     }
     ESP_ERROR_CHECK(esp_netif_attach(s_eth_netif, eth_glue));
+    // #1145: attach installed the glue's input path; the count-only hook takes
+    // its place (same priv, the netif) and forwards every frame to it.
+    ESP_ERROR_CHECK(pd_eth_ingress_install(eth_handle, s_eth_netif));
 
     // ── Static IP (optional) ────────────────────────────────────────────
 #if USE_STATIC_IP
