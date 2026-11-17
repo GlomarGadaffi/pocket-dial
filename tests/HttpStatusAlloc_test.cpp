@@ -494,7 +494,7 @@ TEST(HttpStatusAlloc, TheStatusKeyListIsPinnedAndTheDramAccountGuardAddsOnlyItsO
 		"freeHeapInternal", "largestFreeBlockInternal", "freeHeapDma", "largestFreeBlockDma", "resetReason",
 		"stackHwm_sip_server_task", "stackHwm_udp_receiver_task", "stackHwm_rtp_media_tx", "stackHwm_rtp_media_rx",
 		"stackHwm_conf_mix_tick", "stackHwm_tel_ctl0", "stackHwm_tel_ctl1", "stackHwm_tel_drop", "stackHwm_tel_sos",
-		"stackHwm_tel_sweep", "stackHwm_flash_writer", "stackHwm_http_conn", "telSweepWorker", "httpConnWorstRoute", "coredump", "l2Tx", "memory", "mutexHold", "mediaTx",
+		"stackHwm_tel_sweep", "stackHwm_flash_writer", "stackHwm_eth_rx", "stackHwm_tcpip", "stackHwm_http_conn", "telSweepWorker", "httpConnWorstRoute", "coredump", "l2Tx", "memory", "mutexHold", "mediaTx",
 	};
 #if POCKETDIAL_HTTP_DRAM_ACCOUNT
 	want.push_back("httpDramAccount");

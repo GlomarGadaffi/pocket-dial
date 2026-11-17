@@ -12,6 +12,7 @@
 #include "esp_log.h"
 
 #include "Ip4InputGuard.h"
+#include "L2IngressParse.h"
 #include "lwip_hooks/pd_lwip_hooks.h"
 
 static uint32_t s_padded;          // see pd_ip4_guard_counts(); written only here
@@ -25,9 +26,36 @@ void pd_ip4_guard_counts(uint32_t out[3])
 	out[1] = __atomic_load_n(&s_tinyFragments, __ATOMIC_RELAXED);
 }
 
+// #1145: would-drop counts (L2IngressParse.h), out[0] martian, out[1] wanService.
+// Count only: nothing here frees or returns 1.
+static uint32_t s_l2Ingress[PD_L2_INGRESS_COUNTS];
+
+void pd_l2_ingress_counts(uint32_t out[PD_L2_INGRESS_COUNTS])
+{
+	for (int i = 0; i < PD_L2_INGRESS_COUNTS; ++i)
+		out[i] = __atomic_load_n(&s_l2Ingress[i], __ATOMIC_RELAXED);
+}
+
+// ip4_input() holds the lwIP core lock here (LWIP_ASSERT_CORE_LOCKED; with
+// IDF's default config this is the tcpip thread itself), and that lock owns
+// the netif, so its address fields are plain reads. No esp_netif getter: the
+// hook stays on plain field reads. Taken before the
+// checksum check, so lwIP may still drop a frame counted here.
+static void pd_l2_count(const struct pbuf *p, const struct netif *inp)
+{
+	if (inp == NULL) return;
+	const int v = pd_l2_classify_ip4((const uint8_t *)p->payload, p->len,
+		lwip_ntohl(ip4_addr_get_u32(netif_ip4_addr(inp))),
+		lwip_ntohl(ip4_addr_get_u32(netif_ip4_netmask(inp))),
+		lwip_ntohl(ip4_addr_get_u32(netif_ip4_gw(inp))));
+	if (v == PD_L2_WOULD_DROP_MARTIAN)
+		__atomic_fetch_add(&s_l2Ingress[0], 1u, __ATOMIC_RELAXED);
+	else if (v == PD_L2_WOULD_DROP_WAN_SERVICE)
+		__atomic_fetch_add(&s_l2Ingress[1], 1u, __ATOMIC_RELAXED);
+}
+
 int pd_ip4_input_hook(struct pbuf *p, struct netif *inp)
 {
-	(void)inp;
 	if (p == NULL || p->len < IP_HLEN) return 0;   // lwIP's own checks drop it
 	const struct ip_hdr *iphdr = (const struct ip_hdr *)p->payload;
 
@@ -58,6 +86,7 @@ int pd_ip4_input_hook(struct pbuf *p, struct netif *inp)
 			pbuf_free(p);
 			return 1;
 		}
+		pd_l2_count(p, inp);
 		return 0;
 	}
 }
