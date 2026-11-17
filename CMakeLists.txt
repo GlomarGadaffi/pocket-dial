@@ -105,6 +105,15 @@ if(DEFINED ENV{IDF_PATH})
                     -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_no_entropy_conflicts.cmake
             COMMENT "Issue #420: checking the eth image links no ADC/RF driver"
             VERBATIM)
+        # Issue #1145: fail the build unless the eth main calls the input-hook
+        # install and the image links the hook (tools/check_eth_input_hook.cmake).
+        idf_component_get_property(pd_main_lib main COMPONENT_LIB)
+        add_custom_command(TARGET ${pd_elf} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -DNM=${CMAKE_NM} -DELF=$<TARGET_FILE:${pd_elf}>
+                    -DMAIN_LIB=$<TARGET_FILE:${pd_main_lib}>
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_eth_input_hook.cmake
+            COMMENT "Issue #1145: checking the eth image installs the esp_eth input hook"
+            VERBATIM)
     endif()
 else()
     project ("SipServer")

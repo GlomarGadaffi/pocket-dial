@@ -6226,10 +6226,17 @@ namespace
 	bool isValidEmailAuth(const std::string& s);
 }
 #endif
-void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::string& password)
+// The export is built in three frames that never live together (#1044): the readable
+// part, the sealed part's plaintext, and sendApiConfigExport's own, which holds only
+// strings. A std::ostringstream is several hundred bytes, and the three used to sit in
+// one http_conn frame.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+static void exportPlaintextJson(RequestsHandler* handler, std::string& plaintextJson)
 {
-	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
-
 	std::ostringstream pt;
 	pt << "{";
 
@@ -6469,13 +6476,17 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 	   << "\"mdnsHostname\":\"" << jsonEscape(POCKETDIAL_HOSTNAME) << "\","
 	   << "\"schemaVer\":" << DeviceConfig::kSchemaVersion;
 	pt << "}";
+	plaintextJson = pt.str();
+}
 
-	const std::string plaintextJson = pt.str();
-
-	std::ostringstream out;
-	out << "{\"exportVer\":1,\"plaintext\":" << plaintextJson;
-
-	if (withSecrets)
+// The sealed block's plaintext: the secrets, and the data only an Owner may restore.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+static void exportGatedJson(RequestsHandler* handler, std::string& gatedPlaintext)
+{
 	{
 		std::ostringstream gated;
 		gated << "{\"wifiPassword\":\"" << jsonEscape(DeviceConfig::getWifiPassword()) << "\""
@@ -6566,7 +6577,24 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 		gated << "]";
 #endif
 		gated << "}";
-		std::string gatedPlaintext = gated.str();
+		gatedPlaintext = gated.str();
+	}
+}
+
+void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::string& password)
+{
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+
+	std::string plaintextJson;
+	exportPlaintextJson(handler, plaintextJson);
+
+	std::string out = "{\"exportVer\":1,\"plaintext\":";
+	out += plaintextJson;
+
+	if (withSecrets)
+	{
+		std::string gatedPlaintext;
+		exportGatedJson(handler, gatedPlaintext);
 
 		uint8_t salt[AdminAuth::kKdfSaltBytes];
 		uint8_t nonce[AdminAuth::kGcmNonceBytes];
@@ -6587,16 +6615,19 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 		secureWipe(key, sizeof(key));
 		secureWipe(&gatedPlaintext[0], gatedPlaintext.size());
 
-		out << ",\"secretsEnc\":{\"kdf\":\"pbkdf2-sha256\""
-		    << ",\"iter\":" << AdminAuth::kExportKdfIterations
-		    << ",\"salt\":\"" << toHexLocal(salt, sizeof(salt)) << "\""
-		    << ",\"nonce\":\"" << toHexLocal(nonce, sizeof(nonce)) << "\""
-		    << ",\"ct\":\""
-		    << toHexLocal(reinterpret_cast<const uint8_t*>(ct.data()), ct.size()) << "\"}";
+		out += ",\"secretsEnc\":{\"kdf\":\"pbkdf2-sha256\",\"iter\":";
+		out += std::to_string(AdminAuth::kExportKdfIterations);
+		out += ",\"salt\":\"";
+		out += toHexLocal(salt, sizeof(salt));
+		out += "\",\"nonce\":\"";
+		out += toHexLocal(nonce, sizeof(nonce));
+		out += "\",\"ct\":\"";
+		out += toHexLocal(reinterpret_cast<const uint8_t*>(ct.data()), ct.size());
+		out += "\"}";
 	}
 
-	out << "}";
-	sendResponse(sock, 200, "OK", "application/json", out.str());
+	out += "}";
+	sendResponse(sock, 200, "OK", "application/json", out);
 }
 
 #if POCKETDIAL_BACKUP_SECTION_C
@@ -6705,6 +6736,33 @@ static bool restoreMacBindings(RequestsHandler& handler, const JsonReader::Value
 	return false;
 }
 #endif
+
+// The import's answer. Its own frame, gone before the response goes out, so the
+// stream object is not part of sendApiConfigImport's frame (#1044).
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+static std::string importResultJson(const std::vector<std::string>& applied,
+	const std::vector<std::string>& skipped)
+{
+	std::ostringstream json;
+	json << "{\"status\":\"ok\",\"applied\":[";
+	for (size_t i = 0; i < applied.size(); ++i)
+	{
+		if (i) json << ",";
+		json << "\"" << jsonEscape(applied[i]) << "\"";
+	}
+	json << "],\"skipped\":[";
+	for (size_t i = 0; i < skipped.size(); ++i)
+	{
+		if (i) json << ",";
+		json << "\"" << jsonEscape(skipped[i]) << "\"";
+	}
+	json << "]}";
+	return json.str();
+}
 
 // Restores config from an export blob. Body: form-encoded
 // blob=<url-encoded export JSON>&password=<optional>&confirm=REPLACE.
@@ -7418,21 +7476,7 @@ void HttpServer::sendApiConfigImport(int sock, const std::string& body)
 	if (pt->find("trunk")) skipped.push_back("trunk/email/e911/adminExt (not on this build, #689)");
 #endif
 
-	std::ostringstream json;
-	json << "{\"status\":\"ok\",\"applied\":[";
-	for (size_t i = 0; i < applied.size(); ++i)
-	{
-		if (i) json << ",";
-		json << "\"" << jsonEscape(applied[i]) << "\"";
-	}
-	json << "],\"skipped\":[";
-	for (size_t i = 0; i < skipped.size(); ++i)
-	{
-		if (i) json << ",";
-		json << "\"" << jsonEscape(skipped[i]) << "\"";
-	}
-	json << "]}";
-	sendResponse(sock, 200, "OK", "application/json", json.str());
+	sendResponse(sock, 200, "OK", "application/json", importResultJson(applied, skipped));
 }
 
 bool HttpServer::streamBody(int sock, const char* prefix, size_t prefixLen,

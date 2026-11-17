@@ -28,6 +28,16 @@ source file differs from the number of table entries for that file (a new
 task that nobody budgeted fails closed). Line numbers in the table are
 references only, so unrelated edits don't break the gate.
 
+External rows (#1145): a row with "external": true budgets our code that runs
+on a task created outside src/ and main/ (inside IDF or a managed component),
+such as a callback an IDF task calls through a pointer. It is left out of the
+site count, and its "file" names where the entry is defined. It is walked from
+"entry" like any row, with its own "bytes" and "variants", and it must state
+"caller_bytes", a reserve for the frames the walk cannot see above the entry
+(the creating task's own and the indirect call into ours), with
+"caller_reason" saying how that figure was got. It fails when
+chain + caller_bytes + margin > bytes.
+
 The numbers only mean something on Xtensa .ci files from the ESP build
 (CI runs it in the stack-depth-gate job, which builds the esp32s3/eth image with
 the call-graph flags; BigDog's gate runs it by hand; the Call-Graph Guard job runs
@@ -317,6 +327,14 @@ def valid_row(row):
             and isinstance(row.get("reason"), str) and bool(row["reason"].strip()))
 
 
+def external_ok(row):
+    """An external row (#1145) states its caller reserve, why, and the images it is linked into."""
+    c = row.get("caller_bytes")
+    return (isinstance(c, int) and not isinstance(c, bool) and c >= 0
+            and isinstance(row.get("caller_reason"), str) and bool(row["caller_reason"].strip())
+            and isinstance(row.get("variants"), list) and bool(row["variants"]))
+
+
 def find_entry(nodes, pattern):
     """Nodes whose function name matches the table's entry regex."""
     rx = re.compile(pattern)
@@ -564,7 +582,12 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
               f"(absolute, or relative to {root}/build; --project-root: the checkout the .ci "
               f"files were compiled from)")
 
-    want = collections.Counter(t["file"] for t in tasks)
+    for t in tasks:
+        if t.get("external") and not external_ok(t):
+            rc = 1
+            print(f"FAIL table: external row '{t['name']}' needs a whole-number caller_bytes >= 0, "
+                  f"a caller_reason and a non-empty variants list")
+    want = collections.Counter(t["file"] for t in tasks if not t.get("external"))
     have = count_sites(src_root)
     for f in sorted(set(want) | set(have)):
         if want[f] != have.get(f, 0):
@@ -580,6 +603,9 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
         variants = t.get("variants") or ([t["file"]] if MAIN_VARIANT_RE.match(t["file"]) else None)
         if t["entry"] is None or (variants and main_variant not in variants):
             continue
+        if t.get("external") and not external_ok(t):
+            continue        # already failed above; its reserve is not a number to add
+
         # A site compiled only under a Kconfig overlay (heap_trace) is walked
         # only when this image has that feature; given --with, it must be found.
         if t.get("only") and t["only"] not in features:
@@ -679,7 +705,8 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
         for t, hits in batch:
             total, path = max((worst_chain(unit.get(h, h), succ, cost, memo) for h in hits),
                               key=lambda r: r[0])
-            ok = total + margin <= t["bytes"]
+            caller = t.get("caller_bytes", 0) if t.get("external") else 0
+            ok = total + caller + margin <= t["bytes"]
             # known_findings: a reported over-budget task that does not fail the job, so a red job means
             # something new. It holds only while the chain is no deeper than the recorded max_total; a
             # deeper chain is a new finding and fails. A ratchet: a stale row (the task fits again, the total
@@ -713,7 +740,7 @@ def run(ci_dir, table_path, src_root, main_variant, features=(), project_root=No
             unbounded = [v for v in callers if v not in bound_of] if strict else []
             rc |= 1 if unbounded else 0
             label = "FAIL" if (unbounded or stale) else "ok  " if ok else "KNOWN" if known_hit else "FAIL"
-            print(f"{label} {t['name']}: {total} B + {margin} margin "
+            print(f"{label} {t['name']}: {total} B + {f'{caller} caller + ' if t.get('external') else ''}{margin} margin "
                   f"{'<=' if ok else '>'} {t['bytes']} B ({t['file']}:{t['line']})")
             print(f"        block operations (unlabelled placeholder edges, charged as memcpy): {blockops} function(s) reachable")
             chain = {m for x in path for m in members.get(x, (x,))}

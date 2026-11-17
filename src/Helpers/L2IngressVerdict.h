@@ -40,6 +40,15 @@
 extern "C" {
 #endif
 
+// For every pd_l2_ helper here and in L2FrameFacts.h / L2GwPin.h. The esp_eth
+// input hook (main/pd_eth_ingress.c) is IRAM_ATTR; at -Og GCC emits a plain
+// static inline out of line, in flash. always_inline keeps it in the hook.
+#if defined(__GNUC__)
+#define PD_L2_INLINE static inline __attribute__((always_inline))
+#else
+#define PD_L2_INLINE static inline
+#endif
+
 enum
 {
 	PD_L2_PASS = 0,
@@ -76,7 +85,7 @@ typedef struct
 	uint32_t flags;
 } pd_l2_frame_t;
 
-static inline int pd_l2_is_martian_src(uint32_t src)
+PD_L2_INLINE int pd_l2_is_martian_src(uint32_t src)
 {
 	const uint32_t top = src >> 24;
 	return top == 0 || top == 127 || top >= 240;
@@ -84,14 +93,14 @@ static inline int pd_l2_is_martian_src(uint32_t src)
 
 // Flagged by the caller, or multicast / 255.255.255.255 (224/3 and up), or the
 // subnet-directed broadcast of any subnet under our mask. Needs mask != 0.
-static inline int pd_l2_dst_is_bcast_mcast(const pd_l2_frame_t *f)
+PD_L2_INLINE int pd_l2_dst_is_bcast_mcast(const pd_l2_frame_t *f)
 {
 	if (f->flags & PD_L2F_DST_BCAST_MCAST) return 1;
 	if (f->dstIp >= 0xE0000000u) return 1;
 	return f->mask != 0xFFFFFFFFu && (f->dstIp & ~f->mask) == ~f->mask;
 }
 
-static inline int pd_l2_on_link_verdict(const pd_l2_frame_t *f)
+PD_L2_INLINE int pd_l2_on_link_verdict(const pd_l2_frame_t *f)
 {
 	const uint32_t need = PD_L2F_MAC_VISIBLE | PD_L2F_GW_MAC_PINNED | PD_L2F_SRC_MAC_IS_GW;
 	if (f->srcIp == f->gateway) return PD_L2_PASS;
@@ -99,7 +108,7 @@ static inline int pd_l2_on_link_verdict(const pd_l2_frame_t *f)
 	return PD_L2_WOULD_DROP_LAN_GW_MAC;
 }
 
-static inline int pd_l2_off_link_verdict(const pd_l2_frame_t *f)
+PD_L2_INLINE int pd_l2_off_link_verdict(const pd_l2_frame_t *f)
 {
 	const uint32_t flags = f->flags;
 	if (f->dstIp != f->ourIp) return PD_L2_DEFER;
@@ -108,7 +117,7 @@ static inline int pd_l2_off_link_verdict(const pd_l2_frame_t *f)
 	return PD_L2_WOULD_DROP_WAN_SERVICE;
 }
 
-static inline int pd_l2_ingress_verdict(const pd_l2_frame_t *f)
+PD_L2_INLINE int pd_l2_ingress_verdict(const pd_l2_frame_t *f)
 {
 	const uint32_t fl = f->flags;
 	if (!f->ourIp || !f->mask || !f->gateway) return PD_L2_DEFER;
