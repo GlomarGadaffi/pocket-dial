@@ -169,5 +169,36 @@ class HttpConnFrames(unittest.TestCase):
         self.assertEqual(int(m.group(1)), 4096)
 
 
+    def test_json_escape_hooks_share_the_declaration_guard(self):
+        # #1044: the hooks are declared only on the host; a definition outside the same
+        # guard fails every device build ("no declaration matches").
+        guard = "#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)"
+        found = 0
+        for path, marker in ((HPP, "static std::string jsonEscapeForTest"),
+                             (CPP, "std::string HttpServer::jsonEscapeForTest")):
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            idx = [i for i, l in enumerate(lines) if marker in l]
+            self.assertEqual(len(idx), 1, marker)
+            guards = []
+            for l in lines[:idx[0]]:
+                st = l.strip()
+                if st.startswith("#if"):
+                    guards.append(st)
+                elif st.startswith("#endif") and guards:
+                    guards.pop()
+                elif st.startswith("#else") or st.startswith("#elif"):
+                    if guards:
+                        guards[-1] = st
+            self.assertTrue(guards, path)
+            self.assertEqual(guards[-1], guard, path)
+            sib = [i for i, l in enumerate(lines) if "jsonEscapeAppendForTest" in l]
+            self.assertTrue(sib)
+            between = lines[min(idx[0], sib[0]):max(idx[0], sib[-1])]
+            self.assertFalse([l for l in between if l.strip().startswith("#")], path)
+            found += 1
+        self.assertEqual(found, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

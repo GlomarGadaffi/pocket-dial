@@ -2204,8 +2204,10 @@ static std::string jsonEscape(const std::string& s)
 	return out;
 }
 
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
 std::string HttpServer::jsonEscapeForTest(const std::string& s) { return jsonEscape(s); }
 void HttpServer::jsonEscapeAppendForTest(std::string& out, const std::string& s) { jsonEscapeAppend(out, s); }
+#endif
 
 // An integer appended in decimal, no heap and no stream (#1044). The 24 bytes hold any
 // 64-bit value; a failed conversion cannot happen, but is not silently written as a gap.
@@ -6737,7 +6739,7 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 		// section, without failing authentication on import.
 		AdminAuth::aesGcmSeal(key, nonce, plaintextJson, gatedPlaintext, ct);
 		secureWipe(key, sizeof(key));
-		secureWipe(&gatedPlaintext[0], gatedPlaintext.size());
+		secureWipe(gatedPlaintext.data(), gatedPlaintext.size());
 
 		out += ",\"secretsEnc\":{\"kdf\":\"pbkdf2-sha256\",\"iter\":";
 		out += std::to_string(AdminAuth::kExportKdfIterations);
