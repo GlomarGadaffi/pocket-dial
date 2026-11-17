@@ -124,7 +124,7 @@ namespace
 		{"GET /api/coredump/info", 2}, {"GET /api/e911-config", 2},
 		{"GET /api/registrar", 2},
 		{"GET /api/email", 3},
-		{"GET /api/ap-security", 4}, {"POST /api/dialplan", 6}, {"GET /api/config/export", 10},
+		{"GET /api/ap-security", 4}, {"POST /api/dialplan", 6}, {"GET /api/config/export", 3},
 		{"GET /api/telephony-config", 12},
 	};
 

@@ -214,6 +214,10 @@ public:
 	// of `len` bytes -- buildResponseHead() itself, so a test compares the
 	// streamed page against the old head, not against a copy of it.
 	static std::string legacyHtmlHeadForTest(size_t len);
+	// #1044: the file-scope JSON string escapers, so a test can hold them to the old algorithm
+	// for every byte value.
+	static std::string jsonEscapeForTest(const std::string& s);
+	static void jsonEscapeAppendForTest(std::string& out, const std::string& s);
 	// #410 phase 2: sendResponseWithHeader() ON THE CALLING THREAD (it is
 	// private), so a test can count its allocations with AllocGuard; and what
 	// the pre-#410 path put on the wire for the same response --

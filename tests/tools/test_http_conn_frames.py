@@ -11,7 +11,7 @@ import re
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-CPP = os.path.join(ROOT, "src", "Helpers", "HttpServer.cpp")
+CPP = os.environ.get("PD_HTTP_CPP") or os.path.join(ROOT, "src", "Helpers", "HttpServer.cpp")
 HPP = os.path.join(ROOT, "src", "Helpers", "HttpServer.hpp")
 
 LIMIT = 256
@@ -72,6 +72,47 @@ def _body(name):
     raise AssertionError("unbalanced braces in " + name)
 
 
+def _static_body(name):
+    """Body of a file-scope `static void name(...)` helper, comments and literals blanked."""
+    with open(CPP, encoding="utf-8") as f:
+        src = _strip(f.read())
+    m = re.search(r"static\s+void\s+" + name + r"\s*\(", src)
+    assert m, name + " not found"
+    start = src.index("{", m.end())
+    depth = 0
+    for i in range(start, len(src)):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:i + 1]
+    raise AssertionError("unbalanced braces in " + name)
+
+
+SECTION_HELPER = re.compile(r"^static\s+void\s+(export(?:Section\w+|Gated(?!Json\s*\()[A-Z]\w*))\s*\(", re.M)
+
+
+def _section_helpers():
+    """Names and bodies of the per-section export helpers, comments and literals blanked."""
+    with open(CPP, encoding="utf-8") as f:
+        raw = f.read()
+    src = _strip(raw)
+    out = []
+    for m in SECTION_HELPER.finditer(src):
+        start = src.index("{", m.end())
+        depth = 0
+        for i in range(start, len(src)):
+            if src[i] == "{":
+                depth += 1
+            elif src[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    out.append((m.group(1), src[start:i + 1], raw[:m.start()].rstrip().splitlines()[-1].strip()))
+                    break
+    return out
+
+
 def _large_locals(body):
     found = []
     for t in LARGE_TYPES:
@@ -114,12 +155,99 @@ class HttpConnFrames(unittest.TestCase):
                           + name + r"\s*\(", src)
             self.assertTrue(m, name + " must stay noinline")
 
+    def test_export_path_builds_no_stream(self):
+        # #1044: std::ostringstream formatting is the deepest thing the export calls.
+        bodies = {
+            "exportPlaintextJson": _static_body("exportPlaintextJson"),
+            "exportGatedJson": _static_body("exportGatedJson"),
+            "sendApiConfigExport": _body("sendApiConfigExport"),
+        }
+        for n, b, _ in _section_helpers():
+            bodies[n] = b
+        for name, body in bodies.items():
+            self.assertNotRegex(body, r"stringstream|ostream|<<", name + " must not use a stream")
+
+    def test_export_helper_bodies_are_found_not_vacuous(self):
+        helpers = dict((n, b) for n, b, _ in _section_helpers())
+        pt = "".join(b for n, b in helpers.items() if n.startswith("exportSection"))
+        gated = "".join(b for n, b in helpers.items() if n.startswith("exportGated"))
+        self.assertIn("jsonEscape", pt)
+        self.assertGreater(len(pt), 2000)
+        self.assertIn("getHa1", gated)
+        self.assertGreater(len(gated), 800)
+        send = _body("sendApiConfigExport")
+        self.assertIn("exportPlaintextJson", send)
+        self.assertIn("aesGcmSeal", send)
+        self.assertGreater(len(send), 600)
+
+    def test_append_integer_checks_the_conversion(self):
+        # #1044: a to_chars that failed must not be written as a gap.
+        body = _static_body("appendInteger")
+        self.assertIn("to_chars", body)
+        self.assertRegex(body, r"\.ec\s*==\s*std::errc\(\)")
+        self.assertRegex(body, r"char\s+buf\[24\]")
+
+    def test_leaf_helpers_and_sections_are_noinline(self):
+        # #1044: a leaf helper inlined into a caller copies its buffer into that frame, and a
+        # section helper inlined into exportPlaintextJson puts every getter's result back in
+        # one frame (1072 B against the 1024 B ceiling).
+        with open(CPP, encoding="utf-8") as f:
+            src = f.read()
+        self.assertRegex(src, r"#define\s+PD_EXPORT_NOINLINE\s+__attribute__\(\(noinline\)\)")
+        self.assertRegex(src, r"#define\s+PD_EXPORT_NOINLINE\s+__declspec\(noinline\)")
+        for pat in (r"PD_EXPORT_NOINLINE\s+static\s+void\s+jsonEscapeAppend\s*\(",
+                    r"template\s*<typename T>\s+PD_EXPORT_NOINLINE\s+static\s+void\s+appendInteger\s*\("):
+            self.assertRegex(src, pat)
+        helpers = _section_helpers()
+        # Positive control: the split exists. 14 plaintext sections and 5 gated ones.
+        self.assertGreaterEqual(len(helpers), 19)
+        for name, body, prev in helpers:
+            self.assertEqual(prev, "PD_EXPORT_NOINLINE", name + " must be noinline")
+            self.assertEqual(_large_locals(body), [], name)
+
+    def test_top_level_export_is_a_short_sequence(self):
+        body = _static_body("exportPlaintextJson")
+        self.assertNotIn("for (", body)
+        self.assertNotIn("jsonEscapeAppend", body)
+        self.assertLess(len(body), 4000)
+
     def test_stack_constant_unchanged(self):
         with open(HPP, encoding="utf-8") as f:
             hpp = f.read()
         m = re.search(r"kHttpConnStackBytes\s*=\s*(\d+)\s*;", hpp)
         self.assertTrue(m)
         self.assertEqual(int(m.group(1)), 4096)
+
+
+    def test_json_escape_hooks_share_the_declaration_guard(self):
+        # #1044: the hooks are declared only on the host; a definition outside the same
+        # guard fails every device build ("no declaration matches").
+        guard = "#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)"
+        found = 0
+        for path, marker in ((HPP, "static std::string jsonEscapeForTest"),
+                             (CPP, "std::string HttpServer::jsonEscapeForTest")):
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            idx = [i for i, l in enumerate(lines) if marker in l]
+            self.assertEqual(len(idx), 1, marker)
+            guards = []
+            for l in lines[:idx[0]]:
+                st = l.strip()
+                if st.startswith("#if"):
+                    guards.append(st)
+                elif st.startswith("#endif") and guards:
+                    guards.pop()
+                elif st.startswith("#else") or st.startswith("#elif"):
+                    if guards:
+                        guards[-1] = st
+            self.assertTrue(guards, path)
+            self.assertEqual(guards[-1], guard, path)
+            sib = [i for i, l in enumerate(lines) if "jsonEscapeAppendForTest" in l]
+            self.assertTrue(sib)
+            between = lines[min(idx[0], sib[0]):max(idx[0], sib[-1])]
+            self.assertFalse([l for l in between if l.strip().startswith("#")], path)
+            found += 1
+        self.assertEqual(found, 2)
 
 
 if __name__ == "__main__":

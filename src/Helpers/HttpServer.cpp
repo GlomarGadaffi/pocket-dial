@@ -2169,11 +2169,15 @@ void HttpServer::sendHtml(int sock, const HttpRequest& req)
 // containing a stray control byte (e.g. 0x01, 0x1F) would otherwise land in
 // the JSON body unescaped, producing invalid JSON that breaks the dashboard's
 // JSON.parse() and silently freezes the live trace view.
-static std::string jsonEscape(const std::string& s)
+#if defined(_MSC_VER)
+#define PD_EXPORT_NOINLINE __declspec(noinline)
+#else
+#define PD_EXPORT_NOINLINE __attribute__((noinline))
+#endif
+PD_EXPORT_NOINLINE
+static void jsonEscapeAppend(std::string& out, std::string_view s)
 {
 	static const char* hex = "0123456789abcdef";
-	std::string out;
-	out.reserve(s.size() + 8);
 	for (unsigned char c : s)
 	{
 		switch (c)
@@ -2196,7 +2200,37 @@ static std::string jsonEscape(const std::string& s)
 				}
 		}
 	}
+}
+
+static std::string jsonEscape(const std::string& s)
+{
+	std::string out;
+	out.reserve(s.size() + 8);
+	jsonEscapeAppend(out, s);
 	return out;
+}
+
+#if !defined(ESP_PLATFORM) && !defined(ESP32) && !defined(ARDUINO)
+std::string HttpServer::jsonEscapeForTest(const std::string& s) { return jsonEscape(s); }
+void HttpServer::jsonEscapeAppendForTest(std::string& out, const std::string& s) { jsonEscapeAppend(out, s); }
+#endif
+
+// An integer appended in decimal, no heap and no stream (#1044). The 24 bytes hold any
+// 64-bit value; a failed conversion cannot happen, but is not silently written as a gap.
+template <typename T>
+PD_EXPORT_NOINLINE
+static void appendInteger(std::string& out, T value)
+{
+	char buf[24];
+	const auto r = std::to_chars(buf, buf + sizeof(buf), value);
+	if (r.ec == std::errc())
+	{
+		out.append(buf, static_cast<size_t>(r.ptr - buf));
+	}
+	else
+	{
+		out += "0";
+	}
 }
 
 // #410: bounded JSON writer over a caller-owned fixed buffer -- no heap. Once
@@ -6228,8 +6262,291 @@ namespace
 #endif
 // The export is built in three frames that never live together (#1044): the readable
 // part, the sealed part's plaintext, and sendApiConfigExport's own, which holds only
-// strings. A std::ostringstream is several hundred bytes, and the three used to sit in
-// one http_conn frame.
+// strings. None of them uses a std::ostringstream: its formatting is the deepest call
+// chain on the http_conn stack. The parts are appended to strings reserved once; the
+// reserves cover a typical board, and a larger table just grows the string (a fixed
+// buffer would truncate a backup silently, and caPem alone can run to several KB).
+static constexpr size_t kExportPlaintextReserve = 2048;
+static constexpr size_t kExportGatedReserve = 1024;
+// One frame per section: each getter's result lives only in its own helper and is gone
+// before the next section's getter runs, so the http_conn stack never holds two of them.
+PD_EXPORT_NOINLINE
+static void exportSectionExtensions(RequestsHandler* handler, std::string& pt)
+{
+	if (!handler) return;
+	bool first = true;
+	for (const auto& d : handler->getAdoptedDevices())
+	{
+		if (!first) pt += ",";
+		first = false;
+		pt += "{\"mac\":\"";
+		jsonEscapeAppend(pt, d.mac);
+		pt += "\",\"extension\":\"";
+		jsonEscapeAppend(pt, d.extension);
+		pt += "\",\"state\":\"";
+		pt += (d.state == RequestsHandler::DeviceState::Secured) ? "secured" : "learned";
+		pt += "\"}";
+	}
+}
+
+PD_EXPORT_NOINLINE
+static void exportSectionSecuredNames(std::string& pt)
+{
+	bool first = true;
+	for (const auto& ext : SipSecretStore::securedExtensions())
+	{
+		if (!SipSecretStore::hasSecret(ext)) continue;
+		if (!first) pt += ",";
+		first = false;
+		pt += "\"";
+		jsonEscapeAppend(pt, ext);
+		pt += "\"";
+	}
+}
+
+PD_EXPORT_NOINLINE
+static void exportSectionRingGroups(RequestsHandler* handler, std::string& pt)
+{
+	if (!handler) return;
+	bool first = true;
+	for (const auto& g : handler->getRingGroups())
+	{
+		if (!first) pt += ",";
+		first = false;
+		pt += "{\"extension\":\"";
+		jsonEscapeAppend(pt, std::get<0>(g));
+		pt += "\",\"mode\":\"";
+		jsonEscapeAppend(pt, std::get<1>(g));
+		pt += "\",\"members\":\"";
+		jsonEscapeAppend(pt, std::get<2>(g));
+		pt += "\"}";
+	}
+}
+
+PD_EXPORT_NOINLINE
+static void exportSectionForwards(RequestsHandler* handler, std::string& pt)
+{
+	if (!handler) return;
+	bool first = true;
+	for (const auto& f : handler->getForwards())
+	{
+		if (!first) pt += ",";
+		first = false;
+		pt += "{\"extension\":\"";
+		jsonEscapeAppend(pt, std::get<0>(f));
+		pt += "\",\"always\":\"";
+		jsonEscapeAppend(pt, std::get<1>(f));
+		pt += "\",\"busy\":\"";
+		jsonEscapeAppend(pt, std::get<2>(f));
+		pt += "\",\"noAnswer\":\"";
+		jsonEscapeAppend(pt, std::get<3>(f));
+		pt += "\",\"noAnswerSeconds\":";
+		appendInteger(pt, std::get<4>(f));
+		pt += "}";
+	}
+}
+
+PD_EXPORT_NOINLINE
+static void exportSectionDnd(RequestsHandler* handler, std::string& pt)
+{
+	if (!handler) return;
+	bool first = true;
+	for (const auto& ext : handler->getDndExtensions())
+	{
+		if (!first) pt += ",";
+		first = false;
+		pt += "\"";
+		jsonEscapeAppend(pt, ext);
+		pt += "\"";
+	}
+}
+
+PD_EXPORT_NOINLINE
+static void exportSectionVoicemail(RequestsHandler* handler, std::string& pt)
+{
+	if (!handler) return;
+	bool first = true;
+	for (const auto& ext : handler->getVoicemailExtensions())
+	{
+		if (!first) pt += ",";
+		first = false;
+		pt += "\"";
+		jsonEscapeAppend(pt, ext);
+		pt += "\"";
+	}
+}
+
+PD_EXPORT_NOINLINE
+static void exportSectionPageZones(RequestsHandler* handler, std::string& pt)
+{
+	if (!handler) return;
+	bool first = true;
+	for (const auto& z : handler->getPageZones())
+	{
+		if (!first) pt += ",";
+		first = false;
+		pt += "{\"zone\":\"";
+		jsonEscapeAppend(pt, z.first);
+		pt += "\",\"members\":\"";
+		jsonEscapeAppend(pt, z.second);
+		pt += "\"}";
+	}
+}
+
+PD_EXPORT_NOINLINE
+static void exportSectionDialPlan(RequestsHandler* handler, std::string& pt)
+{
+	if (!handler) return;
+	bool first = true;
+	for (const auto& r : handler->getDialRules())
+	{
+		if (!first) pt += ",";
+		first = false;
+		pt += "{\"pattern\":\"";
+		jsonEscapeAppend(pt, std::get<0>(r));
+		pt += "\",\"action\":\"";
+		jsonEscapeAppend(pt, std::get<1>(r));
+		pt += "\",\"target\":\"";
+		jsonEscapeAppend(pt, std::get<2>(r));
+		pt += "\",\"stripDigits\":";
+		appendInteger(pt, std::get<3>(r));
+		pt += "}";
+	}
+}
+
+PD_EXPORT_NOINLINE
+static void exportSectionDidMappings(RequestsHandler* handler, std::string& pt)
+{
+	if (!handler) return;
+	bool first = true;
+	for (const auto& e : handler->getDidMappings())
+	{
+		if (!first) pt += ",";
+		first = false;
+		pt += "{\"did\":\"";
+		jsonEscapeAppend(pt, e.did);
+		pt += "\",\"extension\":\"";
+		jsonEscapeAppend(pt, e.extension);
+		pt += "\"}";
+	}
+}
+
+PD_EXPORT_NOINLINE
+static void exportSectionTelephony(RequestsHandler* handler, std::string& pt)
+{
+	if (!handler) return;
+	bool first = true;
+	auto slots = handler->getTelephonyConfigSlots();
+	for (size_t i = 0; i < slots.size(); ++i)
+	{
+		if (!first) pt += ",";
+		first = false;
+		pt += "{\"index\":";
+		appendInteger(pt, i);
+		pt += ",\"type\":\"";
+		pt += telephonyProviderName(slots[i].type);
+		pt += "\",\"enabled\":";
+		pt += slots[i].enabled ? "true" : "false";
+		pt += ",\"secretSet\":";
+		pt += slots[i].secretSet ? "true" : "false";
+		pt += "}";
+	}
+}
+
+#if POCKETDIAL_BACKUP_SECTION_C
+// Ends with the comma that opens the e-mail member, so the two helpers read as one member list.
+PD_EXPORT_NOINLINE
+static void exportSectionTrunk(std::string& pt)
+{
+	const TrunkConfigStore::Config t = TrunkConfigStore::load();
+	pt += "\"trunk\":{\"host\":\"";
+	jsonEscapeAppend(pt, t.host);
+	pt += "\",\"port\":";
+	appendInteger(pt, t.port);
+	pt += ",\"proxyHost\":\"";
+	jsonEscapeAppend(pt, t.proxyHost);
+	pt += "\",\"proxyPort\":";
+	appendInteger(pt, t.proxyPort);
+	pt += ",\"fromUser\":\"";
+	jsonEscapeAppend(pt, t.fromUser);
+	pt += "\",\"callerId\":\"";
+	jsonEscapeAppend(pt, t.callerId);
+	pt += "\",\"authUser\":\"";
+	jsonEscapeAppend(pt, t.authUser);
+	pt += "\",\"enabled\":";
+	pt += t.enabled ? "true" : "false";
+	pt += "},";
+}
+
+PD_EXPORT_NOINLINE
+static void exportSectionEmail(std::string& pt)
+{
+	const EmailConfigStore::Config e = EmailConfigStore::load();
+	pt += "\"email\":{\"host\":\"";
+	jsonEscapeAppend(pt, e.host);
+	pt += "\",\"port\":";
+	appendInteger(pt, e.port);
+	// Validated enums, nothing to escape.
+	pt += ",\"mode\":\"";
+	pt += isValidEmailMode(e.mode) ? e.mode.c_str() : "";
+	pt += "\",\"auth\":\"";
+	pt += isValidEmailAuth(e.auth) ? e.auth.c_str() : "";
+	pt += "\",\"user\":\"";
+	jsonEscapeAppend(pt, e.user);
+	pt += "\",\"from\":\"";
+	jsonEscapeAppend(pt, e.from);
+	pt += "\",\"to\":\"";
+	jsonEscapeAppend(pt, e.to);
+	pt += "\",\"gsaEmail\":\"";
+	jsonEscapeAppend(pt, e.gsaEmail);
+	pt += "\",\"insecure\":";
+	pt += e.insecureSkipVerify ? "true" : "false";
+	pt += ",\"caPem\":\"";
+	jsonEscapeAppend(pt, e.caPem);
+	pt += "\"},";
+}
+
+PD_EXPORT_NOINLINE
+static void exportSectionE911(RequestsHandler* handler, std::string& pt)
+{
+	if (!handler) return;
+	std::string exts, callback, location;
+	std::tie(exts, callback, location) = handler->getE911Config();
+	pt += "\"e911\":{\"notifyExts\":\"";
+	jsonEscapeAppend(pt, exts);
+	pt += "\",\"callback\":\"";
+	jsonEscapeAppend(pt, callback);
+	pt += "\",\"location\":\"";
+	jsonEscapeAppend(pt, location);
+	pt += "\"},\"adminExt\":\"";
+	jsonEscapeAppend(pt, handler->getAdminExt());
+	pt += "\",";
+}
+#endif
+
+// Informational only -- see gap 3 above; import is a no-op for the last three.
+#ifndef POCKETDIAL_HOSTNAME
+#define POCKETDIAL_HOSTNAME "pocketdial"
+#endif
+PD_EXPORT_NOINLINE
+static void exportSectionDevice(std::string& pt)
+{
+	pt += "\"wifiSsid\":\"";
+	jsonEscapeAppend(pt, DeviceConfig::getWifiSsid());
+	pt += "\",\"wifiMode\":";
+	appendInteger(pt, static_cast<int>(DeviceConfig::getWifiMode()));
+	pt += ",\"apSecure\":";
+	pt += DeviceConfig::isApSecure() ? "true" : "false";
+	pt += ",";
+	pt += "\"parkTimeoutSec\":";
+	appendInteger(pt, POCKETDIAL_PARK_TIMEOUT_SEC);
+	pt += ",\"mdnsHostname\":\"";
+	jsonEscapeAppend(pt, POCKETDIAL_HOSTNAME);
+	pt += "\",\"schemaVer\":";
+	appendInteger(pt, DeviceConfig::kSchemaVersion);
+	pt += "}";
+}
+
 #if defined(_MSC_VER)
 __declspec(noinline)
 #else
@@ -6237,30 +6554,21 @@ __attribute__((noinline))
 #endif
 static void exportPlaintextJson(RequestsHandler* handler, std::string& plaintextJson)
 {
-	std::ostringstream pt;
-	pt << "{";
+	// Appended to a string reserved once, never through a std::ostringstream (#1044): the
+	// stream's formatting went through the locale and num_put machinery, the deepest chain
+	// on the http_conn stack. The size is not bounded here (caPem alone may run to several
+	// KB), so this stays a growable string: a fixed buffer would truncate a backup silently.
+	std::string& pt = plaintextJson;
+	pt.clear();
+	pt.reserve(kExportPlaintextReserve);
+	pt += "{";
 
 	// Extensions + MAC bindings (always-plaintext per #186's field list). Readable
 	// here, but the import never adopts from this list: it restores bindings only
 	// from the secretsEnc copy below, which also carries the lock (gap 1 above).
-	pt << "\"extensions\":[";
-	{
-		bool first = true;
-		if (handler)
-		{
-			for (const auto& d : handler->getAdoptedDevices())
-			{
-				if (!first) pt << ",";
-				first = false;
-				pt << "{\"mac\":\"" << jsonEscape(d.mac)
-				   << "\",\"extension\":\"" << jsonEscape(d.extension)
-				   << "\",\"state\":\""
-				   << ((d.state == RequestsHandler::DeviceState::Secured) ? "secured" : "learned")
-				   << "\"}";
-			}
-		}
-	}
-	pt << "],";
+	pt += "\"extensions\":[";
+	exportSectionExtensions(handler, pt);
+	pt += "],";
 
 	// Issue #482: WHICH extensions are secured -- names only, the
 	// secretSet-not-secret contract. Their HA1s are plaintext-EQUIVALENT (an
@@ -6269,217 +6577,162 @@ static void exportPlaintextJson(RequestsHandler* handler, std::string& plaintext
 	// here: this part is served to any sysop and is also the encrypted
 	// export's readable `plaintext` member. (#186's field list named them as
 	// always-plaintext; that is the choice #482 reverses.)
-	pt << "\"securedExtensions\":[";
-	{
-		bool first = true;
-		for (const auto& ext : SipSecretStore::securedExtensions())
-		{
-			if (!SipSecretStore::hasSecret(ext)) continue;
-			if (!first) pt << ",";
-			first = false;
-			pt << "\"" << jsonEscape(ext) << "\"";
-		}
-	}
-	pt << "],";
+	pt += "\"securedExtensions\":[";
+	exportSectionSecuredNames(pt);
+	pt += "],";
 
-	pt << "\"ringGroups\":[";
-	{
-		bool first = true;
-		if (handler)
-		{
-			for (const auto& g : handler->getRingGroups())
-			{
-				if (!first) pt << ",";
-				first = false;
-				pt << "{\"extension\":\"" << jsonEscape(std::get<0>(g))
-				   << "\",\"mode\":\"" << jsonEscape(std::get<1>(g))
-				   << "\",\"members\":\"" << jsonEscape(std::get<2>(g)) << "\"}";
-			}
-		}
-	}
-	pt << "],";
+	pt += "\"ringGroups\":[";
+	exportSectionRingGroups(handler, pt);
+	pt += "],";
 
-	pt << "\"forwards\":[";
-	{
-		bool first = true;
-		if (handler)
-		{
-			for (const auto& f : handler->getForwards())
-			{
-				if (!first) pt << ",";
-				first = false;
-				pt << "{\"extension\":\"" << jsonEscape(std::get<0>(f))
-				   << "\",\"always\":\"" << jsonEscape(std::get<1>(f))
-				   << "\",\"busy\":\"" << jsonEscape(std::get<2>(f))
-				   << "\",\"noAnswer\":\"" << jsonEscape(std::get<3>(f))
-				   << "\",\"noAnswerSeconds\":" << std::get<4>(f) << "}";
-			}
-		}
-	}
-	pt << "],";
+	pt += "\"forwards\":[";
+	exportSectionForwards(handler, pt);
+	pt += "],";
 
-	pt << "\"dnd\":[";
-	{
-		bool first = true;
-		if (handler)
-		{
-			for (const auto& ext : handler->getDndExtensions())
-			{
-				if (!first) pt << ",";
-				first = false;
-				pt << "\"" << jsonEscape(ext) << "\"";
-			}
-		}
-	}
-	pt << "],";
+	pt += "\"dnd\":[";
+	exportSectionDnd(handler, pt);
+	pt += "],";
 
-	pt << "\"voicemail\":[";
-	{
-		bool first = true;
-		if (handler)
-		{
-			for (const auto& ext : handler->getVoicemailExtensions())
-			{
-				if (!first) pt << ",";
-				first = false;
-				pt << "\"" << jsonEscape(ext) << "\"";
-			}
-		}
-	}
-	pt << "],";
+	pt += "\"voicemail\":[";
+	exportSectionVoicemail(handler, pt);
+	pt += "],";
 
-	pt << "\"pageZones\":[";
-	{
-		bool first = true;
-		if (handler)
-		{
-			for (const auto& z : handler->getPageZones())
-			{
-				if (!first) pt << ",";
-				first = false;
-				pt << "{\"zone\":\"" << jsonEscape(z.first)
-				   << "\",\"members\":\"" << jsonEscape(z.second) << "\"}";
-			}
-		}
-	}
-	pt << "],";
+	pt += "\"pageZones\":[";
+	exportSectionPageZones(handler, pt);
+	pt += "],";
 
-	pt << "\"dialPlan\":[";
-	{
-		bool first = true;
-		if (handler)
-		{
-			for (const auto& r : handler->getDialRules())
-			{
-				if (!first) pt << ",";
-				first = false;
-				pt << "{\"pattern\":\"" << jsonEscape(std::get<0>(r))
-				   << "\",\"action\":\"" << jsonEscape(std::get<1>(r))
-				   << "\",\"target\":\"" << jsonEscape(std::get<2>(r))
-				   << "\",\"stripDigits\":" << std::get<3>(r) << "}";
-			}
-		}
-	}
-	pt << "],";
+	pt += "\"dialPlan\":[";
+	exportSectionDialPlan(handler, pt);
+	pt += "],";
 
-	pt << "\"didMappings\":[";
-	{
-		bool first = true;
-		if (handler)
-		{
-			for (const auto& e : handler->getDidMappings())
-			{
-				if (!first) pt << ",";
-				first = false;
-				pt << "{\"did\":\"" << jsonEscape(e.did)
-				   << "\",\"extension\":\"" << jsonEscape(e.extension) << "\"}";
-			}
-		}
-	}
-	pt << "],";
+	pt += "\"didMappings\":[";
+	exportSectionDidMappings(handler, pt);
+	pt += "],";
 
-	pt << "\"registrarMode\":\""
-	   << (handler ? registrarModeName(handler->getRegistrarMode()) : "learn") << "\",";
+	pt += "\"registrarMode\":\"";
+	pt += handler ? registrarModeName(handler->getRegistrarMode()) : "learn";
+	pt += "\",";
 
 	// Telephony-API slot METADATA only. baseUrl/clientId/routeDn are
 	// password-gated (#186: "anchor/trunk base URL, client ID/secret, source
 	// DN") -- see the gated block below. The secret itself is never
 	// exportable at all, gated or not -- see gap 2 above.
-	pt << "\"telephonyConfig\":[";
-	{
-		bool first = true;
-		if (handler)
-		{
-			auto slots = handler->getTelephonyConfigSlots();
-			for (size_t i = 0; i < slots.size(); ++i)
-			{
-				if (!first) pt << ",";
-				first = false;
-				pt << "{\"index\":" << i
-				   << ",\"type\":\"" << telephonyProviderName(slots[i].type) << "\""
-				   << ",\"enabled\":" << (slots[i].enabled ? "true" : "false")
-				   << ",\"secretSet\":" << (slots[i].secretSet ? "true" : "false") << "}";
-			}
-		}
-	}
-	pt << "],";
+	pt += "\"telephonyConfig\":[";
+	exportSectionTelephony(handler, pt);
+	pt += "],";
 
 #if POCKETDIAL_BACKUP_SECTION_C
 	// #483: the trunk and SMTP settings WITHOUT trunk_pass, smtp_pass and
 	// gsa_key -- those travel in the secretsEnc block below and nowhere else.
 	// Written straight into `pt`, not via trunkConfigJson()/emailConfigJson(),
 	// which would each add two allocations to this #410-gated route.
-	{
-		const TrunkConfigStore::Config t = TrunkConfigStore::load();
-		const EmailConfigStore::Config e = EmailConfigStore::load();
-		pt << "\"trunk\":{\"host\":\"" << jsonEscape(t.host)
-		   << "\",\"port\":" << t.port
-		   << ",\"proxyHost\":\"" << jsonEscape(t.proxyHost)
-		   << "\",\"proxyPort\":" << t.proxyPort
-		   << ",\"fromUser\":\"" << jsonEscape(t.fromUser)
-		   << "\",\"callerId\":\"" << jsonEscape(t.callerId)
-		   << "\",\"authUser\":\"" << jsonEscape(t.authUser)
-		   << "\",\"enabled\":" << (t.enabled ? "true" : "false")
-		   << "},\"email\":{\"host\":\"" << jsonEscape(e.host)
-		   << "\",\"port\":" << e.port
-		   // Validated enums, nothing to escape (and "starttls" + 8 would push
-		   // jsonEscape() out of the small-string buffer: one more allocation).
-		   << ",\"mode\":\"" << (isValidEmailMode(e.mode) ? e.mode.c_str() : "")
-		   << "\",\"auth\":\"" << (isValidEmailAuth(e.auth) ? e.auth.c_str() : "")
-		   << "\",\"user\":\"" << jsonEscape(e.user)
-		   << "\",\"from\":\"" << jsonEscape(e.from)
-		   << "\",\"to\":\"" << jsonEscape(e.to)
-		   << "\",\"gsaEmail\":\"" << jsonEscape(e.gsaEmail)
-		   << "\",\"insecure\":" << (e.insecureSkipVerify ? "true" : "false")
-		   << ",\"caPem\":\"" << jsonEscape(e.caPem) << "\"},";
-	}
-	if (handler)
-	{
-		std::string exts, callback, location;
-		std::tie(exts, callback, location) = handler->getE911Config();
-		pt << "\"e911\":{\"notifyExts\":\"" << jsonEscape(exts)
-		   << "\",\"callback\":\"" << jsonEscape(callback)
-		   << "\",\"location\":\"" << jsonEscape(location)
-		   << "\"},\"adminExt\":\"" << jsonEscape(handler->getAdminExt()) << "\",";
-	}
+	exportSectionTrunk(pt);
+	exportSectionEmail(pt);
+	exportSectionE911(handler, pt);
 #endif
 
-	pt << "\"wifiSsid\":\"" << jsonEscape(DeviceConfig::getWifiSsid()) << "\""
-	   << ",\"wifiMode\":" << static_cast<int>(DeviceConfig::getWifiMode())
-	   << ",\"apSecure\":" << (DeviceConfig::isApSecure() ? "true" : "false") << ",";
-
-	// Informational only -- see gap 3 above; import is a no-op for both.
-#ifndef POCKETDIAL_HOSTNAME
-#define POCKETDIAL_HOSTNAME "pocketdial"
-#endif
-	pt << "\"parkTimeoutSec\":" << POCKETDIAL_PARK_TIMEOUT_SEC << ","
-	   << "\"mdnsHostname\":\"" << jsonEscape(POCKETDIAL_HOSTNAME) << "\","
-	   << "\"schemaVer\":" << DeviceConfig::kSchemaVersion;
-	pt << "}";
-	plaintextJson = pt.str();
+	exportSectionDevice(pt);
 }
 
 // The sealed block's plaintext: the secrets, and the data only an Owner may restore.
+PD_EXPORT_NOINLINE
+static void exportGatedTelephony(RequestsHandler* handler, std::string& gated)
+{
+	if (!handler) return;
+	bool first = true;
+	auto slots = handler->getTelephonyConfigSlots();
+	for (size_t i = 0; i < slots.size(); ++i)
+	{
+		if (!first) gated += ",";
+		first = false;
+		gated += "{\"index\":";
+		appendInteger(gated, i);
+		gated += ",\"baseUrl\":\"";
+		jsonEscapeAppend(gated, slots[i].baseUrl);
+		gated += "\",\"clientId\":\"";
+		jsonEscapeAppend(gated, slots[i].clientId);
+		gated += "\",\"routeDn\":\"";
+		jsonEscapeAppend(gated, slots[i].routeDn);
+		gated += "\"}";
+	}
+}
+
+PD_EXPORT_NOINLINE
+static void exportGatedHa1s(std::string& gated)
+{
+	bool first = true;
+	for (const auto& ext : SipSecretStore::securedExtensions())
+	{
+		auto ha1 = SipSecretStore::getHa1(ext);
+		if (!ha1.has_value()) continue;
+		if (!first) gated += ",";
+		first = false;
+		gated += "{\"extension\":\"";
+		jsonEscapeAppend(gated, ext);
+		gated += "\",\"ha1\":\"";
+		jsonEscapeAppend(gated, *ha1);
+		gated += "\"}";
+	}
+}
+
+#if POCKETDIAL_BACKUP_SECTION_C
+PD_EXPORT_NOINLINE
+static void exportGatedTrunkPass(std::string& gated)
+{
+	gated += ",\"trunkPass\":\"";
+	jsonEscapeAppend(gated, TrunkConfigStore::load().pass);
+	gated += "\",";
+}
+
+PD_EXPORT_NOINLINE
+static void exportGatedEmailSecrets(std::string& gated)
+{
+	const EmailConfigStore::Config email = EmailConfigStore::load();
+	gated += "\"smtpPass\":\"";
+	jsonEscapeAppend(gated, email.pass);
+	gated += "\",\"gsaKey\":\"";
+	jsonEscapeAppend(gated, email.gsaKey);
+	gated += "\"";
+}
+
+PD_EXPORT_NOINLINE
+static void exportGatedBindings(RequestsHandler* handler, std::string& gated)
+{
+	if (!handler) return;
+	bool first = true;
+	std::vector<RequestsHandler::AdoptedDevice> rows = handler->getAdoptedDevices();
+	// An insertion sort, not std::sort: the table is POCKETDIAL_MAX_CLIENTS rows at
+	// most, and std::sort's introsort recurses, a cycle the task-stack gate would
+	// charge to http_conn (tools/ci/task_stacks.json).
+	const auto firstClaim = [](const RequestsHandler::AdoptedDevice& a,
+	                           const RequestsHandler::AdoptedDevice& b) {
+		return a.seq != b.seq ? a.seq < b.seq : a.mac < b.mac;
+	};
+	for (size_t i = 1; i < rows.size(); ++i)
+	{
+		for (size_t j = i; j > 0 && firstClaim(rows[j], rows[j - 1]); --j)
+		{
+			std::swap(rows[j], rows[j - 1]);
+		}
+	}
+	for (const auto& d : rows)
+	{
+		if (d.assigned) continue;
+		if (!first) gated += ",";
+		first = false;
+		gated += "[\"";
+		jsonEscapeAppend(gated, d.mac);
+		gated += "\",\"";
+		jsonEscapeAppend(gated, d.extension);
+		gated += "\",";
+		appendInteger(gated, d.state == RequestsHandler::DeviceState::Secured ? 1 : 0);
+		gated += ",";
+		appendInteger(gated, Registrar::encodeRowFlags(Registrar::RowFlags{d.locked, d.shared, false}));
+		gated += "]";
+	}
+}
+#endif
+
 #if defined(_MSC_VER)
 __declspec(noinline)
 #else
@@ -6487,98 +6740,40 @@ __attribute__((noinline))
 #endif
 static void exportGatedJson(RequestsHandler* handler, std::string& gatedPlaintext)
 {
-	{
-		std::ostringstream gated;
-		gated << "{\"wifiPassword\":\"" << jsonEscape(DeviceConfig::getWifiPassword()) << "\""
-		      << ",\"apPsk\":\"" << jsonEscape(DeviceConfig::getApPsk()) << "\""
-		      << ",\"telephonyConfig\":[";
-		{
-			bool first = true;
-			if (handler)
-			{
-				auto slots = handler->getTelephonyConfigSlots();
-				for (size_t i = 0; i < slots.size(); ++i)
-				{
-					if (!first) gated << ",";
-					first = false;
-					gated << "{\"index\":" << i
-					      << ",\"baseUrl\":\"" << jsonEscape(slots[i].baseUrl) << "\""
-					      << ",\"clientId\":\"" << jsonEscape(slots[i].clientId) << "\""
-					      << ",\"routeDn\":\"" << jsonEscape(slots[i].routeDn) << "\"}";
-				}
-			}
-		}
-		gated << "]";
-		// #482: the per-extension digest secrets (HA1s) live HERE and only here,
-		// so a restore can bring secured extensions back (SipSecretStore::setHa1)
-		// without ever putting them in the readable part of the file.
-		gated << ",\"extensionSecrets\":[";
-		{
-			bool first = true;
-			for (const auto& ext : SipSecretStore::securedExtensions())
-			{
-				auto ha1 = SipSecretStore::getHa1(ext);
-				if (!ha1.has_value()) continue;
-				if (!first) gated << ",";
-				first = false;
-				gated << "{\"extension\":\"" << jsonEscape(ext)
-				      << "\",\"ha1\":\"" << jsonEscape(*ha1) << "\"}";
-			}
-		}
-		gated << "]";
+	std::string& gated = gatedPlaintext;
+	gated.clear();
+	gated.reserve(kExportGatedReserve);
+	gated += "{\"wifiPassword\":\"";
+	jsonEscapeAppend(gated, DeviceConfig::getWifiPassword());
+	gated += "\",\"apPsk\":\"";
+	jsonEscapeAppend(gated, DeviceConfig::getApPsk());
+	gated += "\",\"telephonyConfig\":[";
+	exportGatedTelephony(handler, gated);
+	gated += "]";
+	// #482: the per-extension digest secrets (HA1s) live HERE and only here,
+	// so a restore can bring secured extensions back (SipSecretStore::setHa1)
+	// without ever putting them in the readable part of the file.
+	gated += ",\"extensionSecrets\":[";
+	exportGatedHa1s(gated);
+	gated += "]";
 #if POCKETDIAL_BACKUP_SECTION_C
-		// #483: the three secrets section C keeps out of the plaintext part.
-		{
-			const EmailConfigStore::Config email = EmailConfigStore::load();
-			gated << ",\"trunkPass\":\"" << jsonEscape(TrunkConfigStore::load().pass)
-			      << "\",\"smtpPass\":\"" << jsonEscape(email.pass)
-			      << "\",\"gsaKey\":\"" << jsonEscape(email.gsaKey) << "\"";
-		}
-		// #483: the MAC bindings, lock included. A Secured or locked row decides who
-		// may register an extension, so restoring one is as privileged as restoring an
-		// HA1 (the route is Owner-gated for the same reason). Unclaimed zero-touch
-		// rows (#826) stay out: restored as plain locked rows, nothing would evict them.
-		// Each row is ["<mac>","<extension>",<state 0 learned | 1 secured>,<flags>] with the
-		// flags of Registrar::encodeRowFlags (bit 0 locked, bit 1 shared): 27 bytes where an
-		// object with long keys took 74, which is what keeps a full table under the import's
-		// 16 KB caps. In adoption order (seq), so the import, which adopts in file order,
-		// keeps which phone holds an extension's first claim.
-		gated << ",\"extensions\":[";
-		{
-			bool first = true;
-			if (handler)
-			{
-				std::vector<RequestsHandler::AdoptedDevice> rows = handler->getAdoptedDevices();
-				// An insertion sort, not std::sort: the table is POCKETDIAL_MAX_CLIENTS rows at
-				// most, and std::sort's introsort recurses, a cycle the task-stack gate would
-				// charge to http_conn (tools/ci/task_stacks.json).
-				const auto firstClaim = [](const RequestsHandler::AdoptedDevice& a,
-				                           const RequestsHandler::AdoptedDevice& b) {
-					return a.seq != b.seq ? a.seq < b.seq : a.mac < b.mac;
-				};
-				for (size_t i = 1; i < rows.size(); ++i)
-				{
-					for (size_t j = i; j > 0 && firstClaim(rows[j], rows[j - 1]); --j)
-					{
-						std::swap(rows[j], rows[j - 1]);
-					}
-				}
-				for (const auto& d : rows)
-				{
-					if (d.assigned) continue;
-					if (!first) gated << ",";
-					first = false;
-					gated << "[\"" << jsonEscape(d.mac) << "\",\"" << jsonEscape(d.extension) << "\","
-					      << (d.state == RequestsHandler::DeviceState::Secured ? 1 : 0) << ","
-					      << Registrar::encodeRowFlags(Registrar::RowFlags{d.locked, d.shared, false}) << "]";
-				}
-			}
-		}
-		gated << "]";
+	// #483: the three secrets section C keeps out of the plaintext part.
+	exportGatedTrunkPass(gated);
+	exportGatedEmailSecrets(gated);
+	// #483: the MAC bindings, lock included. A Secured or locked row decides who
+	// may register an extension, so restoring one is as privileged as restoring an
+	// HA1 (the route is Owner-gated for the same reason). Unclaimed zero-touch
+	// rows (#826) stay out: restored as plain locked rows, nothing would evict them.
+	// Each row is ["<mac>","<extension>",<state 0 learned | 1 secured>,<flags>] with the
+	// flags of Registrar::encodeRowFlags (bit 0 locked, bit 1 shared): 27 bytes where an
+	// object with long keys took 74, which is what keeps a full table under the import's
+	// 16 KB caps. In adoption order (seq), so the import, which adopts in file order,
+	// keeps which phone holds an extension's first claim.
+	gated += ",\"extensions\":[";
+	exportGatedBindings(handler, gated);
+	gated += "]";
 #endif
-		gated << "}";
-		gatedPlaintext = gated.str();
-	}
+	gated += "}";
 }
 
 void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::string& password)
@@ -6588,13 +6783,19 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 	std::string plaintextJson;
 	exportPlaintextJson(handler, plaintextJson);
 
-	std::string out = "{\"exportVer\":1,\"plaintext\":";
+	// The sealed part's plaintext is built first so `out` is reserved once for everything it
+	// will carry: the readable part, and the sealed block (hex doubles the ciphertext, which
+	// is the gated text plus its tag; the rest is the fixed keys and the salt and nonce).
+	std::string gatedPlaintext;
+	if (withSecrets) exportGatedJson(handler, gatedPlaintext);
+
+	std::string out;
+	out.reserve(plaintextJson.size() + 2 * gatedPlaintext.size() + (withSecrets ? 256 : 0) + 64);
+	out += "{\"exportVer\":1,\"plaintext\":";
 	out += plaintextJson;
 
 	if (withSecrets)
 	{
-		std::string gatedPlaintext;
-		exportGatedJson(handler, gatedPlaintext);
 
 		uint8_t salt[AdminAuth::kKdfSaltBytes];
 		uint8_t nonce[AdminAuth::kGcmNonceBytes];
@@ -6613,7 +6814,7 @@ void HttpServer::sendApiConfigExport(int sock, bool withSecrets, const std::stri
 		// section, without failing authentication on import.
 		AdminAuth::aesGcmSeal(key, nonce, plaintextJson, gatedPlaintext, ct);
 		secureWipe(key, sizeof(key));
-		secureWipe(&gatedPlaintext[0], gatedPlaintext.size());
+		secureWipe(gatedPlaintext.data(), gatedPlaintext.size());
 
 		out += ",\"secretsEnc\":{\"kdf\":\"pbkdf2-sha256\",\"iter\":";
 		out += std::to_string(AdminAuth::kExportKdfIterations);
