@@ -219,9 +219,9 @@ extern "C" uint64_t pd_sd_capacity_mb(void);
 // than a form param. Mirrors isProvisioningConfigPath's style: pure string-shape
 // checks, no registry access, used directly in the route table's if/else chain
 // below (each defined further down, alongside the handlers that use them).
-static bool parseTelephonyConfigSlotPath(const std::string& path, size_t& slotIdx);
-static bool parseTelephonyConfigActivatePath(const std::string& path, size_t& slotIdx);
-static bool parseTelephonyConfigTestPath(const std::string& path, size_t& slotIdx);
+static bool parseTelephonyConfigSlotPath(std::string_view path, size_t& slotIdx);
+static bool parseTelephonyConfigActivatePath(std::string_view path, size_t& slotIdx);
+static bool parseTelephonyConfigTestPath(std::string_view path, size_t& slotIdx);
 
 // Captive-portal decay hold. The display app's decay watchdog reads this; the web
 // "/api/configuring" confirm sets it to pause the auto-switch to Standalone while a user is
@@ -788,7 +788,7 @@ void HttpServer::releaseSourceLocked(uint32_t addr)
 }
 
 
-void HttpServer::routeLabel(const std::string& method, const std::string& path,
+void HttpServer::routeLabel(std::string_view method, std::string_view path,
                             char* out, size_t cap)
 {
 	if (out == nullptr || cap == 0) return;
@@ -803,7 +803,7 @@ void HttpServer::routeLabel(const std::string& method, const std::string& path,
 
 	bool methodOk = !method.empty() && method.size() <= 7;
 	for (char c : method) methodOk = methodOk && c >= 'A' && c <= 'Z';
-	put(methodOk ? std::string_view(method) : std::string_view("?"));
+	put(methodOk ? method : std::string_view("?"));
 	put(" ");
 
 	if (path == "/" || path == "/index.html") put("/");
@@ -814,7 +814,7 @@ void HttpServer::routeLabel(const std::string& method, const std::string& path,
 		// Under /api/ and /setup/ keep lower-case word segments; the first numeric
 		// or unknown one ends the label, so a slot index or an extension never
 		// appears. Anything else (a 404 probe, a scan) is just "other".
-		const std::string_view p(path);
+		const std::string_view p = path;
 		const bool known = p.substr(0, 5) == "/api/" || p.substr(0, 7) == "/setup/";
 		size_t kept = 0;
 		size_t pos = 0;
@@ -945,10 +945,14 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 	// #18: ensure the complete POST body is present before parsing.
 	// If the headers indicate a Content-Length larger than what arrived in the
 	// first segment, keep reading until we have it all.
-	std::string raw(buf, static_cast<size_t>(bytesRead));
-#if POCKETDIAL_HTTP_DRAM_ACCOUNT
-	heldRaw.set(httpdram::heapBytes(raw));
-#endif
+	//
+	// #1048: the request is read in place. `raw` is a view of the bytes recv()
+	// just left in `buf`, and the request line and headers are parsed as views of
+	// it, so a request that arrives whole costs no copy. Only a body that is still
+	// arriving moves to `rawOwned`, because the buffer is reused for each further
+	// read. Nothing below may read `raw` after `buf` has been refilled.
+	std::string_view raw(buf, static_cast<size_t>(bytesRead));
+	std::string rawOwned;
 
 	// --- OTA upload interception (firmware streaming) -------------------------
 	// A firmware image is >1.5 MB, so it must NOT flow through the 16 KB-capped
@@ -964,7 +968,7 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 		if (reqLineEnd != std::string::npos && hdrEnd != std::string::npos)
 		{
 			// Cheap method+path probe on the request line only.
-			const std::string reqLine = raw.substr(0, reqLineEnd);
+			const std::string_view reqLine = raw.substr(0, reqLineEnd);
 			if (reqLine.compare(0, 5, "POST ") == 0 &&
 			    (reqLine.find(" /api/ota/upload ") != std::string::npos ||
 			     reqLine.find(" /api/moh/upload ") != std::string::npos))
@@ -1021,13 +1025,17 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 					return;
 				}
 
+				// The streaming handlers keep what was already read as a string.
+				// Copied here, after the auth gate and the length check, so a
+				// refused upload costs nothing.
+				const std::string alreadyRead(raw);
 				if (isMoh)
 				{
-					handleMohUpload(clientSock, raw, hdrEnd + 4, otaLen);
+					handleMohUpload(clientSock, alreadyRead, hdrEnd + 4, otaLen);
 					closeSocket(clientSock);
 					return;
 				}
-				handleOtaUpload(clientSock, raw, hdrEnd + 4, otaLen);
+				handleOtaUpload(clientSock, alreadyRead, hdrEnd + 4, otaLen);
 				closeSocket(clientSock);
 				return;
 			}
@@ -1092,6 +1100,9 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 						closeSocket(clientSock);
 						return;
 					}
+					// The first segment is still only in `buf`: move it out before
+					// the buffer is reused.
+					if (rawOwned.empty()) rawOwned.assign(raw.data(), raw.size());
 					std::memset(buf, 0, kReadBufBytes);
 #if defined _WIN32 || defined _WIN64
 					int n = recv(clientSock, buf, static_cast<int>(kReadBufBytes) - 1, 0);
@@ -1105,12 +1116,13 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 						return;
 					}
 					if (n <= 0) break;
-					raw.append(buf, static_cast<size_t>(n));
+					rawOwned.append(buf, static_cast<size_t>(n));
 #if POCKETDIAL_HTTP_DRAM_ACCOUNT
-					heldRaw.set(httpdram::heapBytes(raw));   // append may have regrown it
+					heldRaw.set(httpdram::heapBytes(rawOwned));   // append may have regrown it
 #endif
 					bodyHave += static_cast<size_t>(n);
 				}
+				if (!rawOwned.empty()) raw = rawOwned;   // what the parse below reads
 			}
 		}
 	}
@@ -1123,8 +1135,7 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 	// its ARP lookup.
 	req.clientIp = peerIp;
 #if POCKETDIAL_HTTP_DRAM_ACCOUNT
-	heldReq.set(httpdram::heapBytesOf(req.method, req.path, req.body, req.origin, req.host,
-	                                  req.cookie, req.csrf, req.userAgent, req.clientIp));
+	heldReq.set(httpdram::heapBytesOf(req.body, req.clientIp));   // the rest are views
 #endif
 	if (routeOut) routeLabel(req.method, req.path, routeOut, kRouteLabelBytes);   // #405
 	// Out-param for the two telephony-config routes below, whose slot index is
@@ -1797,56 +1808,64 @@ void HttpServer::handleClient(int clientSock, char* readBuf, char* routeOut)
 	closeSocket(clientSock);
 }
 
-HttpServer::HttpRequest HttpServer::parseRequest(const std::string& raw)
+HttpServer::HttpRequest HttpServer::parseRequest(std::string_view raw)
 {
 	HttpRequest req;
 
 	// Parse request line: "GET /path HTTP/1.1\r\n"
 	size_t methodEnd = raw.find(' ');
-	if (methodEnd == std::string::npos) return req;
+	if (methodEnd == std::string_view::npos) return req;
 	req.method = raw.substr(0, methodEnd);
 
 	size_t pathStart = methodEnd + 1;
 	size_t pathEnd = raw.find(' ', pathStart);
-	if (pathEnd == std::string::npos) return req;
+	if (pathEnd == std::string_view::npos) return req;
 	req.path = raw.substr(pathStart, pathEnd - pathStart);
 
 	// Strip query string
 	size_t queryPos = req.path.find('?');
-	if (queryPos != std::string::npos)
+	if (queryPos != std::string_view::npos)
 	{
 		req.path = req.path.substr(0, queryPos);
 	}
 
-	// Efficient, low-overhead line-by-line header scanner (Observation 1)
+	// Efficient, low-overhead line-by-line header scanner (Observation 1).
+	// #1048: every line, name and value is a view of `raw`; nothing is copied.
+	const auto isSpace = [](char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; };
+	const auto iequals = [](std::string_view a, std::string_view lowerName) {
+		if (a.size() != lowerName.size()) return false;
+		for (size_t i = 0; i < a.size(); ++i)
+		{
+			if (std::tolower(static_cast<unsigned char>(a[i])) != static_cast<unsigned char>(lowerName[i])) return false;
+		}
+		return true;
+	};
 	size_t pos = raw.find("\r\n");
-	if (pos != std::string::npos) {
+	if (pos != std::string_view::npos) {
 		pos += 2; // Skip request line
 		while (pos < raw.size()) {
 			size_t lineEnd = raw.find("\r\n", pos);
-			if (lineEnd == std::string::npos) break;
+			if (lineEnd == std::string_view::npos) break;
 			if (lineEnd == pos) break; // Reached header-body boundary
 
-			std::string line = raw.substr(pos, lineEnd - pos);
+			const std::string_view line = raw.substr(pos, lineEnd - pos);
 			size_t colon = line.find(':');
-			if (colon != std::string::npos) {
-				std::string hName = line.substr(0, colon);
-				std::transform(hName.begin(), hName.end(), hName.begin(), ::tolower);
-				
-				// Strip trailing whitespaces from name
-				while (!hName.empty() && std::isspace(static_cast<unsigned char>(hName.back()))) hName.pop_back();
+			if (colon != std::string_view::npos) {
+				// Header names are case-insensitive; blanks before the colon are ignored.
+				std::string_view hName = line.substr(0, colon);
+				while (!hName.empty() && isSpace(hName.back())) hName.remove_suffix(1);
 
-				if (hName == "origin" || hName == "host" || hName == "cookie" ||
-				    hName == "x-csrf" || hName == "user-agent") {
-					size_t valStart = colon + 1;
-					while (valStart < line.size() && std::isspace(static_cast<unsigned char>(line[valStart]))) valStart++;
-					std::string hVal = line.substr(valStart);
-					while (!hVal.empty() && std::isspace(static_cast<unsigned char>(hVal.back()))) hVal.pop_back();
-					if (hName == "origin") req.origin = hVal;
-					else if (hName == "host") req.host = hVal;
-					else if (hName == "cookie") req.cookie = hVal;
-					else if (hName == "x-csrf") req.csrf = hVal;
-					else if (hName == "user-agent") req.userAgent = hVal;
+				std::string_view* slot = nullptr;
+				if (iequals(hName, "origin")) slot = &req.origin;
+				else if (iequals(hName, "host")) slot = &req.host;
+				else if (iequals(hName, "cookie")) slot = &req.cookie;
+				else if (iequals(hName, "x-csrf")) slot = &req.csrf;
+				else if (iequals(hName, "user-agent")) slot = &req.userAgent;
+				if (slot != nullptr) {
+					std::string_view hVal = line.substr(colon + 1);
+					while (!hVal.empty() && isSpace(hVal.front())) hVal.remove_prefix(1);
+					while (!hVal.empty() && isSpace(hVal.back())) hVal.remove_suffix(1);
+					*slot = hVal;
 				}
 			}
 			pos = lineEnd + 2;
@@ -1855,9 +1874,10 @@ HttpServer::HttpRequest HttpServer::parseRequest(const std::string& raw)
 
 	// Find body (after \r\n\r\n)
 	size_t bodyStart = raw.find("\r\n\r\n");
-	if (bodyStart != std::string::npos)
+	if (bodyStart != std::string_view::npos)
 	{
-		req.body = raw.substr(bodyStart + 4);
+		const std::string_view body = raw.substr(bodyStart + 4);
+		req.body.assign(body.data(), body.size());
 	}
 
 	return req;
@@ -3318,25 +3338,51 @@ void HttpServer::sendApiCdr(int sock)
 
 	uint64_t nowMs = currentTimeMs();   // same steady-clock basis as the CDR startMs
 
-	std::ostringstream json;
-	json << "[";
+	// #1048: polled by the dashboard, so no heap here. Like /api/status, the body
+	// is written into one of the fixed buffers allocated in the constructor and
+	// sent from there; one that does not fit is refused with a counted 500, never
+	// truncated.
+	std::atomic<bool>* busy = nullptr;
+	char* buf = leaseStatusBuf(busy);
+	if (buf == nullptr)   // all busy (fewer buffers than slots without PSRAM), or failed at boot
+	{
+		_statusRefusals.fetch_add(1, std::memory_order_relaxed);
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+			"{\"error\":\"no status buffer\"}");
+		return;
+	}
+	struct Release
+	{
+		std::atomic<bool>* f;
+		~Release() { f->store(false, std::memory_order_release); }
+	} release{busy};   // held until the send below has finished reading buf
+	JsonOut json{buf, (std::min)(_statusCap, kStatusBufBytes)};
+
+	json.s("[");
 	for (size_t i = 0; i < records.size(); i++)
 	{
-		if (i > 0) json << ",";
+		if (i > 0) json.s(",");
 		const CallDetailRecord& r = records[i];
 		// "ageSec": seconds since the call started, derived from the shared
 		// steady-clock basis (no wall clock / RTC is guaranteed on the device).
 		uint64_t ageSec = (nowMs >= r.startMs) ? (nowMs - r.startMs) / 1000 : 0;
-		json << "{\"caller\":\"" << jsonEscape(r.caller) << "\","
-		     << "\"callee\":\"" << jsonEscape(r.callee) << "\","
-		     << "\"startMs\":" << r.startMs << ","
-		     << "\"ageSec\":" << ageSec << ","
-		     << "\"duration\":" << r.durationSec << ","
-		     << "\"result\":\"" << cdrResultToString(r.result) << "\"}";
+		json.s("{\"caller\":\"").e(r.caller).s("\",")
+		    .s("\"callee\":\"").e(r.callee).s("\",")
+		    .s("\"startMs\":").n(r.startMs).s(",")
+		    .s("\"ageSec\":").n(ageSec).s(",")
+		    .s("\"duration\":").n(r.durationSec).s(",")
+		    .s("\"result\":\"").s(cdrResultToString(r.result)).s("\"}");
 	}
-	json << "]";
+	json.s("]");
 
-	sendResponse(sock, 200, "OK", "application/json", json.str());
+	if (json.full)
+	{
+		_statusRefusals.fetch_add(1, std::memory_order_relaxed);
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+			"{\"error\":\"cdr response too large\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json", std::string_view(buf, json.len));
 }
 
 void HttpServer::sendApiPcap(int sock)
@@ -3513,6 +3559,44 @@ void HttpServer::sendApiTrace(int sock)
 	// aid polled every second or two, so re-sending it is cheap — and it
 	// avoids the server needing to track any per-client polling state. The
 	// dashboard filters to unseen `seq` values client-side.
+	//
+	// #1048: written into a leased fixed buffer, so the poll allocates nothing.
+	// Unlike /api/status this is a debugging view whose size depends on the
+	// packets captured (up to a full ring of 2 KB messages), and it has always
+	// answered whatever the ring held: a body that does not fit the buffer, or no
+	// free buffer, is therefore built on the heap as before, never truncated.
+	{
+		std::atomic<bool>* busy = nullptr;
+		char* buf = leaseStatusBuf(busy);
+		if (buf != nullptr)
+		{
+			struct Release
+			{
+				std::atomic<bool>* f;
+				~Release() { f->store(false, std::memory_order_release); }
+			} release{busy};   // held until the send below has finished reading buf
+			JsonOut json{buf, (std::min)(_statusCap, kStatusBufBytes)};
+			json.s("[");
+			for (std::size_t i = 0; i < records.size(); ++i)
+			{
+				if (i > 0) json.s(",");
+				const auto& r = records[i];
+				json.s("{\"seq\":").n(r.seq).s(",")
+				    .s("\"tsUs\":").n(r.tsUs).s(",")
+				    .s("\"dir\":\"").s(r.outbound ? "out" : "in").s("\",")
+				    .s("\"peer\":\"").e(r.peer).s("\",")
+				    .s("\"text\":\"").e(r.text).s("\",")
+				    .s("\"truncated\":").b(r.truncated).s("}");
+			}
+			json.s("]");
+			if (!json.full)
+			{
+				sendResponse(sock, 200, "OK", "application/json", std::string_view(buf, json.len));
+				return;
+			}
+		}
+	}
+
 	std::ostringstream json;
 	json << "[";
 	for (std::size_t i = 0; i < records.size(); ++i)
@@ -3615,16 +3699,23 @@ HttpServer::ProvisioningPathType HttpServer::parseProvisioningPath(
 	return ProvisioningPathType::Invalid;
 }
 
-bool HttpServer::isProvisioningConfigPath(const std::string& path)
+bool HttpServer::isProvisioningConfigPath(std::string_view path)
 {
+	// Asked of every GET: a path that is not under /config/ (every API route) is
+	// answered from the view, without the copy parseProvisioningPath() takes.
+	static constexpr std::string_view kPrefix = "/config/";
+	if (path.size() <= kPrefix.size() || path.compare(0, kPrefix.size(), kPrefix) != 0)
+	{
+		return false;
+	}
 	std::string unused;
-	return parseProvisioningPath(path, unused) != ProvisioningPathType::Invalid;
+	return parseProvisioningPath(std::string(path), unused) != ProvisioningPathType::Invalid;
 }
 
 void HttpServer::sendProvisioningResponse(int sock, const HttpRequest& req)
 {
 	std::string key;
-	ProvisioningPathType type = parseProvisioningPath(req.path, key);
+	ProvisioningPathType type = parseProvisioningPath(std::string(req.path), key);   // a provisioning fetch: the copy is fine here
 	if (type == ProvisioningPathType::Invalid)
 	{
 		send404(sock);
@@ -3736,9 +3827,10 @@ void HttpServer::sendProvisioningResponse(int sock, const HttpRequest& req)
 	}
 	else // ProvisioningPathType::Yealink (/config/<mac>.cfg)
 	{
-		provisioning::Vendor vendor = provisioning::detectVendorFromUserAgent(req.userAgent);
+		const std::string userAgent(req.userAgent);   // the renderers take a string
+		provisioning::Vendor vendor = provisioning::detectVendorFromUserAgent(userAgent);
 		cfg = provisioning::renderProvisioningConfigForUserAgent(
-			req.userAgent, info->extension, activeIp, 5060, info->authRequired);
+			userAgent, info->extension, activeIp, 5060, info->authRequired);
 		if (vendor == provisioning::Vendor::Yealink)
 		{
 			contentType = "text/plain";
@@ -4090,17 +4182,17 @@ void HttpServer::sendApiDialPlan(int sock, const std::string& body)
 // range-checking against TelephonyApiConfig::kSlots is deliberately left to
 // RequestsHandler::setTelephonyConfigSlot() (-> TelephonyApiConfig::setSlot()),
 // so there is exactly one place in the codebase that knows the valid range.
-static bool parseTelephonyConfigSlotPath(const std::string& path, size_t& slotIdx)
+static bool parseTelephonyConfigSlotPath(std::string_view path, size_t& slotIdx)
 {
-	static const std::string prefix = "/api/telephony-config/";
+	static constexpr std::string_view prefix = "/api/telephony-config/";
 	if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0)
 	{
 		return false;
 	}
-	const std::string rest = path.substr(prefix.size());
+	const std::string_view rest = path.substr(prefix.size());
 	// No legitimate slot index needs more than a handful of digits; capping the
 	// length keeps the accumulation below overflow-free of any extra guard.
-	if (rest.empty() || rest.size() > 9 || rest.find('/') != std::string::npos)
+	if (rest.empty() || rest.size() > 9 || rest.find('/') != std::string_view::npos)
 	{
 		return false;
 	}
@@ -4116,9 +4208,9 @@ static bool parseTelephonyConfigSlotPath(const std::string& path, size_t& slotId
 
 // Same prefix, but requires a trailing "/activate" segment -- used for
 // POST .../<slot>/activate.
-static bool parseTelephonyConfigActivatePath(const std::string& path, size_t& slotIdx)
+static bool parseTelephonyConfigActivatePath(std::string_view path, size_t& slotIdx)
 {
-	static const std::string suffix = "/activate";
+	static constexpr std::string_view suffix = "/activate";
 	if (path.size() <= suffix.size() ||
 	    path.compare(path.size() - suffix.size(), suffix.size(), suffix) != 0)
 	{
@@ -4130,9 +4222,9 @@ static bool parseTelephonyConfigActivatePath(const std::string& path, size_t& sl
 // Same prefix, but requires a trailing "/test" segment -- used for
 // POST .../<slot>/test (Issue #165's dashboard patch-bay: the interconnect
 // module's "Test Dial" action).
-static bool parseTelephonyConfigTestPath(const std::string& path, size_t& slotIdx)
+static bool parseTelephonyConfigTestPath(std::string_view path, size_t& slotIdx)
 {
-	static const std::string suffix = "/test";
+	static constexpr std::string_view suffix = "/test";
 	if (path.size() <= suffix.size() ||
 	    path.compare(path.size() - suffix.size(), suffix.size(), suffix) != 0)
 	{
@@ -4685,26 +4777,33 @@ bool HttpServer::isSameOrigin(const HttpRequest& req) const
 	// No Origin header means a direct request (browser nav, curl, etc.) — allow.
 	if (req.origin.empty()) return true;
 
+	// #1048: views throughout; nothing here allocates.
 	// Strip the scheme from the Origin (e.g. "http://192.168.4.1:8080" → "192.168.4.1:8080")
-	std::string originHost = req.origin;
+	std::string_view originHost = req.origin;
 	size_t schemeEnd = originHost.find("://");
-	if (schemeEnd != std::string::npos)
-		originHost = originHost.substr(schemeEnd + 3);
+	if (schemeEnd != std::string_view::npos)
+		originHost.remove_prefix(schemeEnd + 3);
 
-	// Split "host:port" (port optional → empty string when absent).
-	auto splitHostPort = [](const std::string& h) -> std::pair<std::string, std::string> {
+	// Split "host:port" (port optional → empty when absent).
+	const auto splitHostPort = [](std::string_view h) -> std::pair<std::string_view, std::string_view> {
 		size_t colon = h.find(':');
-		if (colon != std::string::npos) return { h.substr(0, colon), h.substr(colon + 1) };
-		return { h, std::string() };
+		if (colon != std::string_view::npos) return { h.substr(0, colon), h.substr(colon + 1) };
+		return { h, std::string_view() };
 	};
 
-	auto originParts = splitHostPort(originHost);
-	auto hostParts   = splitHostPort(req.host);
-	const std::string& cleanOrigin = originParts.first;
-	const std::string& cleanHost   = hostParts.first;
+	const auto originParts = splitHostPort(originHost);
+	const auto hostParts   = splitHostPort(req.host);
+	const std::string_view cleanOrigin = originParts.first;
+	const std::string_view cleanHost   = hostParts.first;
 
 	// Host header must be our local IP or local mDNS hostname or localhost
-	std::string activeIp = (_ip == "0.0.0.0") ? getPrimaryLocalIP() : _ip;
+	char primaryIp[INET_ADDRSTRLEN] = "";
+	std::string_view activeIp = _ip;
+	if (_ip == "0.0.0.0")
+	{
+		(void)getPrimaryLocalIPInto(primaryIp, sizeof(primaryIp));   // false leaves "127.0.0.1", as getPrimaryLocalIP() does
+		activeIp = primaryIp;
+	}
 	bool hostValid = (cleanHost == activeIp ||
 	                  cleanHost == "192.168.4.1" ||
 	                  cleanHost == "pocketdial.local" ||
@@ -4725,11 +4824,12 @@ bool HttpServer::isSameOrigin(const HttpRequest& req) const
 	return true;
 }
 
-std::string HttpServer::cookieValue(const HttpRequest& req, const std::string& name)
+std::string_view HttpServer::cookieValue(const HttpRequest& req, std::string_view name)
 {
 	// Cookie header is "k1=v1; k2=v2; ...". Find name= as a token boundary.
-	const std::string& c = req.cookie;
-	if (c.empty()) return "";
+	// #1048: the value is a view into the request; nothing is copied.
+	const std::string_view c = req.cookie;
+	if (c.empty()) return std::string_view();
 
 	size_t pos = 0;
 	while (pos < c.size())
@@ -4737,24 +4837,24 @@ std::string HttpServer::cookieValue(const HttpRequest& req, const std::string& n
 		// Skip leading spaces / separators.
 		while (pos < c.size() && (c[pos] == ' ' || c[pos] == ';')) ++pos;
 		size_t eq = c.find('=', pos);
-		if (eq == std::string::npos) break;
-		std::string k = c.substr(pos, eq - pos);
+		if (eq == std::string_view::npos) break;
+		const std::string_view k = c.substr(pos, eq - pos);
 		size_t valStart = eq + 1;
 		size_t valEnd = c.find(';', valStart);
-		std::string v = (valEnd == std::string::npos)
+		std::string_view v = (valEnd == std::string_view::npos)
 			? c.substr(valStart)
 			: c.substr(valStart, valEnd - valStart);
 		// Trim surrounding whitespace from the value.
-		while (!v.empty() && (v.front() == ' ')) v.erase(v.begin());
-		while (!v.empty() && (v.back() == ' ' || v.back() == '\r' || v.back() == '\n')) v.pop_back();
+		while (!v.empty() && (v.front() == ' ')) v.remove_prefix(1);
+		while (!v.empty() && (v.back() == ' ' || v.back() == '\r' || v.back() == '\n')) v.remove_suffix(1);
 		if (k == name) return v;
-		if (valEnd == std::string::npos) break;
+		if (valEnd == std::string_view::npos) break;
 		pos = valEnd + 1;
 	}
-	return "";
+	return std::string_view();
 }
 
-std::string HttpServer::sessionToken(const HttpRequest& req) const
+std::string_view HttpServer::sessionToken(const HttpRequest& req) const
 {
 	return cookieValue(req, "pd_session");
 }
@@ -4804,7 +4904,7 @@ bool HttpServer::requireAdmin(int sock, const HttpRequest& req, bool needCsrf,
 	//    can be unconditional from the very first boot — the old
 	//    "open AP until a PIN is set" window (docs/THREAT_MODEL.md §5.1) is
 	//    gone.
-	const std::string token = sessionToken(req);
+	const std::string_view token = sessionToken(req);   // a view into req: nothing is copied (#1048)
 	if (!AdminAuth::validateSession(token))
 	{
 		sendResponse(sock, 401, "Unauthorized", "application/json",
@@ -4852,7 +4952,7 @@ bool HttpServer::requireAdmin(int sock, const HttpRequest& req, bool needCsrf,
 
 bool HttpServer::isAuthed(const HttpRequest& req) const
 {
-	std::string token = cookieValue(req, "pd_session");
+	const std::string_view token = cookieValue(req, "pd_session");
 	if (token.empty()) return false;
 	return AdminAuth::validateSession(token);
 }
@@ -5799,15 +5899,38 @@ void HttpServer::sendApiAdminStatus(int sock, const HttpRequest& req)
 	// `role` is "" (not "none") while unauthenticated -- unauthenticated
 	// already has its own boolean field, so a caller doesn't need to parse a
 	// string to learn it.
-	std::ostringstream json;
-	json << "{\"provisioned\":" << (provisioned ? "true" : "false")
-	     << ",\"needsSetup\":" << (provisioned ? "false" : "true")
-	     << ",\"authenticated\":" << (authenticated ? "true" : "false")
-	     << ",\"role\":\"" << (role == AdminAuth::Role::Owner ? "owner" :
-	                            role == AdminAuth::Role::Sysop ? "sysop" : "")
-	     << "\",\"ownerProvisioned\":" << (AdminAuth::isOwnerProvisioned() ? "true" : "false")
-	     << ",\"sessionRemainingSec\":" << (sessionRemainingMs / 1000) << "}";
-	sendResponse(sock, 200, "OK", "application/json", json.str());
+	// #1048: written into a leased fixed buffer (the dashboard polls this), so
+	// no heap; same refusals as /api/status when there is none or it is too small.
+	std::atomic<bool>* busy = nullptr;
+	char* buf = leaseStatusBuf(busy);
+	if (buf == nullptr)
+	{
+		_statusRefusals.fetch_add(1, std::memory_order_relaxed);
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+			"{\"error\":\"no status buffer\"}");
+		return;
+	}
+	struct Release
+	{
+		std::atomic<bool>* f;
+		~Release() { f->store(false, std::memory_order_release); }
+	} release{busy};   // held until the send below has finished reading buf
+	JsonOut json{buf, (std::min)(_statusCap, kStatusBufBytes)};
+	json.s("{\"provisioned\":").b(provisioned)
+	    .s(",\"needsSetup\":").b(!provisioned)
+	    .s(",\"authenticated\":").b(authenticated)
+	    .s(",\"role\":\"").s(role == AdminAuth::Role::Owner ? "owner" :
+	                       role == AdminAuth::Role::Sysop ? "sysop" : "")
+	    .s("\",\"ownerProvisioned\":").b(AdminAuth::isOwnerProvisioned())
+	    .s(",\"sessionRemainingSec\":").n(sessionRemainingMs / 1000).s("}");
+	if (json.full)
+	{
+		_statusRefusals.fetch_add(1, std::memory_order_relaxed);
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+			"{\"error\":\"admin status response too large\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json", std::string_view(buf, json.len));
 }
 
 void HttpServer::sendApiAdminSetOwnerCredential(int sock, const HttpRequest& req)
@@ -5995,7 +6118,7 @@ void HttpServer::sendApiAdminLogin(int sock, const HttpRequest& req)
 
 void HttpServer::sendApiAdminLogout(int sock, const HttpRequest& req)
 {
-	std::string token = cookieValue(req, "pd_session");
+	const std::string_view token = cookieValue(req, "pd_session");
 	if (!token.empty())
 	{
 		AdminAuth::destroySession(token);
@@ -8141,22 +8264,45 @@ void HttpServer::handleOtaUpload(int sock, const std::string& alreadyRead,
 
 void HttpServer::sendApiOtaStatus(int sock)
 {
-	std::ostringstream json;
-	json << "{";
-	json << "\"running\":\""          << jsonEscape(OtaUpdater::runningPartitionLabel())    << "\",";
-	json << "\"runningPartition\":\"" << jsonEscape(OtaUpdater::runningPartitionLabel())    << "\",";
-	json << "\"inProgress\":"         << (OtaUpdater::isUpdateInProgress() ? "true" : "false") << ",";
-	json << "\"boot\":\""             << jsonEscape(OtaUpdater::bootPartitionLabel())       << "\",";
-	json << "\"next\":\""     << jsonEscape(OtaUpdater::nextUpdatePartitionLabel()) << "\",";
-	json << "\"pendingVerify\":" << (OtaUpdater::isPendingVerify() ? "true" : "false") << ",";
+	// #1048: polled by the dashboard, so written into a leased fixed buffer
+	// (no heap); same refusals as /api/status when there is none or it is too small.
+	std::atomic<bool>* busy = nullptr;
+	char* buf = leaseStatusBuf(busy);
+	if (buf == nullptr)
+	{
+		_statusRefusals.fetch_add(1, std::memory_order_relaxed);
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+			"{\"error\":\"no status buffer\"}");
+		return;
+	}
+	struct Release
+	{
+		std::atomic<bool>* f;
+		~Release() { f->store(false, std::memory_order_release); }
+	} release{busy};   // held until the send below has finished reading buf
+	JsonOut json{buf, (std::min)(_statusCap, kStatusBufBytes)};
+	json.s("{");
+	json.s("\"running\":\"").e(OtaUpdater::runningPartitionLabel()).s("\",");
+	json.s("\"runningPartition\":\"").e(OtaUpdater::runningPartitionLabel()).s("\",");
+	json.s("\"inProgress\":").b(OtaUpdater::isUpdateInProgress()).s(",");
+	json.s("\"boot\":\"").e(OtaUpdater::bootPartitionLabel()).s("\",");
+	json.s("\"next\":\"").e(OtaUpdater::nextUpdatePartitionLabel()).s("\",");
+	json.s("\"pendingVerify\":").b(OtaUpdater::isPendingVerify()).s(",");
 #if defined(ESP_PLATFORM)
-	json << "\"otaSupported\":true,";
+	json.s("\"otaSupported\":true,");
 #else
-	json << "\"otaSupported\":false,";
+	json.s("\"otaSupported\":false,");
 #endif
-	json << "\"error\":\"\"";
-	json << "}";
-	sendResponse(sock, 200, "OK", "application/json", json.str());
+	json.s("\"error\":\"\"");
+	json.s("}");
+	if (json.full)
+	{
+		_statusRefusals.fetch_add(1, std::memory_order_relaxed);
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+			"{\"error\":\"ota status response too large\"}");
+		return;
+	}
+	sendResponse(sock, 200, "OK", "application/json", std::string_view(buf, json.len));
 }
 
 #if defined(POCKETDIAL_ANCHOR_BENCH_PROBE) && defined(ESP_PLATFORM)
