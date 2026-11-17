@@ -1671,3 +1671,134 @@ TEST_F(ConfigExportImportTest, EncryptedRestore_ListsRefusedRowsInRowOrder_SixAt
 	EXPECT_NE(report.find("row 0 mac, row 1 mac, row 2 mac, row 3 shape, row 4 mac, row 5 mac, and 4 more"),
 		std::string::npos) << report;
 }
+
+// ── Issue #1044: the export is built without a std::ostringstream; its bytes must not move ──
+namespace
+{
+	std::string unhexBytes(const std::string& hex)
+	{
+		std::string out;
+		for (size_t i = 0; i + 1 < hex.size(); i += 2)
+		{
+			out.push_back(static_cast<char>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+		}
+		return out;
+	}
+
+	std::string memberOf(const std::string& json, const std::string& key)
+	{
+		const std::string marker = "\"" + key + "\":\"";
+		const size_t at = json.find(marker);
+		if (at == std::string::npos) return "";
+		const size_t start = at + marker.size();
+		return json.substr(start, json.find('"', start) - start);
+	}
+
+	// Every field the export writes, set to something: several extensions (one secured),
+	// DIDs, a ring group, forwards (with a no-answer time), a dial plan rule, a page zone,
+	// the trunk and mail stores, and strings that need JSON escaping.
+	void populateForExportGolden(RequestsHandler& h)
+	{
+		EXPECT_TRUE(SipSecretStore::setSecret("101", "digestpw-101"));
+		h.adoptDeviceForTest("0200000000a1", "101", RequestsHandler::DeviceState::Secured);
+		h.adoptDeviceForTest("0200000000a2", "102", RequestsHandler::DeviceState::Learned, /*locked=*/true);
+		h.adoptDeviceForTest("0200000000a3", "103");
+		h.setRegistrarMode(RequestsHandler::RegistrarMode::Secure);
+		h.setRingGroup("700", "101,102,103", "hunt");
+		h.setForward("101", "always", "102");
+		h.setForward("101", "busy", "103");
+		h.setForward("102", "noanswer", "103");
+		EXPECT_TRUE(h.setNoAnswerSeconds("102", 45));
+		h.setDnd("103", true);
+		h.setVoicemail("102", true);
+		h.setPageZone("980", "101,102");
+		h.setDialRule("9XXXXXXXXXX", "trunk", "1", 1);
+		h.setDialRule("555XXXX", "group", "700");
+		EXPECT_EQ(h.setDidMapping("2025550100", "101"), "");
+		EXPECT_EQ(h.setDidMapping("2025550101", "102"), "");
+		h.setE911Config("101,102", "2025550100", "Dock \"B\" \\ north");
+		EXPECT_TRUE(h.setAdminExt("101"));
+
+		TrunkConfigStore::Config t;
+		t.host = "sip.example.invalid";
+		t.port = 5061;
+		t.proxyHost = "proxy\\edge";
+		t.proxyPort = 5070;
+		t.fromUser = "main \"line\"";
+		t.callerId = "2025550100";
+		t.authUser = "trunk\tuser";
+		t.pass = "trunk-pass-\"q\"";
+		t.enabled = true;
+		EXPECT_TRUE(TrunkConfigStore::save(t));
+
+		EmailConfigStore::Config e;
+		e.host = "mail.example.invalid";
+		e.port = 465;
+		e.mode = "tls";
+		e.auth = "plain";
+		e.user = "ops@example.invalid";
+		e.pass = "smtp-pass\\1";
+		e.from = "pbx@example.invalid";
+		e.to = "a@example.invalid,b@example.invalid";
+		e.gsaEmail = "svc@example.invalid";
+		e.gsaKey = "-----KEY-----\nline\x01two\n";
+		e.insecureSkipVerify = true;
+		e.caPem = "-----BEGIN-----\r\nq\"b\\c\x1f\n-----END-----\n";
+		EXPECT_TRUE(EmailConfigStore::save(e));
+
+		EXPECT_TRUE(DeviceConfig::setWifiConfig("Shop \"Wifi\"\\1", 1));
+		EXPECT_TRUE(DeviceConfig::setWifiPassword("wifi\x02pass"));
+		EXPECT_TRUE(DeviceConfig::setApPsk("ap-psk-\"x\""));
+	}
+}
+
+TEST_F(ConfigExportImportTest, ExportBytesAreStable_PlaintextPart)
+{
+	populateForExportGolden(*_handler);
+	const std::string body = bodyOf(httpRaw(_port, "GET", "/api/config/export", "",
+		"pd_session=" + _sysop.cookie));
+	EXPECT_EQ(body, 
+		"{\"exportVer\":1,\"plaintext\":{\"extensions\":[{\"mac\":\"0200000000a3\",\"extension\":\"103\",\"state\":\"learned\"},{\"mac\":\"0200000000a2\",\"extension\":\"102\",\"state\":\"learned\"},{\"mac\":\"0200000000a1\",\"extension\":\"101\",\"state\":\"secured\"}],"
+		"\"securedExtensions\":[\"101\"],"
+		"\"ringGroups\":[{\"extension\":\"700\",\"mode\":\"hunt\",\"members\":\"101,102,103\"}],"
+		"\"forwards\":[{\"extension\":\"102\",\"always\":\"\",\"busy\":\"\",\"noAnswer\":\"103\",\"noAnswerSeconds\":45},{\"extension\":\"101\",\"always\":\"102\",\"busy\":\"103\",\"noAnswer\":\"\",\"noAnswerSeconds\":0}],"
+		"\"dnd\":[\"103\"],"
+		"\"voicemail\":[\"102\"],"
+		"\"pageZones\":[{\"zone\":\"980\",\"members\":\"101,102\"}],"
+		"\"dialPlan\":[{\"pattern\":\"9XXXXXXXXXX\",\"action\":\"trunk\",\"target\":\"1\",\"stripDigits\":1},{\"pattern\":\"555XXXX\",\"action\":\"group\",\"target\":\"700\",\"stripDigits\":0}],"
+		"\"didMappings\":[{\"did\":\"2025550100\",\"extension\":\"101\"},{\"did\":\"2025550101\",\"extension\":\"102\"}],"
+		"\"registrarMode\":\"secure\",\"telephonyConfig\":[{\"index\":0,\"type\":\"LOOPBACK\",\"enabled\":false,\"secretSet\":false},{\"index\":1,\"type\":\"LOOPBACK\",\"enabled\":false,\"secretSet\":false},{\"index\":2,\"type\":\"LOOPBACK\",\"enabled\":false,\"secretSet\":false},{\"index\":3,\"type\":\"LOOPBACK\",\"enabled\":false,\"secretSet\":false}],"
+		"\"trunk\":{\"host\":\"sip.example.invalid\",\"port\":5061,\"proxyHost\":\"proxy\\\\edge\",\"proxyPort\":5070,\"fromUser\":\"main \\\"line\\\"\",\"callerId\":\"2025550100\",\"authUser\":\"trunk\\tuser\",\"enabled\":true},"
+		"\"email\":{\"host\":\"mail.example.invalid\",\"port\":465,\"mode\":\"tls\",\"auth\":\"plain\",\"user\":\"ops@example.invalid\",\"from\":\"pbx@example.invalid\",\"to\":\"a@example.invalid,b@example.invalid\",\"gsaEmail\":\"svc@example.invalid\",\"insecure\":true,\"caPem\":\"-----BEGIN-----\\r\\nq\\\"b\\\\c\\u001f\\n-----END-----\\n\"},"
+		"\"e911\":{\"notifyExts\":\"101,102\",\"callback\":\"2025550100\",\"location\":\"Dock \\\"B\\\" \\\\ north\"},"
+		"\"adminExt\":\"101\",\"wifiSsid\":\"Shop \\\"Wifi\\\"\\\\1\",\"wifiMode\":1,\"apSecure\":false,\"parkTimeoutSec\":90,\"mdnsHostname\":\"pocketdial\",\"schemaVer\":2}}");
+	SipSecretStore::clearSecret("101");
+}
+
+TEST_F(ConfigExportImportTest, ExportBytesAreStable_SealedPart)
+{
+	populateForExportGolden(*_handler);
+	AdminSession owner = loginOwner();
+	const std::string body = bodyOf(httpRaw(_port, "POST", "/api/config/export",
+		"password=exportpass123", "pd_session=" + owner.cookie, owner.csrf));
+	const size_t enc = body.find(",\"secretsEnc\":");
+	ASSERT_NE(enc, std::string::npos) << body;
+	const std::string plaintextPart = body.substr(std::string("{\"exportVer\":1,\"plaintext\":").size(),
+		enc - std::string("{\"exportVer\":1,\"plaintext\":").size());
+	const std::string saltRaw = unhexBytes(memberOf(body, "salt"));
+	const std::string nonceRaw = unhexBytes(memberOf(body, "nonce"));
+	const std::string ct = unhexBytes(memberOf(body, "ct"));
+	ASSERT_EQ(saltRaw.size(), static_cast<size_t>(AdminAuth::kKdfSaltBytes));
+	ASSERT_EQ(nonceRaw.size(), static_cast<size_t>(AdminAuth::kGcmNonceBytes));
+	uint8_t key[AdminAuth::kAesKeyBytes];
+	AdminAuth::pbkdf2Sha256("exportpass123", reinterpret_cast<const uint8_t*>(saltRaw.data()), saltRaw.size(),
+		AdminAuth::kExportKdfIterations, key, sizeof(key));
+	std::string gated;
+	ASSERT_TRUE(AdminAuth::aesGcmOpen(key, reinterpret_cast<const uint8_t*>(nonceRaw.data()),
+		plaintextPart, ct, gated));
+	EXPECT_EQ(gated, 
+		"{\"wifiPassword\":\"wifi\\u0002pass\",\"apPsk\":\"ap-psk-\\\"x\\\"\",\"telephonyConfig\":[{\"index\":0,\"baseUrl\":\"\",\"clientId\":\"\",\"routeDn\":\"\"},{\"index\":1,\"baseUrl\":\"\",\"clientId\":\"\",\"routeDn\":\"\"},{\"index\":2,\"baseUrl\":\"\",\"clientId\":\"\",\"routeDn\":\"\"},{\"index\":3,\"baseUrl\":\"\",\"clientId\":\"\",\"routeDn\":\"\"}],"
+		"\"extensionSecrets\":[{\"extension\":\"101\",\"ha1\":\"0843d5002bbf4a47e2776725960c910d\"}],"
+		"\"trunkPass\":\"trunk-pass-\\\"q\\\"\",\"smtpPass\":\"smtp-pass\\\\1\",\"gsaKey\":\"-----KEY-----\\nline\\u0001two\\n\",\"extensions\":[[\"0200000000a1\",\"101\",1,0],[\"0200000000a2\",\"102\",0,1],[\"0200000000a3\",\"103\",0,0]]}");
+	SipSecretStore::clearSecret("101");
+}

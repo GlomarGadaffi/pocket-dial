@@ -72,6 +72,24 @@ def _body(name):
     raise AssertionError("unbalanced braces in " + name)
 
 
+def _static_body(name):
+    """Body of a file-scope `static void name(...)` helper, comments and literals blanked."""
+    with open(CPP, encoding="utf-8") as f:
+        src = _strip(f.read())
+    m = re.search(r"static\s+void\s+" + name + r"\s*\(", src)
+    assert m, name + " not found"
+    start = src.index("{", m.end())
+    depth = 0
+    for i in range(start, len(src)):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:i + 1]
+    raise AssertionError("unbalanced braces in " + name)
+
+
 def _large_locals(body):
     found = []
     for t in LARGE_TYPES:
@@ -113,6 +131,24 @@ class HttpConnFrames(unittest.TestCase):
             m = re.search(r"__attribute__\(\(noinline\)\)\s*#endif\s*static\s+[\w:<>& ,]+?"
                           + name + r"\s*\(", src)
             self.assertTrue(m, name + " must stay noinline")
+
+    def test_export_path_builds_no_stream(self):
+        # #1044: std::ostringstream formatting is the deepest thing the export calls.
+        bodies = {
+            "exportPlaintextJson": _static_body("exportPlaintextJson"),
+            "exportGatedJson": _static_body("exportGatedJson"),
+            "sendApiConfigExport": _body("sendApiConfigExport"),
+        }
+        for name, body in bodies.items():
+            self.assertNotRegex(body, r"stringstream|ostream|<<", name + " must not use a stream")
+
+    def test_export_helper_bodies_are_found_not_vacuous(self):
+        pt = _static_body("exportPlaintextJson")
+        gated = _static_body("exportGatedJson")
+        self.assertIn("jsonEscape", pt)
+        self.assertGreater(len(pt), 2000)
+        self.assertIn("getHa1", gated)
+        self.assertGreater(len(gated), 800)
 
     def test_stack_constant_unchanged(self):
         with open(HPP, encoding="utf-8") as f:

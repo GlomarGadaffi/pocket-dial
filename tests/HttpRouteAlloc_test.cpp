@@ -132,7 +132,7 @@ namespace
 		{"GET /api/pnp", 2},
 		{"GET /api/zero-touch", 2},   // #826 part B: same two, requireAdmin(); the body is a fixed buffer
 		{"GET /api/email", 5}, {"GET /api/admin/status", 5},
-		{"GET /api/ap-security", 6}, {"POST /api/dialplan", 9}, {"GET /api/config/export", 10},
+		{"GET /api/ap-security", 6}, {"POST /api/dialplan", 9}, {"GET /api/config/export", 5},
 		{"GET /api/telephony-config", 14},
 	};
 
@@ -245,7 +245,7 @@ TEST(HttpRouteAlloc, TheConfigExportCountDoesNotDependOnAWifiSsidAnEarlierTestLe
 	// The host's WiFi station mirror is process-global and DeviceConfig::clearAll()
 	// leaves it alone, so ConfigExportImportTest.PasswordGatedRoundTrip... once left
 	// "TestOfficeWifi" in it for every later test. jsonEscape() reserves for any
-	// value of 8+ characters, and /api/config/export escapes the SSID: one more
+	// value of 8+ characters, and /api/config/export then escaped the SSID into a new string: one more
 	// allocation than the ceiling, in the shuffled orders that ran that test first.
 	struct CleanUp { ~CleanUp() { DeviceConfig::resetWifiForTest(); } } cleanUp;
 	ASSERT_TRUE(DeviceConfig::setWifiConfig("TestOfficeWifi", 1));
