@@ -196,6 +196,10 @@ public:
 	// drop the upstream leg of a bridge that has outlived its session.
 	std::string participantId() const;
 	std::string callId() const;
+	// True when this bridge is active and serves the given call id OR participant id. An
+	// empty id on either side matches nothing. One lookup under the bridge's own lock, no
+	// copy: the orphan-bridge sweep runs it for every bridge on every tick.
+	bool isOwnedBy(std::string_view callID, std::string_view participantId) const;
 
 	// The UDP port the bridge's RTP receiver is bound on (0 if not active). This
 	// is the port the handset must send its audio to, so it MUST be the value

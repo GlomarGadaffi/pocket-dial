@@ -599,6 +599,8 @@ add_executable(sip_parser_tests
     CdrPersistBlob_test.cpp
     # Issue #463 (#284 batch B): the idle tick, OPTIONS ping and header rewrites.
     IdleTickAlloc_test.cpp
+    # Issue #1048: the orphan-bridge sweep copies no string per bridge per tick.
+    OrphanSweepAlloc_test.cpp
     # Issue #464 (#284 batch C): per-request lookups allocate nothing.
     AllocFreeLookups_test.cpp
     DropProbe_test.cpp
