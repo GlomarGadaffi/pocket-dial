@@ -1,2 +1,2 @@
-# ConfigExportImport_test.cpp: ConfigExportImportTest.ExportBytesAreStable_* (2). The config export's bytes (readable part, and the sealed part decrypted) must not move when it stops using std::ostringstream (#1044).
-2
+# ConfigExportImport_test.cpp: ConfigExportImportTest.ExportBytesAreStable_* (4: plaintext part, sealed part, empty board, edge fields) and JsonEscapeSameAsBefore.EveryByteValueAloneAndInContext (1). The config export's bytes and the JSON string escaper must not move when the export stops using std::ostringstream (#1044).
+5

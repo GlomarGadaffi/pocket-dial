@@ -149,6 +149,17 @@ class HttpConnFrames(unittest.TestCase):
         self.assertGreater(len(pt), 2000)
         self.assertIn("getHa1", gated)
         self.assertGreater(len(gated), 800)
+        send = _body("sendApiConfigExport")
+        self.assertIn("exportPlaintextJson", send)
+        self.assertIn("aesGcmSeal", send)
+        self.assertGreater(len(send), 600)
+
+    def test_append_integer_checks_the_conversion(self):
+        # #1044: a to_chars that failed must not be written as a gap.
+        body = _static_body("appendInteger")
+        self.assertIn("to_chars", body)
+        self.assertRegex(body, r"\.ec\s*==\s*std::errc\(\)")
+        self.assertRegex(body, r"char\s+buf\[24\]")
 
     def test_stack_constant_unchanged(self):
         with open(HPP, encoding="utf-8") as f:

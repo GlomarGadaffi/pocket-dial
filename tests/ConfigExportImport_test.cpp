@@ -1802,3 +1802,176 @@ TEST_F(ConfigExportImportTest, ExportBytesAreStable_SealedPart)
 		"\"trunkPass\":\"trunk-pass-\\\"q\\\"\",\"smtpPass\":\"smtp-pass\\\\1\",\"gsaKey\":\"-----KEY-----\\nline\\u0001two\\n\",\"extensions\":[[\"0200000000a1\",\"101\",1,0],[\"0200000000a2\",\"102\",0,1],[\"0200000000a3\",\"103\",0,0]]}");
 	SipSecretStore::clearSecret("101");
 }
+
+// GOLDEN-BEGIN
+namespace
+{
+	struct ExportParts
+	{
+		std::string plaintext;   // the readable part, as shipped
+		std::string gated;       // the sealed part, decrypted
+	};
+
+	// The sealed export of the fixture's board, its sealed part decrypted with the password.
+	ExportParts sealedExportParts(int port, const AdminSession& owner)
+	{
+		ExportParts parts;
+		const std::string body = bodyOf(httpRaw(port, "POST", "/api/config/export",
+			"password=exportpass123", "pd_session=" + owner.cookie, owner.csrf));
+		const std::string head = "{\"exportVer\":1,\"plaintext\":";
+		const size_t enc = body.find(",\"secretsEnc\":");
+		EXPECT_NE(enc, std::string::npos) << body;
+		if (enc == std::string::npos) return parts;
+		parts.plaintext = body.substr(head.size(), enc - head.size());
+		const std::string saltRaw = unhexBytes(memberOf(body, "salt"));
+		const std::string nonceRaw = unhexBytes(memberOf(body, "nonce"));
+		const std::string ct = unhexBytes(memberOf(body, "ct"));
+		uint8_t key[AdminAuth::kAesKeyBytes];
+		AdminAuth::pbkdf2Sha256("exportpass123", reinterpret_cast<const uint8_t*>(saltRaw.data()), saltRaw.size(),
+			AdminAuth::kExportKdfIterations, key, sizeof(key));
+		EXPECT_TRUE(AdminAuth::aesGcmOpen(key, reinterpret_cast<const uint8_t*>(nonceRaw.data()),
+			parts.plaintext, ct, parts.gated));
+		return parts;
+	}
+
+	// The fields populateForExportGolden leaves alone: telephony slots that are enabled, set and
+	// carry a URL, a second secured extension, a trunk port at both ends of its range, a trunk
+	// left disabled, a secure AP, a WiFi mode of 0, and strings with DEL, UTF-8 and invalid UTF-8.
+	void populateEdgeFieldsForExport(RequestsHandler& h)
+	{
+		EXPECT_TRUE(SipSecretStore::setSecret("101", "digestpw-101"));
+		EXPECT_TRUE(SipSecretStore::setSecret("104", "digestpw-104"));
+		h.adoptDeviceForTest("0200000000b4", "104", RequestsHandler::DeviceState::Secured, /*locked=*/true);
+		h.adoptDeviceForTest("0200000000b1", "101", RequestsHandler::DeviceState::Secured);
+		h.adoptDeviceForTest("0200000000b2", "r\x7f\xc3\xa9\xff", RequestsHandler::DeviceState::Learned);
+		h.setDialRule("1XXXXXXXXXXX", "trunk", "1", 12);
+
+		TelephonyApiConfig::Slot s;
+		s.type = TelephonyProviderType::Telephony;
+		s.enabled = true;
+		s.baseUrl = "https://pbx.example.invalid/\xc3\xa9\"x\"";
+		s.clientId = "cid\1\x7f";
+		s.secret = "slot-secret";
+		s.routeDn = "100";
+		const TelephonyApiConfig::Acceptance accepted{TelephonyApiConfig::kAcceptanceVersion, 1, 1760000000};
+		EXPECT_EQ(h.setTelephonyConfigSlot(0, s, false, &accepted), "");
+		TelephonyApiConfig::Slot draft = s;
+		draft.enabled = false;
+		draft.routeDn = "\xff\xfe";
+		EXPECT_EQ(h.setTelephonyConfigSlot(2, draft, false), "");
+
+		TrunkConfigStore::Config t;
+		t.host = "\xc3\xa9.example.invalid";
+		t.port = 65535;
+		t.proxyPort = 0;
+		t.enabled = false;
+		EXPECT_TRUE(TrunkConfigStore::save(t));
+		EmailConfigStore::Config e;
+		e.port = 25;
+		EXPECT_TRUE(EmailConfigStore::save(e));
+
+		EXPECT_TRUE(DeviceConfig::setWifiConfig("caf\xc3\xa9\x7f\xff", 0));
+		EXPECT_TRUE(DeviceConfig::setApSecure(true));
+		EXPECT_TRUE(DeviceConfig::setWifiPassword("p\x7f\xc3\xa9\xff"));
+		EXPECT_TRUE(DeviceConfig::setApPsk("ap-psk-edge"));
+	}
+}
+
+TEST_F(ConfigExportImportTest, ExportBytesAreStable_EmptyBoard)
+{
+	ASSERT_TRUE(SipSecretStore::securedExtensions().empty());
+	EXPECT_TRUE(DeviceConfig::setApPsk("ap-psk-empty"));   // unset, it is a fresh random value on each export
+	const std::string plain = bodyOf(httpRaw(_port, "GET", "/api/config/export", "",
+		"pd_session=" + _sysop.cookie));
+	EXPECT_EQ(plain, "{\"exportVer\":1,\"plaintext\":{\"extensions\":[],\"securedExtensions\":[],\"ringGroups\":[],\"forwards\":[],\"dnd\":[],\"voicemail\":[],\"pageZones\":[],"
+		"\"dialPlan\":[],\"didMappings\":[],\"registrarMode\":\"learn\",\"telephonyConfig\":[{\"index\":0,\"type\":\"LOOPBACK\",\"enabled\":false,\"secretSet\":false},{\"index\":1,"
+		"\"type\":\"LOOPBACK\",\"enabled\":false,\"secretSet\":false},{\"index\":2,\"type\":\"LOOPBACK\",\"enabled\":false,\"secretSet\":false},{\"index\":3,\"type\":\"LOOPBACK\","
+		"\"enabled\":false,\"secretSet\":false}],\"trunk\":{\"host\":\"\",\"port\":5060,\"proxyHost\":\"\",\"proxyPort\":5060,\"fromUser\":\"\",\"callerId\":\"\","
+		"\"authUser\":\"\",\"enabled\":false},\"email\":{\"host\":\"\",\"port\":587,\"mode\":\"starttls\",\"auth\":\"none\",\"user\":\"\",\"from\":\"\",\"to\":\"\","
+		"\"gsaEmail\":\"\",\"insecure\":false,\"caPem\":\"\"},\"e911\":{\"notifyExts\":\"\",\"callback\":\"\",\"location\":\"\"},\"adminExt\":\"1001\",\"wifiSsid\":\"\","
+		"\"wifiMode\":0,\"apSecure\":false,\"parkTimeoutSec\":90,\"mdnsHostname\":\"pocketdial\",\"schemaVer\":2}}");
+	AdminSession owner = loginOwner();
+	const ExportParts parts = sealedExportParts(_port, owner);
+	EXPECT_EQ(parts.gated, "{\"wifiPassword\":\"\",\"apPsk\":\"ap-psk-empty\",\"telephonyConfig\":[{\"index\":0,\"baseUrl\":\"\",\"clientId\":\"\",\"routeDn\":\"\"},{\"index\":1,\"baseUrl\":\"\","
+		"\"clientId\":\"\",\"routeDn\":\"\"},{\"index\":2,\"baseUrl\":\"\",\"clientId\":\"\",\"routeDn\":\"\"},{\"index\":3,\"baseUrl\":\"\",\"clientId\":\"\",\"routeDn\":\"\"}],"
+		"\"extensionSecrets\":[],\"trunkPass\":\"\",\"smtpPass\":\"\",\"gsaKey\":\"\",\"extensions\":[]}");
+}
+
+TEST_F(ConfigExportImportTest, ExportBytesAreStable_EdgeFields)
+{
+	populateEdgeFieldsForExport(*_handler);
+	const std::string plain = bodyOf(httpRaw(_port, "GET", "/api/config/export", "",
+		"pd_session=" + _sysop.cookie));
+	EXPECT_EQ(plain, "{\"exportVer\":1,\"plaintext\":{\"extensions\":[{\"mac\":\"0200000000b2\",\"extension\":\"r\177\303\251\377\",\"state\":\"learned\"},{\"mac\":\"0200000000b1\","
+		"\"extension\":\"101\",\"state\":\"secured\"},{\"mac\":\"0200000000b4\",\"extension\":\"104\",\"state\":\"secured\"}],\"securedExtensions\":[\"101\",\"104\"],"
+		"\"ringGroups\":[],\"forwards\":[],\"dnd\":[],\"voicemail\":[],\"pageZones\":[],\"dialPlan\":[{\"pattern\":\"1XXXXXXXXXXX\",\"action\":\"trunk\",\"target\":\"1\","
+		"\"stripDigits\":12}],\"didMappings\":[],\"registrarMode\":\"learn\",\"telephonyConfig\":[{\"index\":0,\"type\":\"TELEPHONY-API\",\"enabled\":true,\"secretSet\":true},{\"index\":1,"
+		"\"type\":\"LOOPBACK\",\"enabled\":false,\"secretSet\":false},{\"index\":2,\"type\":\"TELEPHONY-API\",\"enabled\":false,\"secretSet\":true},{\"index\":3,"
+		"\"type\":\"LOOPBACK\",\"enabled\":false,\"secretSet\":false}],\"trunk\":{\"host\":\"\303\251.example.invalid\",\"port\":65535,\"proxyHost\":\"\",\"proxyPort\":0,"
+		"\"fromUser\":\"\",\"callerId\":\"\",\"authUser\":\"\",\"enabled\":false},\"email\":{\"host\":\"\",\"port\":25,\"mode\":\"starttls\",\"auth\":\"none\",\"user\":\"\","
+		"\"from\":\"\",\"to\":\"\",\"gsaEmail\":\"\",\"insecure\":false,\"caPem\":\"\"},\"e911\":{\"notifyExts\":\"\",\"callback\":\"\",\"location\":\"\"},\"adminExt\":\"1001\","
+		"\"wifiSsid\":\"caf\303\251\177\377\",\"wifiMode\":0,\"apSecure\":true,\"parkTimeoutSec\":90,\"mdnsHostname\":\"pocketdial\",\"schemaVer\":2}}");
+	AdminSession owner = loginOwner();
+	const ExportParts parts = sealedExportParts(_port, owner);
+	EXPECT_EQ(parts.gated, "{\"wifiPassword\":\"p\177\303\251\377\",\"apPsk\":\"ap-psk-edge\",\"telephonyConfig\":[{\"index\":0,\"baseUrl\":\"https://pbx.example.invalid/\303\251\\\"x\\\"\","
+		"\"clientId\":\"cid\\u0001\177\",\"routeDn\":\"100\"},{\"index\":1,\"baseUrl\":\"\",\"clientId\":\"\",\"routeDn\":\"\"},{\"index\":2,\"baseUrl\":\"https://pbx.example.invalid/\303\251\\\"x\\\"\","
+		"\"clientId\":\"cid\\u0001\177\",\"routeDn\":\"\377\376\"},{\"index\":3,\"baseUrl\":\"\",\"clientId\":\"\",\"routeDn\":\"\"}],\"extensionSecrets\":[{\"extension\":\"101\","
+		"\"ha1\":\"0843d5002bbf4a47e2776725960c910d\"},{\"extension\":\"104\",\"ha1\":\"49e93e5032a342b51f3b9fbea9524b32\"}],\"trunkPass\":\"\",\"smtpPass\":\"\","
+		"\"gsaKey\":\"\",\"extensions\":[[\"0200000000b4\",\"104\",1,1],[\"0200000000b1\",\"101\",1,0],[\"0200000000b2\",\"r\177\303\251\377\",0,0]]}");
+	SipSecretStore::clearSecret("101");
+	SipSecretStore::clearSecret("104");
+}
+// GOLDEN-END
+
+// #1044: jsonEscape now wraps jsonEscapeAppend. The reference is the algorithm it replaced.
+namespace
+{
+	std::string referenceJsonEscape(const std::string& s)
+	{
+		static const char* hex = "0123456789abcdef";
+		std::string out;
+		out.reserve(s.size() + 8);
+		for (unsigned char c : s)
+		{
+			switch (c)
+			{
+				case '"':  out += "\\\""; break;
+				case '\\': out += "\\\\"; break;
+				case '\n': out += "\\n";  break;
+				case '\r': out += "\\r";  break;
+				case '\t': out += "\\t";  break;
+				default:
+					if (c < 0x20)
+					{
+						out += "\\u00";
+						out += hex[(c >> 4) & 0x0F];
+						out += hex[c & 0x0F];
+					}
+					else
+					{
+						out += static_cast<char>(c);
+					}
+			}
+		}
+		return out;
+	}
+}
+
+TEST(JsonEscapeSameAsBefore, EveryByteValueAloneAndInContext)
+{
+	std::string all;
+	for (int b = 0; b < 256; ++b)
+	{
+		const std::string one(1, static_cast<char>(b));
+		EXPECT_EQ(HttpServer::jsonEscapeForTest(one), referenceJsonEscape(one)) << "byte " << b;
+		std::string appended = "pre\"";
+		HttpServer::jsonEscapeAppendForTest(appended, one);
+		EXPECT_EQ(appended, "pre\"" + referenceJsonEscape(one)) << "byte " << b;
+		all += one;
+	}
+	EXPECT_EQ(all.size(), 256u);   // the NUL is inside it
+	EXPECT_EQ(HttpServer::jsonEscapeForTest(all), referenceJsonEscape(all));
+	const std::string badUtf8("\xc3\x28\xff\xfe\xed\xa0\x80\xf8\x88\x80\x80\x80\x80\0z\0", 17);
+	EXPECT_EQ(HttpServer::jsonEscapeForTest(badUtf8), referenceJsonEscape(badUtf8));
+	EXPECT_EQ(HttpServer::jsonEscapeForTest(""), "");
+}

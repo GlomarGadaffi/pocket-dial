@@ -2184,6 +2184,9 @@ static std::string jsonEscape(const std::string& s)
 	return out;
 }
 
+std::string HttpServer::jsonEscapeForTest(const std::string& s) { return jsonEscape(s); }
+void HttpServer::jsonEscapeAppendForTest(std::string& out, const std::string& s) { jsonEscapeAppend(out, s); }
+
 // An integer appended in decimal, no heap and no stream (#1044). The 24 bytes hold any
 // 64-bit value; a failed conversion cannot happen, but is not silently written as a gap.
 template <typename T>
