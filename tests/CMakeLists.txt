@@ -119,6 +119,9 @@ add_executable(sip_parser_tests
     HttpDramAccount_test.cpp
     # Issue #410 done-when 4: the per-route allocation gate.
     HttpRouteAlloc_test.cpp
+    # Issue #1048: the shared request path works on views over the read buffer
+    # (padded/mixed-case headers, cookie order, refusals, byte-exact /api/cdr).
+    HttpRequestViews_test.cpp
     # Issue #412: every allocateVirtualPeer() caller must survive an exhausted
     # pool -- refuse with 503 (or drop the anchor leg) and release what it had
     # claimed, never publish a session with a null peer.

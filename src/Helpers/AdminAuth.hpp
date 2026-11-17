@@ -167,7 +167,7 @@ namespace AdminAuth
 	// The role bound to a live session, or Role::None if the token is
 	// unknown/expired. Read-only (does not slide expiry), same contract as
 	// sessionCsrf().
-	Role sessionRole(const std::string& token);
+	Role sessionRole(std::string_view token);
 
 	// True iff a session with role `sessionRole(token)` may perform an action
 	// gated at `need`. Owner-gated actions (`need == Role::Owner`) ALSO admit a
@@ -178,7 +178,7 @@ namespace AdminAuth
 	// grant them back. Once an owner exists, this floor closes — only an Owner
 	// session satisfies an Owner gate from then on. Sysop-gated actions
 	// (`need == Role::Sysop`) admit either role, since Owner is a superset.
-	bool sessionSatisfiesRole(const std::string& token, Role need);
+	bool sessionSatisfiesRole(std::string_view token, Role need);
 
 	// True iff a REAL (operator-set, non-default) login credential is stored.
 	// False on a freshly-flashed device, and again immediately after
@@ -279,28 +279,28 @@ namespace AdminAuth
 	std::string createSession(Role role = Role::Sysop);
 
 	// True iff the token names a live (non-expired) session.
-	bool validateSession(const std::string& token);
+	bool validateSession(std::string_view token);
 
 	// The CSRF token bound to a live session, or "" if the session is unknown or
 	// expired. Generated with the session and stored beside it, so it is bound by
 	// storage rather than derived from anything the client controls. It is rendered
 	// into the dashboard page (never set as a cookie), so a cross-site page cannot
 	// read it even though the browser would happily attach the cookie.
-	std::string sessionCsrf(const std::string& token);
+	std::string sessionCsrf(std::string_view token);
 
 	// Constant-time check of a submitted CSRF token against the one bound to
-	// `token`'s session. False if the session is unknown/expired or the token does
+	// `token`'s session (#1048: both are views; nothing is copied or allocated). False if the session is unknown/expired or the token does
 	// not match. Does NOT slide the session expiry (validateSession does that).
-	bool validateCsrf(const std::string& token, const std::string& csrf);
+	bool validateCsrf(std::string_view token, std::string_view csrf);
 
 	// Milliseconds until `token`'s session expires, or 0 if the token is
 	// unknown/expired. Read-only — unlike validateSession(), this does NOT
 	// slide the expiry, so a dashboard polling this to show a countdown
 	// doesn't itself keep resetting the countdown it is displaying.
-	uint64_t sessionRemainingMs(const std::string& token);
+	uint64_t sessionRemainingMs(std::string_view token);
 
 	// Destroy a session by token (logout). No-op if unknown.
-	void destroySession(const std::string& token);
+	void destroySession(std::string_view token);
 
 	// Wipe the stored login credential AND the DTMF PIN AND all live sessions,
 	// and reset the lockout state. Used by factory-reset so the device returns
