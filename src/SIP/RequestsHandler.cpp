@@ -7815,6 +7815,22 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 			if (data->getFromNumber() == src->getNumber())       farLeg = dest;
 			else if (data->getFromNumber() == dest->getNumber()) farLeg = src;
 		}
+		if (farLeg && session.value()->isEmergency() &&
+			sameAddress(farLeg->getAddress(), data->getSource()))
+		{
+			// #1149: an emergency leg whose spliced peer ended keeps a stand-in dest that
+			// carries the sender's own address: there is no far phone to BYE. Answer it
+			// and end the leg now, rather than BYE the phone that just hung up.
+			auto response = getMessageFromPool(*data);
+			if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+			response->setHeader(SipMessageTypes::OK);
+			response->clearBody();
+			response->setVia(sipwire::viaWithReceived(data->getVia(), data->getSource()));
+			_outbox.emplace_back(data->getSource(), std::move(response));
+			setCallDisposition(data->getCallID(), Session::Disposition::Bye);
+			endCall(data->getCallID(), src->getNumber(), dest->getNumber(), "emergency leg hung up (peer already ended)");
+			return;
+		}
 		if (farLeg)
 		{
 			// A BYE already in flight for this dialog: a retransmit that got past the
@@ -9948,6 +9964,7 @@ void RequestsHandler::endClientCalls(const std::string& extension, const std::st
 		std::string_view src, dest;
 		bool trunkInbound = false;
 		bool found = false;
+		std::shared_ptr<Session> emergencyPeer;   // #1149: the surviving emergency half of a spliced pair
 		for (const auto& [key, s] : _sessions)
 		{
 			if (!sessionOnExtension(*s, extension) || key.size() >= sizeof(cid)) continue;
@@ -10044,6 +10061,13 @@ void RequestsHandler::endClientCalls(const std::string& extension, const std::st
 					}
 				}
 			}
+			// #1149 (Rule 5): the pair-level check decides. When the other half of a spliced
+			// pair is an emergency call it stays up and is never sent a BYE; only its link to
+			// this ending session is cleared below, once the session is gone.
+			if (isSplicedPair(s) && pairHasEmergency(s) && !s->isEmergency())
+			{
+				if (auto peer = getSession(s->getPeerCallID()); peer.has_value()) emergencyPeer = peer.value();
+			}
 			std::memcpy(cid, key.data(), key.size());
 			cid[key.size()] = '\0';
 			// Numbers live in the clients (released after this loop), so views are stable.
@@ -10067,6 +10091,7 @@ void RequestsHandler::endClientCalls(const std::string& extension, const std::st
 		}
 #endif
 		endCall(id, src, dest, reason);
+		if (emergencyPeer) emergencyPeer->setPeerCallID(std::string());
 	}
 }
 
@@ -13735,7 +13760,9 @@ void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point n
 
 		// Rule 5: a spliced pair with an emergency session in it is not reaped from
 		// either leg: ending one half would leave the other up on dead air.
-		if (isSplicedPair(session) && pairHasEmergency(session)) continue;
+		// #1149: the session's own flag protects too: a surviving emergency leg whose
+		// peer ended (link cleared) is no longer a pair, and must not be reaped here.
+		if (session->isEmergency() || (isSplicedPair(session) && pairHasEmergency(session))) continue;
 
 		if (now >= session->getSessionExpiry())
 		{

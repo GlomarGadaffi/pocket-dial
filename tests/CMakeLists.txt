@@ -566,6 +566,8 @@ add_executable(sip_parser_tests
     # Pins: one BYE per leg on the right dialog tags via _asyncOutbox, and
     # endCall()'s side effects actually happening.
     ForceDisconnect_test.cpp
+    # Issue #1149: a park retriever unregistering must leave an emergency peer up, unBYEd, with its peer link cleared.
+    EmergencyPairUnregister_test.cpp
     # Issue #199 root cause 2: capability advertisement beyond OPTIONS. #200
     # built addCapabilityHeaders() but wired it only into the OPTIONS 200 OK,
     # which is not what gates UPDATE or Replaces on a conformant phone — it reads
