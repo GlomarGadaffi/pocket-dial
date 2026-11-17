@@ -12188,14 +12188,13 @@ void RequestsHandler::tick()
 		for (auto& b : _mediaBridges)
 		{
 			if (!b.isActive()) continue;
-			const std::string bpart = b.participantId();
-			const std::string bcall = b.callId();
+			// Compared under the bridge's own lock, no id copied out: this runs for every
+			// active bridge every tick. An empty id on either side owns nothing.
 			bool owned = false;
 			for (const auto& [cid, s] : _sessions)
 			{
 				if (!s->isAnchor()) continue;
-				if ((!bcall.empty() && cid == bcall) ||
-				    (!bpart.empty() && s->getAnchorParticipantId() == bpart))
+				if (b.isOwnedBy(cid, s->getAnchorParticipantId()))
 				{
 					owned = true;
 					break;
@@ -12203,6 +12202,7 @@ void RequestsHandler::tick()
 			}
 			if (!owned)
 			{
+				const std::string bpart = b.participantId();
 				if (!bpart.empty())
 				{
 					if (anchorIsSynchronous() && _anchorClient) _anchorClient->dropCall(bpart);

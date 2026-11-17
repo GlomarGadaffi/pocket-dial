@@ -427,6 +427,14 @@ bool MediaBridge::isForCallId(const std::string& callID) const
 	return _active.load(std::memory_order_acquire) && !callID.empty() && _callID == callID;
 }
 
+bool MediaBridge::isOwnedBy(std::string_view callID, std::string_view participantId) const
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	if (!_active.load(std::memory_order_acquire)) return false;
+	return (!callID.empty() && _callID == callID) ||
+	       (!participantId.empty() && _participantId == participantId);
+}
+
 std::string MediaBridge::participantId() const
 {
 	std::lock_guard<std::mutex> lock(_mutex);
