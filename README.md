@@ -249,7 +249,7 @@ That is **Learn** mode, trust on first use. Switch the registrar to **Secure** a
 
 ## Releases
 
-**v1.7.0** (2026-10-28) is current: 55 pull requests since v1.6.0, built to be left running, on two boards. The flasher offers it and every earlier tag; images and checksums are on the [releases page](https://github.com/GlomarGadaffi/pocket-dial/releases). `main` moves ahead of the newest tag between releases; the [changelog](CHANGELOG.md) says what changed and what is still a known gap.
+**v1.8.0** (2026-11-18) is current: 8 pull requests since v1.7.0, on memory pressure, soaked on two boards. The flasher offers it and every earlier tag; images and checksums are on the [releases page](https://github.com/GlomarGadaffi/pocket-dial/releases). `main` moves ahead of the newest tag between releases; the [changelog](CHANGELOG.md) says what changed and what is still a known gap.
 
 ## Repository layout
 
