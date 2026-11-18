@@ -1515,7 +1515,12 @@ bool TelephonyAnchorClient::connectWs()
 	wsCfg.reconnect_timeout_ms = 5000;
 	wsCfg.network_timeout_ms   = 10000;
 
-	esp_websocket_client_handle_t wsClient = esp_websocket_client_init(&wsCfg);
+	// #1162: both 4096 B buffers come from PSRAM, not internal DRAM (see psram::MallocScope).
+	esp_websocket_client_handle_t wsClient = nullptr;
+	{
+		psram::MallocScope psramBuffers;
+		wsClient = esp_websocket_client_init(&wsCfg);
+	}
 	if (!wsClient)
 	{
 		return false;
@@ -2906,7 +2911,13 @@ esp_http_client_handle_t TelephonyAnchorClient::makeAuthedClient(const char* url
 	config.keep_alive_enable  = true;
 	config.save_client_session = true;
 
-	esp_http_client_handle_t client = esp_http_client_init(&config);
+	// #1162: the 4096 B receive buffer comes from PSRAM, not internal DRAM (see psram::MallocScope).
+	// The scope ends before the client is used, so nothing but the allocations of init is moved.
+	esp_http_client_handle_t client = nullptr;
+	{
+		psram::MallocScope psramBuffers;
+		client = esp_http_client_init(&config);
+	}
 	if (!client)
 	{
 		return nullptr;
