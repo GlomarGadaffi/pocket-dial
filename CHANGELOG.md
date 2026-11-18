@@ -1,5 +1,65 @@
 # Changelog
 
+## v1.8.0 — 2026-11-18
+
+8 PRs since `v1.7.0`, on one theme: no crashes under memory pressure. The work is in three places: the stack of the HTTP connection thread on the config export, the heap on the per-tick and per-request paths, and the internal heap of a board with the 3CX anchor configured. The release ran on both Ethernet boards (LilyGO T-ETH-Elite and Waveshare ESP32-S3-ETH): a 4.6 h soak on the `v1.8.0-rc.1` tree, then a one-hour smoke on the Elite on this tree after the one fix the soak called for. What was and was not run on this tree is under "Release evidence".
+
+### Highlights
+
+- A config export leaves 932 B (Elite) and 964 B (Waveshare) of stack free on the HTTP connection thread, from 332 B and 212 B.
+- The once-a-second tick and 17 HTTP routes, the status poll among them, allocate nothing per call.
+- A board with the anchor configured keeps about 40 KB more internal heap free: its low-water mark under call load is 39.9 KB, from 3.6 KB.
+- Ethernet input is now counted by class below the IP stack. Nothing is dropped by it.
+
+### Stack
+
+- `GET /api/config/export` no longer builds its answer with `std::ostringstream`: the export and import frames are split into small helpers (#1158), and the export is appended to one reserved string, each section in its own helper (#1161; #1044). The bytes of the export are unchanged. Free stack on `http_conn` after an export, measured on hardware: Elite 332 B, then 508 B, then 932 B; Waveshare 212 B, then 964 B. The target was 512 B.
+- The Stack Depth Gate's caps for `http_conn` were lowered to the new totals (6,144 B on the standard images, 6,096 B on the constrained one), so a regression fails CI.
+
+### Heap
+
+- The tick's orphan-bridge sweep compares call ownership under the bridge's own lock and copies no string per bridge per second (#1159; #1048 item 1).
+- The HTTP server parses a request as views over its read buffer, and `/api/cdr`, `/api/admin/status`, `/api/ota/status` and `/api/trace` write into a leased fixed buffer, as `/api/status` already did (#1160; #1048 item 2). The list of routes that still allocate per request went from 35 to 18, and a test fails if a route on neither list allocates (#1033).
+- A config export makes 3 allocations, from 10 (#1161).
+- The anchor's HTTP and WebSocket clients get their 4 KB buffers from PSRAM instead of internal RAM (#1163; #1162). On the Elite with the anchor configured, free internal heap with four phones registered went from 28 KB to 68 KB.
+
+### Network
+
+- A pure classifier gives a verdict for each Ethernet frame (#1155), an IPv4 input hook counts what it would drop, by class (#1156), and an `esp_eth` input-path hook counts frames (#1157; #1145). The counters are on `/api/status` (`ip4Guard`, `l2Ingress`). This is count-only: no frame is dropped, and arming any drop is not part of this release.
+
+### Release evidence
+
+- Soak, `v1.8.0-rc.1` tree, both boards at once, 4.6 h, 253 of 253 calls on each (echo, extension to extension, three-leg conference, park and retrieve): no reboot, no coredump, no stuck session, idle internal heap flat on both. The Waveshare passed every check. The Elite failed one, `heap-floor`: internal heap low-water 3,604 B against a floor of 16,384 B (#1162).
+- #1163 is the only change after that soak. One-hour smoke on the Elite on this tree: every check passed, low-water 39,932 B, 56 of 56 calls. The 4.6 h soak was not repeated on this tree. In the smoke the idle heap trend read -881 B/h against a floor of -1,024 B/h; over 4.6 h on the rc.1 tree the same board read -69 B/h.
+- The Waveshare was not re-run on this tree with call load beyond the heap-trace run below: it has no anchor configured, so #1163's code does not execute there.
+- Lowest free stack per task under the soak's load, both boards, floor 512 B: `http_conn` 932 and 964 B, `rtp_media_tx` 1,104 B, `tcpip` 1,440 B, `conf_mix_tick` 2,100 B, `eth_rx` 2,852 B, `rtp_media_rx` 3,824 B, `flash_writer` 4,192 B, `sip_server_task` 4,356 B, `udp_receiver_task` 7,464 B, the anchor's `tel_*` tasks 11,552 B and up. These are the first hardware readings for `rtp_media_tx` and `conf_mix_tick`.
+- Heap trace of calls on the Waveshare, this tree, 10 of 10 calls: outstanding internal allocations were 148.5 KB idle, 154.9 KB with an extension call up, 159.0 KB with a three-leg conference up and 157.1 KB after every call ended. No growth per call after the first of each kind. About 10 KB is taken once and kept.
+
+### Fixed since the v1.7.0 gaps
+
+- `http_conn` had 128 B of stack headroom on the config export (#1044): fixed above.
+- The TASK_WDT under an OTA upload with orphaned 888 legs (#1016) is closed as mitigated, not fixed: since #1037 the OTA route refuses an upload while any call is up or ringing, so the upload that starved the idle task no longer starts. A call that begins during an upload is not covered.
+
+### Known limitations
+
+- The SIP request path still allocates. The heap trace shows `onInvite`, `onRegister` and `onBye` as allocation sites, through the SIP message layer (#1048 items 3 to 5). Nothing is retained per call, but an allocation can fail under pressure. That layer is planned to move to the shared endpoint stack, not to be reworked here.
+- Internal heap falls by 16 to 20 KB for under a second during some three-leg conferences, on both boards; it coincides with one slow Ethernet send (#1162). With the anchor configured the Elite now has about 40 KB of room at that moment, where it had 4 KB. The cause is not fixed. Each anchor token refresh, every 3,000 s, still takes about 7 KB for a second.
+- 18 HTTP routes still allocate per request (#1033). `POST /api/config/import` was not run on hardware: its frame is 1,072 B by the gate, and the `http_conn` row in the Stack Depth Gate stays a known finding for it (#457).
+- On the `display` build in station mode the dashboard may not start: internal RAM runs out before the HTTP server task is created (#1005). The failed create is now logged; the memory is not yet found.
+- NVS commits and other slow work still run under the call-control lock in places (#986).
+- The heap-trace build does not run as shipped: it asserts within seconds of boot (#374). With per-task heap tracking off it ran 18 minutes on the Waveshare; that setting is not in the tree. With the anchor configured the trace build runs the Elite out of internal heap in two minutes.
+- Ring groups are not a DID target on the anchor: a DID mapped to a ring-group number rings every registered handset instead of the group, and a PSAP callback on that DID does the same. Map callback DIDs to a single extension.
+- The SIP trunk is deprecated and experimental, and is not a supported way to reach a PSAP. No SIP trunk carries 911 or 933.
+- A far-side or loopback-only board has no 911 route: 911 and 933 get `503 Emergency Call Not Routable` and the Kari's Law notification.
+- The config export does not carry a telephony slot's client secret (on purpose), and the constrained 4 MB image does not export or import the trunk, SMTP, E911, admin_ext or MAC-binding sections (#483).
+- An inbound PSAP callback on the anchor can wait behind another call's status GET for its caller-ID lookup, and the emergency no-slot drop holds the control lock across its POST (#949 items 2 and 3). Unregistering a park retriever can leave its emergency peer with a dangling link (#1149).
+- If 3CX ends a call by removing only a far leg whose id was never recorded, the call stays up until the phone hangs up (#1101).
+- Hardware evidence is two boards: LilyGO T-ETH-Elite and Waveshare ESP32-S3-ETH. There is no Waveshare release image; build it from source with `PD_ETH_BOARD=waveshare`.
+
+### Planned
+
+- Arming the ingress filter's drops, behind an allowlist and its own soaks (#1145).
+
 ## v1.7.0 — 2026-10-28
 
 55 PRs since `v1.6.0`, on one theme: every call leg is torn down exactly once. The post-merge pass on `a9eb4fd7` ran on both Ethernet boards (LilyGO T-ETH-Elite over serial, Waveshare ESP32-S3-ETH over OTA) and passed. The Stack Depth Gate bounds `tel_sweep` with at least 512 B free on every firmware variant, and #1116 was closed on that static figure, not on a measured high-water mark. Hardware evidence is the `a9eb4fd7` post-merge pass only; everything else was covered by host tests and the interop suite.
