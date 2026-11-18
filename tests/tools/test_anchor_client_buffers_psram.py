@@ -31,6 +31,14 @@ def block_before(src, call):
 SCOPE = re.compile(r"\bpsram::MallocScope\s+\w+\s*;")
 
 
+def scope_covers(before):
+    """A scope declared in the call's own block, with no block closed between it and the call."""
+    last = None
+    for last in SCOPE.finditer(before):
+        pass
+    return last is not None and "}" not in before[last.end():]
+
+
 class AnchorClientBuffersPsramTest(unittest.TestCase):
     longMessage = False
 
@@ -40,11 +48,11 @@ class AnchorClientBuffersPsramTest(unittest.TestCase):
 
     def test_http_client_is_created_inside_a_scope(self):
         before = block_before(self.cpp, "esp_http_client_init(&config)")
-        self.assertTrue(SCOPE.search(before), "makeAuthedClient creates its client outside a psram::MallocScope")
+        self.assertTrue(scope_covers(before), "makeAuthedClient creates its client outside a psram::MallocScope")
 
     def test_websocket_client_is_created_inside_a_scope(self):
         before = block_before(self.cpp, "esp_websocket_client_init(&wsCfg)")
-        self.assertTrue(SCOPE.search(before), "connectWs creates its client outside a psram::MallocScope")
+        self.assertTrue(scope_covers(before), "connectWs creates its client outside a psram::MallocScope")
 
     def test_one_place_creates_each_client(self):
         # Positive control for the two tests above: they look at the only call sites there are.
@@ -58,6 +66,14 @@ class AnchorClientBuffersPsramTest(unittest.TestCase):
     def test_device_arm_sets_and_restores_the_idf_threshold(self):
         self.assertIn("heap_caps_malloc_extmem_enable(", self.hpp)
         self.assertIn("CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL", self.hpp)
+        # The lower threshold while a scope lives, and the board's own when the last one ends.
+        self.assertIn("applyMallocInternalLimit(kMallocScopeMinBytes - 1);", self.hpp)
+        self.assertIn("applyMallocInternalLimit(kMallocDefaultInternalLimit);", self.hpp)
+
+    def test_a_scope_that_ended_before_the_call_does_not_count(self):
+        # Positive control for scope_covers().
+        self.assertFalse(scope_covers("{ { psram::MallocScope s; } client = "))
+        self.assertTrue(scope_covers("{ psram::MallocScope s; client = "))
 
 
 if __name__ == "__main__":
