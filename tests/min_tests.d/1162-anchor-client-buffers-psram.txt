@@ -1,0 +1,2 @@
+# PsramMallocScope_test.cpp: PsramMallocScope.* (3). The scope lowers the malloc threshold to 4095 while alive and restores it when the last one ends.
+3
